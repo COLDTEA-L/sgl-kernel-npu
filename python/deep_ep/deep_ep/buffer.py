@@ -469,6 +469,17 @@ class Buffer:
                 recv_tokens_per_expert,
             )
 
+    def all2_all_detour_io_die(
+        self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the A5 CCU/IO Die All2All over the selected communication ranks.
+
+        Every rank in ``self.group`` must call this method with the same ordered
+        ``comm_rank_ids``. Ranks not listed in ``comm_rank_ids`` participate in
+        the collective with zero send/receive counts.
+        """
+        return self.runtime.all2_all_detour_io_die(send_data, comm_rank_ids)
+
     @log_parameters()
     def combine(
         self,

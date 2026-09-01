@@ -108,6 +108,30 @@ bool Buffer::is_available() const
     return available;
 }
 
+torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)
+{
+    EP_HOST_ASSERT(send_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kHalf || send_data.scalar_type() == at::kBFloat16 ||
+                   send_data.scalar_type() == at::kFloat || send_data.scalar_type() == at::kInt);
+    EP_HOST_ASSERT(comm_rank_ids.is_contiguous());
+    EP_HOST_ASSERT(comm_rank_ids.dim() == 1);
+    EP_HOST_ASSERT(comm_rank_ids.scalar_type() == at::kInt);
+    EP_HOST_ASSERT(comm_rank_ids.numel() > 0 && comm_rank_ids.numel() <= num_ranks);
+    EP_HOST_ASSERT(send_data.numel() % comm_rank_ids.numel() == 0);
+
+    char hcom_ep_name[HCOMM_NAME_LEN];
+    if (!moe_all_to_all_group_name.empty()) {
+        std::memcpy(hcom_ep_name, moe_all_to_all_group_name.data(), moe_all_to_all_group_name.size() + 1);
+    } else {
+        HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
+    }
+
+    auto recv_data = torch::empty_like(send_data);
+    EXEC_NPU_CMD(aclnnAll2AllDetourIoDie, send_data, comm_rank_ids, hcom_ep_name, num_ranks, rank, recv_data);
+    return recv_data;
+}
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, std::optional<EventHandle> &previous_event,
                             bool async, bool allocate_on_comm_stream)

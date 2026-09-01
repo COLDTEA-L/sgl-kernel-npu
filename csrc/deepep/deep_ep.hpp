@@ -63,6 +63,8 @@ public:
 
     torch::Tensor get_notify_send_data();
 
+    torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
+
     std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,
                std::vector<int>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, std::optional<EventHandle>>
     intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,

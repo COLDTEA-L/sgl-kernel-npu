@@ -12,6 +12,11 @@ if("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
             ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch_tiling.cc)
         message(STATUS "DeepEP single-op host build: NotifyDispatch")
+    elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "all2_all_detour_io_die")
+        set(ops_srcs
+            ${CMAKE_CURRENT_SOURCE_DIR}/all2_all_detour_io_die_def.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/all2_all_detour_io_die_tiling.cpp)
+        message(STATUS "DeepEP single-op host build: All2AllDetourIoDie")
     else()
         # Keep one FusedDeepMoe definition visible to code generation on A5.
         list(REMOVE_ITEM ops_srcs
@@ -44,6 +49,10 @@ if("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "notify_dispatch")
     file(GLOB pregen_file
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.h")
+elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "all2_all_detour_io_die")
+    file(GLOB pregen_file
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_all2_all_detour_io_die.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_all2_all_detour_io_die.h")
 elseif("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
     # Keep all existing ACLNN wrappers (including low-latency dispatch/combine)
     # and overlay only the A5-specific FusedDeepMoe wrapper.

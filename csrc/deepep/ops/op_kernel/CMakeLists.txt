@@ -5,14 +5,14 @@ endif()
 
 message(STATUS "ASCEND include path: ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/moe_distribute_dispatch")
 
-set(_DEEPEP_NOTIFY_ONLY OFF)
-if("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "notify_dispatch")
-    set(_DEEPEP_NOTIFY_ONLY ON)
-    message(STATUS "DeepEP single-op kernel build: NotifyDispatch")
+set(_DEEPEP_SINGLE_OP_ONLY OFF)
+if(NOT "$ENV{DEEPEP_SINGLE_OP}" STREQUAL "")
+    set(_DEEPEP_SINGLE_OP_ONLY ON)
+    message(STATUS "DeepEP single-op kernel build: $ENV{DEEPEP_SINGLE_OP}")
 endif()
 
 set(_DISPATCH_FFN_INC_OPTS)
-if(NOT _DEEPEP_NOTIFY_ONLY)
+if(NOT _DEEPEP_SINGLE_OP_ONLY)
     if (EXISTS ${CMAKE_SOURCE_DIR}/third_party/catlass/include)
         list(APPEND _DISPATCH_FFN_INC_OPTS -I${CMAKE_SOURCE_DIR}/third_party/catlass/include)
     else()
@@ -25,7 +25,7 @@ endif()
 # deepep/ops/build.sh for A3 kernels. These options must be appended to the
 # final global option set because OPC's per-op compiler inherits that set.
 set(_A5_FUSED_DEEP_MOE_INC_OPTS)
-if ("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950" AND NOT _DEEPEP_NOTIFY_ONLY)
+if ("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950" AND NOT _DEEPEP_SINGLE_OP_ONLY)
     set(_A5_SYSTEM_MOE_BASE_COMMON_DIR "${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common")
     set(_A5_SYSTEM_MOE_BASE_OP_KERNEL "${_A5_SYSTEM_MOE_BASE_COMMON_DIR}/op_kernel/moe_distribute_base.h")
     set(_A5_SYSTEM_MOE_BASE_INC_KERNEL "${_A5_SYSTEM_MOE_BASE_COMMON_DIR}/inc/kernel/moe_distribute_base.h")

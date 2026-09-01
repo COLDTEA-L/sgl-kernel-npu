@@ -19,7 +19,7 @@ fi
 echo "using ASCEND_HOME_PATH: $ASCEND_HOME_PATH"
 script_path=$(realpath $(dirname $0))
 
-if [[ "${DEEPEP_SINGLE_OP:-}" != "notify_dispatch" ]]; then
+if [[ -z "${DEEPEP_SINGLE_OP:-}" ]]; then
 mkdir -p "${script_path}/third_party"
 CATLASS_DIR="${script_path}/third_party/catlass"
 CATLASS_REPO_URL="https://gitcode.com/cann/catlass.git"
@@ -97,7 +97,7 @@ sed -i 's/struct HcclRankRelationResV2 {/struct HcclRankRelationResV2Custom {/g'
 # sed -i 's/struct HcclOpResParam {/struct HcclOpResParamCustom {/g' "$TARGET_FILE_BF16"
 # sed -i 's/struct HcclRankRelationResV2 {/struct HcclRankRelationResV2Custom {/g' "$TARGET_FILE_BF16"
 else
-    echo "single-op build: NotifyDispatch (skip Catlass and fused-op preparation)"
+    echo "single-op build: ${DEEPEP_SINGLE_OP} (skip Catlass and fused-op preparation)"
 fi
 
 BUILD_DIR="build_out"
