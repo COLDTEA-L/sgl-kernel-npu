@@ -73,6 +73,8 @@ python3 -m pip install --force-reinstall --no-deps output/deep_ep-*.whl
 export ASCEND_RT_VISIBLE_DEVICES=2,5
 ```
 
+仅设置四张可见卡但使用 `--nproc-per-node=2` 时，实际只会使用可见列表中的前两张卡。
+
 ## 两卡全通信测试
 
 ```bash
@@ -114,3 +116,7 @@ PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
 - 支持 FP16、BF16、FP32、INT32；底层按字节调用 CCU，因此不会做类型转换；
 - 通信域中每个 rank 都必须进入算子，否则 collective 会等待；
 - 当前版本针对单机 A5 通信域验证，跨机拓扑需要在目标集群另行做正确性和性能验证。
+
+## `HcclGetCcuTaskInfo ret = 4`
+
+AlltoAllV 的 AIV 通信编排至少需要两个且为偶数个 Vector Core。算子 tiling 使用平台的全部 AIV 核，kernel 中所有 AIV 核完成 CCU 初始化和同步，仅 0 核提交通信任务及执行 `Finalize`。若使用旧 commit `d52dd0f` 遇到该错误，请更新到包含多 AIV 修复的后续 commit 并重新编译、安装 wheel。

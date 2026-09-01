@@ -103,12 +103,15 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     workspace[0] = SYSTEM_WORKSPACE_BYTES;
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    const uint32_t aivNum = platform.GetCoreNumAiv();
+    OP_TILING_CHECK(aivNum < 2U, OP_LOGE(nodeName, "CCU AlltoAllV requires at least two AIV cores"),
+                    return ge::GRAPH_FAILED);
     context->SetTilingKey(1UL);
-    context->SetBlockDim(platform.CalcTschBlockDim(1U, 0U, 1U));
+    context->SetBlockDim(platform.CalcTschBlockDim(aivNum, 0U, aivNum));
     context->SetScheduleMode(1);
     OP_LOGI(nodeName,
-            "A5 IO Die All2AllV: rank=%ld/%ld commRanks=%lu sendCount=%lu perRankBytes=%lu",
-            *rankIdPtr, *rankSizePtr, commRankCount, sendCount, tiling->info.perRankBytes);
+            "A5 IO Die All2AllV: rank=%ld/%ld commRanks=%lu sendCount=%lu perRankBytes=%lu aivNum=%u",
+            *rankIdPtr, *rankSizePtr, commRankCount, sendCount, tiling->info.perRankBytes, aivNum);
     return ge::GRAPH_SUCCESS;
 }
 
