@@ -10,6 +10,7 @@ struct All2AllDetourIoDieInfo {
     uint32_t reserved;
     uint64_t sendCount;
     uint64_t perRankBytes;
+    uint64_t windowStrideBytes;
 };
 
 struct All2AllDetourIoDieTilingData {

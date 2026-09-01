@@ -9,9 +9,10 @@
 本实现不读取 `windowsIn[]`，也不把远端地址暴露给 AIV：
 
 1. host 侧将 executor 的 HCCL server type 设置为 `CCU`；
-2. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllV`；
-3. `commRankIds` 之外的 rank 使用 0 send/recv count，但仍参与同一通信域中的 collective；
-4. 数据转发和链路选择由 A5 CCU/IO Die 完成，接收数据直接写入 `recvData`。
+2. host tiling 使用 A5 专用的 `HCCL_CMD_HALFALLTOALLV + A5_CCU_ENGINE`；
+3. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllvWrite`，由 CCU/IO Die 把数据写入每个目标 rank 的本地 `windowsOut[0]`；
+4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
+5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
 
 输入 `sendData` 的第 `i` 个等长数据块发往 `commRankIds[i]`；输出 `recvData` 的第 `i` 个数据块来自 `commRankIds[i]`。所有 rank 必须传入完全相同、升序且不重复的 `commRankIds`。
 
@@ -108,6 +109,27 @@ python3 -m torch.distributed.run \
 PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
 ```
 
+## 八卡全通信测试
+
+确认 8 张卡都映射进容器后，可直接跑完整通信域：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=8 \
+  tests/python/deepep/test_a5_io_die_all2all_detour.py
+```
+
+如果只想让偶数逻辑 rank 传数据、其余 rank 仅参与 collective，以验证子集转发：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=8 \
+  tests/python/deepep/test_a5_io_die_all2all_detour.py \
+  --comm-ranks 0,2,4,6
+```
+
 ## 约束
 
 - `rank_size <= 32`，与当前 CANN 9.1 CCU AlltoAllV 参数上限一致；
@@ -119,4 +141,41 @@ PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
 
 ## `HcclGetCcuTaskInfo ret = 4`
 
-AlltoAllV 的 AIV 通信编排至少需要两个且为偶数个 Vector Core。算子 tiling 使用平台的全部 AIV 核，kernel 中所有 AIV 核完成 CCU 初始化和同步，仅 0 核提交通信任务及执行 `Finalize`。若使用旧 commit `d52dd0f` 遇到该错误，请更新到包含多 AIV 修复的后续 commit 并重新编译、安装 wheel。
+如果日志在进入 AICore kernel 前报以下错误：
+
+```text
+HcclGetCcuTaskInfo ... ret = 4
+```
+
+请先确认代码已经包含 A5 HalfAllToAllV 修复。A5 CCU 路径只接受 `HCCL_CMD_HALFALLTOALLV` 和 `A5_CCU_ENGINE`；普通 `AllToAllV + AIV_ENGINE` 会在 Host 侧生成 CCU task info 时失败。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
+
+```bash
+git pull --ff-only
+bash scripts/build_a5_io_die_all2all_detour.sh
+python3 -m pip install --force-reinstall --no-deps output/deep_ep-*.whl
+```
+
+重新运行前可确认源码与已安装自定义库的时间：
+
+```bash
+git log -1 --oneline
+ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
+```
+
+## `Invalid device ID`（四进程测试）
+
+`--nproc-per-node=4` 要求容器内至少有 4 张可见卡。若此前执行过：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+```
+
+则 local rank 2、3 必然报 `Expected value: [0, 2)`。四卡测试前应改为：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+# 或者使用容器已经映射好的全部卡
+unset ASCEND_RT_VISIBLE_DEVICES
+```
+
+然后再执行 `--nproc-per-node=4`。物理卡号由 `ASCEND_RT_VISIBLE_DEVICES` 决定；测试程序里的 rank 0～3 是重映射后的逻辑卡号。

@@ -11,8 +11,8 @@
 #include "../op_kernel/all2_all_detour_io_die_tiling.h"
 
 namespace {
-constexpr uint32_t OP_TYPE_ALL_TO_ALL = 8U;
 constexpr uint32_t MAX_CCU_RANKS = 32U;
+constexpr uint64_t CCU_WINDOW_ALIGN = 512UL;
 constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr size_t SYSTEM_WORKSPACE_BYTES = 16UL * 1024UL * 1024UL;
 constexpr int ATTR_GROUP = 0;
@@ -90,10 +90,16 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     tiling->info.commRankCount = static_cast<uint32_t>(commRankCount);
     tiling->info.sendCount = sendCount;
     tiling->info.perRankBytes = (sendCount / commRankCount) * elementBytes;
+    tiling->info.windowStrideBytes =
+        (tiling->info.perRankBytes + CCU_WINDOW_ALIGN - 1UL) / CCU_WINDOW_ALIGN * CCU_WINDOW_ALIGN;
 
+    // A5 CCU only accepts the HalfAllToAllV task type. AlltoAllvWrite sends
+    // directly to every destination's local HCCL window, so windowsIn[] is not needed.
+    const uint32_t opType =
+        static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_HALFALLTOALLV);
     AscendC::Mc2CcTilingConfig ccuConfig(
-        std::string(groupPtr), OP_TYPE_ALL_TO_ALL, "AlltoAll=level0:fullmesh;level1:pairwise");
-    ccuConfig.SetCommEngine(mc2tiling::AIV_ENGINE);
+        std::string(groupPtr), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
+    ccuConfig.SetCommEngine(mc2tiling::A5_CCU_ENGINE);
     ccuConfig.GetTiling(tiling->mc2InitTiling);
     ccuConfig.GetTiling(tiling->mc2CcTiling);
 
@@ -110,8 +116,10 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     context->SetBlockDim(platform.CalcTschBlockDim(aivNum, 0U, aivNum));
     context->SetScheduleMode(1);
     OP_LOGI(nodeName,
-            "A5 IO Die All2AllV: rank=%ld/%ld commRanks=%lu sendCount=%lu perRankBytes=%lu aivNum=%u",
-            *rankIdPtr, *rankSizePtr, commRankCount, sendCount, tiling->info.perRankBytes, aivNum);
+            "A5 IO Die HalfAllToAllV: rank=%ld/%ld commRanks=%lu sendCount=%lu "
+            "perRankBytes=%lu windowStrideBytes=%lu aivNum=%u",
+            *rankIdPtr, *rankSizePtr, commRankCount, sendCount, tiling->info.perRankBytes,
+            tiling->info.windowStrideBytes, aivNum);
     return ge::GRAPH_SUCCESS;
 }
 
