@@ -6,19 +6,26 @@ aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR} ops_srcs)
 set(a5_fused_deep_moe_host_dir ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe_a5)
 set(op_codegen_options -g)
 if("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
-    # Keep one FusedDeepMoe definition visible to code generation on A5.
-    list(REMOVE_ITEM ops_srcs
-        ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_def.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_infer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_tiling.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe_infer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe_tiling.cpp)
-    list(APPEND ops_srcs
-        ${a5_fused_deep_moe_host_dir}/fused_deep_moe.cpp
-        ${a5_fused_deep_moe_host_dir}/fused_deep_moe_infer.cpp
-        ${a5_fused_deep_moe_host_dir}/fused_deep_moe_tiling.cpp)
     list(APPEND op_codegen_options -D__DAV_C310__)
+    if("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "notify_dispatch")
+        set(ops_srcs
+            ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch_tiling.cc)
+        message(STATUS "DeepEP single-op host build: NotifyDispatch")
+    else()
+        # Keep one FusedDeepMoe definition visible to code generation on A5.
+        list(REMOVE_ITEM ops_srcs
+            ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_def.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_infer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_ffn_combine_tiling.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe_infer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/fused_deep_moe_tiling.cpp)
+        list(APPEND ops_srcs
+            ${a5_fused_deep_moe_host_dir}/fused_deep_moe.cpp
+            ${a5_fused_deep_moe_host_dir}/fused_deep_moe_infer.cpp
+            ${a5_fused_deep_moe_host_dir}/fused_deep_moe_tiling.cpp)
+    endif()
 endif()
 
 #1、使用npu_op_code_gen生成aclnn单算子调用代码、入图所需的原型定义代码等。
@@ -33,7 +40,11 @@ npu_op_code_gen(
 file(GLOB_RECURSE pregen_file
     "${CMAKE_CURRENT_SOURCE_DIR}/op_api/*"
 )
-if("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
+if("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "notify_dispatch")
+    file(GLOB pregen_file
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.h")
+elseif("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
     # Keep all existing ACLNN wrappers (including low-latency dispatch/combine)
     # and overlay only the A5-specific FusedDeepMoe wrapper.
     list(REMOVE_ITEM pregen_file
