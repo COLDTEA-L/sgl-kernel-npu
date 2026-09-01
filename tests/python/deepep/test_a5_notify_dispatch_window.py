@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import os
 import site
 import sys
 from pathlib import Path
 
-import torch
-import torch.distributed as dist
 
-
-def import_deep_ep():
-    """Load deep_ep_cpp from the source build or an installed wheel."""
+def candidate_package_dirs():
     project_root = Path(__file__).resolve().parents[3]
     package_dirs = [project_root / "python" / "deep_ep" / "deep_ep"]
     site_dirs = site.getsitepackages()
@@ -18,25 +15,72 @@ def import_deep_ep():
     if user_site:
         site_dirs.append(user_site)
     package_dirs.extend(Path(path) / "deep_ep" for path in site_dirs)
+    return package_dirs
 
-    extension = None
+
+def prepend_path(value: str, path: Path) -> str:
+    path_str = str(path)
+    entries = [entry for entry in value.split(":") if entry]
+    return ":".join([path_str, *[entry for entry in entries if entry != path_str]])
+
+
+def prepare_custom_op_runtime():
+    """Prepare OPP and loader paths before torch/deep_ep loads shared libraries."""
+    package_dirs = candidate_package_dirs()
+    selected = None
     for package_dir in package_dirs:
-        matches = sorted(package_dir.glob("deep_ep_cpp*.so"))
-        if not matches:
-            continue
-        extension = matches[0]
-        # The package currently imports deep_ep_cpp as a top-level module.
-        # Add both directories so source builds and installed wheels work.
-        sys.path.insert(0, str(package_dir.parent))
-        sys.path.insert(0, str(package_dir))
-        break
+        extensions = sorted(package_dir.glob("deep_ep_cpp*.so"))
+        op_api = package_dir / "vendors" / "hwcomputing" / "op_api" / "lib" / "libcust_opapi.so"
+        if extensions and op_api.is_file():
+            selected = (package_dir, extensions[0], op_api)
+            break
 
-    if extension is None:
+    if selected is None:
         searched = "\n  ".join(str(path) for path in package_dirs)
         raise RuntimeError(
-            "deep_ep_cpp was not found. Compile NotifyDispatch with the same Python "
-            "environment before running this test. Searched:\n  " + searched
+            "deep_ep_cpp or libcust_opapi.so was not found. Compile NotifyDispatch "
+            "with the same Python environment before running this test. Searched:\n  " + searched
         )
+
+    package_dir, extension, op_api = selected
+    vendor_dir = package_dir / "vendors" / "hwcomputing"
+    op_api_dir = op_api.parent
+    required_env = {
+        "ASCEND_CUSTOM_OPP_PATH": prepend_path(os.environ.get("ASCEND_CUSTOM_OPP_PATH", ""), vendor_dir),
+        "LD_LIBRARY_PATH": prepend_path(os.environ.get("LD_LIBRARY_PATH", ""), op_api_dir),
+    }
+    if any(os.environ.get(name, "") != value for name, value in required_env.items()):
+        env = os.environ.copy()
+        env.update(required_env)
+        argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+        os.execvpe(sys.executable, argv, env)
+
+    try:
+        ctypes.CDLL(str(op_api), mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Found {op_api}, but the dynamic loader could not load it. Check CANN's "
+            "set_env.sh and the library dependencies with ldd."
+        ) from exc
+
+    return package_dir, extension, op_api
+
+
+DEEP_EP_PACKAGE_DIR, DEEP_EP_EXTENSION, CUSTOM_OP_API = prepare_custom_op_runtime()
+
+import torch
+import torch.distributed as dist
+
+
+def import_deep_ep():
+    """Load deep_ep_cpp from the source build or an installed wheel."""
+    package_dir = DEEP_EP_PACKAGE_DIR
+    extension = DEEP_EP_EXTENSION
+
+    # The package currently imports deep_ep_cpp as a top-level module.
+    # Add both directories so source builds and installed wheels work.
+    sys.path.insert(0, str(package_dir.parent))
+    sys.path.insert(0, str(package_dir))
 
     try:
         import deep_ep
@@ -49,6 +93,7 @@ def import_deep_ep():
 
     if os.environ.get("RANK", "0") == "0":
         print(f"Using deep_ep_cpp: {extension}", flush=True)
+        print(f"Using custom op API: {CUSTOM_OP_API}", flush=True)
     return deep_ep
 
 

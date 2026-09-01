@@ -84,11 +84,14 @@ bash scripts/build_a5_notify_dispatch.sh --python-env /path/to/sglang-conda-env
 在一个新的 Python 进程中用两张卡测试：
 
 ```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export DEEP_USE_MODE=default
 export HCCL_BUFFSIZE=2300
 torchrun --standalone --nproc-per-node=2 \
   tests/python/deepep/test_a5_notify_dispatch_window.py
 ```
+
+测试脚本会在导入 torch/DeepEP 前自动把 wheel 内的 `vendors/hwcomputing` 和 `libcust_opapi.so` 加入 `ASCEND_CUSTOM_OPP_PATH`、`LD_LIBRARY_PATH`，并重新执行当前 Python 进程，保证 ACLNN 能发现 `aclnnNotifyDispatch`。
 
 成功输出：
 
