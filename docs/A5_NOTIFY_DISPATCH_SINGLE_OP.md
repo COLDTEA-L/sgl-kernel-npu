@@ -66,7 +66,7 @@ bash scripts/build_a5_notify_dispatch.sh --python-env /path/to/sglang-conda-env
 
 ## 安装和双卡测试
 
-安装时禁止 pip 改动现有 torch 依赖：
+测试脚本会优先从当前代码仓的 `python/deep_ep/deep_ep/deep_ep_cpp*.so` 自动加载刚编译的扩展，因此只做算子验证时可以不安装 wheel。若要安装，必须禁止 pip 改动现有 torch 依赖：
 
 ```bash
 wheel="$(ls -1t output/deep_ep*.whl | head -1)"
@@ -74,6 +74,12 @@ python3 -m pip install --no-deps --force-reinstall "${wheel}"
 ```
 
 这个 wheel 只携带 `NotifyDispatch`，不能替代生产服务需要的完整 DeepEP。请在单独的开发容器/环境中安装和测试，或在测试后恢复原来的完整 `deep_ep` wheel；不要让正在提供请求的 SGLang worker 使用它。
+
+如果脚本仍提示找不到 `deep_ep_cpp`，说明编译和测试使用的不是同一个代码目录或 Python 环境。重新用测试所用环境编译：
+
+```bash
+bash scripts/build_a5_notify_dispatch.sh --python-env /path/to/sglang-conda-env
+```
 
 在一个新的 Python 进程中用两张卡测试：
 

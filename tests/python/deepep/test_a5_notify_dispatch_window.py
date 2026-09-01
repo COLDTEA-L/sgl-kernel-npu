@@ -1,11 +1,55 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import site
+import sys
+from pathlib import Path
 
-import deep_ep
 import torch
 import torch.distributed as dist
-import torch_npu  # noqa: F401
+
+
+def import_deep_ep():
+    """Load deep_ep_cpp from the source build or an installed wheel."""
+    project_root = Path(__file__).resolve().parents[3]
+    package_dirs = [project_root / "python" / "deep_ep" / "deep_ep"]
+    site_dirs = site.getsitepackages()
+    user_site = site.getusersitepackages()
+    if user_site:
+        site_dirs.append(user_site)
+    package_dirs.extend(Path(path) / "deep_ep" for path in site_dirs)
+
+    extension = None
+    for package_dir in package_dirs:
+        matches = sorted(package_dir.glob("deep_ep_cpp*.so"))
+        if not matches:
+            continue
+        extension = matches[0]
+        # The package currently imports deep_ep_cpp as a top-level module.
+        # Add both directories so source builds and installed wheels work.
+        sys.path.insert(0, str(package_dir.parent))
+        sys.path.insert(0, str(package_dir))
+        break
+
+    if extension is None:
+        searched = "\n  ".join(str(path) for path in package_dirs)
+        raise RuntimeError(
+            "deep_ep_cpp was not found. Compile NotifyDispatch with the same Python "
+            "environment before running this test. Searched:\n  " + searched
+        )
+
+    try:
+        import deep_ep
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            f"Found {extension}, but it could not be loaded. Make sure the test uses "
+            "the same Python/torch_npu environment as the build and that the CANN "
+            "environment is sourced."
+        ) from exc
+
+    if os.environ.get("RANK", "0") == "0":
+        print(f"Using deep_ep_cpp: {extension}", flush=True)
+    return deep_ep
 
 
 def main() -> None:
@@ -21,6 +65,7 @@ def main() -> None:
     if world_size < 2:
         raise RuntimeError("Use at least two A5 NPUs to validate a remote communication-window address")
 
+    deep_ep = import_deep_ep()
     torch.npu.set_device(local_rank)
     dist.init_process_group("hccl")
     group = dist.new_group(list(range(world_size)))
