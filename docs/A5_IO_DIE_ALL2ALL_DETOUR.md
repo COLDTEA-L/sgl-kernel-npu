@@ -1,64 +1,61 @@
-# A5 IO Die All2All 绕路算子
+# A5 IO Die All2All CCU 算子
 
-## 目标与实现差异
+## 当前目标
 
-`All2AllDetourIoDie` 用于 A5（Ascend 950）上的通信 rank 子集 All2All。
+`All2AllDetourIoDie` 当前首先验证 A5（Ascend 950）上的完整 CCU AllToAllV 通信是否能够建立、下发并得到正确结果。
 
-旧实现依赖 `GetHcclContext()` 中的 `windowsIn[peerRank]`，由通信卡直接读写绕路卡 HBM。在 A5 环境中这些远端 window 地址可能为 0，因此无法作为跨卡目标地址。
+它不再访问 `GetHcclContext()` 中为 0 的 `windowsIn[peerRank]`，也不让 AIV 直接读写远端卡的 HBM。数据由 HCCL 的 CCU 通信任务从 `sendData` 直接传到目标 rank 的 `recvData`。
 
-本实现不读取 `windowsIn[]`，也不把远端地址暴露给 AIV：
+需要特别区分两个目标：
 
-1. host 侧将 executor 的 HCCL server type 设置为 `CCU`；
-2. host tiling 使用与 CANN 9.1 device 实现匹配的 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(5)`；
-3. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllvWrite`，由 CCU/IO Die 把数据写入每个目标 rank 的本地 `windowsOut[0]`；
-4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
-5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
+- 当前版本验证“完整通信域上的 CCU AllToAllV”以及“部分 rank 的 count 为 0”；
+- CCU/HCCL 根据拓扑选择 IO Die 路径，当前公开接口不能指定必须经过哪张中间卡。因此 `--comm-ranks 0,2` 不等价于强制 rank 1、3 做转发卡。
 
-算子 workspace 的前 1024 字节专门存放双 Die 的 `sendSizes/sendOffsets`，后面另行保留 HCCL 所需的固定 16 MiB 系统工作区。两部分不能重叠。
+显式指定 2～7 卡共同承担 0→1 的转发，是后续路由策略问题，不能由本测试的 `commRankIds` 参数保证。
 
-输入 `sendData` 的第 `i` 个等长数据块发往 `commRankIds[i]`；输出 `recvData` 的第 `i` 个数据块来自 `commRankIds[i]`。所有 rank 必须传入完全相同、升序且不重复的 `commRankIds`。
+## 为什么从 HalfAllToAllV 改为完整 AllToAllV
 
-## CCU 参考实现与两卡数据布局
+仓库中的 A5 dispatch/combine CCU 实现使用：
 
-本实现已与两个现有实现交叉核对：
+```text
+Hccl<HCCL_SERVER_TYPE_CCU>
+InitV2 + SetCcTilingV2
+AlltoAllvWrite
+HCCL_CMD_HALF_ALLTOALLV
+```
 
-- `/home/liuyuanwen/hccl` 的 AllReduce 在 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 时进入 CCU selector；A5 双 Die
-  拓扑会选择 `CcuAllReduceMesh1DMem2Mem2DieOneShot` 等 CCU 模板，并分别启动两个 Die 的 CCU kernel；
-- 本仓库 `moe_distribute_dispatch_v2_ccu.h` 和 `moe_distribute_combine_v2_ccu.h` 使用
-  `Hccl<HCCL_SERVER_TYPE_CCU> + InitV2 + SetCcTilingV2 + AlltoAllvWrite<true>`，host tiling 使用
-  `HCCL_CMD_HALFALLTOALLV + A5_CCU_ENGINE`。
+`AlltoAllvWrite` 是 dispatch/combine 使用的半程 window 协议。此前版本照搬该接口后，目标环境在 device kernel 启动前返回：
 
-当前 All2All 与仓库已验证 CCU 算子的关键调用序列一致：
+```text
+HcclAllocComResourceByTiling ... ret = 5
+```
 
-1. 所有 AIV 完成初始化；
-2. AIV0 准备 `sendSizes[2 * rankSize]` 和 `sendOffsets[2 * rankSize]`；
-3. `SyncAll<true>()` 保证参数准备完成；
-4. 仅 AIV0 调用一次 `AlltoAllvWrite<true>` 并 `Wait`；
-5. 再次 `SyncAll<true>()`，AIV0 从本 rank 的 `windowsOut[0]` 拷贝结果；
-6. 所有 AIV 完成同步并 `Finalize`。
+`ret=5` 是 `HCCL_E_NOT_SUPPORT`。这说明该通信域没有成功建立 HalfAllToAllV 资源，不是 AIV kernel 内部死锁。
 
-两卡全通信测试中，每个 rank 的输入有两个等长块。以 `perRankBytes=1024` 为例：
+`/home/liuyuanwen/hccl` 的完整 AllToAllV 路径有 A5 CCU selector、executor 和 CCU kernel 注册，包括 `CcuAlltoAllVMesh1D` 与双 Die 的 `CcuAllToAllVMesh2Die`。因此当前版本改为一致的完整协议：
 
-- rank 0 把输入块 0 发到 rank 0 的 window offset 0，把输入块 1 发到 rank 1 的 window offset 0；
-- rank 1 把输入块 0 发到 rank 0 的 window offset 1024，把输入块 1 发到 rank 1 的 window offset 1024；
-- 每个 1024 字节块按双 Die 拆为 512 + 512 字节；
-- 目标 rank 从本地 window 的 offset 0、1024 依次取回来自 rank 0、1 的数据。
+```text
+host:   HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE(5)
+device: Hccl::AlltoAllV<true>(sendData, ..., recvData, ...)
+```
 
-因此两卡测试验证的是完整的 CCU All2All 数据交换，不依赖 `windowsIn[]`，也不经过 AIV 远端 HBM 读写。
+只有 AIV0 写 HCCL message area、提交任务并等待 handle；所有 AIV 在结束前同步并调用 `Finalize`。收发 count 和 displacement 使用 `uint64_t[rankSize]`，数据类型传 `HCCL_DATA_TYPE_INT8`，因此单位是字节。
 
-## 已验证环境
+两卡全通信时，每个 rank 的输入包含两个等长块：输入块 `i` 发给 rank `i`；输出块 `i` 来自 rank `i`。测试脚本据此逐元素校验。
+
+## 已验证的编译环境
 
 - 分支：`feature/a5-io-die-all2all-detour`
 - Docker：`cam_lyw_dev_91`
 - CANN：`9.1.0-beta.1`
-- SoC 编译目标：`Ascend950` / `ascend950`
-- 编译结果：FP16、BF16、FP32、INT32 四个 device binary 均成功生成
+- 编译目标：`Ascend950` / `ascend950`
+- FP16、BF16、FP32、INT32 四个 device binary 均可生成
 
-无卡服务器只能完成编译验证；正确性测试需要在 A5 有卡服务器执行。
+无卡服务器只能验证编译；通信与正确性必须在 A5 有卡服务器验证。
 
-## 在 sglang Docker 中准备环境
+## 有卡 sglang Docker 环境
 
-以下命令均在已有 sglang Docker 内执行，不使用 conda。先加载 CANN 环境：
+以下命令均在已有 sglang Docker 内执行，不使用 conda：
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
@@ -67,17 +64,15 @@ source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
 python3 -c 'import torch, torch_npu, pybind11; print(torch.__version__); print(torch_npu.__version__)'
 ```
 
-如果缺少 `pybind11` 或构建工具：
+若只缺构建工具：
 
 ```bash
 python3 -m pip install pybind11 wheel setuptools
 ```
 
-`torch` 和 `torch_npu` 应继续使用当前能够启动 sglang 服务的版本，不要为了编译算子单独替换。
+不要替换当前能够启动 sglang 的 `torch` 和 `torch_npu`。
 
-## 单算子编译
-
-先更新到远端分支的最新提交，并确认当前提交号：
+## 拉取、编译、安装最新包
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -85,57 +80,36 @@ git fetch origin
 git switch feature/a5-io-die-all2all-detour
 git pull --ff-only origin feature/a5-io-die-all2all-detour
 git log -1 --oneline
-```
 
-再执行单算子编译：
-
-```bash
 bash scripts/build_a5_io_die_all2all_detour.sh
-```
 
-脚本设置 `DEEPEP_SINGLE_OP=all2_all_detour_io_die`，跳过 Catlass 与其他 device kernel。成功时末尾应出现：
-
-```text
-All2AllDetourIoDie device binaries: 4
-Built: output/deep_ep-....whl
-```
-
-安装到当前 sglang Python：
-
-```bash
 latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
 test -n "${latest_wheel}" || { echo "没有找到 deep_ep wheel" >&2; exit 1; }
 echo "Installing ${latest_wheel}"
 python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
 
-# 每次重新安装 wheel 或进入新的 shell 后，都要加载自定义算子的
-# OPP、op_api 和动态库搜索路径。
 source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 ```
 
-必须给 wheel 路径加双引号。不要直接把 `output/deep_ep-*.whl` 传给 `pip install`：如果目录中保留了多次编译生成的 wheel，shell 会把通配符展开为多个包，导致 pip 同时安装多个版本并报冲突。`ls -1t` 按修改时间倒序排列，上述命令只选取第一项，即本次最新生成的 wheel。
+不要直接执行 `pip install output/deep_ep-*.whl`：目录中有多个历史包时，通配符会展开为多个 wheel。上面的 `ls -1t ... | head -n 1` 只选择最新包。
 
-`set_env.bash` 对当前 shell 生效，不能由另一个已经结束的 shell 永久保存。因此每次重新进入 Docker、打开新 shell 或重新安装 wheel 后，都要再执行一次 `source`。测试脚本会优先加载当前源码目录下由编译步骤刷新的 `deep_ep_cpp` 和 `libcust_opapi.so`，启动时会打印两者的绝对路径。运行测试前可同时核对提交和产物时间：
+`set_env.bash` 只对当前 shell 生效。每次进入 Docker、新开 shell 或重装 wheel 后，都要重新 `source`。
+
+可核对源码和实际加载产物：
 
 ```bash
-git log -1 --oneline
+git rev-parse --short HEAD
+grep -n "HCCL_CMD_.*ALLTOALLV\|SetCommEngine" \
+  csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
 ls -l python/deep_ep/deep_ep/deep_ep_cpp*.so
 ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 ```
 
-## 选择测试卡
+当前源码应显示 `HCCL_CMD_ALLTOALLV`，不能再是 `HCCL_CMD_HALFALLTOALLV`。
 
-`torchrun --nproc-per-node=N` 使用 `ASCEND_RT_VISIBLE_DEVICES` 中从左到右的 N 张卡。当前有卡环境选择物理卡 4、5：
+## 两卡全量 CCU 测试
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=4,5
-```
-
-此时进程内的逻辑 device 0、1 分别对应物理卡 4、5。更换测试卡时只修改这个列表。
-
-仅设置四张可见卡但使用 `--nproc-per-node=2` 时，实际只会使用可见列表中的前两张卡。
-
-## 两卡全通信测试
+以下示例选择物理卡 4、5；两个 worker 内的逻辑 device 0、1 分别映射到物理卡 4、5：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -146,225 +120,80 @@ source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing
 export HCCL_BUFFSIZE=2300
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=4,5
+unset ASCEND_LAUNCH_BLOCKING
 
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
   tests/python/deepep/test_a5_io_die_all2all_detour.py
 ```
 
-两卡场景可验证 CCU 调用、数据布局和正确性，但没有非通信 rank。
+成功时应输出：
 
-## 四卡通信子集 / IO Die 路由测试
+```text
+PASS: A5 All2AllDetourIoDie (full group)
+world_size=2, comm_ranks=[0, 1], elements_per_peer=256
+```
 
-下面让 rank 0、2 交换数据，rank 1、3 以 0 count 参与 collective：
+`torchrun --nproc-per-node=N` 使用 `ASCEND_RT_VISIBLE_DEVICES` 中从左到右的 N 张卡。换卡时只修改该列表。
+
+## 四卡和八卡测试
+
+四卡全量通信：
 
 ```bash
-cd /home/l00934901/sgl-kernel-npu
-source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
-source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
-source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-
-export HCCL_BUFFSIZE=2300
-export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=4 \
+  tests/python/deepep/test_a5_io_die_all2all_detour.py
+```
 
+四卡通信域中仅 rank 0、2 使用非零 count：
+
+```bash
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=4 \
   tests/python/deepep/test_a5_io_die_all2all_detour.py \
   --comm-ranks 0,2
 ```
 
-成功时 rank 0 输出：
-
-```text
-PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
-```
-
-## 八卡全通信测试
-
-确认 8 张卡都映射进容器后，可直接跑完整通信域：
+八卡全量通信：
 
 ```bash
-cd /home/l00934901/sgl-kernel-npu
-source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
-source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
-source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-
-export HCCL_BUFFSIZE=2300
-export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=8 \
   tests/python/deepep/test_a5_io_die_all2all_detour.py
 ```
 
-如果只想让偶数逻辑 rank 传数据、其余 rank 仅参与 collective，以验证子集转发：
+即使某些 rank 的 count 为 0，通信域中的所有 rank 也必须进入算子，否则 collective 会等待。
+
+## 故障定位
+
+### `HcclAllocComResourceByTiling ret = 5`
+
+若仍报 `ret=5`，先看 wrapper 输出的 workspace：
+
+- 新的完整 AllToAllV 版本应为 `16777216`（16 MiB）；
+- 旧 HalfAllToAllV 版本为 `16778240`（16 MiB + 1024），说明仍加载了旧 wheel。
+
+确认源码、重新编译、安装最新 wheel 并重新 `source set_env.bash`。如果源码已是 `HCCL_CMD_ALLTOALLV` 且仍返回 5，收集运行时库和 HCCL 日志：
 
 ```bash
-python3 -m torch.distributed.run \
-  --standalone --nproc-per-node=8 \
-  tests/python/deepep/test_a5_io_die_all2all_detour.py \
-  --comm-ranks 0,2,4,6
-```
-
-## 约束
-
-- `rank_size <= 32`，与当前 CANN 9.1 CCU AlltoAllV 参数上限一致；
-- `commRankIds` 必须是 NPU 上连续的 INT32 一维 tensor；
-- `sendData.numel()` 必须能被 `commRankIds.numel()` 整除；
-- 支持 FP16、BF16、FP32、INT32；底层按字节调用 CCU，因此不会做类型转换；
-- 通信域中每个 rank 都必须进入算子，否则 collective 会等待；
-- 当前版本针对单机 A5 通信域验证，跨机拓扑需要在目标集群另行做正确性和性能验证。
-
-## `HcclAllocComResourceByTiling ret = 5`
-
-HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`，错误发生在 Host 侧通信资源分配阶段，此时 device kernel 还没有启动。
-
-本算子 host tiling 使用 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(5)`。这里的两项不能混用：CANN 9.1 的 v310 `Hccl::AlltoAllvWrite` device 实现内部提交的是 `HCCL_CMD_HALF_ALLTOALLV`，所以 host 必须按 HalfAllToAllV 类型申请 task 资源。CANN 9.1 `HcclOpExpansionMode` 的实际枚举值为 `CCU_MS=4`、`CCU_SCHED=5`、`AIV_ONLY=6`；host 代码使用仓库已有的 `mc2tiling::A5_CCU_ENGINE`（值为 5），避免再次手写错误的数字。
-
-另外，创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
-
-```bash
-export HCCL_OP_EXPANSION_MODE=CCU_SCHED
-```
-
-环境变量必须在 `torch.distributed.init_process_group("hccl")` 之前生效。当前测试脚本会在导入 `torch` 和创建通信域前自动设置它；如果外部已经设置成其他值（例如 `AIV` 或 `AI_CPU`），脚本会直接报出冲突，避免等到异步执行阶段才失败。
-
-如果更新、重编译后仍返回 `5`，先保存以下诊断信息，不要继续修改 device kernel；此时 kernel 尚未启动：
-
-```bash
-git rev-parse --short HEAD
-grep -n "HCCL_CMD_.*ALLTOALLV\|SetCommEngine" \
-  csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
-
 python3 -c 'import torch, torch_npu; print("torch", torch.__version__); print("torch_npu", torch_npu.__version__)'
 find /usr/local/Ascend -maxdepth 5 -type f -name version.info -print
-ldconfig -p 2>/dev/null | grep -E "libhccl|libopapi|libascendcl"
+ldconfig -p 2>/dev/null | grep -E "libhccl|libhcomm|libopapi|libascendcl"
 ldd python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 
 find /usr/slog -type f -mmin -10 -print 2>/dev/null
 grep -RInE "HcclAllocComResourceByTiling|All2AllDetourIoDie|HCCL_E_NOT_SUPPORT" \
-  /usr/slog 2>/dev/null | tail -n 200
-```
-
-## 设置 `CCU_SCHED` 后进程报 `SIGSEGV`
-
-Ascend 950 CCU 使用双 Die。`AlltoAllvWrite` 的 `sendSizes` 和 `sendOffsets` 不是普通的 `rankDim` 长度数组，而是各包含 `2 * rankDim` 项：前半段描述 Die0，后半段描述 Die1。每个 peer 的数据也必须拆分成两个连续片段。旧版本只提供了单 Die 参数，CCU 读取第二组参数时会越界，表现为两个 worker 同时收到 `SIGSEGV`。请更新到包含双 Die 参数布局修复的版本并重新编译、安装 wheel。
-
-## `HcclGetCcuTaskInfo ret = 4`
-
-如果日志在进入 AICore kernel 前报以下错误：
-
-```text
-HcclGetCcuTaskInfo ... ret = 4
-```
-
-请确认 host tiling 使用的是 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(5)`。旧版本使用 `AIV_ENGINE(3)` 时会在 Host 侧生成 CCU task info 阶段失败；错误地使用值 `6` 时实际选择的是 `AIV_ONLY`，不是 `CCU_SCHED`。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
-
-```bash
-git fetch origin
-git switch feature/a5-io-die-all2all-detour
-git pull --ff-only origin feature/a5-io-die-all2all-detour
-bash scripts/build_a5_io_die_all2all_detour.sh
-latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
-python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
-```
-
-重新运行前可确认源码与已安装自定义库的时间：
-
-```bash
-git log -1 --oneline
-ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
-```
-
-## `execute end: status=561000`
-
-`561000` 是算子下发/执行阶段的通用内部错误，单独看这个数字不能判断具体根因。若日志已经显示
-`GetWorkspaceSize end: status=0`，说明 host tiling 和 HCCL 资源申请已经通过，问题位于随后下发的 device kernel。
-
-旧版本在这里有两项问题：
-
-1. `EXEC_NPU_CMD` 中保存 workspace 的 Tensor 在算子真正下发前已经离开作用域；
-2. device kernel 曾让所有 AIV 同时写同一组 `sendSizes/sendOffsets` 并重复提交同一个 CCU collective，
-   与仓库中已经验证的 A5 CCU dispatch/combine 调用序列不一致。
-
-新版本会让 workspace 至少存活到下发完成，并按已验证算子使用的顺序执行：AIV0 准备双 Die 参数、全核
-`SyncAll`、仅 AIV0 调用并等待一次 `AlltoAllvWrite`、全核再次 `SyncAll`。更新后必须重新编译、选择最新
-wheel 安装并重新加载自定义算子环境，不能只重新运行测试：
-
-```bash
-cd /home/l00934901/sgl-kernel-npu
-git fetch origin
-git switch feature/a5-io-die-all2all-detour
-git pull --ff-only origin feature/a5-io-die-all2all-detour
-bash scripts/build_a5_io_die_all2all_detour.sh
-
-latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
-echo "Installing ${latest_wheel}"
-python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-```
-
-如果新版本仍返回 `561000`，wrapper 会在 `detail=` 后打印 `aclGetRecentErrMsg()`。同时在失败后立即收集最近日志：
-
-```bash
-find /usr/slog -type f -mmin -5 -print 2>/dev/null
-grep -RInE "All2AllDetourIoDie|561000|Kernel Run failed|kernel.*fail|rtFusionLaunch|AICORE" \
   /usr/slog 2>/dev/null | tail -n 300
 ```
 
-请保留 `execute end` 的完整一行和上述 grep 结果；这两部分比 Python 的 `SIGSEGV` 汇总更接近首个设备侧错误。
+普通 HCCL barrier 成功只说明通信域可用，不代表 MC2 的指定 CCU task 资源一定可用。
 
-## `Can not find kernel ... tilingKey=1`
+### 卡住或 `status=561000`
 
-如果 HCCL 资源分配已经成功，但启动算子时报：
-
-```text
-Can not find kernel by function[0x0], tilingKey=1
-rtFusionLaunch execution failed, reason=kernel pointer null
-```
-
-说明 host 下发的 tiling key 与编译进 wheel 的 device kernel 不一致。当前 device kernel 使用
-`REGISTER_TILING_DEFAULT(All2AllDetourIoDieTilingData)`，对应默认 key `0`；host tiling 也必须执行
-`context->SetTilingKey(0UL)`。旧版本错误地设置成了 `1`，但单算子编译没有生成 key 1 变体，
-因此运行时找不到 kernel 函数。
-
-更新源码、重编并安装最新 wheel：
-
-```bash
-cd /home/l00934901/sgl-kernel-npu
-git fetch origin
-git switch feature/a5-io-die-all2all-detour
-git pull --ff-only origin feature/a5-io-die-all2all-detour
-
-grep -n "SetTilingKey" \
-  csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
-# 预期：context->SetTilingKey(0UL)
-
-bash scripts/build_a5_io_die_all2all_detour.sh
-latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
-test -n "${latest_wheel}" || { echo "没有找到 deep_ep wheel" >&2; exit 1; }
-echo "Installing ${latest_wheel}"
-python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
-```
-
-这类错误与选了哪两张物理卡无关，也不是 `HCCL_BUFFSIZE` 不足；在 kernel 真正启动前就已经失败。
-
-## 启动后无报错但一直不退出
-
-如果已经打印 `Using HCCL runtime`，没有新的错误，但 `torchrun` 一直不退出，先按 `Ctrl+C`
-终止进程。这说明算子已经进入 device kernel，通常卡在 CCU collective 或核间同步，不应继续无限等待。
-
-测试脚本会为每个 rank 打印阶段和耗时，并在 60 秒后自动输出 Python 线程栈。例如：
-
-```text
-[rank0] All2AllDetourIoDie enqueue begin
-[rank0] All2AllDetourIoDie enqueue done; device synchronize begin
-```
-
-最后一条阶段日志可以区分 HCCL 建域、普通 HCCL barrier、Buffer 初始化、Host 算子下发和 device
-kernel 执行。线程栈只用于诊断，不会主动结束进程；仍需用 `Ctrl+C` 终止卡住的测试。可调整等待时间：
+测试脚本逐 rank 输出阶段，并在默认 60 秒后打印 Python 栈。需要缩短时间时：
 
 ```bash
 python3 -m torch.distributed.run \
@@ -373,90 +202,46 @@ python3 -m torch.distributed.run \
   --traceback-timeout 30
 ```
 
-请保留两个 rank 的最后一条阶段日志及自动输出的线程栈。若普通 `preflight HCCL barrier` 都无法完成，
-问题在算子之外的 HCCL 通信域或卡状态；若卡在 `device synchronize begin`，才是 device kernel 内部等待。
-
-若两个 rank 都停在 `All2AllDetourIoDie enqueue begin`，开启 ACLNN wrapper 跟踪：
+开启 wrapper 跟踪：
 
 ```bash
 export A5_DETOUR_TRACE=1
-echo "ASCEND_LAUNCH_BLOCKING=${ASCEND_LAUNCH_BLOCKING:-unset}"
 ```
 
-日志会进一步显示：
+判断方式：
 
-```text
-[A5 detour][rank=0] GetWorkspaceSize begin
-[A5 detour][rank=0] GetWorkspaceSize end: status=0, workspace=...
-[A5 detour][rank=0] HCCL server type set to CCU
-[A5 detour][rank=0] execute begin
-```
+- 卡在 `preflight HCCL barrier`：问题在算子外部的 HCCL 建域、卡状态或拓扑；
+- `GetWorkspaceSize` 直接失败：host tiling 或通信资源配置错误；
+- `execute end: status=0` 后卡在同步：device CCU task 没有完成；
+- `execute end: status=561000, detail=...`：以 `detail` 中第一条 HCCL/ACL 错误为根因，Python 的 SIGSEGV 只是后续异常。
 
-- 只有 `GetWorkspaceSize begin`：Host tiling 或 HCCL 资源申请阻塞；
-- 打印 `execute begin` 但没有 `execute end`：执行接口正在等待 device kernel；
-- `execute end` 已打印而 Python 停在 `device synchronize begin`：算子已异步下发，device kernel 未完成。
-
-如果两个 rank 均显示 `GetWorkspaceSize status=0`、`execute status=0`，但调用仍不返回，说明 Host 下发已经成功，阻塞位于 device kernel 的 CCU 完成等待。一个关键检查项是 host/device task type 必须一致：
-
-```text
-device AlltoAllvWrite -> HCCL_CMD_HALF_ALLTOALLV
-host Mc2CcTilingConfig -> HCCL_CMD_HALFALLTOALLV
-engine                -> CCU_SCHED (5)
-```
-
-曾经使用的 `HCCL_CMD_ALLTOALLV + engine(6)` 同时存在两处不匹配：device API 实际提交 HalfAllToAllV task，而且 CANN 9.1 中 engine 6 实际是 `AIV_ONLY`。后续的 `HCCL_CMD_HALFALLTOALLV + engine(6)` 虽修正了 task type，却仍可能在 Host 下发成功后永远等待 CCU 完成。正确组合是 `HCCL_CMD_HALFALLTOALLV + engine(5)`。更新到修复该组合的提交后，需要重新编译、安装最新 wheel；仅设置环境变量无法修复已安装库中的 host tiling。
-
-另一个关键检查项是 workspace 大小。`AlltoAllvWrite` 的双 Die 参数数组需要独立的用户工作区，不能覆盖 HCCL 用于 `finishCnt`、handle 参数和 CCU 消息的系统工作区。对于当前 `MAX_CCU_RANKS=32`，跟踪日志应显示：
-
-```text
-GetWorkspaceSize end: status=0, workspace=16778240
-```
-
-其中 `16778240 = 16 MiB + 1024`。如果仍显示旧值 `16777216`，说明加载的 host tiling 尚未包含 workspace 分离修复；旧版本会把 `sendSizes/sendOffsets` 写到 HCCL 系统区开头，破坏 device `Wait` 所依赖的完成计数和消息结构。
-
-`ASCEND_LAUNCH_BLOCKING=1` 会把 device 等待放进 `execute` 调用中；unset 时通常表现为 enqueue 返回、
-随后阻塞在 `torch.npu.synchronize()`。两者只是错误定位位置不同，不会消除通信死锁。
-
-`AlltoAllvWrite + CCU_SCHED` 要求所有 AIV 核以相同顺序执行：
-
-```text
-AlltoAllvWrite -> Wait -> SyncAll -> Finalize
-```
-
-旧版本仅让 block 0 调用 `AlltoAllvWrite/Wait`，其他 AIV 核直接进入 `SyncAll`，会形成互等。
-当前版本已按照 CCU_SCHED 调度模型处理：
-
-- 用 `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)` 声明 kernel task type；
-- block 0 生成双 Die 的 `sendSizes/sendOffsets`，然后所有 AIV 核同步；
-- 所有 AIV 核均调用 `AlltoAllvWrite` 和 `Wait`；
-- 数据拷贝完成后，所有 AIV 核再次同步并分别调用 `Finalize`。
-
-更新、编译、安装最新 wheel 后再测试。调试时可以设置：
+失败后立即收集：
 
 ```bash
-export ASCEND_LAUNCH_BLOCKING=1
+find /usr/slog -type f -mmin -5 -print 2>/dev/null
+grep -RInE "All2AllDetourIoDie|561000|HcclAllocComResourceByTiling|Kernel Run failed|rtFusionLaunch" \
+  /usr/slog 2>/dev/null | tail -n 300
 ```
 
-测试结束后应恢复异步模式：
+### `Can not find kernel ... tilingKey=1`
 
-```bash
-unset ASCEND_LAUNCH_BLOCKING
+device 使用 `REGISTER_TILING_DEFAULT`，host 必须使用：
+
+```text
+context->SetTilingKey(0UL)
 ```
 
-## `Invalid device ID`（四进程测试）
+出现 key 1 表示安装的是旧包，需要更新、重编并重装最新 wheel。
 
-`--nproc-per-node=4` 要求容器内至少有 4 张可见卡。若此前执行过：
+### `Invalid device ID`
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1
-```
+`--nproc-per-node=4` 要求 `ASCEND_RT_VISIBLE_DEVICES` 至少列出四张卡。如果只设置 `0,1`，local rank 2、3 必然报错。
 
-则 local rank 2、3 必然报 `Expected value: [0, 2)`。四卡测试前应改为：
+## 当前约束
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-# 或者使用容器已经映射好的全部卡
-unset ASCEND_RT_VISIBLE_DEVICES
-```
-
-然后再执行 `--nproc-per-node=4`。物理卡号由 `ASCEND_RT_VISIBLE_DEVICES` 决定；测试程序里的 rank 0～3 是重映射后的逻辑卡号。
+- `rank_size <= 32`；
+- `commRankIds` 必须是 NPU 上连续的 INT32 一维 tensor；
+- `sendData.numel()` 必须能被 `commRankIds.numel()` 整除；
+- 支持 FP16、BF16、FP32、INT32，底层按字节通信，不做类型转换；
+- 当前只验证单机 A5；跨机拓扑需单独测试；
+- 当前不提供用户指定 IO Die 中转 rank 的能力。

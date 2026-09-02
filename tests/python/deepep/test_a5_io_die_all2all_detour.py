@@ -93,6 +93,11 @@ def import_deep_ep():
             f"HCCL_BUFFSIZE={os.environ['HCCL_BUFFSIZE']}",
             flush=True,
         )
+        print(
+            "Using custom collective: full HCCL_CMD_ALLTOALLV via A5 CCU "
+            "(direct sendData -> recvData, no windowsIn/windowsOut)",
+            flush=True,
+        )
     return deep_ep
 
 

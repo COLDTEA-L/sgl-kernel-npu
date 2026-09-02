@@ -9,9 +9,6 @@ using namespace AscendC;
 
 namespace {
 constexpr uint32_t MAX_CCU_RANKS = 32U;
-constexpr uint32_t DUAL_DIE_COUNT = 2U;
-constexpr uint32_t PARAM_ARRAY_COUNT = 4U;
-constexpr uint32_t COPY_BUFFER_BYTES = 32U * 1024U;
 }
 
 extern "C" __global__ __aicore__ void all2_all_detour_io_die(
@@ -22,7 +19,6 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
 
     const uint32_t commRankCount = tilingData.info.commRankCount;
     const uint64_t perRankBytes = tilingData.info.perRankBytes;
-    const uint64_t windowStrideBytes = tilingData.info.windowStrideBytes;
 
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     __gm__ HcclCombineOpParam *context =
@@ -48,23 +44,18 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
             }
         }
 
-        GM_ADDR sendSizesGM = workspace;
-        GM_ADDR sendOffsetsGM = workspace + DUAL_DIE_COUNT * rankSize * sizeof(uint64_t);
-        TPipe pipe;
-        TBuf<TPosition::VECCALC> paramBuf;
-        TBuf<TPosition::VECCALC> copyBuf;
-        pipe.InitBuffer(paramBuf, PARAM_ARRAY_COUNT * MAX_CCU_RANKS * sizeof(uint64_t));
-        pipe.InitBuffer(copyBuf, COPY_BUFFER_BYTES);
-        LocalTensor<uint64_t> params = paramBuf.Get<uint64_t>();
-        LocalTensor<uint8_t> copyLocal = copyBuf.Get<uint8_t>();
-
-        // Match the repository's validated A5 CCU dispatch/combine sequence:
-        // prepare the two-die arrays first, synchronize all AIVs, and let only
-        // AIV0 submit and wait for one CCU task. Submitting from every AIV
-        // duplicates the collective and races on the same parameter arrays.
-        const uint32_t sendSizesBase = 0U;
-        const uint32_t sendOffsetsBase = DUAL_DIE_COUNT * MAX_CCU_RANKS;
+        // AlltoAllvWrite submits HCCL_CMD_HALF_ALLTOALLV. That command is
+        // intended for the dispatch/combine window protocol and is not a
+        // complete AllToAllV collective. This validation operator instead
+        // submits HCCL_CMD_ALLTOALLV, for which the A5 runtime registers the
+        // CCU Mesh1D/2Die executors. INT8 makes counts/displacements bytes.
+        SyncAll<true>();
         if (GetBlockIdx() == 0) {
+            uint64_t sendCounts[MAX_CCU_RANKS] = {0UL};
+            uint64_t sendDisplacements[MAX_CCU_RANKS] = {0UL};
+            uint64_t recvCounts[MAX_CCU_RANKS] = {0UL};
+            uint64_t recvDisplacements[MAX_CCU_RANKS] = {0UL};
+
             for (uint32_t peer = 0; peer < rankSize; ++peer) {
                 bool peerParticipates = false;
                 uint32_t peerCommIndex = 0U;
@@ -75,70 +66,28 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
                         break;
                     }
                 }
-                const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
-                const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
-                const uint64_t die1Bytes = perRankBytes - die0Bytes;
                 const bool shouldSend = selfParticipates && peerParticipates;
-                params.SetValue(sendSizesBase + peer, shouldSend ? die0Bytes : 0UL);
-                params.SetValue(sendSizesBase + rankSize + peer, shouldSend ? die1Bytes : 0UL);
-                params.SetValue(sendOffsetsBase + peer, peerOffset);
-                params.SetValue(sendOffsetsBase + rankSize + peer, peerOffset + die0Bytes);
+                const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
+                sendCounts[peer] = shouldSend ? perRankBytes : 0UL;
+                sendDisplacements[peer] = peerOffset;
+                recvCounts[peer] = shouldSend ? perRankBytes : 0UL;
+                recvDisplacements[peer] = peerOffset;
             }
 
-            GlobalTensor<uint64_t> sendSizes;
-            GlobalTensor<uint64_t> sendOffsets;
-            sendSizes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendSizesGM));
-            sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM));
-            DataCopyExtParams paramCopyParams = {
-                1U, static_cast<uint32_t>(DUAL_DIE_COUNT * rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
-            AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            DataCopyPad(sendSizes, params[sendSizesBase], paramCopyParams);
-            DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
-        }
-
-        SyncAll<true>();
-        if (GetBlockIdx() == 0) {
-            const uint64_t remoteWindowOffset = static_cast<uint64_t>(rankId) * windowStrideBytes;
-            const uint64_t localDataSize = selfParticipates ? perRankBytes : 0UL;
-            HcclHandle handle = hccl.AlltoAllvWrite<true>(
-                sendData, sendOffsetsGM, sendSizesGM, remoteWindowOffset, localDataSize);
+            HcclHandle handle = hccl.AlltoAllV<true>(
+                sendData,
+                sendCounts,
+                sendDisplacements,
+                HcclDataType::HCCL_DATA_TYPE_INT8,
+                recvData,
+                recvCounts,
+                recvDisplacements,
+                HcclDataType::HCCL_DATA_TYPE_INT8);
             hccl.Wait(handle);
         }
-        SyncAll<true>();
 
-        if (GetBlockIdx() == 0 && selfParticipates) {
-            GlobalTensor<uint8_t> localWindow;
-            GlobalTensor<uint8_t> output;
-            localWindow.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(context->windowsOut[0]));
-            output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(recvData));
-            DataCopyPadExtParams<uint8_t> padParams = {false, 0U, 0U, 0U};
-
-            for (uint32_t i = 0; i < commRankCount; ++i) {
-                const uint32_t sourceRank = static_cast<uint32_t>(commRanks.GetValue(i));
-                uint64_t bytesCopied = 0UL;
-                while (bytesCopied < perRankBytes) {
-                    const uint32_t copyBytes = static_cast<uint32_t>(
-                        (perRankBytes - bytesCopied > COPY_BUFFER_BYTES)
-                            ? COPY_BUFFER_BYTES
-                            : perRankBytes - bytesCopied);
-                    const uint64_t sourceOffset =
-                        static_cast<uint64_t>(sourceRank) * windowStrideBytes + bytesCopied;
-                    const uint64_t outputOffset = static_cast<uint64_t>(i) * perRankBytes + bytesCopied;
-                    DataCopyExtParams copyParams = {1U, copyBytes, 0U, 0U, 0U};
-                    DataCopyPad(copyLocal, localWindow[sourceOffset], copyParams, padParams);
-                    AscendC::SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-                    AscendC::WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-                    DataCopyPad(output[outputOffset], copyLocal, copyParams);
-                    AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                    AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                    bytesCopied += copyBytes;
-                }
-            }
-        }
-
-        // All AIV cores must finish consuming the local window before any of
-        // them tears down the CCU task state.
+        // Keep every AIV in the same lifetime even though only AIV0 may write
+        // the HCCL message area and submit the collective.
         SyncAll<true>();
         hccl.Finalize();
     }
