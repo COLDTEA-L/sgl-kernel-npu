@@ -9,7 +9,7 @@
 本实现不读取 `windowsIn[]`，也不把远端地址暴露给 AIV：
 
 1. host 侧将 executor 的 HCCL server type 设置为 `CCU`；
-2. host tiling 使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`；
+2. host tiling 使用与 CANN 9.1 device 实现匹配的 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(6)`；
 3. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllvWrite`，由 CCU/IO Die 把数据写入每个目标 rank 的本地 `windowsOut[0]`；
 4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
 5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
@@ -171,7 +171,7 @@ python3 -m torch.distributed.run \
 
 HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`，错误发生在 Host 侧通信资源分配阶段，此时 device kernel 还没有启动。
 
-本算子 host tiling 使用与 CANN `AlltoAllvWrite` 示例匹配的 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`。CANN 9.1 中通信引擎值 `5` 表示 `CCU_MS`，该模式不支持 AllToAllV；值 `6` 才表示 `CCU_SCHED`。仓库中的 `mc2tiling::A5_CCU_ENGINE` 常量值为 `5`，适用于已有 MoE HalfAllToAllV 路径，但不能用于这个独立 AlltoAllvWrite 算子，否则 `HcclAllocComResourceByTiling` 会返回 `HCCL_E_NOT_SUPPORT`。
+本算子 host tiling 使用 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(6)`。这里的两项不能混用：CANN 9.1 的 v310 `Hccl::AlltoAllvWrite` device 实现内部提交的是 `HCCL_CMD_HALF_ALLTOALLV`，所以 host 必须按 HalfAllToAllV 类型申请 task 资源；通信引擎仍须使用值 `6`（`CCU_SCHED`）。值 `5` 是 `CCU_MS`，不适用于此 AlltoAllvWrite 路径。
 
 另外，创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
 
@@ -210,7 +210,7 @@ Ascend 950 CCU 使用双 Die。`AlltoAllvWrite` 的 `sendSizes` 和 `sendOffsets
 HcclGetCcuTaskInfo ... ret = 4
 ```
 
-请确认 host tiling 使用的是 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`。旧版本使用 `AIV_ENGINE(3)` 时会在 Host 侧生成 CCU task info 阶段失败；使用 `CCU_MS engine(5)` 时则会在资源分配阶段返回不支持。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
+请确认 host tiling 使用的是 `HCCL_CMD_HALFALLTOALLV + CCU_SCHED engine(6)`。旧版本使用 `AIV_ENGINE(3)` 时会在 Host 侧生成 CCU task info 阶段失败；使用 `CCU_MS engine(5)` 时则会在资源分配阶段返回不支持。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
 
 ```bash
 git fetch origin
@@ -307,6 +307,16 @@ echo "ASCEND_LAUNCH_BLOCKING=${ASCEND_LAUNCH_BLOCKING:-unset}"
 - 只有 `GetWorkspaceSize begin`：Host tiling 或 HCCL 资源申请阻塞；
 - 打印 `execute begin` 但没有 `execute end`：执行接口正在等待 device kernel；
 - `execute end` 已打印而 Python 停在 `device synchronize begin`：算子已异步下发，device kernel 未完成。
+
+如果两个 rank 均显示 `GetWorkspaceSize status=0`、`execute status=0`，但调用仍不返回，说明 Host 下发已经成功，阻塞位于 device kernel 的 CCU 完成等待。一个关键检查项是 host/device task type 必须一致：
+
+```text
+device AlltoAllvWrite -> HCCL_CMD_HALF_ALLTOALLV
+host Mc2CcTilingConfig -> HCCL_CMD_HALFALLTOALLV
+engine                -> CCU_SCHED (6)
+```
+
+曾经使用的 `HCCL_CMD_ALLTOALLV + engine(6)` 能通过 Host 资源分配和下发，但与 device API 实际提交的 HalfAllToAllV task 不一致，可能表现为 `execute status=0` 后一直等待完成。更新到修复该组合的提交后，需要重新编译、安装最新 wheel；仅设置环境变量无法修复已安装库中的 host tiling。
 
 `ASCEND_LAUNCH_BLOCKING=1` 会把 device 等待放进 `execute` 调用中；unset 时通常表现为 enqueue 返回、
 随后阻塞在 `torch.npu.synchronize()`。两者只是错误定位位置不同，不会消除通信死锁。

@@ -96,10 +96,12 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     tiling->info.windowStrideBytes =
         (tiling->info.perRankBytes + CCU_WINDOW_ALIGN - 1UL) / CCU_WINDOW_ALIGN * CCU_WINDOW_ALIGN;
 
-    // AlltoAllvWrite uses the regular AllToAllV task type. The A5 CCU engine
-    // sends directly to every destination's local HCCL window, so windowsIn[] is not needed.
+    // CANN 9.1's v310 AlltoAllvWrite implementation submits
+    // HCCL_CMD_HALF_ALLTOALLV to the CCU.  The host must allocate the matching
+    // task resources, otherwise the device-side Wait never observes completion.
+    // Keep engine 6 (CCU_SCHED): engine 5 is CCU_MS, not this execution path.
     const uint32_t opType =
-        static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLTOALLV);
+        static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_HALFALLTOALLV);
     AscendC::Mc2CcTilingConfig ccuConfig(
         std::string(groupPtr), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
     ccuConfig.SetCommEngine(A5_CCU_SCHED_ENGINE);
