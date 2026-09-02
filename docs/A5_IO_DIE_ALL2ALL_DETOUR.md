@@ -171,7 +171,7 @@ python3 -m torch.distributed.run \
 
 HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`，错误发生在 Host 侧通信资源分配阶段，此时 device kernel 还没有启动。
 
-本算子 host tiling 必须使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。不要照搬 MoE dispatch/combine 内部使用的 `HCCL_CMD_HALFALLTOALLV`；后者用于特定的 MoE 半 AllToAllV 流程，在这个独立 AlltoAllvWrite 算子中会导致资源分配返回 `HCCL_E_NOT_SUPPORT`。
+本算子 host tiling 使用与 CANN `AlltoAllvWrite` 示例匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。MoE dispatch/combine 内部使用的 `HCCL_CMD_HALFALLTOALLV` 属于另一种通信流程，不应作为这个独立算子的默认 task type。需要注意，返回码 `5` 只能说明当前运行时拒绝了资源配置，不能只凭该返回码断定是 task type；即使 task type 正确，CANN/HCCL 运行库不匹配或目标通信域不支持当前 CCU 配置也会返回同一错误。
 
 另外，创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
 
@@ -180,6 +180,23 @@ export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 ```
 
 环境变量必须在 `torch.distributed.init_process_group("hccl")` 之前生效。当前测试脚本会在导入 `torch` 和创建通信域前自动设置它；如果外部已经设置成其他值（例如 `AIV` 或 `AI_CPU`），脚本会直接报出冲突，避免等到异步执行阶段才失败。
+
+如果更新、重编译后仍返回 `5`，先保存以下诊断信息，不要继续修改 device kernel；此时 kernel 尚未启动：
+
+```bash
+git rev-parse --short HEAD
+grep -n "HCCL_CMD_.*ALLTOALLV\|SetCommEngine" \
+  csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
+
+python3 -c 'import torch, torch_npu; print("torch", torch.__version__); print("torch_npu", torch_npu.__version__)'
+find /usr/local/Ascend -maxdepth 5 -type f -name version.info -print
+ldconfig -p 2>/dev/null | grep -E "libhccl|libopapi|libascendcl"
+ldd python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
+
+find /usr/slog -type f -mmin -10 -print 2>/dev/null
+grep -RInE "HcclAllocComResourceByTiling|All2AllDetourIoDie|HCCL_E_NOT_SUPPORT" \
+  /usr/slog 2>/dev/null | tail -n 200
+```
 
 ## 设置 `CCU_SCHED` 后进程报 `SIGSEGV`
 
