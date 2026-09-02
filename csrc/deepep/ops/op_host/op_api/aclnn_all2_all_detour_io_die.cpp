@@ -39,6 +39,7 @@ void TraceDetour(const char *stage)
 
 extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(
     void *executor, NnopbaseHcclServerType serverType);
+extern "C" const char *__attribute__((weak)) aclGetRecentErrMsg();
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,8 +88,11 @@ aclnnStatus aclnnAll2AllDetourIoDie(
     aclnnStatus status = aclnnInnerAll2AllDetourIoDie(workspace, workspaceSize, executor, stream);
     if (DetourTraceEnabled()) {
         const char *rank = std::getenv("RANK");
-        std::fprintf(stderr, "[A5 detour][rank=%s] execute end: status=%d\n",
-                     rank == nullptr ? "?" : rank, static_cast<int>(status));
+        const char *detail =
+            status == ACLNN_SUCCESS || !aclGetRecentErrMsg ? nullptr : aclGetRecentErrMsg();
+        std::fprintf(stderr, "[A5 detour][rank=%s] execute end: status=%d, detail=%s\n",
+                     rank == nullptr ? "?" : rank, static_cast<int>(status),
+                     detail == nullptr ? "<none>" : detail);
         std::fflush(stderr);
     }
     return status;

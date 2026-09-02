@@ -8,9 +8,7 @@
 using namespace AscendC;
 
 namespace {
-constexpr uint32_t MAX_CCU_RANKS = 32U;
 constexpr uint32_t DUAL_DIE_COUNT = 2U;
-constexpr uint32_t PARAM_ARRAY_COUNT = 4U;
 constexpr uint32_t COPY_BUFFER_BYTES = 32U * 1024U;
 }
 
@@ -20,8 +18,6 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     REGISTER_TILING_DEFAULT(All2AllDetourIoDieTilingData);
     GET_TILING_DATA_WITH_STRUCT(All2AllDetourIoDieTilingData, tilingData, tiling);
 
-    const uint32_t rankSize = tilingData.info.rankSize;
-    const uint32_t rankId = tilingData.info.rankId;
     const uint32_t commRankCount = tilingData.info.commRankCount;
     const uint64_t perRankBytes = tilingData.info.perRankBytes;
     const uint64_t windowStrideBytes = tilingData.info.windowStrideBytes;
@@ -34,6 +30,11 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     hccl.SetCcTilingV2(offsetof(All2AllDetourIoDieTilingData, mc2CcTiling));
 
     if ASCEND_IS_AIV {
+        // Use the communicator values populated by InitV2. This is the same
+        // source of truth used by CANN's AlltoAllvWrite sample and avoids a
+        // rank mismatch between operator attributes and the HCCL context.
+        const uint32_t rankSize = hccl.GetRankDim();
+        const uint32_t rankId = hccl.GetRankId();
         GlobalTensor<int32_t> commRanks;
         commRanks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(commRankIds));
 
@@ -48,51 +49,36 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
         GM_ADDR sendSizesGM = workspace;
         GM_ADDR sendOffsetsGM = workspace + DUAL_DIE_COUNT * rankSize * sizeof(uint64_t);
         TPipe pipe;
-        TBuf<TPosition::VECCALC> paramBuf;
         TBuf<TPosition::VECCALC> copyBuf;
-        pipe.InitBuffer(paramBuf, PARAM_ARRAY_COUNT * MAX_CCU_RANKS * sizeof(uint64_t));
         pipe.InitBuffer(copyBuf, COPY_BUFFER_BYTES);
-        LocalTensor<uint64_t> params = paramBuf.Get<uint64_t>();
         LocalTensor<uint8_t> copyLocal = copyBuf.Get<uint8_t>();
 
-        const uint32_t sendSizesBase = 0U;
-        const uint32_t sendOffsetsBase = DUAL_DIE_COUNT * MAX_CCU_RANKS;
-        if (GetBlockIdx() == 0) {
-            for (uint32_t peer = 0; peer < rankSize; ++peer) {
-                bool peerParticipates = false;
-                uint32_t peerCommIndex = 0U;
-                for (uint32_t i = 0; i < commRankCount; ++i) {
-                    if (static_cast<uint32_t>(commRanks.GetValue(i)) == peer) {
-                        peerParticipates = true;
-                        peerCommIndex = i;
-                        break;
-                    }
+        // AlltoAllvWrite's CCU implementation enters on every AIV. Follow the
+        // CANN sample exactly here: every AIV writes the same two-die arrays
+        // directly to GM before entering the collective. Restricting this to
+        // block 0 and adding a pre-collective SyncAll changes the CCU task
+        // sequence and can make the launch fail with ACLNN status 561000.
+        __gm__ uint64_t *sendSizes = reinterpret_cast<__gm__ uint64_t *>(sendSizesGM);
+        __gm__ uint64_t *sendOffsets = reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM);
+        for (uint32_t peer = 0; peer < rankSize; ++peer) {
+            bool peerParticipates = false;
+            uint32_t peerCommIndex = 0U;
+            for (uint32_t i = 0; i < commRankCount; ++i) {
+                if (static_cast<uint32_t>(commRanks.GetValue(i)) == peer) {
+                    peerParticipates = true;
+                    peerCommIndex = i;
+                    break;
                 }
-                const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
-                const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
-                const uint64_t die1Bytes = perRankBytes - die0Bytes;
-                const bool shouldSend = selfParticipates && peerParticipates;
-                params.SetValue(sendSizesBase + peer, shouldSend ? die0Bytes : 0UL);
-                params.SetValue(sendSizesBase + rankSize + peer, shouldSend ? die1Bytes : 0UL);
-                params.SetValue(sendOffsetsBase + peer, peerOffset);
-                params.SetValue(sendOffsetsBase + rankSize + peer, peerOffset + die0Bytes);
             }
-
-            GlobalTensor<uint64_t> sendSizes;
-            GlobalTensor<uint64_t> sendOffsets;
-            sendSizes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendSizesGM));
-            sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM));
-            DataCopyExtParams paramCopyParams = {
-                1U, static_cast<uint32_t>(DUAL_DIE_COUNT * rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
-            DataCopyPad(sendSizes, params[sendSizesBase], paramCopyParams);
-            DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
-            AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-            AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
+            const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
+            const uint64_t die1Bytes = perRankBytes - die0Bytes;
+            const bool shouldSend = selfParticipates && peerParticipates;
+            sendSizes[peer] = shouldSend ? die0Bytes : 0UL;
+            sendSizes[rankSize + peer] = shouldSend ? die1Bytes : 0UL;
+            sendOffsets[peer] = peerOffset;
+            sendOffsets[rankSize + peer] = peerOffset + die0Bytes;
         }
-
-        // CCU_SCHED requires every AIV core to enter the communication task.
-        // Synchronize first so that all cores observe block 0's parameter arrays.
-        SyncAll<true>();
 
         const uint64_t remoteWindowOffset = static_cast<uint64_t>(rankId) * windowStrideBytes;
         const uint64_t localDataSize = selfParticipates ? perRankBytes : 0UL;

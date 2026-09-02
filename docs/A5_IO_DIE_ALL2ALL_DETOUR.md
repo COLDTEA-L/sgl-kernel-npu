@@ -250,6 +250,43 @@ git log -1 --oneline
 ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 ```
 
+## `execute end: status=561000`
+
+`561000` 是算子下发/执行阶段的通用内部错误，单独看这个数字不能判断具体根因。若日志已经显示
+`GetWorkspaceSize end: status=0`，说明 host tiling 和 HCCL 资源申请已经通过，问题位于随后下发的 device kernel。
+
+旧版本在这里有两项问题：
+
+1. `EXEC_NPU_CMD` 中保存 workspace 的 Tensor 在算子真正下发前已经离开作用域；
+2. device kernel 只让 block 0 经 UB/MTE 写 `sendSizes/sendOffsets`，并在 collective 前插入了一次额外的
+   `SyncAll`，与 CANN 9.1 的 `AlltoAllvWrite` CCU 示例所要求的调用序列不同。
+
+新版本会让 workspace 至少存活到下发完成，并让每个 AIV 按 CANN 示例直接写同一组双 Die GM 参数，然后立即进入
+`AlltoAllvWrite`。更新后必须重新编译、选择最新 wheel 安装并重新加载自定义算子环境，不能只重新运行测试：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-io-die-all2all-detour
+git pull --ff-only origin feature/a5-io-die-all2all-detour
+bash scripts/build_a5_io_die_all2all_detour.sh
+
+latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
+echo "Installing ${latest_wheel}"
+python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+```
+
+如果新版本仍返回 `561000`，wrapper 会在 `detail=` 后打印 `aclGetRecentErrMsg()`。同时在失败后立即收集最近日志：
+
+```bash
+find /usr/slog -type f -mmin -5 -print 2>/dev/null
+grep -RInE "All2AllDetourIoDie|561000|Kernel Run failed|kernel.*fail|rtFusionLaunch|AICORE" \
+  /usr/slog 2>/dev/null | tail -n 300
+```
+
+请保留 `execute end` 的完整一行和上述 grep 结果；这两部分比 Python 的 `SIGSEGV` 汇总更接近首个设备侧错误。
+
 ## `Can not find kernel ... tilingKey=1`
 
 如果 HCCL 资源分配已经成功，但启动算子时报：
