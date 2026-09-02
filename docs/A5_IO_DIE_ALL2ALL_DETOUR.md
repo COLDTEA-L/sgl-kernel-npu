@@ -263,6 +263,37 @@ python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
 
 这类错误与选了哪两张物理卡无关，也不是 `HCCL_BUFFSIZE` 不足；在 kernel 真正启动前就已经失败。
 
+## 启动后无报错但一直不退出
+
+如果已经打印 `Using HCCL runtime`，没有新的错误，但 `torchrun` 一直不退出，先按 `Ctrl+C`
+终止进程。这说明算子已经进入 device kernel，通常卡在 CCU collective 或核间同步，不应继续无限等待。
+
+`AlltoAllvWrite + CCU_SCHED` 要求所有 AIV 核以相同顺序执行：
+
+```text
+AlltoAllvWrite -> Wait -> SyncAll -> Finalize
+```
+
+旧版本仅让 block 0 调用 `AlltoAllvWrite/Wait`，其他 AIV 核直接进入 `SyncAll`，会形成互等。
+当前版本已按照 CCU_SCHED 调度模型处理：
+
+- 用 `KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2)` 声明 kernel task type；
+- block 0 生成双 Die 的 `sendSizes/sendOffsets`，然后所有 AIV 核同步；
+- 所有 AIV 核均调用 `AlltoAllvWrite` 和 `Wait`；
+- 数据拷贝完成后，所有 AIV 核再次同步并分别调用 `Finalize`。
+
+更新、编译、安装最新 wheel 后再测试。调试时可以设置：
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+```
+
+测试结束后应恢复异步模式：
+
+```bash
+unset ASCEND_LAUNCH_BLOCKING
+```
+
 ## `Invalid device ID`（四进程测试）
 
 `--nproc-per-node=4` 要求容器内至少有 4 张可见卡。若此前执行过：

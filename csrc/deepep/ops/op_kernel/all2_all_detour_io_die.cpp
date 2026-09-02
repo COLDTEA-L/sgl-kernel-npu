@@ -26,14 +26,14 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     const uint64_t perRankBytes = tilingData.info.perRankBytes;
     const uint64_t windowStrideBytes = tilingData.info.windowStrideBytes;
 
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     __gm__ HcclCombineOpParam *context =
         reinterpret_cast<__gm__ HcclCombineOpParam *>(GetHcclContext<0>());
     Hccl<HcclServerType::HCCL_SERVER_TYPE_CCU> hccl;
     hccl.InitV2(reinterpret_cast<GM_ADDR>(context), &tilingData);
     hccl.SetCcTilingV2(offsetof(All2AllDetourIoDieTilingData, mc2CcTiling));
-    SyncAll<true>();
 
-    if (GetBlockIdx() == 0) {
+    if ASCEND_IS_AIV {
         GlobalTensor<int32_t> commRanks;
         commRanks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(commRankIds));
 
@@ -45,6 +45,8 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
             }
         }
 
+        GM_ADDR sendSizesGM = workspace;
+        GM_ADDR sendOffsetsGM = workspace + DUAL_DIE_COUNT * rankSize * sizeof(uint64_t);
         TPipe pipe;
         TBuf<TPosition::VECCALC> paramBuf;
         TBuf<TPosition::VECCALC> copyBuf;
@@ -55,46 +57,51 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
 
         const uint32_t sendSizesBase = 0U;
         const uint32_t sendOffsetsBase = DUAL_DIE_COUNT * MAX_CCU_RANKS;
-        for (uint32_t peer = 0; peer < rankSize; ++peer) {
-            bool peerParticipates = false;
-            uint32_t peerCommIndex = 0U;
-            for (uint32_t i = 0; i < commRankCount; ++i) {
-                if (static_cast<uint32_t>(commRanks.GetValue(i)) == peer) {
-                    peerParticipates = true;
-                    peerCommIndex = i;
-                    break;
+        if (GetBlockIdx() == 0) {
+            for (uint32_t peer = 0; peer < rankSize; ++peer) {
+                bool peerParticipates = false;
+                uint32_t peerCommIndex = 0U;
+                for (uint32_t i = 0; i < commRankCount; ++i) {
+                    if (static_cast<uint32_t>(commRanks.GetValue(i)) == peer) {
+                        peerParticipates = true;
+                        peerCommIndex = i;
+                        break;
+                    }
                 }
+                const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
+                const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
+                const uint64_t die1Bytes = perRankBytes - die0Bytes;
+                const bool shouldSend = selfParticipates && peerParticipates;
+                params.SetValue(sendSizesBase + peer, shouldSend ? die0Bytes : 0UL);
+                params.SetValue(sendSizesBase + rankSize + peer, shouldSend ? die1Bytes : 0UL);
+                params.SetValue(sendOffsetsBase + peer, peerOffset);
+                params.SetValue(sendOffsetsBase + rankSize + peer, peerOffset + die0Bytes);
             }
-            const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
-            const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
-            const uint64_t die1Bytes = perRankBytes - die0Bytes;
-            const bool shouldSend = selfParticipates && peerParticipates;
-            params.SetValue(sendSizesBase + peer, shouldSend ? die0Bytes : 0UL);
-            params.SetValue(sendSizesBase + rankSize + peer, shouldSend ? die1Bytes : 0UL);
-            params.SetValue(sendOffsetsBase + peer, peerOffset);
-            params.SetValue(sendOffsetsBase + rankSize + peer, peerOffset + die0Bytes);
+
+            GlobalTensor<uint64_t> sendSizes;
+            GlobalTensor<uint64_t> sendOffsets;
+            sendSizes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendSizesGM));
+            sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM));
+            DataCopyExtParams paramCopyParams = {
+                1U, static_cast<uint32_t>(DUAL_DIE_COUNT * rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
+            DataCopyPad(sendSizes, params[sendSizesBase], paramCopyParams);
+            DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
+            AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
 
-        GlobalTensor<uint64_t> sendSizes;
-        GlobalTensor<uint64_t> sendOffsets;
-        GM_ADDR sendSizesGM = workspace;
-        GM_ADDR sendOffsetsGM = workspace + DUAL_DIE_COUNT * rankSize * sizeof(uint64_t);
-        sendSizes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendSizesGM));
-        sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM));
-        DataCopyExtParams paramCopyParams = {
-            1U, static_cast<uint32_t>(DUAL_DIE_COUNT * rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
-        DataCopyPad(sendSizes, params[sendSizesBase], paramCopyParams);
-        DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
-        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        // CCU_SCHED requires every AIV core to enter the communication task.
+        // Synchronize first so that all cores observe block 0's parameter arrays.
+        SyncAll<true>();
 
         const uint64_t remoteWindowOffset = static_cast<uint64_t>(rankId) * windowStrideBytes;
         const uint64_t localDataSize = selfParticipates ? perRankBytes : 0UL;
         HcclHandle handle = hccl.AlltoAllvWrite<true>(
             sendData, sendOffsetsGM, sendSizesGM, remoteWindowOffset, localDataSize);
         hccl.Wait(handle);
+        SyncAll<true>();
 
-        if (selfParticipates) {
+        if (GetBlockIdx() == 0 && selfParticipates) {
             GlobalTensor<uint8_t> localWindow;
             GlobalTensor<uint8_t> output;
             localWindow.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(context->windowsOut[0]));
@@ -123,10 +130,10 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
                 }
             }
         }
-    }
 
-    SyncAll<true>();
-    if (GetBlockIdx() == 0) {
+        // All AIV cores must finish consuming the local window before any of
+        // them tears down the CCU task state.
+        SyncAll<true>();
         hccl.Finalize();
     }
 }
