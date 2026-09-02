@@ -81,6 +81,7 @@ export ASCEND_RT_VISIBLE_DEVICES=2,5
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 export HCCL_BUFFSIZE=2300
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 
 python3 -m torch.distributed.run \
@@ -95,6 +96,8 @@ python3 -m torch.distributed.run \
 下面让 rank 0、2 交换数据，rank 1、3 以 0 count 参与 collective：
 
 ```bash
+export HCCL_BUFFSIZE=2300
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 
 python3 -m torch.distributed.run \
@@ -114,6 +117,8 @@ PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
 确认 8 张卡都映射进容器后，可直接跑完整通信域：
 
 ```bash
+export HCCL_BUFFSIZE=2300
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 python3 -m torch.distributed.run \
@@ -138,6 +143,16 @@ python3 -m torch.distributed.run \
 - 支持 FP16、BF16、FP32、INT32；底层按字节调用 CCU，因此不会做类型转换；
 - 通信域中每个 rank 都必须进入算子，否则 collective 会等待；
 - 当前版本针对单机 A5 通信域验证，跨机拓扑需要在目标集群另行做正确性和性能验证。
+
+## `HcclAllocComResourceByTiling ret = 5`
+
+HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`。本算子 host tiling 使用 `A5_CCU_ENGINE`，因此创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
+
+```bash
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+```
+
+环境变量必须在 `torch.distributed.init_process_group("hccl")` 之前生效。当前测试脚本会在导入 `torch` 和创建通信域前自动设置它；如果外部已经设置成其他值（例如 `AIV` 或 `AI_CPU`），脚本会直接报出冲突，避免等到异步执行阶段才失败。
 
 ## `HcclGetCcuTaskInfo ret = 4`
 

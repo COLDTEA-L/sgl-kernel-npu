@@ -7,6 +7,18 @@ import sys
 from pathlib import Path
 
 
+def prepare_a5_ccu_runtime():
+    expansion_mode = os.environ.get("HCCL_OP_EXPANSION_MODE", "")
+    if expansion_mode and expansion_mode != "CCU_SCHED":
+        raise RuntimeError(
+            "All2AllDetourIoDie requires HCCL_OP_EXPANSION_MODE=CCU_SCHED on A5; "
+            f"got {expansion_mode!r}"
+        )
+    # These variables must be set before torch.distributed creates the HCCL communicator.
+    os.environ["HCCL_OP_EXPANSION_MODE"] = "CCU_SCHED"
+    os.environ.setdefault("HCCL_BUFFSIZE", "2300")
+
+
 def candidate_package_dirs():
     project_root = Path(__file__).resolve().parents[3]
     package_dirs = [project_root / "python" / "deep_ep" / "deep_ep"]
@@ -50,6 +62,7 @@ def prepare_custom_op_runtime():
     return package_dir, extension, op_api
 
 
+prepare_a5_ccu_runtime()
 DEEP_EP_PACKAGE_DIR, DEEP_EP_EXTENSION, CUSTOM_OP_API = prepare_custom_op_runtime()
 
 import torch
@@ -64,6 +77,12 @@ def import_deep_ep():
     if os.environ.get("RANK", "0") == "0":
         print(f"Using deep_ep_cpp: {DEEP_EP_EXTENSION}", flush=True)
         print(f"Using custom op API: {CUSTOM_OP_API}", flush=True)
+        print(
+            "Using HCCL runtime: "
+            f"HCCL_OP_EXPANSION_MODE={os.environ['HCCL_OP_EXPANSION_MODE']}, "
+            f"HCCL_BUFFSIZE={os.environ['HCCL_BUFFSIZE']}",
+            flush=True,
+        )
     return deep_ep
 
 
