@@ -228,6 +228,41 @@ git log -1 --oneline
 ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 ```
 
+## `Can not find kernel ... tilingKey=1`
+
+如果 HCCL 资源分配已经成功，但启动算子时报：
+
+```text
+Can not find kernel by function[0x0], tilingKey=1
+rtFusionLaunch execution failed, reason=kernel pointer null
+```
+
+说明 host 下发的 tiling key 与编译进 wheel 的 device kernel 不一致。当前 device kernel 使用
+`REGISTER_TILING_DEFAULT(All2AllDetourIoDieTilingData)`，对应默认 key `0`；host tiling 也必须执行
+`context->SetTilingKey(0UL)`。旧版本错误地设置成了 `1`，但单算子编译没有生成 key 1 变体，
+因此运行时找不到 kernel 函数。
+
+更新源码、重编并安装最新 wheel：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-io-die-all2all-detour
+git pull --ff-only origin feature/a5-io-die-all2all-detour
+
+grep -n "SetTilingKey" \
+  csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
+# 预期：context->SetTilingKey(0UL)
+
+bash scripts/build_a5_io_die_all2all_detour.sh
+latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
+test -n "${latest_wheel}" || { echo "没有找到 deep_ep wheel" >&2; exit 1; }
+echo "Installing ${latest_wheel}"
+python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
+```
+
+这类错误与选了哪两张物理卡无关，也不是 `HCCL_BUFFSIZE` 不足；在 kernel 真正启动前就已经失败。
+
 ## `Invalid device ID`（四进程测试）
 
 `--nproc-per-node=4` 要求容器内至少有 4 张可见卡。若此前执行过：

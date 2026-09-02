@@ -115,7 +115,10 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     const uint32_t aivNum = platform.GetCoreNumAiv();
     OP_TILING_CHECK(aivNum < 2U, OP_LOGE(nodeName, "CCU AlltoAllV requires at least two AIV cores"),
                     return ge::GRAPH_FAILED);
-    context->SetTilingKey(1UL);
+    // The device source registers only REGISTER_TILING_DEFAULT, whose runtime
+    // dispatch key is 0.  A non-zero key makes rtFusionLaunch look for a
+    // kernel variant that was never emitted by the single-op build.
+    context->SetTilingKey(0UL);
     context->SetBlockDim(platform.CalcTschBlockDim(aivNum, 0U, aivNum));
     context->SetScheduleMode(1);
     OP_LOGI(nodeName,
