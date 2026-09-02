@@ -13,6 +13,10 @@
 namespace {
 constexpr uint32_t MAX_CCU_RANKS = 32U;
 constexpr uint64_t CCU_WINDOW_ALIGN = 512UL;
+// Two uint64 arrays per Die: sendSizes[2 * rankSize] followed by
+// sendOffsets[2 * rankSize]. Keep this user workspace separate from the
+// fixed 16 MiB system workspace used by the HCCL context.
+constexpr size_t CCU_PARAM_WORKSPACE_BYTES = 4UL * MAX_CCU_RANKS * sizeof(uint64_t);
 constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr size_t SYSTEM_WORKSPACE_BYTES = 16UL * 1024UL * 1024UL;
 constexpr int ATTR_GROUP = 0;
@@ -110,7 +114,7 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     size_t *workspace = context->GetWorkspaceSizes(1);
     OP_TILING_CHECK(workspace == nullptr, OP_LOGE(nodeName, "workspace metadata is null"),
                     return ge::GRAPH_FAILED);
-    workspace[0] = SYSTEM_WORKSPACE_BYTES;
+    workspace[0] = CCU_PARAM_WORKSPACE_BYTES + SYSTEM_WORKSPACE_BYTES;
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const uint32_t aivNum = platform.GetCoreNumAiv();

@@ -14,6 +14,8 @@
 4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
 5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
 
+算子 workspace 的前 1024 字节专门存放双 Die 的 `sendSizes/sendOffsets`，后面另行保留 HCCL 所需的固定 16 MiB 系统工作区。两部分不能重叠。
+
 输入 `sendData` 的第 `i` 个等长数据块发往 `commRankIds[i]`；输出 `recvData` 的第 `i` 个数据块来自 `commRankIds[i]`。所有 rank 必须传入完全相同、升序且不重复的 `commRankIds`。
 
 ## 已验证环境
@@ -337,6 +339,14 @@ engine                -> CCU_SCHED (5)
 ```
 
 曾经使用的 `HCCL_CMD_ALLTOALLV + engine(6)` 同时存在两处不匹配：device API 实际提交 HalfAllToAllV task，而且 CANN 9.1 中 engine 6 实际是 `AIV_ONLY`。后续的 `HCCL_CMD_HALFALLTOALLV + engine(6)` 虽修正了 task type，却仍可能在 Host 下发成功后永远等待 CCU 完成。正确组合是 `HCCL_CMD_HALFALLTOALLV + engine(5)`。更新到修复该组合的提交后，需要重新编译、安装最新 wheel；仅设置环境变量无法修复已安装库中的 host tiling。
+
+另一个关键检查项是 workspace 大小。`AlltoAllvWrite` 的双 Die 参数数组需要独立的用户工作区，不能覆盖 HCCL 用于 `finishCnt`、handle 参数和 CCU 消息的系统工作区。对于当前 `MAX_CCU_RANKS=32`，跟踪日志应显示：
+
+```text
+GetWorkspaceSize end: status=0, workspace=16778240
+```
+
+其中 `16778240 = 16 MiB + 1024`。如果仍显示旧值 `16777216`，说明加载的 host tiling 尚未包含 workspace 分离修复；旧版本会把 `sendSizes/sendOffsets` 写到 HCCL 系统区开头，破坏 device `Wait` 所依赖的完成计数和消息结构。
 
 `ASCEND_LAUNCH_BLOCKING=1` 会把 device 等待放进 `execute` 调用中；unset 时通常表现为 enqueue 返回、
 随后阻塞在 `torch.npu.synchronize()`。两者只是错误定位位置不同，不会消除通信死锁。
