@@ -13,9 +13,6 @@
 namespace {
 constexpr uint32_t MAX_CCU_RANKS = 32U;
 constexpr uint64_t CCU_WINDOW_ALIGN = 512UL;
-// HcclCommConfig::hcclOpExpansionMode value for A5 CCU scheduling mode.
-// Value 5 is CCU_MS and does not support AllToAllV.
-constexpr uint8_t A5_CCU_SCHED_ENGINE = 6U;
 constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr size_t SYSTEM_WORKSPACE_BYTES = 16UL * 1024UL * 1024UL;
 constexpr int ATTR_GROUP = 0;
@@ -99,12 +96,14 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     // CANN 9.1's v310 AlltoAllvWrite implementation submits
     // HCCL_CMD_HALF_ALLTOALLV to the CCU.  The host must allocate the matching
     // task resources, otherwise the device-side Wait never observes completion.
-    // Keep engine 6 (CCU_SCHED): engine 5 is CCU_MS, not this execution path.
+    // CANN 9.1 HcclOpExpansionMode defines CCU_MS=4, CCU_SCHED=5 and
+    // AIV_ONLY=6. Use the repository's named A5 CCU_SCHED constant instead
+    // of duplicating the numeric value here.
     const uint32_t opType =
         static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_HALFALLTOALLV);
     AscendC::Mc2CcTilingConfig ccuConfig(
         std::string(groupPtr), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
-    ccuConfig.SetCommEngine(A5_CCU_SCHED_ENGINE);
+    ccuConfig.SetCommEngine(mc2tiling::A5_CCU_ENGINE);
     ccuConfig.GetTiling(tiling->mc2InitTiling);
     ccuConfig.GetTiling(tiling->mc2CcTiling);
 
