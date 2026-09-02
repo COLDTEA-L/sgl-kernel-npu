@@ -1,18 +1,13 @@
 #include "register/op_def_registry.h"
 
 namespace ops {
-class All2AllDetourIoDie : public OpDef {
+class HcclAll2AllCcu : public OpDef {
 public:
-    explicit All2AllDetourIoDie(const char *name) : OpDef(name)
+    explicit HcclAll2AllCcu(const char *name) : OpDef(name)
     {
         this->Input("sendData")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_INT32})
-            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
-        this->Input("commRankIds")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
         this->Output("recvData")
@@ -20,10 +15,10 @@ public:
             .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+
         this->Attr("group").AttrType(REQUIRED).String();
         this->Attr("rank_size").AttrType(REQUIRED).Int();
         this->Attr("rank_id").AttrType(REQUIRED).Int();
-        this->Attr("magic").AttrType(REQUIRED).Int();
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)
@@ -41,5 +36,5 @@ public:
     }
 };
 
-OP_ADD(All2AllDetourIoDie);
+OP_ADD(HcclAll2AllCcu);
 }  // namespace ops

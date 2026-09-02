@@ -12,6 +12,13 @@ if("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
             ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/notify_dispatch_tiling.cc)
         message(STATUS "DeepEP single-op host build: NotifyDispatch")
+    elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "a5_all2all_validation")
+        set(ops_srcs
+            ${CMAKE_CURRENT_SOURCE_DIR}/hccl_all2_all_ccu_def.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/hccl_all2_all_ccu_tiling.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/all2_all_detour_io_die_def.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/all2_all_detour_io_die_tiling.cpp)
+        message(STATUS "DeepEP A5 validation build: HCCL CCU AllToAll + AIV/URMA detour")
     elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "all2_all_detour_io_die")
         set(ops_srcs
             ${CMAKE_CURRENT_SOURCE_DIR}/all2_all_detour_io_die_def.cpp
@@ -49,6 +56,12 @@ if("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "notify_dispatch")
     file(GLOB pregen_file
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_notify_dispatch.h")
+elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "a5_all2all_validation")
+    file(GLOB pregen_file
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_hccl_all2_all_ccu.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_hccl_all2_all_ccu.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_all2_all_detour_io_die.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_all2_all_detour_io_die.h")
 elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "all2_all_detour_io_die")
     file(GLOB pregen_file
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_all2_all_detour_io_die.cpp"

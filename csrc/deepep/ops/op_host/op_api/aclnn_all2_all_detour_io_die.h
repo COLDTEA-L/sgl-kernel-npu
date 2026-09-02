@@ -13,6 +13,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnAll2AllDetourIoDieGetWor
     char *group,
     int64_t rankSize,
     int64_t rankId,
+    int64_t magic,
     const aclTensor *recvData,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);

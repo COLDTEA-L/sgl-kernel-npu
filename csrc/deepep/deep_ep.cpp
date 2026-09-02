@@ -108,6 +108,26 @@ bool Buffer::is_available() const
     return available;
 }
 
+torch::Tensor Buffer::hccl_all2_all_ccu(const torch::Tensor &send_data)
+{
+    EP_HOST_ASSERT(send_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kHalf || send_data.scalar_type() == at::kBFloat16 ||
+                   send_data.scalar_type() == at::kFloat || send_data.scalar_type() == at::kInt);
+    EP_HOST_ASSERT(send_data.numel() % num_ranks == 0);
+
+    char hcom_ep_name[HCOMM_NAME_LEN];
+    if (!moe_all_to_all_group_name.empty()) {
+        std::memcpy(hcom_ep_name, moe_all_to_all_group_name.data(), moe_all_to_all_group_name.size() + 1);
+    } else {
+        HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
+    }
+
+    auto recv_data = torch::empty_like(send_data);
+    EXEC_NPU_CMD(aclnnHcclAll2AllCcu, send_data, hcom_ep_name, num_ranks, rank, recv_data);
+    return recv_data;
+}
+
 torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)
 {
     EP_HOST_ASSERT(send_data.is_contiguous());
@@ -128,7 +148,8 @@ torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, con
     }
 
     auto recv_data = torch::empty_like(send_data);
-    EXEC_NPU_CMD(aclnnAll2AllDetourIoDie, send_data, comm_rank_ids, hcom_ep_name, num_ranks, rank, recv_data);
+    const int64_t magic = all2_all_detour_magic++;
+    EXEC_NPU_CMD(aclnnAll2AllDetourIoDie, send_data, comm_rank_ids, hcom_ep_name, num_ranks, rank, magic, recv_data);
     return recv_data;
 }
 

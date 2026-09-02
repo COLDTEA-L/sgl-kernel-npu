@@ -9,8 +9,9 @@ usage()
     cat <<'EOF'
 Usage: bash scripts/build_a5_io_die_all2all_detour.sh [--python-env PATH]
 
-Build a DeepEP wheel containing only All2AllDetourIoDie for Ascend 950.
-The kernel uses the A5 CCU AlltoAllV path and never reads windowsIn[].
+Build a focused DeepEP wheel for the two A5 AllToAll validation stages:
+  1. fixed-count HCCL AllToAll using the CCU runtime;
+  2. AIV+URMA two-hop AllToAll using explicit relay-rank windows.
 EOF
 }
 
@@ -33,12 +34,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${PYTHON_ENV}" ]] \
-    && ! python3 -c 'import importlib.util; assert importlib.util.find_spec("torch") and importlib.util.find_spec("torch_npu") and importlib.util.find_spec("pybind11")' >/dev/null 2>&1 \
-    && [[ -x /opt/conda/envs/cam_py311_pt28/bin/python3 ]]; then
-    PYTHON_ENV=/opt/conda/envs/cam_py311_pt28
-fi
-
 if [[ -n "${PYTHON_ENV}" ]]; then
     [[ -x "${PYTHON_ENV}/bin/python3" ]] || {
         echo "Invalid Python environment: ${PYTHON_ENV}" >&2
@@ -47,7 +42,12 @@ if [[ -n "${PYTHON_ENV}" ]]; then
     export PATH="${PYTHON_ENV}/bin:${PATH}"
 fi
 
-export DEEPEP_SINGLE_OP=all2_all_detour_io_die
+python3 -c 'import importlib.util; assert importlib.util.find_spec("torch") and importlib.util.find_spec("torch_npu") and importlib.util.find_spec("pybind11")' >/dev/null 2>&1 || {
+    echo "python3 must provide torch, torch_npu and pybind11" >&2
+    exit 1
+}
+
+export DEEPEP_SINGLE_OP=a5_all2all_validation
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
 cd "${PROJECT_ROOT}"
@@ -63,20 +63,20 @@ import zipfile
 wheel = sys.argv[1]
 with zipfile.ZipFile(wheel) as archive:
     names = archive.namelist()
-target = [
+ccu = [
+    name for name in names
+    if "/kernel/ascend950/hccl_all2_all_ccu/" in name and name.endswith(".o")
+]
+detour = [
     name for name in names
     if "/kernel/ascend950/all2_all_detour_io_die/" in name and name.endswith(".o")
 ]
-other = [
-    name for name in names
-    if "/kernel/ascend950/" in name and name.endswith(".o")
-    and "/all2_all_detour_io_die/" not in name
-]
-if not target:
+if not ccu:
+    raise SystemExit("wheel does not contain the HcclAll2AllCcu device binary")
+if not detour:
     raise SystemExit("wheel does not contain the All2AllDetourIoDie device binary")
-if other:
-    raise SystemExit(f"wheel unexpectedly contains other device binaries: {other[:5]}")
-print(f"All2AllDetourIoDie device binaries: {len(target)}")
+print(f"HcclAll2AllCcu device binaries: {len(ccu)}")
+print(f"All2AllDetourIoDie device binaries: {len(detour)}")
 PY
 
 echo "Built: ${wheel}"

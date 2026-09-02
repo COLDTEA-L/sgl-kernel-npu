@@ -39,6 +39,11 @@ struct Buffer {
 private:
     std::string moe_all_to_all_group_name;
 
+    // All ranks create Buffer and invoke the validation collectives in the
+    // same order, so this produces the same non-zero generation on every
+    // rank.  The AIV+URMA relay uses it to distinguish reused window flags.
+    int64_t all2_all_detour_magic = 1;
+
     int device_id;
 
     HcclComm ep_comm;
@@ -62,6 +67,8 @@ public:
                         bool async, bool allocate_on_comm_stream);
 
     torch::Tensor get_notify_send_data();
+
+    torch::Tensor hccl_all2_all_ccu(const torch::Tensor &send_data);
 
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 

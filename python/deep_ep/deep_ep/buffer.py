@@ -469,14 +469,23 @@ class Buffer:
                 recv_tokens_per_expert,
             )
 
+    def hccl_all2_all_ccu(self, send_data: torch.Tensor) -> torch.Tensor:
+        """Run the fixed-count HCCL AllToAll implemented by the A5 CCU runtime.
+
+        Every rank in ``self.group`` must provide ``WORLD_SIZE`` equal-sized
+        peer blocks in destination-rank order.
+        """
+        return self.runtime.hccl_all2_all_ccu(send_data)
+
     def all2_all_detour_io_die(
         self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Run the A5 CCU/IO Die All2All over the selected communication ranks.
+        """Run the A5 AIV+URMA two-hop AllToAll over communication ranks.
 
         Every rank in ``self.group`` must call this method with the same ordered
-        ``comm_rank_ids``. Ranks not listed in ``comm_rank_ids`` participate in
-        the collective with zero send/receive counts.
+        ``comm_rank_ids``. Ranks outside that list expose their HCCL/URMA window
+        as passive relay memory. A communication rank writes each relay window;
+        the destination communication rank waits and reads the same window.
         """
         return self.runtime.all2_all_detour_io_die(send_data, comm_rank_ids)
 

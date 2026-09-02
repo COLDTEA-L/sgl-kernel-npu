@@ -7,10 +7,11 @@ struct All2AllDetourIoDieInfo {
     uint32_t rankSize;
     uint32_t rankId;
     uint32_t commRankCount;
-    uint32_t reserved;
+    uint32_t magic;
     uint64_t sendCount;
     uint64_t perRankBytes;
-    uint64_t windowStrideBytes;
+    uint64_t cellBytes;
+    uint64_t dataRegionOffset;
 };
 
 struct All2AllDetourIoDieTilingData {
