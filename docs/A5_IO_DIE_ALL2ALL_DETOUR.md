@@ -77,11 +77,15 @@ latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
 test -n "${latest_wheel}" || { echo "没有找到 deep_ep wheel" >&2; exit 1; }
 echo "Installing ${latest_wheel}"
 python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
+
+# 每次重新安装 wheel 或进入新的 shell 后，都要加载自定义算子的
+# OPP、op_api 和动态库搜索路径。
+source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 ```
 
 必须给 wheel 路径加双引号。不要直接把 `output/deep_ep-*.whl` 传给 `pip install`：如果目录中保留了多次编译生成的 wheel，shell 会把通配符展开为多个包，导致 pip 同时安装多个版本并报冲突。`ls -1t` 按修改时间倒序排列，上述命令只选取第一项，即本次最新生成的 wheel。
 
-测试脚本会优先加载当前源码目录下由编译步骤刷新的 `deep_ep_cpp` 和 `libcust_opapi.so`，启动时会打印两者的绝对路径。运行测试前可同时核对提交和产物时间：
+`set_env.bash` 对当前 shell 生效，不能由另一个已经结束的 shell 永久保存。因此每次重新进入 Docker、打开新 shell 或重新安装 wheel 后，都要再执行一次 `source`。测试脚本会优先加载当前源码目录下由编译步骤刷新的 `deep_ep_cpp` 和 `libcust_opapi.so`，启动时会打印两者的绝对路径。运行测试前可同时核对提交和产物时间：
 
 ```bash
 git log -1 --oneline
@@ -91,11 +95,13 @@ ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 
 ## 选择测试卡
 
-`torchrun --nproc-per-node=N` 使用 `ASCEND_RT_VISIBLE_DEVICES` 中从左到右的 N 张卡。例如选择物理卡 2、5：
+`torchrun --nproc-per-node=N` 使用 `ASCEND_RT_VISIBLE_DEVICES` 中从左到右的 N 张卡。当前有卡环境选择物理卡 4、5：
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=2,5
+export ASCEND_RT_VISIBLE_DEVICES=4,5
 ```
+
+此时进程内的逻辑 device 0、1 分别对应物理卡 4、5。更换测试卡时只修改这个列表。
 
 仅设置四张可见卡但使用 `--nproc-per-node=2` 时，实际只会使用可见列表中的前两张卡。
 
@@ -103,9 +109,13 @@ export ASCEND_RT_VISIBLE_DEVICES=2,5
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
+source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
+source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+
 export HCCL_BUFFSIZE=2300
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
-export ASCEND_RT_VISIBLE_DEVICES=0,1
+export ASCEND_RT_VISIBLE_DEVICES=4,5
 
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
@@ -119,6 +129,11 @@ python3 -m torch.distributed.run \
 下面让 rank 0、2 交换数据，rank 1、3 以 0 count 参与 collective：
 
 ```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
+source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
+source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+
 export HCCL_BUFFSIZE=2300
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
@@ -140,6 +155,11 @@ PASS: A5 All2AllDetourIoDie (subset/IO-Die routing)
 确认 8 张卡都映射进容器后，可直接跑完整通信域：
 
 ```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
+source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || true
+source /home/l00934901/sgl-kernel-npu/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+
 export HCCL_BUFFSIZE=2300
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
