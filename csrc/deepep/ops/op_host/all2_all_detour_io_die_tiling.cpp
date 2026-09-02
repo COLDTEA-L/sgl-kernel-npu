@@ -13,6 +13,9 @@
 namespace {
 constexpr uint32_t MAX_CCU_RANKS = 32U;
 constexpr uint64_t CCU_WINDOW_ALIGN = 512UL;
+// HcclCommConfig::hcclOpExpansionMode value for A5 CCU scheduling mode.
+// Value 5 is CCU_MS and does not support AllToAllV.
+constexpr uint8_t A5_CCU_SCHED_ENGINE = 6U;
 constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr size_t SYSTEM_WORKSPACE_BYTES = 16UL * 1024UL * 1024UL;
 constexpr int ATTR_GROUP = 0;
@@ -99,7 +102,7 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
         static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLTOALLV);
     AscendC::Mc2CcTilingConfig ccuConfig(
         std::string(groupPtr), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
-    ccuConfig.SetCommEngine(mc2tiling::A5_CCU_ENGINE);
+    ccuConfig.SetCommEngine(A5_CCU_SCHED_ENGINE);
     ccuConfig.GetTiling(tiling->mc2InitTiling);
     ccuConfig.GetTiling(tiling->mc2CcTiling);
 

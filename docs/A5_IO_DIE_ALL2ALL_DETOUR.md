@@ -9,7 +9,7 @@
 本实现不读取 `windowsIn[]`，也不把远端地址暴露给 AIV：
 
 1. host 侧将 executor 的 HCCL server type 设置为 `CCU`；
-2. host tiling 使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`；
+2. host tiling 使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`；
 3. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllvWrite`，由 CCU/IO Die 把数据写入每个目标 rank 的本地 `windowsOut[0]`；
 4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
 5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
@@ -171,7 +171,7 @@ python3 -m torch.distributed.run \
 
 HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`，错误发生在 Host 侧通信资源分配阶段，此时 device kernel 还没有启动。
 
-本算子 host tiling 使用与 CANN `AlltoAllvWrite` 示例匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。MoE dispatch/combine 内部使用的 `HCCL_CMD_HALFALLTOALLV` 属于另一种通信流程，不应作为这个独立算子的默认 task type。需要注意，返回码 `5` 只能说明当前运行时拒绝了资源配置，不能只凭该返回码断定是 task type；即使 task type 正确，CANN/HCCL 运行库不匹配或目标通信域不支持当前 CCU 配置也会返回同一错误。
+本算子 host tiling 使用与 CANN `AlltoAllvWrite` 示例匹配的 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`。CANN 9.1 中通信引擎值 `5` 表示 `CCU_MS`，该模式不支持 AllToAllV；值 `6` 才表示 `CCU_SCHED`。仓库中的 `mc2tiling::A5_CCU_ENGINE` 常量值为 `5`，适用于已有 MoE HalfAllToAllV 路径，但不能用于这个独立 AlltoAllvWrite 算子，否则 `HcclAllocComResourceByTiling` 会返回 `HCCL_E_NOT_SUPPORT`。
 
 另外，创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
 
@@ -210,7 +210,7 @@ Ascend 950 CCU 使用双 Die。`AlltoAllvWrite` 的 `sendSizes` 和 `sendOffsets
 HcclGetCcuTaskInfo ... ret = 4
 ```
 
-请确认 host tiling 使用的是 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。旧版本虽然使用普通 AllToAllV task type，但错误地设置成 `AIV_ENGINE`，会在 Host 侧生成 CCU task info 时失败。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
+请确认 host tiling 使用的是 `HCCL_CMD_ALLTOALLV + CCU_SCHED engine(6)`。旧版本使用 `AIV_ENGINE(3)` 时会在 Host 侧生成 CCU task info 阶段失败；使用 `CCU_MS engine(5)` 时则会在资源分配阶段返回不支持。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
 
 ```bash
 git fetch origin
