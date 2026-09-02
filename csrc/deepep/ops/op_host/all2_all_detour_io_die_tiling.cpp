@@ -93,10 +93,10 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     tiling->info.windowStrideBytes =
         (tiling->info.perRankBytes + CCU_WINDOW_ALIGN - 1UL) / CCU_WINDOW_ALIGN * CCU_WINDOW_ALIGN;
 
-    // A5 CCU only accepts the HalfAllToAllV task type. AlltoAllvWrite sends
-    // directly to every destination's local HCCL window, so windowsIn[] is not needed.
+    // AlltoAllvWrite uses the regular AllToAllV task type. The A5 CCU engine
+    // sends directly to every destination's local HCCL window, so windowsIn[] is not needed.
     const uint32_t opType =
-        static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_HALFALLTOALLV);
+        static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLTOALLV);
     AscendC::Mc2CcTilingConfig ccuConfig(
         std::string(groupPtr), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
     ccuConfig.SetCommEngine(mc2tiling::A5_CCU_ENGINE);
@@ -116,7 +116,7 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     context->SetBlockDim(platform.CalcTschBlockDim(aivNum, 0U, aivNum));
     context->SetScheduleMode(1);
     OP_LOGI(nodeName,
-            "A5 IO Die HalfAllToAllV: rank=%ld/%ld commRanks=%lu sendCount=%lu "
+            "A5 IO Die AllToAllV: rank=%ld/%ld commRanks=%lu sendCount=%lu "
             "perRankBytes=%lu windowStrideBytes=%lu aivNum=%u",
             *rankIdPtr, *rankSizePtr, commRankCount, sendCount, tiling->info.perRankBytes,
             tiling->info.windowStrideBytes, aivNum);

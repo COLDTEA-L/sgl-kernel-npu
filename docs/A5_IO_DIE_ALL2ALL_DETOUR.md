@@ -9,7 +9,7 @@
 本实现不读取 `windowsIn[]`，也不把远端地址暴露给 AIV：
 
 1. host 侧将 executor 的 HCCL server type 设置为 `CCU`；
-2. host tiling 使用 A5 专用的 `HCCL_CMD_HALFALLTOALLV + A5_CCU_ENGINE`；
+2. host tiling 使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`；
 3. kernel 调用 `Hccl<HCCL_SERVER_TYPE_CCU>::AlltoAllvWrite`，由 CCU/IO Die 把数据写入每个目标 rank 的本地 `windowsOut[0]`；
 4. `commRankIds` 之外的 rank 使用 0 send size，但仍参与同一通信域中的 collective；
 5. 通信完成后，目标 rank 从自己的本地 window 拷贝到 `recvData`。整个过程不访问 `windowsIn[]`。
@@ -47,9 +47,19 @@ python3 -m pip install pybind11 wheel setuptools
 
 ## 单算子编译
 
+先更新到远端分支的最新提交，并确认当前提交号：
+
 ```bash
 cd /home/l00934901/sgl-kernel-npu
+git fetch origin
 git switch feature/a5-io-die-all2all-detour
+git pull --ff-only origin feature/a5-io-die-all2all-detour
+git log -1 --oneline
+```
+
+再执行单算子编译：
+
+```bash
 bash scripts/build_a5_io_die_all2all_detour.sh
 ```
 
@@ -63,7 +73,20 @@ Built: output/deep_ep-....whl
 安装到当前 sglang Python：
 
 ```bash
-python3 -m pip install --force-reinstall --no-deps output/deep_ep-*.whl
+latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
+test -n "${latest_wheel}" || { echo "没有找到 deep_ep wheel" >&2; exit 1; }
+echo "Installing ${latest_wheel}"
+python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
+```
+
+必须给 wheel 路径加双引号。不要直接把 `output/deep_ep-*.whl` 传给 `pip install`：如果目录中保留了多次编译生成的 wheel，shell 会把通配符展开为多个包，导致 pip 同时安装多个版本并报冲突。`ls -1t` 按修改时间倒序排列，上述命令只选取第一项，即本次最新生成的 wheel。
+
+测试脚本会优先加载当前源码目录下由编译步骤刷新的 `deep_ep_cpp` 和 `libcust_opapi.so`，启动时会打印两者的绝对路径。运行测试前可同时核对提交和产物时间：
+
+```bash
+git log -1 --oneline
+ls -l python/deep_ep/deep_ep/deep_ep_cpp*.so
+ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 ```
 
 ## 选择测试卡
@@ -146,7 +169,11 @@ python3 -m torch.distributed.run \
 
 ## `HcclAllocComResourceByTiling ret = 5`
 
-HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`。本算子 host tiling 使用 `A5_CCU_ENGINE`，因此创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
+HCCL 返回码 `5` 是 `HCCL_E_NOT_SUPPORT`，错误发生在 Host 侧通信资源分配阶段，此时 device kernel 还没有启动。
+
+本算子 host tiling 必须使用与 `AlltoAllvWrite` 匹配的 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。不要照搬 MoE dispatch/combine 内部使用的 `HCCL_CMD_HALFALLTOALLV`；后者用于特定的 MoE 半 AllToAllV 流程，在这个独立 AlltoAllvWrite 算子中会导致资源分配返回 `HCCL_E_NOT_SUPPORT`。
+
+另外，创建 HCCL 通信域之前必须选择 950 的 CCU 调度展开模式：
 
 ```bash
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
@@ -166,12 +193,15 @@ Ascend 950 CCU 使用双 Die。`AlltoAllvWrite` 的 `sendSizes` 和 `sendOffsets
 HcclGetCcuTaskInfo ... ret = 4
 ```
 
-请先确认代码已经包含 A5 HalfAllToAllV 修复。A5 CCU 路径只接受 `HCCL_CMD_HALFALLTOALLV` 和 `A5_CCU_ENGINE`；普通 `AllToAllV + AIV_ENGINE` 会在 Host 侧生成 CCU task info 时失败。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
+请确认 host tiling 使用的是 `HCCL_CMD_ALLTOALLV + A5_CCU_ENGINE`。旧版本虽然使用普通 AllToAllV task type，但错误地设置成 `AIV_ENGINE`，会在 Host 侧生成 CCU task info 时失败。更新分支后必须重新编译并重装 wheel，不能只更新 Python 测试脚本：
 
 ```bash
-git pull --ff-only
+git fetch origin
+git switch feature/a5-io-die-all2all-detour
+git pull --ff-only origin feature/a5-io-die-all2all-detour
 bash scripts/build_a5_io_die_all2all_detour.sh
-python3 -m pip install --force-reinstall --no-deps output/deep_ep-*.whl
+latest_wheel="$(ls -1t output/deep_ep-*.whl | head -n 1)"
+python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
 ```
 
 重新运行前可确认源码与已安装自定义库的时间：
