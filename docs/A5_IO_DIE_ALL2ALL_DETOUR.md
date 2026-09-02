@@ -154,6 +154,10 @@ export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 
 环境变量必须在 `torch.distributed.init_process_group("hccl")` 之前生效。当前测试脚本会在导入 `torch` 和创建通信域前自动设置它；如果外部已经设置成其他值（例如 `AIV` 或 `AI_CPU`），脚本会直接报出冲突，避免等到异步执行阶段才失败。
 
+## 设置 `CCU_SCHED` 后进程报 `SIGSEGV`
+
+Ascend 950 CCU 使用双 Die。`AlltoAllvWrite` 的 `sendSizes` 和 `sendOffsets` 不是普通的 `rankDim` 长度数组，而是各包含 `2 * rankDim` 项：前半段描述 Die0，后半段描述 Die1。每个 peer 的数据也必须拆分成两个连续片段。旧版本只提供了单 Die 参数，CCU 读取第二组参数时会越界，表现为两个 worker 同时收到 `SIGSEGV`。请更新到包含双 Die 参数布局修复的版本并重新编译、安装 wheel。
+
 ## `HcclGetCcuTaskInfo ret = 4`
 
 如果日志在进入 AICore kernel 前报以下错误：

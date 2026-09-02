@@ -9,7 +9,8 @@ using namespace AscendC;
 
 namespace {
 constexpr uint32_t MAX_CCU_RANKS = 32U;
-constexpr uint32_t PARAM_ARRAY_COUNT = 2U;
+constexpr uint32_t DUAL_DIE_COUNT = 2U;
+constexpr uint32_t PARAM_ARRAY_COUNT = 4U;
 constexpr uint32_t COPY_BUFFER_BYTES = 32U * 1024U;
 }
 
@@ -52,8 +53,8 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
         LocalTensor<uint64_t> params = paramBuf.Get<uint64_t>();
         LocalTensor<uint8_t> copyLocal = copyBuf.Get<uint8_t>();
 
-        const uint32_t sendOffsetsBase = 0U;
-        const uint32_t sendSizesBase = MAX_CCU_RANKS;
+        const uint32_t sendSizesBase = 0U;
+        const uint32_t sendOffsetsBase = DUAL_DIE_COUNT * MAX_CCU_RANKS;
         for (uint32_t peer = 0; peer < rankSize; ++peer) {
             bool peerParticipates = false;
             uint32_t peerCommIndex = 0U;
@@ -64,28 +65,33 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
                     break;
                 }
             }
-            params.SetValue(sendOffsetsBase + peer, static_cast<uint64_t>(peerCommIndex) * perRankBytes);
-            params.SetValue(sendSizesBase + peer,
-                            (selfParticipates && peerParticipates) ? perRankBytes : 0UL);
+            const uint64_t peerOffset = static_cast<uint64_t>(peerCommIndex) * perRankBytes;
+            const uint64_t die0Bytes = perRankBytes / DUAL_DIE_COUNT;
+            const uint64_t die1Bytes = perRankBytes - die0Bytes;
+            const bool shouldSend = selfParticipates && peerParticipates;
+            params.SetValue(sendSizesBase + peer, shouldSend ? die0Bytes : 0UL);
+            params.SetValue(sendSizesBase + rankSize + peer, shouldSend ? die1Bytes : 0UL);
+            params.SetValue(sendOffsetsBase + peer, peerOffset);
+            params.SetValue(sendOffsetsBase + rankSize + peer, peerOffset + die0Bytes);
         }
 
-        GlobalTensor<uint64_t> sendOffsets;
         GlobalTensor<uint64_t> sendSizes;
-        sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(workspace));
-        sendSizes.SetGlobalBuffer(
-            reinterpret_cast<__gm__ uint64_t *>(workspace + MAX_CCU_RANKS * sizeof(uint64_t)));
+        GlobalTensor<uint64_t> sendOffsets;
+        GM_ADDR sendSizesGM = workspace;
+        GM_ADDR sendOffsetsGM = workspace + DUAL_DIE_COUNT * rankSize * sizeof(uint64_t);
+        sendSizes.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendSizesGM));
+        sendOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t *>(sendOffsetsGM));
         DataCopyExtParams paramCopyParams = {
-            1U, static_cast<uint32_t>(rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
-        DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
+            1U, static_cast<uint32_t>(DUAL_DIE_COUNT * rankSize * sizeof(uint64_t)), 0U, 0U, 0U};
         DataCopyPad(sendSizes, params[sendSizesBase], paramCopyParams);
+        DataCopyPad(sendOffsets, params[sendOffsetsBase], paramCopyParams);
         AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
 
         const uint64_t remoteWindowOffset = static_cast<uint64_t>(rankId) * windowStrideBytes;
         const uint64_t localDataSize = selfParticipates ? perRankBytes : 0UL;
         HcclHandle handle = hccl.AlltoAllvWrite<true>(
-            sendData, workspace, workspace + MAX_CCU_RANKS * sizeof(uint64_t),
-            remoteWindowOffset, localDataSize);
+            sendData, sendOffsetsGM, sendSizesGM, remoteWindowOffset, localDataSize);
         hccl.Wait(handle);
 
         if (selfParticipates) {
