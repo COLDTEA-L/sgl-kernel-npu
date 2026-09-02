@@ -288,6 +288,29 @@ python3 -m torch.distributed.run \
 请保留两个 rank 的最后一条阶段日志及自动输出的线程栈。若普通 `preflight HCCL barrier` 都无法完成，
 问题在算子之外的 HCCL 通信域或卡状态；若卡在 `device synchronize begin`，才是 device kernel 内部等待。
 
+若两个 rank 都停在 `All2AllDetourIoDie enqueue begin`，开启 ACLNN wrapper 跟踪：
+
+```bash
+export A5_DETOUR_TRACE=1
+echo "ASCEND_LAUNCH_BLOCKING=${ASCEND_LAUNCH_BLOCKING:-unset}"
+```
+
+日志会进一步显示：
+
+```text
+[A5 detour][rank=0] GetWorkspaceSize begin
+[A5 detour][rank=0] GetWorkspaceSize end: status=0, workspace=...
+[A5 detour][rank=0] HCCL server type set to CCU
+[A5 detour][rank=0] execute begin
+```
+
+- 只有 `GetWorkspaceSize begin`：Host tiling 或 HCCL 资源申请阻塞；
+- 打印 `execute begin` 但没有 `execute end`：执行接口正在等待 device kernel；
+- `execute end` 已打印而 Python 停在 `device synchronize begin`：算子已异步下发，device kernel 未完成。
+
+`ASCEND_LAUNCH_BLOCKING=1` 会把 device 等待放进 `execute` 调用中；unset 时通常表现为 enqueue 返回、
+随后阻塞在 `torch.npu.synchronize()`。两者只是错误定位位置不同，不会消除通信死锁。
+
 `AlltoAllvWrite + CCU_SCHED` 要求所有 AIV 核以相同顺序执行：
 
 ```text
