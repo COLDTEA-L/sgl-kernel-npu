@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import ctypes
+import faulthandler
 import os
 import site
 import sys
+import time
 from pathlib import Path
 
 
@@ -69,6 +71,14 @@ import torch
 import torch.distributed as dist
 
 
+TEST_START = time.monotonic()
+
+
+def stage(rank: int, message: str):
+    elapsed = time.monotonic() - TEST_START
+    print(f"[rank{rank}] +{elapsed:7.3f}s {message}", flush=True)
+
+
 def import_deep_ep():
     sys.path.insert(0, str(DEEP_EP_PACKAGE_DIR.parent))
     sys.path.insert(0, str(DEEP_EP_PACKAGE_DIR))
@@ -101,6 +111,12 @@ def main():
     parser = argparse.ArgumentParser(description="A5 CCU/IO Die All2All detour correctness test")
     parser.add_argument("--comm-ranks", default="", help="ordered subset, for example 0,2; default is every rank")
     parser.add_argument("--elements-per-peer", type=int, default=256)
+    parser.add_argument(
+        "--traceback-timeout",
+        type=int,
+        default=60,
+        help="dump every Python thread stack after this many seconds; 0 disables it",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -109,34 +125,62 @@ def main():
     if world_size < 2:
         raise RuntimeError("Use at least two A5 NPUs")
 
-    torch.npu.set_device(local_rank)
-    dist.init_process_group("hccl")
-    group = dist.new_group(list(range(world_size)))
-    comm_ranks = parse_comm_ranks(args.comm_ranks, world_size)
-    deep_ep = import_deep_ep()
+    faulthandler.enable(all_threads=True)
+    if args.traceback_timeout > 0:
+        faulthandler.dump_traceback_later(args.traceback_timeout, repeat=False)
 
+    stage(rank, f"set_device({local_rank}) begin")
+    torch.npu.set_device(local_rank)
+    stage(rank, "set_device done")
+    stage(rank, "init_process_group(hccl) begin")
+    dist.init_process_group("hccl")
+    stage(rank, "init_process_group done")
+    stage(rank, "dist.new_group begin")
+    group = dist.new_group(list(range(world_size)))
+    stage(rank, "dist.new_group done")
+    stage(rank, "preflight HCCL barrier begin")
+    dist.barrier(group=group)
+    stage(rank, "preflight HCCL barrier done")
+    comm_ranks = parse_comm_ranks(args.comm_ranks, world_size)
+    stage(rank, "import deep_ep begin")
+    deep_ep = import_deep_ep()
+    stage(rank, "import deep_ep done")
+
+    stage(rank, "create input tensors begin")
     comm_rank_ids = torch.tensor(comm_ranks, dtype=torch.int32, device="npu")
     index = torch.arange(args.elements_per_peer, dtype=torch.int32, device="npu")
     send_data = torch.stack(
         [rank * 100000 + dst_rank * 1000 + index for dst_rank in comm_ranks]
     ).contiguous()
-
-    buffer = deep_ep.Buffer(group, num_nvl_bytes=0, num_rdma_bytes=0)
-    recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
     torch.npu.synchronize()
+    stage(rank, "create input tensors done")
+
+    stage(rank, "deep_ep.Buffer begin")
+    buffer = deep_ep.Buffer(group, num_nvl_bytes=0, num_rdma_bytes=0)
+    stage(rank, "deep_ep.Buffer done")
+    stage(rank, "All2AllDetourIoDie enqueue begin")
+    recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
+    stage(rank, "All2AllDetourIoDie enqueue done; device synchronize begin")
+    torch.npu.synchronize()
+    stage(rank, "device synchronize done")
 
     if rank in comm_ranks:
+        stage(rank, "correctness check begin")
         expected = torch.stack(
             [src_rank * 100000 + rank * 1000 + index for src_rank in comm_ranks]
         )
         torch.testing.assert_close(recv_data, expected)
+        stage(rank, "correctness check done")
 
+    stage(rank, "final HCCL barrier begin")
     dist.barrier(group=group)
+    stage(rank, "final HCCL barrier done")
     if rank == 0:
         mode = "subset/IO-Die routing" if len(comm_ranks) < world_size else "full group"
         print(f"PASS: A5 All2AllDetourIoDie ({mode})")
         print(f"world_size={world_size}, comm_ranks={comm_ranks}, elements_per_peer={args.elements_per_peer}")
     dist.destroy_process_group()
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

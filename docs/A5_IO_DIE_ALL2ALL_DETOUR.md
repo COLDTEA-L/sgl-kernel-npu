@@ -268,6 +268,26 @@ python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
 如果已经打印 `Using HCCL runtime`，没有新的错误，但 `torchrun` 一直不退出，先按 `Ctrl+C`
 终止进程。这说明算子已经进入 device kernel，通常卡在 CCU collective 或核间同步，不应继续无限等待。
 
+测试脚本会为每个 rank 打印阶段和耗时，并在 60 秒后自动输出 Python 线程栈。例如：
+
+```text
+[rank0] All2AllDetourIoDie enqueue begin
+[rank0] All2AllDetourIoDie enqueue done; device synchronize begin
+```
+
+最后一条阶段日志可以区分 HCCL 建域、普通 HCCL barrier、Buffer 初始化、Host 算子下发和 device
+kernel 执行。线程栈只用于诊断，不会主动结束进程；仍需用 `Ctrl+C` 终止卡住的测试。可调整等待时间：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_io_die_all2all_detour.py \
+  --traceback-timeout 30
+```
+
+请保留两个 rank 的最后一条阶段日志及自动输出的线程栈。若普通 `preflight HCCL barrier` 都无法完成，
+问题在算子之外的 HCCL 通信域或卡状态；若卡在 `device synchronize begin`，才是 device kernel 内部等待。
+
 `AlltoAllvWrite + CCU_SCHED` 要求所有 AIV 核以相同顺序执行：
 
 ```text
