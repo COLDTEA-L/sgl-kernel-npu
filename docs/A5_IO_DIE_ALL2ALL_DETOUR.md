@@ -18,6 +18,34 @@
 
 输入 `sendData` 的第 `i` 个等长数据块发往 `commRankIds[i]`；输出 `recvData` 的第 `i` 个数据块来自 `commRankIds[i]`。所有 rank 必须传入完全相同、升序且不重复的 `commRankIds`。
 
+## CCU 参考实现与两卡数据布局
+
+本实现已与两个现有实现交叉核对：
+
+- `/home/liuyuanwen/hccl` 的 AllReduce 在 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 时进入 CCU selector；A5 双 Die
+  拓扑会选择 `CcuAllReduceMesh1DMem2Mem2DieOneShot` 等 CCU 模板，并分别启动两个 Die 的 CCU kernel；
+- 本仓库 `moe_distribute_dispatch_v2_ccu.h` 和 `moe_distribute_combine_v2_ccu.h` 使用
+  `Hccl<HCCL_SERVER_TYPE_CCU> + InitV2 + SetCcTilingV2 + AlltoAllvWrite<true>`，host tiling 使用
+  `HCCL_CMD_HALFALLTOALLV + A5_CCU_ENGINE`。
+
+当前 All2All 与仓库已验证 CCU 算子的关键调用序列一致：
+
+1. 所有 AIV 完成初始化；
+2. AIV0 准备 `sendSizes[2 * rankSize]` 和 `sendOffsets[2 * rankSize]`；
+3. `SyncAll<true>()` 保证参数准备完成；
+4. 仅 AIV0 调用一次 `AlltoAllvWrite<true>` 并 `Wait`；
+5. 再次 `SyncAll<true>()`，AIV0 从本 rank 的 `windowsOut[0]` 拷贝结果；
+6. 所有 AIV 完成同步并 `Finalize`。
+
+两卡全通信测试中，每个 rank 的输入有两个等长块。以 `perRankBytes=1024` 为例：
+
+- rank 0 把输入块 0 发到 rank 0 的 window offset 0，把输入块 1 发到 rank 1 的 window offset 0；
+- rank 1 把输入块 0 发到 rank 0 的 window offset 1024，把输入块 1 发到 rank 1 的 window offset 1024；
+- 每个 1024 字节块按双 Die 拆为 512 + 512 字节；
+- 目标 rank 从本地 window 的 offset 0、1024 依次取回来自 rank 0、1 的数据。
+
+因此两卡测试验证的是完整的 CCU All2All 数据交换，不依赖 `windowsIn[]`，也不经过 AIV 远端 HBM 读写。
+
 ## 已验证环境
 
 - 分支：`feature/a5-io-die-all2all-detour`
@@ -258,11 +286,12 @@ ls -l python/deep_ep/deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so
 旧版本在这里有两项问题：
 
 1. `EXEC_NPU_CMD` 中保存 workspace 的 Tensor 在算子真正下发前已经离开作用域；
-2. device kernel 只让 block 0 经 UB/MTE 写 `sendSizes/sendOffsets`，并在 collective 前插入了一次额外的
-   `SyncAll`，与 CANN 9.1 的 `AlltoAllvWrite` CCU 示例所要求的调用序列不同。
+2. device kernel 曾让所有 AIV 同时写同一组 `sendSizes/sendOffsets` 并重复提交同一个 CCU collective，
+   与仓库中已经验证的 A5 CCU dispatch/combine 调用序列不一致。
 
-新版本会让 workspace 至少存活到下发完成，并让每个 AIV 按 CANN 示例直接写同一组双 Die GM 参数，然后立即进入
-`AlltoAllvWrite`。更新后必须重新编译、选择最新 wheel 安装并重新加载自定义算子环境，不能只重新运行测试：
+新版本会让 workspace 至少存活到下发完成，并按已验证算子使用的顺序执行：AIV0 准备双 Die 参数、全核
+`SyncAll`、仅 AIV0 调用并等待一次 `AlltoAllvWrite`、全核再次 `SyncAll`。更新后必须重新编译、选择最新
+wheel 安装并重新加载自定义算子环境，不能只重新运行测试：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
