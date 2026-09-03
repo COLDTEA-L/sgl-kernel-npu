@@ -180,7 +180,7 @@ comm_ranks=[0, 1], relay_ranks=[2, 3]
 
 注意：`comm-ranks` 是可见设备重新编号后的逻辑 rank，不是物理卡号。这里的逻辑通信 rank 0、1分别对应物理卡2、3，逻辑绕路 rank 2、3分别对应物理卡4、5。
 
-当前 kernel 只支持恰好两个通信 rank。每个通信 rank 启动的 AIV block 分工如下：
+当前 kernel 只支持恰好两个通信 rank，但允许零个或多个 relay rank。每个通信 rank 启动的 AIV block 分工如下：
 
 ```text
 block 0：本 rank 数据复制
@@ -216,6 +216,36 @@ unset A5_DETOUR_DEBUG_WINDOWS
 ```
 
 性能测试时不要设置 `A5_DETOUR_DEBUG_WINDOWS`，避免设备侧打印干扰计时。
+
+### 6.1 两卡直连 baseline（同一算子）
+
+当 `WORLD_SIZE` 与通信 rank 数相同，即两张卡都在 `--comm-ranks 0,1` 中时，算子自动退化为普通直连模式：`block 0` 复制本 rank 数据，`block 1` 搬运发往对端的全部数据，不创建 relay 路径。这样可以在不更换算子实现和计时方法的情况下与绕路模式比较。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_BUFFSIZE=2300
+export DEEP_USE_MODE=default
+unset HCCL_OP_EXPANSION_MODE
+export ASCEND_LAUNCH_BLOCKING=1
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
+  --comm-ranks 0,1 \
+  --elements-per-peer 524288 \
+  --warmup 10 \
+  --iters 100
+```
+
+预期路径输出为：
+
+```text
+used_aiv_blocks: 2 (self + direct + relays)
+direct_bytes   : 2097152
+relay_bytes    : []
+```
+
+随后使用第6节的4进程命令测试两条 relay。两次都保持 `--elements-per-peer 524288`，即可对比同一 AIV+URMA 算子的两卡直连与四卡绕路模式。
 
 ## 7. AIV+URMA 算法
 

@@ -64,13 +64,11 @@ def parse_comm_ranks(text, world_size):
         raise ValueError("--comm-ranks must contain exactly two sorted, unique ranks")
     if ranks[0] < 0 or ranks[-1] >= world_size:
         raise ValueError("--comm-ranks contains a rank outside WORLD_SIZE")
-    if len(ranks) >= world_size:
-        raise ValueError("AIV+URMA detour needs at least one rank outside --comm-ranks")
     return ranks
 
 
 def split_path_bytes(elements_per_peer, relay_count):
-    """Mirror the kernel's aligned 2:1 direct-to-relay weighted split."""
+    """Mirror the kernel split: direct-only or 2:1 direct-to-relay."""
     total_bytes = elements_per_peer * 4  # test tensors use int32
     if total_bytes % TRANSFER_ALIGN_BYTES != 0:
         raise ValueError(

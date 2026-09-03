@@ -70,8 +70,8 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     OP_TILING_CHECK(group == nullptr || strnlen(group, MAX_GROUP_NAME_LENGTH) == 0UL ||
                         strnlen(group, MAX_GROUP_NAME_LENGTH) == MAX_GROUP_NAME_LENGTH,
                     OP_LOGE(nodeName, "group is invalid"), return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(rankSize == nullptr || *rankSize <= 2 || *rankSize > MAX_MTE_RANKS,
-                    OP_LOGE(nodeName, "AIV+URMA detour requires rank_size in [3, %u]", MAX_MTE_RANKS),
+    OP_TILING_CHECK(rankSize == nullptr || *rankSize < 2 || *rankSize > MAX_MTE_RANKS,
+                    OP_LOGE(nodeName, "AIV+URMA AllToAll requires rank_size in [2, %u]", MAX_MTE_RANKS),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(rankId == nullptr || *rankId < 0 || *rankId >= *rankSize,
                     OP_LOGE(nodeName, "rank_id is invalid"), return ge::GRAPH_FAILED);
@@ -83,9 +83,8 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     const uint64_t elementBytes = DataTypeBytes(sendDesc->GetDataType());
     OP_TILING_CHECK(elementBytes == 0UL || recvDesc->GetDataType() != sendDesc->GetDataType(),
                     OP_LOGE(nodeName, "unsupported or mismatched dtype"), return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(commRankCount != 2UL || commRankCount >= static_cast<uint64_t>(*rankSize),
-                    OP_LOGE(nodeName, "parallel AIV+URMA detour currently requires exactly two communication "
-                                      "ranks and at least one relay"),
+    OP_TILING_CHECK(commRankCount != 2UL || commRankCount > static_cast<uint64_t>(*rankSize),
+                    OP_LOGE(nodeName, "parallel AIV+URMA AllToAll requires exactly two communication ranks"),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(sendCount == 0UL || sendCount % commRankCount != 0UL,
                     OP_LOGE(nodeName, "sendData elements must be divisible by commRankIds size"),
