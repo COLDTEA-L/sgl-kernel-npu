@@ -17,6 +17,17 @@ os.environ["DEEP_USE_MODE"] = "default"
 os.environ.setdefault("HCCL_BUFFSIZE", "2300")
 
 
+def prepend_env_path(name, path):
+    """Prepend one path idempotently and remove duplicates from the variable."""
+    current = [value for value in os.environ.get(name, "").split(":") if value]
+    values = [path]
+    values.extend(value for value in current if value != path and value not in values)
+    updated = ":".join(values)
+    changed = os.environ.get(name, "") != updated
+    os.environ[name] = updated
+    return changed
+
+
 def prepare_custom_op_runtime():
     root = Path(__file__).resolve().parents[3]
     candidates = [root / "python" / "deep_ep" / "deep_ep"]
@@ -30,13 +41,13 @@ def prepare_custom_op_runtime():
         if not extensions or not op_api.is_file():
             continue
         vendor = package / "vendors" / "hwcomputing"
-        required = {
-            "ASCEND_CUSTOM_OPP_PATH": f"{vendor}:{os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}".rstrip(":"),
-            "LD_LIBRARY_PATH": f"{op_api.parent}:{os.environ.get('LD_LIBRARY_PATH', '')}".rstrip(":"),
-        }
-        if any(os.environ.get(key) != value for key, value in required.items()):
+        env_changed = prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor))
+        env_changed |= prepend_env_path("LD_LIBRARY_PATH", str(op_api.parent))
+        if env_changed:
+            if os.environ.get("_DEEPEP_CUSTOM_OP_RUNTIME_REEXEC") == "1":
+                raise RuntimeError("custom-op environment remained unstable after one re-exec")
             env = os.environ.copy()
-            env.update(required)
+            env["_DEEPEP_CUSTOM_OP_RUNTIME_REEXEC"] = "1"
             os.execvpe(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env)
         ctypes.CDLL(str(op_api), mode=ctypes.RTLD_GLOBAL)
         sys.path.insert(0, str(package.parent))
