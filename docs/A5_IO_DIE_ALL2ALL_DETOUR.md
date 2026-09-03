@@ -124,13 +124,13 @@ PY
 
 ## 5. 阶段一：普通 HCCL AllToAll 的 CCU 基线
 
-阶段一只需两张可用卡。下面把物理卡4、5映射成逻辑 rank 0、1：
+后续验证环境固定使用物理卡2～5。阶段一先使用物理卡2、3，它们映射成逻辑 rank 0、1：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 
-export ASCEND_RT_VISIBLE_DEVICES=4,5
+export ASCEND_RT_VISIBLE_DEVICES=2,3
 export HCCL_BUFFSIZE=2300
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export ASCEND_LAUNCH_BLOCKING=1
@@ -150,60 +150,47 @@ PASS: fixed HCCL AllToAll executed through A5 CCU
 
 ## 6. 阶段二：AIV+URMA 显式绕路
 
-阶段二至少需要3张卡：两个通信 rank，加至少一个绕路 rank。要验证“rank 0、1通信，rank 2～7全部参与绕路”，必须启动8个进程并让8张卡都进入同一个 HCCL world group：
+阶段二使用物理卡2～5：逻辑 rank 0、1（物理卡2、3）负责通信，逻辑 rank 2、3（物理卡4、5）作为绕路卡。必须启动4个进程，让4张卡都进入同一个 HCCL world group：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES=2,3,4,5
 export HCCL_BUFFSIZE=2300
 export DEEP_USE_MODE=default
 unset HCCL_OP_EXPANSION_MODE
 export ASCEND_LAUNCH_BLOCKING=1
 
 python3 -m torch.distributed.run \
-  --standalone --nproc-per-node=8 \
+  --standalone --nproc-per-node=4 \
   tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
-  --comm-ranks 0,1
+  --comm-ranks 0,1 \
+  --elements-per-peer 1536
 ```
 
 成功标志：
 
 ```text
 PASS: A5 AIV+URMA AllToAll detour (communication-rank Write + Read)
-comm_ranks=[0, 1], relay_ranks=[2, 3, 4, 5, 6, 7]
+comm_ranks=[0, 1], relay_ranks=[2, 3]
 ```
 
-快速四卡验证示例：物理卡4～7映射成逻辑 rank 0～3，逻辑0、1通信，逻辑2、3绕路：
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export HCCL_BUFFSIZE=2300
-export DEEP_USE_MODE=default
-unset HCCL_OP_EXPANSION_MODE
-
-python3 -m torch.distributed.run \
-  --standalone --nproc-per-node=4 \
-  tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
-  --comm-ranks 0,1
-```
-
-注意：`comm-ranks` 是可见设备重新编号后的逻辑 rank，不是物理卡号。
+注意：`comm-ranks` 是可见设备重新编号后的逻辑 rank，不是物理卡号。这里的逻辑通信 rank 0、1分别对应物理卡2、3，逻辑绕路 rank 2、3分别对应物理卡4、5。`1536 * sizeof(int32) = 6144` 字节，平均分到直达路径和两条绕路路径后每路为2048字节，满足当前 MTE 拷贝的32字节对齐要求。
 
 ## 7. AIV+URMA 算法
 
-以8卡 world、通信 rank `[0,1]` 为例，0发往1的数据平均分成7路：
+以当前4卡 world、通信 rank `[0,1]` 为例，0发往1的数据平均分成3路：
 
 ```text
 一路：rank0 Write rank1窗口，rank1 Read rank1窗口
-六路：rank0 Write rank2～7窗口，rank1 Read rank2～7窗口
+两路：rank0分别 Write rank2、rank3窗口，rank1再分别 Read rank2、rank3窗口
 ```
 
 反方向同时使用独立的 `(srcRank,dstRank)` window cell：
 
 ```text
-rank1 Write rank0/rank2～7窗口，rank0 Read相同窗口
+rank1 Write rank0、rank2、rank3窗口，rank0 Read相同窗口
 ```
 
 每个 cell 包含同步 flag 和数据区。发送通信卡先写数据、再写带 generation 的 flag；接收通信卡等待对应 flag 后读数据。非通信 rank 只提供远端映射窗口，不执行第二跳 kernel。

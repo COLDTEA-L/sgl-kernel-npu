@@ -84,7 +84,9 @@ def stage(rank, message):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--comm-ranks", default="0,1")
-    parser.add_argument("--elements-per-peer", type=int, default=1792)
+    # Four-card default: 2 communication ranks + 2 relay ranks gives three
+    # paths. 1536 int32 elements = 6144 bytes, i.e. 2048 aligned bytes/path.
+    parser.add_argument("--elements-per-peer", type=int, default=1536)
     args = parser.parse_args()
 
     faulthandler.enable(all_threads=True)
