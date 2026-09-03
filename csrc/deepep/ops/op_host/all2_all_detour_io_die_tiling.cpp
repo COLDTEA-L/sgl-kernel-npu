@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -14,8 +15,10 @@ constexpr uint32_t MAX_MTE_RANKS = 32U;
 constexpr uint64_t A5_MTE_STATE_WIN_SIZE = 4UL * 1024UL * 1024UL;
 constexpr uint64_t CELL_FLAG_BYTES = 4096UL;
 constexpr uint64_t CELL_ALIGN_BYTES = 512UL;
+constexpr uint64_t TRANSFER_ALIGN_BYTES = 32UL;
 constexpr size_t MAX_GROUP_NAME_LENGTH = 128UL;
 constexpr size_t SYSTEM_WORKSPACE_BYTES = 16UL * 1024UL * 1024UL;
+constexpr char DEBUG_WINDOWS_ENV[] = "A5_DETOUR_DEBUG_WINDOWS";
 
 uint64_t AlignUp(uint64_t value, uint64_t alignment)
 {
@@ -36,6 +39,12 @@ uint64_t DataTypeBytes(ge::DataType type)
     if (type == ge::DT_FLOAT16 || type == ge::DT_BF16) return 2UL;
     if (type == ge::DT_FLOAT || type == ge::DT_INT32) return 4UL;
     return 0UL;
+}
+
+bool DebugWindowsEnabled()
+{
+    const char *value = std::getenv(DEBUG_WINDOWS_ENV);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 }  // namespace
 
@@ -74,14 +83,28 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     const uint64_t elementBytes = DataTypeBytes(sendDesc->GetDataType());
     OP_TILING_CHECK(elementBytes == 0UL || recvDesc->GetDataType() != sendDesc->GetDataType(),
                     OP_LOGE(nodeName, "unsupported or mismatched dtype"), return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(commRankCount < 2UL || commRankCount >= static_cast<uint64_t>(*rankSize),
-                    OP_LOGE(nodeName, "commRankIds must contain at least two ranks and leave one relay"),
+    OP_TILING_CHECK(commRankCount != 2UL || commRankCount >= static_cast<uint64_t>(*rankSize),
+                    OP_LOGE(nodeName, "parallel AIV+URMA detour currently requires exactly two communication "
+                                      "ranks and at least one relay"),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(sendCount == 0UL || sendCount % commRankCount != 0UL,
                     OP_LOGE(nodeName, "sendData elements must be divisible by commRankIds size"),
                     return ge::GRAPH_FAILED);
 
     const uint64_t perRankBytes = sendCount / commRankCount * elementBytes;
+    const uint32_t pathCount = static_cast<uint32_t>(*rankSize) - static_cast<uint32_t>(commRankCount) + 1U;
+    const uint32_t laneCount = pathCount + 1U;  // direct owns two lanes; each relay owns one.
+    const uint32_t usedAivNum = pathCount + 1U;  // one self-copy block plus one block per path.
+    OP_TILING_CHECK(perRankBytes % TRANSFER_ALIGN_BYTES != 0UL,
+                    OP_LOGE(nodeName, "per-peer payload must be %lu-byte aligned, got %lu bytes",
+                            TRANSFER_ALIGN_BYTES, perRankBytes), return ge::GRAPH_FAILED);
+
+    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    const uint32_t availableAivNum = platform.GetCoreNumAiv();
+    OP_TILING_CHECK(availableAivNum == 0U || usedAivNum > availableAivNum,
+                    OP_LOGE(nodeName, "parallel detour needs %u AIV blocks, but only %u are available",
+                            usedAivNum, availableAivNum), return ge::GRAPH_FAILED);
+
     const uint64_t cellBytes = AlignUp(CELL_FLAG_BYTES + perRankBytes, CELL_ALIGN_BYTES);
     const uint64_t requiredWindow = A5_MTE_STATE_WIN_SIZE +
         static_cast<uint64_t>(*rankSize) * static_cast<uint64_t>(*rankSize) * cellBytes;
@@ -94,6 +117,10 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
     tiling->info.rankId = static_cast<uint32_t>(*rankId);
     tiling->info.commRankCount = static_cast<uint32_t>(commRankCount);
     tiling->info.magic = static_cast<uint32_t>(*magic);
+    tiling->info.pathCount = pathCount;
+    tiling->info.laneCount = laneCount;
+    tiling->info.usedAivNum = usedAivNum;
+    tiling->info.debugEnable = DebugWindowsEnabled() ? 1U : 0U;
     tiling->info.sendCount = sendCount;
     tiling->info.perRankBytes = perRankBytes;
     tiling->info.cellBytes = cellBytes;
@@ -111,11 +138,8 @@ static ge::graphStatus All2AllDetourIoDieTiling(gert::TilingContext *context)
                     return ge::GRAPH_FAILED);
     workspace[0] = SYSTEM_WORKSPACE_BYTES;
 
-    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    OP_TILING_CHECK(platform.GetCoreNumAiv() == 0U, OP_LOGE(nodeName, "no AIV core"),
-                    return ge::GRAPH_FAILED);
     context->SetTilingKey(0UL);
-    context->SetBlockDim(1U);
+    context->SetBlockDim(platform.CalcTschBlockDim(usedAivNum, 0U, usedAivNum));
     context->SetScheduleMode(1);
     return ge::GRAPH_SUCCESS;
 }

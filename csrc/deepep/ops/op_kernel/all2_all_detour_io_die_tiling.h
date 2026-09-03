@@ -8,6 +8,10 @@ struct All2AllDetourIoDieInfo {
     uint32_t rankId;
     uint32_t commRankCount;
     uint32_t magic;
+    uint32_t pathCount;
+    uint32_t laneCount;
+    uint32_t usedAivNum;
+    uint32_t debugEnable;
     uint64_t sendCount;
     uint64_t perRankBytes;
     uint64_t cellBytes;

@@ -166,7 +166,9 @@ python3 -m torch.distributed.run \
   --standalone --nproc-per-node=4 \
   tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
   --comm-ranks 0,1 \
-  --elements-per-peer 1536
+  --elements-per-peer 1536 \
+  --warmup 10 \
+  --iters 100
 ```
 
 成功标志：
@@ -176,15 +178,52 @@ PASS: A5 AIV+URMA AllToAll detour (communication-rank Write + Read)
 comm_ranks=[0, 1], relay_ranks=[2, 3]
 ```
 
-注意：`comm-ranks` 是可见设备重新编号后的逻辑 rank，不是物理卡号。这里的逻辑通信 rank 0、1分别对应物理卡2、3，逻辑绕路 rank 2、3分别对应物理卡4、5。`1536 * sizeof(int32) = 6144` 字节，平均分到直达路径和两条绕路路径后每路为2048字节，满足当前 MTE 拷贝的32字节对齐要求。
+注意：`comm-ranks` 是可见设备重新编号后的逻辑 rank，不是物理卡号。这里的逻辑通信 rank 0、1分别对应物理卡2、3，逻辑绕路 rank 2、3分别对应物理卡4、5。
+
+当前 kernel 只支持恰好两个通信 rank。每个通信 rank 启动的 AIV block 分工如下：
+
+```text
+block 0：本 rank 数据复制
+block 1：直连路径
+block 2：relay rank 2
+block 3：relay rank 3
+```
+
+这些 block 独立执行，不存在“先直连、再 relay 1、再 relay 2”的串行循环。直连路径分配两个虚拟 lane，每条 relay 路径分配一个虚拟 lane，因此直连数据量约为每条 relay 的2倍。所有 lane 均按32字节切分，余数按 lane 顺序分配。
+
+默认 `1536 * sizeof(int32) = 6144` 字节，切分结果为：直连3072字节、relay 2为1536字节、relay 3为1536字节。
+
+如果希望每个 peer 总共传输2 MiB，使用：
+
+```bash
+--elements-per-peer 524288
+```
+
+此时直连为1 MiB，每条 relay 为512 KiB。若使用 `524304`，总量为2097216字节，实际切分为直连1048640字节、每条 relay 524288字节；它控制的是每个 peer 的总量，不是单条路径的数据量。
+
+需要检查 HCCL window 地址和各 block 分片时，只跑一次并打开调试输出：
+
+```bash
+export A5_DETOUR_DEBUG_WINDOWS=1
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=4 \
+  tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
+  --comm-ranks 0,1 \
+  --elements-per-peer 1536 \
+  --warmup 0 \
+  --iters 1
+unset A5_DETOUR_DEBUG_WINDOWS
+```
+
+性能测试时不要设置 `A5_DETOUR_DEBUG_WINDOWS`，避免设备侧打印干扰计时。
 
 ## 7. AIV+URMA 算法
 
-以当前4卡 world、通信 rank `[0,1]` 为例，0发往1的数据平均分成3路：
+以当前4卡 world、通信 rank `[0,1]` 为例，0发往1的数据按2:1:1分成3路：
 
 ```text
-一路：rank0 Write rank1窗口，rank1 Read rank1窗口
-两路：rank0分别 Write rank2、rank3窗口，rank1再分别 Read rank2、rank3窗口
+一路（2份）：rank0 Write rank1窗口，rank1 Read rank1窗口
+两路（各1份）：rank0分别 Write rank2、rank3窗口，rank1再分别 Read rank2、rank3窗口
 ```
 
 反方向同时使用独立的 `(srcRank,dstRank)` window cell：
@@ -193,7 +232,7 @@ comm_ranks=[0, 1], relay_ranks=[2, 3]
 rank1 Write rank0、rank2、rank3窗口，rank0 Read相同窗口
 ```
 
-每个 cell 包含同步 flag 和数据区。发送通信卡先写数据、再写带 generation 的 flag；接收通信卡等待对应 flag 后读数据。非通信 rank 只提供远端映射窗口，不执行第二跳 kernel。
+每个 cell 包含同步 flag 和数据区。发送通信卡先写数据、再写带 generation 的 flag；接收通信卡等待对应 flag 后读数据。直连与每条 relay 由不同 AIV block 并发执行。非通信 rank 只提供远端映射窗口，不执行第二跳 kernel。
 
 ## 8. 代码位置
 

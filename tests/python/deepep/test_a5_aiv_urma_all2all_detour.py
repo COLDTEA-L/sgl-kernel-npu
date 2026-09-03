@@ -16,6 +16,8 @@ os.environ.pop("HCCL_OP_EXPANSION_MODE", None)
 os.environ["DEEP_USE_MODE"] = "default"
 os.environ.setdefault("HCCL_BUFFSIZE", "2300")
 
+TRANSFER_ALIGN_BYTES = 32
+
 
 def prepend_env_path(name, path):
     """Prepend one path idempotently and remove duplicates from the variable."""
@@ -58,13 +60,36 @@ def prepare_custom_op_runtime():
 
 def parse_comm_ranks(text, world_size):
     ranks = [int(value) for value in text.split(",")]
-    if ranks != sorted(set(ranks)) or len(ranks) < 2:
-        raise ValueError("--comm-ranks must be sorted, unique, and contain at least two ranks")
+    if ranks != sorted(set(ranks)) or len(ranks) != 2:
+        raise ValueError("--comm-ranks must contain exactly two sorted, unique ranks")
     if ranks[0] < 0 or ranks[-1] >= world_size:
         raise ValueError("--comm-ranks contains a rank outside WORLD_SIZE")
     if len(ranks) >= world_size:
         raise ValueError("AIV+URMA detour needs at least one rank outside --comm-ranks")
     return ranks
+
+
+def split_path_bytes(elements_per_peer, relay_count):
+    """Mirror the kernel's aligned 2:1 direct-to-relay weighted split."""
+    total_bytes = elements_per_peer * 4  # test tensors use int32
+    if total_bytes % TRANSFER_ALIGN_BYTES != 0:
+        raise ValueError(
+            "--elements-per-peer * sizeof(int32) must be a multiple of 32 bytes"
+        )
+    path_count = relay_count + 1
+    lane_count = path_count + 1  # direct owns two lanes; every relay owns one
+    total_units = total_bytes // TRANSFER_ALIGN_BYTES
+    base_units, remainder = divmod(total_units, lane_count)
+    lanes = [
+        (base_units + (lane < remainder)) * TRANSFER_ALIGN_BYTES
+        for lane in range(lane_count)
+    ]
+    direct_bytes = lanes[0] + lanes[1]
+    relay_bytes = lanes[2:]
+    if direct_bytes == 0 or any(value == 0 for value in relay_bytes):
+        raise ValueError("--elements-per-peer is too small to give every path data")
+    assert direct_bytes + sum(relay_bytes) == total_bytes
+    return total_bytes, direct_bytes, relay_bytes
 
 
 EXTENSION, OP_API = prepare_custom_op_runtime()
@@ -101,6 +126,13 @@ def main():
     parser.add_argument("--iters", type=int, default=100, help="Number of benchmark iterations")
     args = parser.parse_args()
 
+    if args.elements_per_peer <= 0:
+        parser.error("--elements-per-peer must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup cannot be negative")
+    if args.iters <= 0:
+        parser.error("--iters must be positive")
+
     faulthandler.enable(all_threads=True)
     faulthandler.dump_traceback_later(120, repeat=False)
     rank = int(os.environ["RANK"])
@@ -108,6 +140,9 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     comm_ranks = parse_comm_ranks(args.comm_ranks, world_size)
     relay_ranks = [value for value in range(world_size) if value not in comm_ranks]
+    total_bytes, direct_bytes, relay_bytes = split_path_bytes(
+        args.elements_per_peer, len(relay_ranks)
+    )
 
     stage(rank, f"set_device({local_rank}) begin")
     torch.npu.set_device(local_rank)
@@ -127,6 +162,12 @@ def main():
 
     dist.barrier(group=group)
     if rank == 0:
+        print("\n========== Parallel Path Layout ==========", flush=True)
+        print(f"bytes_per_peer : {total_bytes}", flush=True)
+        print(f"used_aiv_blocks: {len(relay_ranks) + 2} (self + direct + relays)", flush=True)
+        print(f"direct_bytes   : {direct_bytes}", flush=True)
+        print(f"relay_bytes    : {relay_bytes}", flush=True)
+        print("==========================================", flush=True)
         print(f"\nWarmup: {args.warmup} iterations", flush=True)
 
     recv_data = None
@@ -184,6 +225,9 @@ def main():
         print(f"comm_ranks={comm_ranks}", flush=True)
         print(f"relay_ranks={relay_ranks}", flush=True)
         print(f"elements_per_peer={args.elements_per_peer}", flush=True)
+        print(f"bytes_per_peer={total_bytes}", flush=True)
+        print(f"direct_bytes={direct_bytes}", flush=True)
+        print(f"relay_bytes={relay_bytes}", flush=True)
         print(f"warmup={args.warmup}", flush=True)
         print(f"iterations={args.iters}", flush=True)
         print()
