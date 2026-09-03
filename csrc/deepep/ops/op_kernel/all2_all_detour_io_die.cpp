@@ -118,7 +118,10 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
 
     if (GetBlockIdx() != 0) return;
     auto *context = reinterpret_cast<__gm__ HcclCombinOpParam *>(GetHcclContext<0>());
-    if (context == nullptr) return;
+    if (context == nullptr) {
+        PRINTF("[A5 window debug] HCCL context is null\n");
+        return;
+    }
 
     const uint32_t rankSize = context->rankDim;
     const uint32_t rankId = context->rankId;
@@ -136,10 +139,15 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     if (selfCommIndex < 0) return;
 
     for (uint32_t rank = 0; rank < rankSize; ++rank) {
-        if (context->windowsIn[rank] == 0UL) {
-            PRINTF("[AIV+URMA detour] rank=%u windowsIn[%u] is zero\n", rankId, rank);
+        const uint64_t windowBase = context->windowsIn[rank];
+        if (windowBase == 0UL) {
+            PRINTF("[A5 window debug] caller_rank=%u window_rank=%u windowsIn=0x%lx INVALID\n",
+                   rankId, rank, windowBase);
             return;
         }
+        const uint64_t dataBase = windowBase + dataRegionOffset;
+        PRINTF("[A5 window debug] caller_rank=%u window_rank=%u windowsIn=0x%lx data_base=0x%lx\n",
+               rankId, rank, windowBase, dataBase);
     }
 
     auto *send = reinterpret_cast<__gm__ uint8_t *>(sendData);
