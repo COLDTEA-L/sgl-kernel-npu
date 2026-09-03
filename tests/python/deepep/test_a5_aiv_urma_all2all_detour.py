@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2: verify communication-rank Write + Read through explicit relay ranks."""
+"""Stage 2 benchmark: AIV+URMA AllToAll detour through explicit relay ranks."""
 
 import argparse
 import ctypes
@@ -81,20 +81,33 @@ def stage(rank, message):
     print(f"[rank{rank}] +{time.monotonic() - START:7.3f}s {message}", flush=True)
 
 
+def percentile(values, q):
+    """Simple percentile for benchmark reporting."""
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    pos = (len(sorted_values) - 1) * q
+    lower = int(pos)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = pos - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--comm-ranks", default="0,1")
-    # Four-card default: 2 communication ranks + 2 relay ranks gives three
-    # paths. 1536 int32 elements = 6144 bytes, i.e. 2048 aligned bytes/path.
     parser.add_argument("--elements-per-peer", type=int, default=1536)
+    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
+    parser.add_argument("--iters", type=int, default=100, help="Number of benchmark iterations")
     args = parser.parse_args()
 
     faulthandler.enable(all_threads=True)
-    faulthandler.dump_traceback_later(60, repeat=False)
+    faulthandler.dump_traceback_later(120, repeat=False)
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     comm_ranks = parse_comm_ranks(args.comm_ranks, world_size)
+    relay_ranks = [value for value in range(world_size) if value not in comm_ranks]
 
     stage(rank, f"set_device({local_rank}) begin")
     torch.npu.set_device(local_rank)
@@ -111,11 +124,45 @@ def main():
     comm_rank_ids = torch.tensor(comm_ranks, dtype=torch.int32, device="npu")
     stage(rank, "deep_ep.Buffer begin")
     buffer = deep_ep.Buffer(group, num_nvl_bytes=0, num_rdma_bytes=0)
-    stage(rank, "AIV+URMA detour enqueue begin")
-    recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
-    stage(rank, "enqueue done; device synchronize begin")
-    torch.npu.synchronize()
-    stage(rank, "device synchronize done")
+
+    dist.barrier(group=group)
+    if rank == 0:
+        print(f"\nWarmup: {args.warmup} iterations", flush=True)
+
+    recv_data = None
+    for _ in range(args.warmup):
+        recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
+        torch.npu.synchronize()
+        dist.barrier(group=group)
+
+    if rank == 0:
+        print("Warmup done\n", flush=True)
+
+    dist.barrier(group=group)
+    if rank == 0:
+        print(f"Benchmark: {args.iters} iterations", flush=True)
+
+    global_times_ms = []
+    elapsed_tensor = torch.zeros(1, dtype=torch.float32, device="npu")
+
+    for i in range(args.iters):
+        torch.npu.synchronize()
+        start = time.perf_counter()
+        recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
+        torch.npu.synchronize()
+        local_elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        elapsed_tensor.fill_(local_elapsed_ms)
+        dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX, group=group)
+        global_elapsed_ms = elapsed_tensor.item()
+
+        if rank == 0:
+            global_times_ms.append(global_elapsed_ms)
+            if (i + 1) % 10 == 0 or i == 0:
+                print(
+                    f"  iter {i + 1:3d}/{args.iters}: {global_elapsed_ms:.3f} ms",
+                    flush=True,
+                )
 
     if rank in comm_ranks:
         expected = torch.stack(
@@ -126,12 +173,29 @@ def main():
 
     dist.barrier(group=group)
     if rank == 0:
-        relay_ranks = [value for value in range(world_size) if value not in comm_ranks]
+        avg_ms = sum(global_times_ms) / len(global_times_ms)
+        p50_ms = percentile(global_times_ms, 0.50)
+        p95_ms = percentile(global_times_ms, 0.95)
+        min_ms = min(global_times_ms)
+        max_ms = max(global_times_ms)
+
+        print()
+        print("PASS: A5 AIV+URMA AllToAll detour (communication-rank Write + Read)", flush=True)
+        print(f"comm_ranks={comm_ranks}", flush=True)
+        print(f"relay_ranks={relay_ranks}", flush=True)
+        print(f"elements_per_peer={args.elements_per_peer}", flush=True)
+        print(f"warmup={args.warmup}", flush=True)
+        print(f"iterations={args.iters}", flush=True)
+        print()
+        print("========== Benchmark Result ==========")
+        print(f"Average operator time : {avg_ms:.3f} ms")
+        print(f"P50 operator time     : {p50_ms:.3f} ms")
+        print(f"P95 operator time     : {p95_ms:.3f} ms")
+        print(f"Min operator time     : {min_ms:.3f} ms")
+        print(f"Max operator time     : {max_ms:.3f} ms")
+        print("======================================")
         print(f"Using deep_ep_cpp: {EXTENSION}", flush=True)
         print(f"Using custom op API: {OP_API}", flush=True)
-        print("PASS: A5 AIV+URMA AllToAll detour (communication-rank Write + Read)", flush=True)
-        print(f"comm_ranks={comm_ranks}, relay_ranks={relay_ranks}", flush=True)
-        print(f"elements_per_peer={args.elements_per_peer}", flush=True)
     dist.destroy_process_group()
     faulthandler.cancel_dump_traceback_later()
 
