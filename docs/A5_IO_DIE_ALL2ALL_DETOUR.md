@@ -264,7 +264,94 @@ rank1 Write rank0、rank2、rank3窗口，rank0 Read相同窗口
 
 每个 cell 包含同步 flag 和数据区。发送通信卡先写数据、再写带 generation 的 flag；接收通信卡等待对应 flag 后读数据。直连与每条 relay 由不同 AIV block 并发执行。非通信 rank 只提供远端映射窗口，不执行第二跳 kernel。
 
-## 8. 代码位置
+## 8. 使用 msprof 采集算子性能
+
+不需要修改 device kernel 添加打点。仓库提供脚本，通过 CANN 9.1 自带的 `msprof` 采集 AICore、MTE、Runtime 和 HCCL 数据。每次采集会在 `/home/liuyuanwen/profiling` 下创建独立的时间戳目录，并在采集完成后自动执行 `msprof --export=on`。
+
+脚本位置：
+
+```text
+scripts/profile_a5_all2all_detour.sh
+```
+
+### 8.1 两卡直连
+
+当前测试数据为 `int32`。`11804800 * sizeof(int32) = 47219200 Byte`，表示两卡之间的对端数据量为47219200字节：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+bash scripts/profile_a5_all2all_detour.sh \
+  --visible-devices 2,3 \
+  --comm-ranks 0,1 \
+  --elements-per-peer 11804800 \
+  --warmup 1 \
+  --iters 3 \
+  --metrics PipeUtilization
+```
+
+结果目录类似：
+
+```text
+/home/liuyuanwen/profiling/a5_all2all_2card_PipeUtilization_YYYYmmdd_HHMMSS/
+```
+
+脚本会自动设置 `ASCEND_RT_VISIBLE_DEVICES`，并根据设备列表自动得到 `--nproc-per-node=2`。profiling时会取消 `ASCEND_LAUNCH_BLOCKING` 和设备侧调试打印，避免改变正常的异步调度并减少干扰。
+
+### 8.2 八卡运行、六卡绕路
+
+八卡全部可用时，逻辑rank 0、1通信，逻辑rank 2～7作为六张relay卡：
+
+```bash
+bash scripts/profile_a5_all2all_detour.sh \
+  --visible-devices 0,1,2,3,4,5,6,7 \
+  --comm-ranks 0,1 \
+  --elements-per-peer 11804800 \
+  --warmup 1 \
+  --iters 3 \
+  --metrics PipeUtilization
+```
+
+### 8.3 采集 Memory 指标
+
+`msprof`一次采集一组 AIC metrics。检查 MTE2/MTE3 流水先使用 `PipeUtilization`；检查 GM/HBM 访问再单独采集一次 `Memory`：
+
+```bash
+bash scripts/profile_a5_all2all_detour.sh \
+  --visible-devices 2,3 \
+  --comm-ranks 0,1 \
+  --elements-per-peer 11804800 \
+  --warmup 1 \
+  --iters 3 \
+  --metrics Memory
+```
+
+也可以覆盖默认输出根目录：
+
+```bash
+bash scripts/profile_a5_all2all_detour.sh \
+  --output-root /home/liuyuanwen/profiling \
+  --visible-devices 2,3
+```
+
+查看所有导出的 CSV：
+
+```bash
+find /home/liuyuanwen/profiling -type f -name '*.csv' | sort
+```
+
+查找当前算子记录：
+
+```bash
+grep -Rin 'All2AllDetourIoDie' \
+  /home/liuyuanwen/profiling/*/PROF_*/mindstudio_profiler_output 2>/dev/null
+```
+
+重点查看 `op_summary*.csv` 中的算子时长、Block Dim、MTE2/MTE3利用率和GM访问指标。为了控制采集体积，默认只建议 `--warmup 1 --iters 3`，不要直接profiling 100次性能循环。
+
+注意：`/home/liuyuanwen/profiling` 必须在有卡Docker内可写。如果希望容器删除后仍保留结果，应在创建Docker时把宿主机目录挂载到同一路径。
+
+## 9. 代码位置
 
 普通 CCU AllToAll：
 
