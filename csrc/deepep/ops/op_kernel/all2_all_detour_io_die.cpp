@@ -8,7 +8,6 @@ using namespace AscendC;
 namespace {
 constexpr uint64_t CELL_FLAG_BYTES = 4096UL;
 constexpr uint64_t FLAG_STRIDE_BYTES = 32UL;
-constexpr uint32_t COPY_CHUNK_BYTES = 64U * 1024U;
 constexpr uint32_t MAX_RANKS = 32U;
 constexpr uint64_t TRANSFER_ALIGN_BYTES = 32UL;
 
@@ -77,29 +76,10 @@ __aicore__ inline uint64_t SliceOffset(uint64_t totalBytes, uint32_t pathCount, 
     return LaneOffset(totalBytes, pathCount + 1U, pathIndex + 1U);
 }
 
-__aicore__ inline void CopyBytes(__gm__ uint8_t *dst, __gm__ uint8_t *src, uint64_t bytes)
-{
-    if (bytes == 0UL) return;
-    __ubuf__ uint8_t *copyUb = reinterpret_cast<__ubuf__ uint8_t *>(get_imm(0));
-    AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-    for (uint64_t offset = 0; offset < bytes;) {
-        const uint32_t current = static_cast<uint32_t>(
-            bytes - offset > COPY_CHUNK_BYTES ? COPY_CHUNK_BYTES : bytes - offset);
-        AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        CpGM2UB(copyUb, src + offset, current);
-        AscendC::SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        AscendC::WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        CpUB2GM(dst + offset, copyUb, current);
-        AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        offset += current;
-    }
-    AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-    pipe_barrier(PIPE_ALL);
-}
-
 __aicore__ inline void WriteFlag(__gm__ uint64_t *address, uint64_t value)
 {
-    __ubuf__ uint64_t *flagUb = reinterpret_cast<__ubuf__ uint64_t *>(get_imm(COPY_CHUNK_BYTES));
+    // CpGM2GM reserves the first 96 UB bytes for scalar flags.
+    __ubuf__ uint64_t *flagUb = reinterpret_cast<__ubuf__ uint64_t *>(get_imm(0));
     *flagUb = value;
     AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
     AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
@@ -111,7 +91,7 @@ __aicore__ inline void WriteFlag(__gm__ uint64_t *address, uint64_t value)
 
 __aicore__ inline void WaitFlag(__gm__ uint64_t *address, uint64_t expected)
 {
-    __ubuf__ uint64_t *flagUb = reinterpret_cast<__ubuf__ uint64_t *>(get_imm(COPY_CHUNK_BYTES));
+    __ubuf__ uint64_t *flagUb = reinterpret_cast<__ubuf__ uint64_t *>(get_imm(0));
     uint64_t value = 0UL;
     do {
         CpGM2UB(flagUb, address, sizeof(uint64_t));
@@ -185,9 +165,13 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     // A dedicated block handles the local peer block while every remaining
     // block owns one communication path (direct or one explicit relay).
     if (blockIdx == 0U) {
-        CopyBytes(recv + static_cast<uint64_t>(selfCommIndex) * perRankBytes,
-                  send + static_cast<uint64_t>(selfCommIndex) * perRankBytes,
-                  perRankBytes);
+        if (debugEnable) {
+            PRINTF("[A5 copy debug] CpGM2GM ping-pong, chunk_bytes=%ld, used_blocks=%u\n",
+                   UB_SINGLE_PING_PONG_ADD_SIZE_MAX, usedAivNum);
+        }
+        CpGM2GM<uint8_t>(recv + static_cast<uint64_t>(selfCommIndex) * perRankBytes,
+                         send + static_cast<uint64_t>(selfCommIndex) * perRankBytes,
+                         perRankBytes);
         return;
     }
 
@@ -207,8 +191,8 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
         PRINTF("[A5 path debug] rank=%u block=%u path=%u mem_rank=%u offset=%lu bytes=%lu\n",
                rankId, blockIdx, path, writeMemRank, sliceOffset, bytes);
     }
-    CopyBytes(writeCell + CELL_FLAG_BYTES,
-              send + static_cast<uint64_t>(peerIndex) * perRankBytes + sliceOffset, bytes);
+    CpGM2GM<uint8_t>(writeCell + CELL_FLAG_BYTES,
+                     send + static_cast<uint64_t>(peerIndex) * perRankBytes + sliceOffset, bytes);
     WriteFlag(reinterpret_cast<__gm__ uint64_t *>(writeCell + rankId * FLAG_STRIDE_BYTES), magic);
 
     // Inbound: the same path block waits for the peer and reads its slice.
@@ -218,6 +202,6 @@ extern "C" __global__ __aicore__ void all2_all_detour_io_die(
     auto *readCell = reinterpret_cast<__gm__ uint8_t *>(context->windowsIn[readMemRank] +
         dataRegionOffset + readCellIndex * cellBytes);
     WaitFlag(reinterpret_cast<__gm__ uint64_t *>(readCell + peerRank * FLAG_STRIDE_BYTES), magic);
-    CopyBytes(recv + static_cast<uint64_t>(peerIndex) * perRankBytes + sliceOffset,
-              readCell + CELL_FLAG_BYTES, bytes);
+    CpGM2GM<uint8_t>(recv + static_cast<uint64_t>(peerIndex) * perRankBytes + sliceOffset,
+                     readCell + CELL_FLAG_BYTES, bytes);
 }

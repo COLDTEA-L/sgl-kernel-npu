@@ -11,7 +11,8 @@ Usage: bash scripts/build_a5_io_die_all2all_detour.sh [--python-env PATH]
 
 Build a focused DeepEP wheel for the two A5 AllToAll validation stages:
   1. fixed-count HCCL AllToAll using the CCU runtime;
-  2. AIV+URMA two-hop AllToAll using explicit relay-rank windows.
+  2. AIV+URMA two-hop AllToAll using explicit relay-rank windows and
+     ping-pong CpGM2GM copies inside each path block.
 EOF
 }
 

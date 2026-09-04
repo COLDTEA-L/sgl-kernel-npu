@@ -52,6 +52,57 @@ FORCE_INLINE_AICORE void CpGM2UB(__ubuf__ T *ubAddr, __gm__ T *gmAddr, uint32_t 
     DataCopyPad(ubTensor, gmTensor, dataCopyParams, padParams);
 }
 
+/**
+ * Copy contiguous data from GM to GM through two alternating UB buffers.
+ *
+ * count is expressed in elements of T.  The two MTE pipelines can overlap the
+ * GM->UB load for one chunk with the UB->GM store for the previous chunk.  The
+ * first 96 bytes of UB remain available to callers for scalar communication
+ * flags; the two data buffers use the same layout as NotifyDispatchA5.
+ */
+template <typename T>
+FORCE_INLINE_AICORE void CpGM2GM(__gm__ T *dst, __gm__ T *src, uint64_t count)
+{
+    if (count == 0UL) {
+        return;
+    }
+
+    constexpr uint32_t maxCountPerLoop =
+        static_cast<uint32_t>(UB_SINGLE_PING_PONG_ADD_SIZE_MAX / sizeof(T));
+    __ubuf__ T *copyUb[2] = {
+        (__ubuf__ T *)(UB_HEAD_OFFSET),
+        (__ubuf__ T *)(UB_MID_OFFSET),
+    };
+
+    AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    AscendC::SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+
+    uint64_t offset = 0UL;
+    uint32_t turn = 0U;
+    while (offset < count) {
+        const uint64_t remaining = count - offset;
+        const uint32_t currentCount = static_cast<uint32_t>(
+            remaining > maxCountPerLoop ? maxCountPerLoop : remaining);
+        const event_t eventId = turn == 0U ? EVENT_ID0 : EVENT_ID1;
+
+        // Do not reuse this UB half until its previous MTE3 store completes.
+        AscendC::WaitFlag<HardEvent::MTE3_MTE2>(eventId);
+        CpGM2UB(copyUb[turn], src + offset, currentCount * sizeof(T));
+        AscendC::SetFlag<HardEvent::MTE2_MTE3>(eventId);
+        AscendC::WaitFlag<HardEvent::MTE2_MTE3>(eventId);
+        CpUB2GM(dst + offset, copyUb[turn], currentCount * sizeof(T));
+        AscendC::SetFlag<HardEvent::MTE3_MTE2>(eventId);
+
+        offset += currentCount;
+        turn ^= 1U;
+    }
+
+    AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    AscendC::WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+    AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID3);
+    AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
+}
+
 template <typename T>
 FORCE_INLINE_AICORE void CopyUB2UB(__ubuf__ T *dst, __ubuf__ T *src, const uint32_t calCount)
 {

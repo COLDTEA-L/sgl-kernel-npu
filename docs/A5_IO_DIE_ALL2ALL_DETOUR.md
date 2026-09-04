@@ -5,7 +5,7 @@
 | 阶段 | Python 接口 | 设备实现 | 用途 |
 |---|---|---|---|
 | 1 | `Buffer.hccl_all2_all_ccu` | `Hccl::AlltoAll` + `HCCL_CMD_ALLTOALL` + A5 CCU | 证明当前环境可以运行 HCCL 普通 AllToAll |
-| 2 | `Buffer.all2_all_detour_io_die` | AIV + MTE/URMA 映射窗口 | 通信卡 Write 绕路卡，通信卡再从绕路卡 Read |
+| 2 | `Buffer.all2_all_detour_io_die` | AIV + MTE/URMA 映射窗口 + `CpGM2GM` 双缓冲 | 通信卡 Write 绕路卡，通信卡再从绕路卡 Read |
 
 阶段一没有复制 HCCL 的私有 CCU kernel。自定义算子只是 MC2 薄封装，真正执行的是 CANN/HCCL 已注册的 `CcuAlltoAllMesh1D`、`CcuAllToAllMesh2Die` 或对应拓扑实现。
 
@@ -18,9 +18,9 @@
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 
-git fetch origin feature/a5-io-die-all2all-detour
-git switch feature/a5-io-die-all2all-detour
-git pull --ff-only origin feature/a5-io-die-all2all-detour
+git fetch origin feature/a5-detour-cpgm2gm
+git switch feature/a5-detour-cpgm2gm
+git pull --ff-only origin feature/a5-detour-cpgm2gm
 
 git branch --show-current
 git log -1 --oneline
@@ -86,7 +86,21 @@ hccl_all2_all_ccu
 all2_all_detour_io_die
 ```
 
-这两个 kernel 已在无卡服务器的 CANN 9.1 `cam_lyw_dev_91` 环境完成编译验证；无卡环境只能验证出包，不能验证通信结果。
+这两个 kernel 已在无卡服务器的 CANN 9.1 `cam_lyw_dev_91` 环境完成过编译验证；无卡环境只能验证编译和出包，不能验证通信结果。本分支新增的 `CpGM2GM` 版本也已用下面的单算子命令完成设备kernel编译：
+
+```bash
+docker exec cam_lyw_dev_91 bash -lc '
+set -e
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
+source /usr/local/Ascend/cann/set_env.sh
+cd /home/liuyuanwen/sgl-kernel-npu/csrc/deepep/ops
+export DEEPEP_SINGLE_OP=all2_all_detour_io_die
+export ASCEND_COMPUTE_UNIT=ascend950
+bash build.sh binary
+'
+```
+
+该命令只编译自定义算子包中的 `All2AllDetourIoDie` device kernel，不依赖容器中安装PyTorch，也不生成可供有卡环境安装的完整DeepEP wheel。有卡SGLang容器仍应执行本节开头的 `scripts/build_a5_io_die_all2all_detour.sh` 来生成wheel。
 
 ## 4. 始终选择最新 wheel 安装
 
@@ -190,6 +204,10 @@ block 3：relay rank 3
 ```
 
 这些 block 独立执行，不存在“先直连、再 relay 1、再 relay 2”的串行循环。直连路径分配两个虚拟 lane，每条 relay 路径分配一个虚拟 lane，因此直连数据量约为每条 relay 的2倍。所有 lane 均按32字节切分，余数按 lane 顺序分配。
+
+本分支没有增加 block 数量，也没有改变上述切分方法。变化仅发生在每个 block 内部：原来的单 UB buffer `CopyBytes` 会等待一块数据完成 GM→UB→GM 后再处理下一块；现在改用 `CpGM2GM<uint8_t>`，使用两个约95 KiB的 UB buffer 交替搬运，使一块数据的 MTE3（UB→GM）可以和下一块数据的 MTE2（GM→UB）重叠。block 0的self copy、写通信窗口、读通信窗口均使用同一实现。
+
+UB的前96字节保留给同步flag，两个数据buffer从 `UB_HEAD_OFFSET` 和 `UB_MID_OFFSET` 开始，避免flag与ping-pong数据区重叠。`CpGM2GM` 返回前会等待两块buffer上的MTE3全部完成，所以仍然保证“先写数据、再发布flag”。
 
 默认 `1536 * sizeof(int32) = 6144` 字节，切分结果为：直连3072字节、relay 2为1536字节、relay 3为1536字节。
 
@@ -308,6 +326,36 @@ rank1 Write rank0、rank2、rank3窗口，rank0 Read相同窗口
 ```
 
 每个 cell 包含同步 flag 和数据区。发送通信卡先写数据、再写带 generation 的 flag；接收通信卡等待对应 flag 后读数据。直连与每条 relay 由不同 AIV block 并发执行。非通信 rank 只提供远端映射窗口，不执行第二跳 kernel。
+
+### 7.1 `CpGM2GM` 数据搬运流水
+
+`CpGM2GM` 不是硬件直接支持的 GM→GM 单指令，实际仍由 MTE 完成 GM→UB→GM。它的优化点是把 UB 分成ping和pong两半：
+
+```text
+迭代0：MTE2 GM→UB ping；MTE3 UB ping→GM
+迭代1：MTE2 GM→UB pong；MTE3 UB pong→GM
+迭代2：等待ping的上一次MTE3完成后复用ping
+```
+
+不同UB半区之间允许MTE2和MTE3形成流水。该实现参考本仓库 `NotifyDispatchA5::CpGM2GMPingPong` 以及HCCL `AivCommBase::CpGM2GM` 的处理方式，但没有引入HCCL私有的 `AivCommBase` 和 `TQue` 依赖。
+
+需要确认有卡环境确实加载了本分支新kernel时，可临时打开：
+
+```bash
+export A5_DETOUR_DEBUG_WINDOWS=1
+```
+
+设备日志应包含：
+
+```text
+[A5 copy debug] CpGM2GM ping-pong
+```
+
+性能测试前必须取消该变量：
+
+```bash
+unset A5_DETOUR_DEBUG_WINDOWS
+```
 
 ## 8. 使用 msprof 采集算子性能
 
@@ -429,6 +477,7 @@ AIV+URMA 绕路：
 csrc/deepep/ops/op_host/all2_all_detour_io_die_def.cpp
 csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
 csrc/deepep/ops/op_host/op_api/aclnn_all2_all_detour_io_die.{h,cpp}
+csrc/deepep/ops/op_kernel/data_copy.h
 csrc/deepep/ops/op_kernel/all2_all_detour_io_die.cpp
 tests/python/deepep/test_a5_aiv_urma_all2all_detour.py
 scripts/profile_a5_all2all_detour.sh
