@@ -359,7 +359,7 @@ unset A5_DETOUR_DEBUG_WINDOWS
 
 ## 8. 使用 msprof 采集算子性能
 
-不需要修改 device kernel 添加打点。仓库提供脚本，通过 CANN 9.1 自带的 `msprof` 采集 AICore、MTE、Runtime 和 HCCL 数据。每次采集会在 `/home/l00934901/profiling` 下创建独立的时间戳目录，并在采集完成后自动执行 `msprof --export=on`。
+不需要修改 device kernel 添加打点。仓库提供脚本，通过 CANN 9.1 自带的 `msprof` 采集 AICore、MTE、Runtime 和 HCCL 数据。每次采集会在 `/home/l00934901/profiling` 下创建独立的时间戳目录。`torchrun` 的不同rank/device可能分别生成一个 `PROF_*` 目录，脚本会发现本次运行生成的全部 `PROF_*`，逐个执行 `msprof --export=on`，不会只导出时间最新的一张卡。
 
 脚本位置：
 
@@ -446,6 +446,17 @@ bash scripts/profile_a5_all2all_detour.sh \
 ```bash
 find /home/l00934901/profiling -type f -name '*.csv' | sort
 ```
+
+确认一次多卡采集实际生成了多少份原始profile：
+
+```bash
+latest_run="$(find /home/l00934901/profiling -mindepth 1 -maxdepth 1 -type d \
+  -name 'a5_*_all2all_*' -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+echo "${latest_run}"
+find "${latest_run}" -type d -name 'PROF_*' | sort
+```
+
+正常情况下，脚本结束时会先输出发现的profile目录数量，再列出每个rank/device导出的CSV。如果这里只找到一个 `PROF_*`，问题发生在msprof对子进程的采集阶段，而不是导出阶段；此时需要再改为每个rank分别启动msprof，不能把缺失数据误判为导出脚本遗漏。
 
 查找当前算子记录：
 

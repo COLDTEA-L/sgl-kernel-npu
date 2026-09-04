@@ -126,15 +126,21 @@ msprof \
         --nproc-per-node="${nproc}" \
         "${test_command[@]}"
 
-prof_dir="$({
-    find "${run_dir}" -maxdepth 2 -type d -name 'PROF_*' -printf '%T@ %p\n' 2>/dev/null || true
-} | sort -nr | awk 'NR==1 {print $2}')"
-if [[ -n "${prof_dir}" ]]; then
-    msprof --export=on --output="${prof_dir}"
-    echo "Exported profile: ${prof_dir}"
-    echo "CSV files:"
-    find "${prof_dir}" -type f -name '*.csv' | sort
-else
+mapfile -d '' prof_dirs < <(
+    find "${run_dir}" -type d -name 'PROF_*' -print0 2>/dev/null
+)
+if (( ${#prof_dirs[@]} == 0 )); then
     echo "Collection finished, but no PROF_* directory was found under ${run_dir}" >&2
     exit 1
 fi
+
+echo "Found ${#prof_dirs[@]} profile directories:"
+for prof_dir in "${prof_dirs[@]}"; do
+    echo "Exporting profile: ${prof_dir}"
+    msprof --export=on --output="${prof_dir}"
+done
+
+echo "Exported CSV files from all ranks/devices:"
+for prof_dir in "${prof_dirs[@]}"; do
+    find "${prof_dir}" -type f -name '*.csv' | sort
+done
