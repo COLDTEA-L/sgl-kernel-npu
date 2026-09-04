@@ -266,7 +266,7 @@ rank1 Write rank0、rank2、rank3窗口，rank0 Read相同窗口
 
 ## 8. 使用 msprof 采集算子性能
 
-不需要修改 device kernel 添加打点。仓库提供脚本，通过 CANN 9.1 自带的 `msprof` 采集 AICore、MTE、Runtime 和 HCCL 数据。每次采集会在 `/home/liuyuanwen/profiling` 下创建独立的时间戳目录，并在采集完成后自动执行 `msprof --export=on`。
+不需要修改 device kernel 添加打点。仓库提供脚本，通过 CANN 9.1 自带的 `msprof` 采集 AICore、MTE、Runtime 和 HCCL 数据。每次采集会在 `/home/l00934901/profiling` 下创建独立的时间戳目录，并在采集完成后自动执行 `msprof --export=on`。
 
 脚本位置：
 
@@ -285,15 +285,15 @@ bash scripts/profile_a5_all2all_detour.sh \
   --visible-devices 2,3 \
   --comm-ranks 0,1 \
   --elements-per-peer 11804800 \
-  --warmup 1 \
-  --iters 3 \
+  --warmup 10 \
+  --iters 100 \
   --metrics PipeUtilization
 ```
 
 结果目录类似：
 
 ```text
-/home/liuyuanwen/profiling/a5_all2all_2card_PipeUtilization_YYYYmmdd_HHMMSS/
+/home/l00934901/profiling/a5_all2all_2card_PipeUtilization_YYYYmmdd_HHMMSS/
 ```
 
 脚本会自动设置 `ASCEND_RT_VISIBLE_DEVICES`，并根据设备列表自动得到 `--nproc-per-node=2`。profiling时会取消 `ASCEND_LAUNCH_BLOCKING` 和设备侧调试打印，避免改变正常的异步调度并减少干扰。
@@ -307,8 +307,8 @@ bash scripts/profile_a5_all2all_detour.sh \
   --visible-devices 0,1,2,3,4,5,6,7 \
   --comm-ranks 0,1 \
   --elements-per-peer 11804800 \
-  --warmup 1 \
-  --iters 3 \
+  --warmup 10 \
+  --iters 100 \
   --metrics PipeUtilization
 ```
 
@@ -321,8 +321,8 @@ bash scripts/profile_a5_all2all_detour.sh \
   --visible-devices 2,3 \
   --comm-ranks 0,1 \
   --elements-per-peer 11804800 \
-  --warmup 1 \
-  --iters 3 \
+  --warmup 10 \
+  --iters 100 \
   --metrics Memory
 ```
 
@@ -330,26 +330,26 @@ bash scripts/profile_a5_all2all_detour.sh \
 
 ```bash
 bash scripts/profile_a5_all2all_detour.sh \
-  --output-root /home/liuyuanwen/profiling \
+  --output-root /home/l00934901/profiling \
   --visible-devices 2,3
 ```
 
 查看所有导出的 CSV：
 
 ```bash
-find /home/liuyuanwen/profiling -type f -name '*.csv' | sort
+find /home/l00934901/profiling -type f -name '*.csv' | sort
 ```
 
 查找当前算子记录：
 
 ```bash
 grep -Rin 'All2AllDetourIoDie' \
-  /home/liuyuanwen/profiling/*/PROF_*/mindstudio_profiler_output 2>/dev/null
+  /home/l00934901/profiling/*/PROF_*/mindstudio_profiler_output 2>/dev/null
 ```
 
-重点查看 `op_summary*.csv` 中的算子时长、Block Dim、MTE2/MTE3利用率和GM访问指标。为了控制采集体积，默认只建议 `--warmup 1 --iters 3`，不要直接profiling 100次性能循环。
+重点查看 `op_summary*.csv` 中的算子时长、Block Dim、MTE2/MTE3利用率和GM访问指标。脚本默认先warmup 10次，再正式profiling 100次，以便与常规benchmark的迭代配置保持一致；相应的采集文件会比较大。
 
-注意：`/home/liuyuanwen/profiling` 必须在有卡Docker内可写。如果希望容器删除后仍保留结果，应在创建Docker时把宿主机目录挂载到同一路径。
+注意：`/home/l00934901/profiling` 必须在有卡Docker内可写。当前Docker已挂载 `/home/l00934901` 时，profiling结果会直接保存在宿主机目录中，容器删除后仍然保留。
 
 ## 9. 代码位置
 

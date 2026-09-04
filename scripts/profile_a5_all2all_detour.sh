@@ -4,10 +4,10 @@ set -eo pipefail
 visible_devices="${ASCEND_RT_VISIBLE_DEVICES:-2,3}"
 comm_ranks="0,1"
 elements_per_peer=11804800
-warmup=1
-iters=3
+warmup=10
+iters=100
 metrics="PipeUtilization"
-output_root="/home/liuyuanwen/profiling"
+output_root="/home/l00934901/profiling"
 
 usage() {
     echo "Usage: $0 [options]"
