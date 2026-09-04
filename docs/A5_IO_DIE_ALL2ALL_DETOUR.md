@@ -247,6 +247,51 @@ relay_bytes    : []
 
 随后使用第6节的4进程命令测试两条 relay。两次都保持 `--elements-per-peer 524288`，即可对比同一 AIV+URMA 算子的两卡直连与四卡绕路模式。
 
+### 6.2 原生 torch.distributed/HCCL AllToAll
+
+使用 `torch.distributed.all_to_all_single` 可以在 SGLang Docker 中直接测试原生 HCCL AllToAll，不经过本仓库的自定义 AllToAll kernel。测试脚本为：
+
+```text
+tests/python/deepep/test_a5_native_hccl_alltoall.py
+```
+
+当前脚本使用 `int32`。`--elements-per-peer 11804800` 表示每个目标peer的数据量为47219200字节；两卡时每个rank的输入包含一份self数据和一份对端数据，总计94438400字节。
+
+原生CCU模式：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || \
+source /usr/local/Ascend/cann/set_env.sh
+
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_BUFFSIZE=2300
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+unset ASCEND_LAUNCH_BLOCKING
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_native_hccl_alltoall.py \
+  --elements-per-peer 11804800 \
+  --warmup 10 \
+  --iters 100
+```
+
+原生AIV模式需要重新启动进程：
+
+```bash
+export HCCL_OP_EXPANSION_MODE=AIV
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_native_hccl_alltoall.py \
+  --elements-per-peer 11804800 \
+  --warmup 10 \
+  --iters 100
+```
+
+脚本会输出平均值、P50、P95、最小值、最大值，以及按每个rank实际对外发送字节数计算的有效带宽。CCU与AIV模式必须在不同的 `torchrun` 进程中测试，因为HCCL在通信域初始化时读取展开模式。
+
 ## 7. AIV+URMA 算法
 
 以当前4卡 world、通信 rank `[0,1]` 为例，0发往1的数据按2:1:1分成3路：
@@ -297,6 +342,20 @@ bash scripts/profile_a5_all2all_detour.sh \
 ```
 
 脚本会自动设置 `ASCEND_RT_VISIBLE_DEVICES`，并根据设备列表自动得到 `--nproc-per-node=2`。profiling时会取消 `ASCEND_LAUNCH_BLOCKING` 和设备侧调试打印，避免改变正常的异步调度并减少干扰。
+
+如果要对原生 HCCL AllToAll 做同样的 `msprof` 采集，增加 `--target native`。原生算法模式由运行脚本前设置的 `HCCL_OP_EXPANSION_MODE` 决定：
+
+```bash
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+
+bash scripts/profile_a5_all2all_detour.sh \
+  --target native \
+  --visible-devices 2,3 \
+  --elements-per-peer 11804800 \
+  --metrics PipeUtilization
+```
+
+自定义绕路算子保持默认 `--target custom`。该模式会在脚本内部取消 `HCCL_OP_EXPANSION_MODE`。
 
 ### 8.2 八卡运行、六卡绕路
 
@@ -361,6 +420,7 @@ csrc/deepep/ops/op_host/hccl_all2_all_ccu_tiling.cpp
 csrc/deepep/ops/op_host/op_api/aclnn_hccl_all2_all_ccu.{h,cpp}
 csrc/deepep/ops/op_kernel/hccl_all2_all_ccu.cpp
 tests/python/deepep/test_a5_hccl_ccu_all2all.py
+tests/python/deepep/test_a5_native_hccl_alltoall.py
 ```
 
 AIV+URMA 绕路：
@@ -371,4 +431,5 @@ csrc/deepep/ops/op_host/all2_all_detour_io_die_tiling.cpp
 csrc/deepep/ops/op_host/op_api/aclnn_all2_all_detour_io_die.{h,cpp}
 csrc/deepep/ops/op_kernel/all2_all_detour_io_die.cpp
 tests/python/deepep/test_a5_aiv_urma_all2all_detour.py
+scripts/profile_a5_all2all_detour.sh
 ```

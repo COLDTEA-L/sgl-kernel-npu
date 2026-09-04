@@ -3,6 +3,7 @@ set -eo pipefail
 
 visible_devices="${ASCEND_RT_VISIBLE_DEVICES:-2,3}"
 comm_ranks="0,1"
+target="custom"
 elements_per_peer=11804800
 warmup=10
 iters=100
@@ -13,6 +14,7 @@ usage() {
     echo "Usage: $0 [options]"
     echo "  --visible-devices IDS   Physical device IDs, default: ${visible_devices}"
     echo "  --comm-ranks IDS        Logical communication ranks, default: ${comm_ranks}"
+    echo "  --target TARGET         custom or native, default: ${target}"
     echo "  --elements-per-peer N   int32 elements sent to each peer, default: ${elements_per_peer}"
     echo "  --warmup N              Warmup iterations, default: ${warmup}"
     echo "  --iters N               Profiled test iterations, default: ${iters}"
@@ -24,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --visible-devices) visible_devices="$2"; shift 2 ;;
         --comm-ranks) comm_ranks="$2"; shift 2 ;;
+        --target) target="$2"; shift 2 ;;
         --elements-per-peer) elements_per_peer="$2"; shift 2 ;;
         --warmup) warmup="$2"; shift 2 ;;
         --iters) iters="$2"; shift 2 ;;
@@ -33,6 +36,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ "${target}" != "custom" && "${target}" != "native" ]]; then
+    echo "--target must be custom or native" >&2
+    exit 2
+fi
 
 IFS=',' read -r -a device_list <<< "${visible_devices}"
 nproc=${#device_list[@]}
@@ -54,28 +62,54 @@ if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
 elif [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
     source /usr/local/Ascend/cann/set_env.sh
 fi
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+if [[ "${target}" == "custom" ]]; then
+    source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+fi
 set -u
 
 command -v msprof >/dev/null || { echo "msprof not found in PATH" >&2; exit 1; }
 mkdir -p "${output_root}"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 metric_tag="${metrics//[^[:alnum:]_-]/_}"
-run_dir="${output_root}/a5_all2all_${nproc}card_${metric_tag}_${timestamp}"
+run_dir="${output_root}/a5_${target}_all2all_${nproc}card_${metric_tag}_${timestamp}"
 mkdir -p "${run_dir}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${visible_devices}"
 export HCCL_BUFFSIZE=2300
 export DEEP_USE_MODE=default
-unset HCCL_OP_EXPANSION_MODE
+if [[ "${target}" == "custom" ]]; then
+    unset HCCL_OP_EXPANSION_MODE
+fi
 unset ASCEND_LAUNCH_BLOCKING
 unset A5_DETOUR_DEBUG_WINDOWS
 
 echo "msprof output : ${run_dir}"
 echo "devices       : ${visible_devices} (${nproc} processes)"
-echo "comm ranks    : ${comm_ranks}"
+echo "target        : ${target}"
+if [[ "${target}" == "custom" ]]; then
+    echo "comm ranks    : ${comm_ranks}"
+else
+    echo "HCCL mode     : ${HCCL_OP_EXPANSION_MODE:-<default>}"
+fi
 echo "elements/peer : ${elements_per_peer} int32"
 echo "AIC metrics   : ${metrics}"
+
+if [[ "${target}" == "native" ]]; then
+    test_command=(
+        tests/python/deepep/test_a5_native_hccl_alltoall.py
+        --elements-per-peer "${elements_per_peer}"
+        --warmup "${warmup}"
+        --iters "${iters}"
+    )
+else
+    test_command=(
+        tests/python/deepep/test_a5_aiv_urma_all2all_detour.py
+        --comm-ranks "${comm_ranks}"
+        --elements-per-peer "${elements_per_peer}"
+        --warmup "${warmup}"
+        --iters "${iters}"
+    )
+fi
 
 msprof \
     --output="${run_dir}" \
@@ -90,11 +124,7 @@ msprof \
     python3 -m torch.distributed.run \
         --standalone \
         --nproc-per-node="${nproc}" \
-        tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
-        --comm-ranks "${comm_ranks}" \
-        --elements-per-peer "${elements_per_peer}" \
-        --warmup "${warmup}" \
-        --iters "${iters}"
+        "${test_command[@]}"
 
 prof_dir="$({
     find "${run_dir}" -maxdepth 2 -type d -name 'PROF_*' -printf '%T@ %p\n' 2>/dev/null || true
