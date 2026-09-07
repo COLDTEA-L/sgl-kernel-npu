@@ -146,11 +146,14 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 首次创建 channel 时会打印类似：
 
 ```text
-[A5 CCU URMA][rank=0 peer=1] route=0 layer=0 link=0 protocol=4 hop=... src_phy=2 dst_phy=5 src_eid=... dst_eid=... SELECTED
+[A5 CCU URMA][rank=0 peer=1] route=0 layer=0 link=0 protocol=4 hop=... src_phy=2 dst_phy=5 src_addr=type=...,raw=... dst_addr=type=...,raw=... SELECTED
 [rank=0] PASS engine=CCU protocol=UBC_CTP route=0 ...
 ```
 
-输出中 `protocol=4` 即 `COMM_PROTOCOL_UBC_CTP`。把打印的 EID 与 `urma_admin show` 对照，确认它属于预期的 UDMA 端口。`hop` 是 RankGraph 对该 link 发布的跳数信息。
+输出中 `protocol=4` 即 `COMM_PROTOCOL_UBC_CTP`。`src_addr/dst_addr` 同时打印 `CommAddr.type` 和前16字节原始地址；
+部分 CANN 9.1 内部 RankGraph 不把地址标成公开枚举 `COMM_ADDR_TYPE_EID`，但原始字节仍会保留，不能据此把
+`not-an-eid` 误判成“没有使用 URMA”。可将原始字节、物理卡号以及 `urma_admin show` 联合对照。
+`hop` 是 RankGraph 对该 link 发布的跳数信息。
 
 如果输出存在 route 1、route 2 等候选，可逐条运行：
 
@@ -200,3 +203,17 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 其中 1～3 只能证明 CCU+URMA 通信可用；4～5 才能证明“选路”真正改变了数据路径。仅看到目的 EID 不足以证明经过了指定中转卡。
 
 若 RankGraph 已暴露多条满足要求的链路，下一步把相同的 channel 选择逻辑接入 AllToAll，并按多条 route 并发切片。若只有一条链路，则先在 UVS/HIXL 拓扑配置中创建并发布新的 EID 对/路由，再继续算子实现。
+
+## 9. `remote memory ... not found; memNum=0`
+
+`HcclCommMemReg` 只注册本地内存。要让建链过程把内存描述交换给对端，还必须在
+`HcclChannelAcquire` 前把返回的 handle 填入：
+
+```cpp
+channelDesc.memHandles = &memHandle;
+channelDesc.memHandleNum = 1;
+```
+
+提交中已经包含该处理。如果仍看到 `memNum=0`，先确认拉取了包含此修复的最新提交、重新编译并安装了
+最新 `.run` 包，再用 `strings` 或文件时间确认 CANN 目录中的 `.so` 不是旧包。测试程序在初始化失败时会跳过
+`aclFinalize`，避免残留的部分初始化 HCCL 资源触发二次 SIGSEGV；首个 HCCL 错误仍是需要分析的根因。

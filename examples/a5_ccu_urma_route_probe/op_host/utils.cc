@@ -31,13 +31,11 @@ struct ThreadLocalCache {
 
 thread_local ThreadLocalCache g_cache;
 
-std::string EidToString(const CommAddr &addr)
+std::string CommAddrToString(const CommAddr &addr)
 {
-    if (addr.type != COMM_ADDR_TYPE_EID) {
-        return "not-an-eid";
-    }
     std::ostringstream out;
-    out << std::hex << std::setfill('0');
+    out << "type=" << static_cast<int>(addr.type) << ",raw="
+        << std::hex << std::setfill('0');
     for (uint32_t i = 0; i < EID_BYTE_NUM; ++i) {
         if (i != 0 && (i % 2) == 0) {
             out << ':';
@@ -48,7 +46,8 @@ std::string EidToString(const CommAddr &addr)
 }
 
 HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, ChannelHandle *channel)
+                         uint32_t routeIndex, HcclMemHandle memHandle,
+                         ChannelHandle *channel)
 {
     uint32_t layerNum = 0;
     uint32_t *layers = nullptr;
@@ -77,16 +76,16 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
                 continue;
             }
             const uint32_t ordinal = static_cast<uint32_t>(candidates.size());
-            const std::string srcEid = EidToString(link.srcEndpointDesc.commAddr);
-            const std::string dstEid = EidToString(link.dstEndpointDesc.commAddr);
+            const std::string srcAddr = CommAddrToString(link.srcEndpointDesc.commAddr);
+            const std::string dstAddr = CommAddrToString(link.dstEndpointDesc.commAddr);
             std::printf("[A5 CCU URMA][rank=%u peer=%u] route=%u layer=%u link=%u "
-                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_eid=%s dst_eid=%s%s\n",
+                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_addr=%s dst_addr=%s%s\n",
                         rank, peer, ordinal, layers[layerIndex], linkIndex,
                         static_cast<int>(link.linkAttr.linkProtocol),
                         static_cast<uint32_t>(link.linkAttr.hop),
                         link.srcEndpointDesc.loc.device.devPhyId,
                         link.dstEndpointDesc.loc.device.devPhyId,
-                        srcEid.c_str(), dstEid.c_str(),
+                        srcAddr.c_str(), dstAddr.c_str(),
                         ordinal == routeIndex ? " SELECTED" : "");
             std::fflush(stdout);
             candidates.push_back(link);
@@ -110,6 +109,8 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
     }
     desc.remoteRank = peer;
     desc.notifyNum = CHANNEL_NOTIFY_NUM;
+    desc.memHandles = &memHandle;
+    desc.memHandleNum = 1;
     desc.channelProtocol = link.linkAttr.linkProtocol;
     desc.localEndpoint = link.srcEndpointDesc;
     desc.remoteEndpoint = link.dstEndpointDesc;
@@ -208,7 +209,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, void *recvBuf,
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = SelectChannel(comm, rank, 1U - rank, routeIndex, &created.channel);
+    status = SelectChannel(comm, rank, 1U - rank, routeIndex, memHandle, &created.channel);
     if (status != HCCL_SUCCESS) {
         return status;
     }

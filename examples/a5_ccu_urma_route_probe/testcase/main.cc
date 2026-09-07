@@ -211,6 +211,11 @@ int main(int argc, char **argv)
         thread.join();
     }
 
+    if (failed.load() != 0) {
+        std::cerr << "Probe failed; skip ACL finalization because a rank may still own partially "
+                     "initialized HCCL resources." << std::endl;
+        return failed.load();
+    }
     aclrtFreeHost(rootInfoBuffer);
     aclFinalize();
     return failed.load();
