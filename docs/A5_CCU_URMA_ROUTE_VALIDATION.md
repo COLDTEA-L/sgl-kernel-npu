@@ -55,12 +55,15 @@ cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann/set_env.sh 2>/dev/null || \
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 ```
 
-编译脚本和运行脚本也会自动执行这些环境设置，因此正常情况下不需要每次手工输入。测试脚本默认选择物理卡 `2,5`，并通过 `ASCEND_RT_VISIBLE_DEVICES=2,5` 映射成逻辑 rank 0、1。
+本探针不要在安装前 source `python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash`。该脚本会把
+`ASCEND_CUSTOM_OPP_PATH` 指向 DeepEP vendor 目录；未指定 `--install-path` 的 HCCL 安装包会因此被重定向到
+`python/deep_ep/deep_ep/vendors/hwcomputing`，而不是 CANN 的 `opp/vendors/cust`。
+
+编译和运行脚本会自动 source CANN 环境。测试脚本默认选择物理卡 `2,5`，并通过
+`ASCEND_RT_VISIBLE_DEVICES=2,5` 映射成逻辑 rank 0、1。
 
 确认 CANN 和 HCOMM：
 
@@ -81,13 +84,16 @@ cd /home/liuyuanwen/sgl-kernel-npu
 bash scripts/build_a5_ccu_urma_route_probe.sh
 ```
 
-有卡服务器的 HCCL 仓若位于其他目录，用环境变量指定：
+有卡服务器会自动优先使用 `/home/l00934901/hccl`，直接编译并安装到当前 CANN：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-export HCCL_REPO=/home/l00934901/hccl
-bash scripts/build_a5_ccu_urma_route_probe.sh
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
 ```
+
+如果 HCCL 或 CANN 位于其他目录，再分别设置 `HCCL_REPO` 或修改 `--install-path`。
 
 脚本会输出本次生成的最新 `.run` 包。不要直接用通配符安装多个历史包；按修改时间只选最新包：
 
@@ -104,15 +110,21 @@ LATEST_PACKAGE=$(
 
 test -n "${LATEST_PACKAGE}"
 echo "installing ${LATEST_PACKAGE}"
-"${LATEST_PACKAGE}" --install
+CANN_ROOT=/usr/local/Ascend/cann-9.1.T560
+env -u ASCEND_CUSTOM_OPP_PATH -u ASCEND_OPP_PATH \
+  "${LATEST_PACKAGE}" --quiet --install "--install-path=${CANN_ROOT}"
 ```
 
 安装后确认文件：
 
 ```bash
-ls -l "${ASCEND_HOME_PATH}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
-ls -l "${ASCEND_HOME_PATH}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+ls -l /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/include/a5_ccu_urma_route_probe.h
+ls -l /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
 ```
+
+脚本执行 `--install` 时会自动清除安装子进程中的 `ASCEND_CUSTOM_OPP_PATH` 和 `ASCEND_OPP_PATH`，并强制传入
+CANN 根目录。因此，即使当前 shell 以前 source 过 DeepEP vendor 环境，也不会再安装到代码仓内部。
+`--quiet` 用于更新已安装的同名探针包，避免安装器等待交互输入。
 
 ## 6. 两卡运行和候选路由枚举
 

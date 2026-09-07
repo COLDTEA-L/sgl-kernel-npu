@@ -31,8 +31,10 @@ if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
 elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 fi
-vendor_env="${repo_root}/python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash"
-[[ ! -f "${vendor_env}" ]] || source "${vendor_env}"
+
+# This is an HCCL custom package installed under the active CANN tree.  A
+# DeepEP vendor environment may redirect ASCEND_CUSTOM_OPP_PATH elsewhere.
+unset ASCEND_CUSTOM_OPP_PATH
 
 [[ "${devices}" == *,* && "${devices}" != *,*,* ]] || {
     echo "--devices must contain exactly two physical device IDs, for example 2,5" >&2
