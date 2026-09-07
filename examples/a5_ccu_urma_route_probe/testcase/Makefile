@@ -45,7 +45,7 @@ test:
 
 # Clean build artifacts
 clean:
-	rm ${TARGET}
+	rm -f ${TARGET}
 
 # Help
 help:

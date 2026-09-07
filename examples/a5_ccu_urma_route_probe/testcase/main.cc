@@ -11,11 +11,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,40 +25,12 @@ struct Options {
     uint32_t routeIndex = 0;
 };
 
-class ReusableBarrier {
-public:
-    explicit ReusableBarrier(uint32_t participants) : participants_(participants) {}
-
-    bool Wait()
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        const uint64_t generation = generation_;
-        if (++arrived_ == participants_) {
-            arrived_ = 0;
-            ++generation_;
-            condition_.notify_all();
-            return true;
-        }
-        return condition_.wait_for(lock, std::chrono::seconds(30), [this, generation]() {
-            return generation_ != generation;
-        });
-    }
-
-private:
-    const uint32_t participants_;
-    uint32_t arrived_ = 0;
-    uint64_t generation_ = 0;
-    std::mutex mutex_;
-    std::condition_variable condition_;
-};
-
 struct ThreadContext {
     HcclRootInfo *rootInfo = nullptr;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
     const Options *options = nullptr;
     std::atomic<int> *failed = nullptr;
-    ReusableBarrier *barrier = nullptr;
 };
 
 static void PrintUsage(const char *program)
@@ -128,16 +98,6 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         }                                                                                    \
     } while (0)
 
-#define THREAD_BARRIER_CHECK()                                                               \
-    do {                                                                                     \
-        if (!ctx->barrier->Wait()) {                                                         \
-            std::cerr << "[rank=" << ctx->rank << "] host barrier timed out at "          \
-                      << __FILE__ << ':' << __LINE__ << std::endl;                           \
-            ctx->failed->store(1);                                                          \
-            return;                                                                          \
-        }                                                                                    \
-    } while (0)
-
 static void RunRank(ThreadContext *ctx)
 {
     const uint64_t sendCount = ctx->options->bytes / sizeof(float);
@@ -160,20 +120,12 @@ static void RunRank(ThreadContext *ctx)
     for (uint32_t i = 0; i < ctx->options->warmup; ++i) {
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
-        THREAD_BARRIER_CHECK();
-        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbeReadback(recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
-        THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
-        THREAD_BARRIER_CHECK();
     }
 
     const auto begin = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < ctx->options->iterations; ++i) {
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
-        THREAD_BARRIER_CHECK();
-        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbeReadback(recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
-        THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
-        THREAD_BARRIER_CHECK();
     }
     const auto end = std::chrono::steady_clock::now();
 
@@ -253,11 +205,10 @@ int main(int argc, char **argv)
     }
 
     std::atomic<int> failed{0};
-    ReusableBarrier barrier(rankSize);
     std::vector<ThreadContext> contexts(rankSize);
     std::vector<std::thread> threads;
     for (uint32_t rank = 0; rank < rankSize; ++rank) {
-        contexts[rank] = ThreadContext{rootInfo, rank, rankSize, &options, &failed, &barrier};
+        contexts[rank] = ThreadContext{rootInfo, rank, rankSize, &options, &failed};
         threads.emplace_back(RunRank, &contexts[rank]);
     }
     for (auto &thread : threads) {

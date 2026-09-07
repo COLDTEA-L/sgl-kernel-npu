@@ -15,10 +15,14 @@ set(HCCL_CUSTOM_OPS_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(HCCL_CUSTOM_OPS_INCLUDE_LIST
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/op_host
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel_ccu
     # CANN Toolkit头文件
     ${ASCEND_CANN_PACKAGE_PATH}/include
     ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
     ${ASCEND_CANN_PACKAGE_PATH}/include/hcomm
+    ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
+    ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm
+    ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm/ccu
 )
 
 # Host 动态链接库
@@ -65,3 +69,4 @@ install(FILES
 
 # 添加子目录
 add_subdirectory(op_host)
+add_subdirectory(op_kernel_ccu)

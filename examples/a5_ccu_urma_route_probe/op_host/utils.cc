@@ -1,8 +1,9 @@
 #include "utils.h"
+#include "route_kernel.h"
 
 #include <hccl/hccl_rank_graph.h>
-#include <hcomm/hcomm_primitives.h>
 #include <hcomm/hcomm_res.h>
+#include <hcomm/ccu/hccl_ccu_res.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -15,7 +16,7 @@
 namespace a5_ccu_urma_probe {
 namespace {
 
-constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 3;
 constexpr uint32_t EID_BYTE_NUM = 16;
 
 struct ThreadLocalCache {
@@ -196,19 +197,25 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
         return HCCL_E_RUNTIME;
     }
 
-    status = HcclGetHcclBuffer(comm, &created.localCclBuffer, &created.localCclBufferSize);
-    std::printf("[A5 CCU URMA][rank=%u] local CCL buffer: status=%d addr=%p size=%lu\n",
-                rank, static_cast<int>(status), created.localCclBuffer,
-                static_cast<unsigned long>(created.localCclBufferSize));
+    RouteKernelArg kernelArg(created.channel, routeIndex);
+    hcomm::KernelCreator creator = CreateRouteKernel;
+    CcuKernelHandle kernel = 0;
+    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegister begin\n", rank);
+    std::fflush(stdout);
+    status = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegister end: status=%d kernel=%lu\n",
+                rank, static_cast<int>(status), static_cast<unsigned long>(kernel));
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = HcclChannelGetHcclBuffer(comm, created.channel, &created.remoteCclBuffer,
-                                      &created.remoteCclBufferSize);
-    std::printf("[A5 CCU URMA][rank=%u] remote CCL buffer: status=%d addr=%p size=%lu\n",
-                rank, static_cast<int>(status), created.remoteCclBuffer,
-                static_cast<unsigned long>(created.remoteCclBufferSize));
+    created.kernel = kernel;
+
+    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish begin\n", rank);
+    std::fflush(stdout);
+    status = HcclCcuKernelRegisterFinish(comm);
+    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish end: status=%d\n",
+                rank, static_cast<int>(status));
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;

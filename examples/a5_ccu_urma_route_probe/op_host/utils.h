@@ -13,10 +13,7 @@ namespace a5_ccu_urma_probe {
 struct RouteResources {
     ThreadHandle thread = 0;
     ChannelHandle channel = 0;
-    void *localCclBuffer = nullptr;
-    uint64_t localCclBufferSize = 0;
-    void *remoteCclBuffer = nullptr;
-    uint64_t remoteCclBufferSize = 0;
+    uint64_t kernel = 0;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
 };

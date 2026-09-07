@@ -6,10 +6,11 @@
 
 - `HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)` 获取 CCU engine thread；
 - `COMM_PROTOCOL_UBC_CTP` 建立 HCOMM channel；
-- `HcclGetHcclBuffer/HcclChannelGetHcclBuffer` 获取本端和对端 CCL buffer；
-- `HcommWriteOnThread` 从本端 CCL buffer 写入对端 CCL buffer；
 - `HcclRankGraphGetLayers/GetLinks` 枚举 HCCL/HIXL 已经发布的链路；
 - `A5_CCU_ROUTE_INDEX` 从候选链路中选定一条，并打印源/目的 EID、物理卡号和 `hop`。
+- `HcclCcuKernelRegister/HcclCcuKernelRegisterFinish` 注册真正的 CCU kernel；
+- `HcclCcuKernelLaunch` 把用户 buffer 地址、token 和长度送入 CCU；
+- CCU kernel 使用 `NotifyRecord/NotifyWait` 交换远端地址和 token，并用 `WriteNb/WaitEvent` 完成传输。
 
 这一步验证“CCU 能否通过指定的 RankGraph UBC_CTP 链路正确通信”。它不会凭空构造 RankGraph 中不存在的 `1 -> 3 -> 8` 路由，也还不是最终的绕路 AllToAll。若 RankGraph 只返回一条 UBC_CTP 链路，则只能选择 route 0；后续要继续检查 UVS/HIXL 路由配置，而不是仅修改 CCU kernel。
 
@@ -144,19 +145,24 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 `--bytes 2097152` 表示每个 rank 输入 2 MiB。每个 rank 的接收区为 4 MiB，因为探针当前是两 rank AllGather 语义。
 
-每轮测试分为两个阶段：两端先提交 remote write 并同步 stream；到达进程内 host barrier 后，再把本端 CCL
-buffer 收到的数据拷回输出；最后经过第二个 barrier，避免下一轮覆盖尚未读回的数据。这个两阶段同步仅用于验证
-CCU primitive、CCL buffer 和所选 route 的正确性，输出的 `avg_us` 包含两次 stream 同步、两次 host barrier 和
-读回开销，不能直接当作最终 AllToAll kernel 的性能。
+首次调用会为选中的 channel 注册 CCU kernel。每轮调用中，本 rank 数据通过异步 D2D copy 写入自己的输出切片，
+对端数据由 CCU kernel 直接写入对端用户输出 buffer。两端在 kernel 内交换远端输出地址和 token，并在写入前后
+通过 channel notify 同步；host 侧不再调用 `HcommWriteOnThread`，也不再经过 CCL buffer、读回阶段或 host barrier。
+输出的 `avg_us` 包含一次 CCU launch、一次本地 self copy 和一次 stream synchronize，用于路线正确性及初步对比，
+仍不能直接代表最终多 route AllToAll 的性能。
+
+当前无卡编译镜像的 CANN 9.1 使用公开的 object-style CCU API（`hcomm::CcuKernel`、`WriteNb`）。它与 HCCL
+原生 CCU collective 中“注册 CCU kernel，再由 kernel 发起 write”的执行模型一致；不要把 host HCOMM primitive
+提交到 `COMM_ENGINE_CCU` thread 上。
 
 首次创建 channel 时会打印类似：
 
 ```text
 [A5 CCU URMA][rank=0 peer=1] route=0 layer=0 link=0 protocol=4 hop=... src_phy=2 dst_phy=5 src_addr=type=...,raw=... dst_addr=type=...,raw=... SELECTED
 [A5 CCU URMA][rank=0 peer=1] HcclChannelAcquire end: status=0 channel=...
-[A5 CCU URMA][rank=0] local CCL buffer: status=0 addr=... size=...
-[A5 CCU URMA][rank=0] remote CCL buffer: status=0 addr=... size=...
-[A5 CCU URMA][rank=0] HcommWriteOnThread end: status=0
+[A5 CCU URMA][rank=0] HcclCcuKernelRegister end: status=0 kernel=...
+[A5 CCU URMA][rank=0] HcclCcuKernelRegisterFinish end: status=0
+[A5 CCU URMA][rank=0] HcclCcuKernelLaunch end: status=0
 [rank=0] PASS engine=CCU protocol=UBC_CTP route=0 ...
 ```
 
@@ -216,7 +222,7 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 ## 9. 常见失败与阶段性结论
 
-早期版本直接注册测试程序的 `sendBuf/recvBuf`，并调用 `HcommWriteWithNotifyOnThread`。即使将
+第一版直接注册测试程序的 `sendBuf/recvBuf`，并调用 `HcommWriteWithNotifyOnThread`。即使将
 `HcclCommMemReg` 返回的 handle 填入下面字段、解决 `remote memory ... not found; memNum=0`：
 
 ```cpp
@@ -224,17 +230,22 @@ channelDesc.memHandles = &memHandle;
 channelDesc.memHandleNum = 1;
 ```
 
-实机仍在 `HcommWriteWithNotifyOnThread` 返回 status 5。当前版本改为 HCOMM 文档示例要求的 CCL buffer：
-本端地址来自 `HcclGetHcclBuffer`，对端地址来自 `HcclChannelGetHcclBuffer`，传输 primitive 改为
-`HcommWriteOnThread`。因此当前版本不再注册或交换测试程序内存。
+实机仍在 `HcommWriteWithNotifyOnThread` 返回 status 5。第二版改用 `HcclGetHcclBuffer` 和
+`HcclChannelGetHcclBuffer`，但在 CCU thread 上调用 host primitive `HcommWriteOnThread` 时发生 SIGSEGV。
+日志已经证明 CCL buffer 地址相互匹配，所以根因不是 remote buffer 查找，而是执行模型错误。
+
+当前版本删除 host primitive 和 CCL staging，改为 `HcclCcuKernelRegister` + `HcclCcuKernelLaunch`；用户
+buffer 的 token 由 `hcomm::CcuRep::GetTokenInfo` 生成，真正的 remote write 在 CCU kernel 内执行。这正是本次
+需要验证的修复点。
 
 排障时按日志中的第一个失败点判断：
 
 - `HcclChannelAcquire end: status=9`：所选 route 建链超时，优先核对两端 route/EID 是否互相匹配；
-- `HcommWriteOnThread failed, status=5`：CANN 9.1 当前 host HCOMM API 组合仍不支持 CCU write。下一步不再改
-  host buffer，而是转为 HCCL native custom-op 的 CCU kernel 注册/编排方式；
-- `host barrier timed out`：通常是另一 rank 已在更早的 HCCL/ACL 调用失败，先查另一 rank 的首个错误；
-- CCL buffer 小于 `2 * --bytes`（含 512-byte 对齐）：减小 `--bytes` 或调整 HCCL CCL buffer 配置。
+- `HcclCcuKernelRegister` 或 `RegisterFinish` 非 0：优先核对 CANN/HCCL 版本、CCU kernel API 和 notify 数量；
+- `HcclCcuKernelLaunch` 非 0：检查两 rank 是否选择了对称 route，以及 task 参数和 user-buffer token；
+- launch 返回 0 但 stream synchronize 超时：通常是 CCU kernel 内双方 notify 未匹配，先比较两端第一个错误和
+  所选 channel；
+- 两端 PASS 但更换 route 后链路计数器不变：只能证明功能正确，尚不能证明指定 route 改变了实际转发路径。
 
 失败路径使用 `std::_Exit`，避免部分初始化的 HCCL channel 在 C++/ACL 清理阶段再次触发 SIGSEGV；因此应以
 退出前打印的首个 HCCL/ACL 错误为根因。
