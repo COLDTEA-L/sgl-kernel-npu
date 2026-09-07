@@ -97,23 +97,52 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
         return candidates.empty() ? HCCL_E_NOT_FOUND : HCCL_E_PARA;
     }
 
-    const CommLink &link = candidates[routeIndex];
-    HcclChannelDesc desc;
-    status = HcclChannelDescInit(&desc, 1);
-    if (status != HCCL_SUCCESS) {
-        return status;
+    // HCCL's native A5 2Die collectives acquire every UBC_CTP link in the
+    // selected network layer as one resource group.  A hop-2 layer can contain
+    // one link per die; acquiring only one member times out even when the two
+    // ranks chose symmetric endpoint pairs.  Acquire the whole layer, then
+    // expose only the route requested by the user to the probe kernel.
+    const uint32_t selectedLayer = candidateLayers[routeIndex];
+    std::vector<HcclChannelDesc> descs;
+    uint32_t selectedGroupIndex = UINT32_MAX;
+    for (uint32_t ordinal = 0; ordinal < candidates.size(); ++ordinal) {
+        if (candidateLayers[ordinal] != selectedLayer) {
+            continue;
+        }
+        HcclChannelDesc desc;
+        status = HcclChannelDescInit(&desc, 1);
+        if (status != HCCL_SUCCESS) {
+            return status;
+        }
+        const CommLink &link = candidates[ordinal];
+        desc.remoteRank = peer;
+        desc.notifyNum = CHANNEL_NOTIFY_NUM;
+        desc.channelProtocol = link.linkAttr.linkProtocol;
+        desc.localEndpoint = link.srcEndpointDesc;
+        desc.remoteEndpoint = link.dstEndpointDesc;
+        if (ordinal == routeIndex) {
+            selectedGroupIndex = static_cast<uint32_t>(descs.size());
+        }
+        descs.push_back(desc);
     }
-    desc.remoteRank = peer;
-    desc.notifyNum = CHANNEL_NOTIFY_NUM;
-    desc.channelProtocol = link.linkAttr.linkProtocol;
-    desc.localEndpoint = link.srcEndpointDesc;
-    desc.remoteEndpoint = link.dstEndpointDesc;
-    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u\n",
-                rank, peer, routeIndex, candidateLayers[routeIndex], candidateLinkIndices[routeIndex]);
+    if (selectedGroupIndex == UINT32_MAX || descs.empty()) {
+        return HCCL_E_INTERNAL;
+    }
+
+    std::vector<ChannelHandle> handles(descs.size(), 0);
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u "
+                "as layer group of %zu channel(s)\n",
+                rank, peer, routeIndex, selectedLayer, candidateLinkIndices[routeIndex], descs.size());
     std::fflush(stdout);
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &desc, 1, channel);
-    std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d channel=%lu\n",
-                rank, peer, static_cast<int>(status), static_cast<unsigned long>(*channel));
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, descs.data(),
+                                static_cast<uint32_t>(descs.size()), handles.data());
+    if (status == HCCL_SUCCESS) {
+        *channel = handles[selectedGroupIndex];
+    }
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
+                "group_size=%zu selected_group_index=%u channel=%lu\n",
+                rank, peer, static_cast<int>(status), handles.size(), selectedGroupIndex,
+                static_cast<unsigned long>(status == HCCL_SUCCESS ? *channel : 0));
     std::fflush(stdout);
     return status;
 }

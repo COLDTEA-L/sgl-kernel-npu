@@ -187,6 +187,12 @@ done
 
 超出候选数量会明确报 `route index ... is out of range`。两端 rank 必须选择相同序号且形成相互匹配的 EID 对，否则 channel 建链会失败或通信超时。
 
+对于同一 network layer 中的多条链路（A5 的 hop-2/2Die 场景通常如此），探针会仿照 HCCL 原生
+2Die AllToAll，把该 layer 的全部 UBC_CTP channel 作为一个资源组传给 `HcclChannelAcquire`，随后只把
+`--route-index` 选中的 channel 注册进探针 kernel。日志中的 `group_size` 是建链时成组申请的 channel 数，
+`selected_group_index` 是实际用于传输的成员。route 0 所在 layer 只有一条链路时，`group_size=1`；route 1/2
+若位于同一个 hop-2 layer，通常会显示 `group_size=2`。
+
 ## 7. 使用 msprof
 
 运行脚本的 `--profile` 会把结果写入 `/home/l00934901/profiling`，并导出本次发现的全部 `PROF_*` 目录：
