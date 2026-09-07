@@ -10,8 +10,12 @@ using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteResources;
 
 namespace {
-constexpr uint32_t NOTIFY_INDEX = 0;
-constexpr uint32_t NOTIFY_TIMEOUT_MS = 60000;
+constexpr uint64_t CCL_BUFFER_ALIGNMENT = 512;
+
+uint64_t AlignUp(uint64_t value, uint64_t alignment)
+{
+    return (value + alignment - 1) / alignment * alignment;
+}
 
 HcclResult ConvertHcommStatus(const char *operation, int32_t status)
 {
@@ -36,31 +40,68 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
 
     const uint64_t bytes = sendCount * sizeof(float);
     RouteResources resources;
-    HcclResult status = GetRouteResources(comm, stream, recvBuf, bytes * 2, &resources);
+    HcclResult status = GetRouteResources(comm, stream, &resources);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    if (resources.remoteRecv.type != COMM_MEM_TYPE_DEVICE || resources.remoteRecv.size < bytes * 2) {
-        std::fprintf(stderr, "[A5 CCU URMA] invalid remote receive memory: type=%d size=%lu\n",
-                     static_cast<int>(resources.remoteRecv.type),
-                     static_cast<unsigned long>(resources.remoteRecv.size));
+    const uint64_t recvOffset = AlignUp(bytes, CCL_BUFFER_ALIGNMENT);
+    const uint64_t requiredBytes = recvOffset + bytes;
+    if (resources.localCclBufferSize < requiredBytes || resources.remoteCclBufferSize < requiredBytes) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA] CCL buffer too small: required=%lu local=%lu remote=%lu\n",
+            static_cast<unsigned long>(requiredBytes),
+            static_cast<unsigned long>(resources.localCclBufferSize),
+            static_cast<unsigned long>(resources.remoteCclBufferSize));
         return HCCL_E_PARA;
     }
 
+    auto *localSend = static_cast<uint8_t *>(resources.localCclBuffer);
+    auto *remoteRecv = static_cast<uint8_t *>(resources.remoteCclBuffer) + recvOffset;
     auto *localDst = static_cast<uint8_t *>(recvBuf) + resources.rank * bytes;
-    auto *remoteDst = static_cast<uint8_t *>(resources.remoteRecv.addr) + resources.rank * bytes;
     status = ConvertHcommStatus("HcommLocalCopyOnThread",
+        HcommLocalCopyOnThread(resources.thread, localSend, sendBuf, bytes));
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+    status = ConvertHcommStatus("HcommLocalCopyOnThread(self)",
         HcommLocalCopyOnThread(resources.thread, localDst, sendBuf, bytes));
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = ConvertHcommStatus("HcommWriteWithNotifyOnThread",
-        HcommWriteWithNotifyOnThread(resources.thread, resources.channel, remoteDst,
-                                     sendBuf, bytes, NOTIFY_INDEX));
+    std::printf("[A5 CCU URMA][rank=%u] HcommWriteOnThread begin: bytes=%lu\n",
+                resources.rank, static_cast<unsigned long>(bytes));
+    std::fflush(stdout);
+    status = ConvertHcommStatus("HcommWriteOnThread",
+        HcommWriteOnThread(resources.thread, resources.channel, remoteRecv, localSend, bytes));
+    std::printf("[A5 CCU URMA][rank=%u] HcommWriteOnThread end: status=%d\n",
+                resources.rank, static_cast<int>(status));
+    std::fflush(stdout);
+    return status;
+}
+
+extern "C" HcclResult HcclCcuUrmaRouteProbeReadback(void *recvBuf,
+    uint64_t sendCount, HcclDataType dataType, HcclComm comm, aclrtStream stream)
+{
+    if (recvBuf == nullptr || comm == nullptr || stream == nullptr) {
+        return HCCL_E_PTR;
+    }
+    if (dataType != HCCL_DATA_TYPE_FP32) {
+        return HCCL_E_NOT_SUPPORT;
+    }
+
+    const uint64_t bytes = sendCount * sizeof(float);
+    RouteResources resources;
+    HcclResult status = GetRouteResources(comm, stream, &resources);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    return ConvertHcommStatus("HcommChannelNotifyWaitOnThread",
-        HcommChannelNotifyWaitOnThread(resources.thread, resources.channel,
-                                       NOTIFY_INDEX, NOTIFY_TIMEOUT_MS));
+    const uint64_t recvOffset = AlignUp(bytes, CCL_BUFFER_ALIGNMENT);
+    if (resources.localCclBufferSize < recvOffset + bytes) {
+        return HCCL_E_PARA;
+    }
+    const uint32_t peer = 1U - resources.rank;
+    auto *localRecv = static_cast<uint8_t *>(resources.localCclBuffer) + recvOffset;
+    auto *output = static_cast<uint8_t *>(recvBuf) + peer * bytes;
+    return ConvertHcommStatus("HcommLocalCopyOnThread(readback)",
+        HcommLocalCopyOnThread(resources.thread, output, localRecv, bytes));
 }

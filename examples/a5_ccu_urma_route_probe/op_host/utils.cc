@@ -2,11 +2,11 @@
 
 #include <hccl/hccl_rank_graph.h>
 #include <hcomm/hcomm_primitives.h>
+#include <hcomm/hcomm_res.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -17,15 +17,11 @@ namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
 constexpr uint32_t EID_BYTE_NUM = 16;
-constexpr char RECV_MEM_TAG[] = "a5_ccu_urma_route_probe_recv";
 
 struct ThreadLocalCache {
     HcclComm comm = nullptr;
     aclrtStream stream = nullptr;
-    void *recvBuf = nullptr;
-    uint64_t recvBytes = 0;
     uint32_t routeIndex = UINT32_MAX;
-    HcclMemHandle memHandle = nullptr;
     RouteResources resources{};
 };
 
@@ -46,8 +42,7 @@ std::string CommAddrToString(const CommAddr &addr)
 }
 
 HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, HcclMemHandle memHandle,
-                         ChannelHandle *channel)
+                         uint32_t routeIndex, ChannelHandle *channel)
 {
     uint32_t layerNum = 0;
     uint32_t *layers = nullptr;
@@ -109,35 +104,17 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
     }
     desc.remoteRank = peer;
     desc.notifyNum = CHANNEL_NOTIFY_NUM;
-    desc.memHandles = &memHandle;
-    desc.memHandleNum = 1;
     desc.channelProtocol = link.linkAttr.linkProtocol;
     desc.localEndpoint = link.srcEndpointDesc;
     desc.remoteEndpoint = link.dstEndpointDesc;
     std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u\n",
                 rank, peer, routeIndex, candidateLayers[routeIndex], candidateLinkIndices[routeIndex]);
     std::fflush(stdout);
-    return HcclChannelAcquire(comm, COMM_ENGINE_CCU, &desc, 1, channel);
-}
-
-HcclResult FindRemoteRecv(HcclComm comm, ChannelHandle channel, CommMem *remoteRecv)
-{
-    uint32_t memNum = 0;
-    CommMem *remoteMems = nullptr;
-    char **memTags = nullptr;
-    HcclResult status = HcclChannelGetRemoteMems(comm, channel, &memNum, &remoteMems, &memTags);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-    for (uint32_t i = 0; i < memNum; ++i) {
-        if (memTags[i] != nullptr && std::strcmp(memTags[i], RECV_MEM_TAG) == 0) {
-            *remoteRecv = remoteMems[i];
-            return HCCL_SUCCESS;
-        }
-    }
-    std::fprintf(stderr, "[A5 CCU URMA] remote memory tag %s not found; memNum=%u\n",
-                 RECV_MEM_TAG, memNum);
-    return HCCL_E_NOT_FOUND;
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &desc, 1, channel);
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d channel=%lu\n",
+                rank, peer, static_cast<int>(status), static_cast<unsigned long>(*channel));
+    std::fflush(stdout);
+    return status;
 }
 
 } // namespace
@@ -163,10 +140,9 @@ HcclResult GetCcuRouteIndex(uint32_t *routeIndex)
     return HCCL_SUCCESS;
 }
 
-HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, void *recvBuf,
-                             uint64_t recvBytes, RouteResources *resources)
+HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *resources)
 {
-    if (comm == nullptr || stream == nullptr || recvBuf == nullptr || resources == nullptr) {
+    if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
     }
     uint32_t routeIndex = 0;
@@ -174,8 +150,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, void *recvBuf,
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    if (g_cache.comm == comm && g_cache.stream == stream && g_cache.recvBuf == recvBuf &&
-        g_cache.recvBytes == recvBytes && g_cache.routeIndex == routeIndex) {
+    if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeIndex == routeIndex) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;
     }
@@ -195,35 +170,53 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, void *recvBuf,
         return HCCL_E_PARA;
     }
 
-    CommMem localRecv{COMM_MEM_TYPE_DEVICE, recvBuf, recvBytes};
-    HcclMemHandle memHandle = nullptr;
-    status = HcclCommMemReg(comm, RECV_MEM_TAG, &localRecv, &memHandle);
+    RouteResources created;
+    created.rank = rank;
+    created.rankSize = rankSize;
+    std::printf("[A5 CCU URMA][rank=%u] HcclThreadAcquireWithStream(CCU) begin\n", rank);
+    std::fflush(stdout);
+    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, 0, &created.thread);
+    std::printf("[A5 CCU URMA][rank=%u] HcclThreadAcquireWithStream end: status=%d thread=%lu\n",
+                rank, static_cast<int>(status), static_cast<unsigned long>(created.thread));
+    std::fflush(stdout);
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+    status = SelectChannel(comm, rank, 1U - rank, routeIndex, &created.channel);
     if (status != HCCL_SUCCESS) {
         return status;
     }
 
-    RouteResources created;
-    created.rank = rank;
-    created.rankSize = rankSize;
-    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, 0, &created.thread);
+    int32_t channelState = -1;
+    const int32_t channelStatus = HcommChannelGetStatus(&created.channel, 1, &channelState);
+    std::printf("[A5 CCU URMA][rank=%u] HcommChannelGetStatus: call_status=%d channel_state=%d\n",
+                rank, channelStatus, channelState);
+    std::fflush(stdout);
+    if (channelStatus != 0) {
+        return HCCL_E_RUNTIME;
+    }
+
+    status = HcclGetHcclBuffer(comm, &created.localCclBuffer, &created.localCclBufferSize);
+    std::printf("[A5 CCU URMA][rank=%u] local CCL buffer: status=%d addr=%p size=%lu\n",
+                rank, static_cast<int>(status), created.localCclBuffer,
+                static_cast<unsigned long>(created.localCclBufferSize));
+    std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = SelectChannel(comm, rank, 1U - rank, routeIndex, memHandle, &created.channel);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-    status = FindRemoteRecv(comm, created.channel, &created.remoteRecv);
+    status = HcclChannelGetHcclBuffer(comm, created.channel, &created.remoteCclBuffer,
+                                      &created.remoteCclBufferSize);
+    std::printf("[A5 CCU URMA][rank=%u] remote CCL buffer: status=%d addr=%p size=%lu\n",
+                rank, static_cast<int>(status), created.remoteCclBuffer,
+                static_cast<unsigned long>(created.remoteCclBufferSize));
+    std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
     }
 
     g_cache.comm = comm;
     g_cache.stream = stream;
-    g_cache.recvBuf = recvBuf;
-    g_cache.recvBytes = recvBytes;
     g_cache.routeIndex = routeIndex;
-    g_cache.memHandle = memHandle;
     g_cache.resources = created;
     *resources = created;
     return HCCL_SUCCESS;

@@ -23,6 +23,10 @@ extern "C" {
 HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCount, HcclDataType dataType, HcclComm comm,
                                aclrtStream stream);
 
+HcclResult HcclCcuUrmaRouteProbeReadback(void *recvBuf, uint64_t sendCount,
+                                        HcclDataType dataType, HcclComm comm,
+                                        aclrtStream stream);
+
 #ifdef __cplusplus
 }
 #endif

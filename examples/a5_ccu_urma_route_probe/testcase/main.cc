@@ -11,9 +11,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,12 +27,40 @@ struct Options {
     uint32_t routeIndex = 0;
 };
 
+class ReusableBarrier {
+public:
+    explicit ReusableBarrier(uint32_t participants) : participants_(participants) {}
+
+    bool Wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const uint64_t generation = generation_;
+        if (++arrived_ == participants_) {
+            arrived_ = 0;
+            ++generation_;
+            condition_.notify_all();
+            return true;
+        }
+        return condition_.wait_for(lock, std::chrono::seconds(30), [this, generation]() {
+            return generation_ != generation;
+        });
+    }
+
+private:
+    const uint32_t participants_;
+    uint32_t arrived_ = 0;
+    uint64_t generation_ = 0;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+};
+
 struct ThreadContext {
     HcclRootInfo *rootInfo = nullptr;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
     const Options *options = nullptr;
     std::atomic<int> *failed = nullptr;
+    ReusableBarrier *barrier = nullptr;
 };
 
 static void PrintUsage(const char *program)
@@ -98,6 +128,16 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         }                                                                                    \
     } while (0)
 
+#define THREAD_BARRIER_CHECK()                                                               \
+    do {                                                                                     \
+        if (!ctx->barrier->Wait()) {                                                         \
+            std::cerr << "[rank=" << ctx->rank << "] host barrier timed out at "          \
+                      << __FILE__ << ':' << __LINE__ << std::endl;                           \
+            ctx->failed->store(1);                                                          \
+            return;                                                                          \
+        }                                                                                    \
+    } while (0)
+
 static void RunRank(ThreadContext *ctx)
 {
     const uint64_t sendCount = ctx->options->bytes / sizeof(float);
@@ -120,18 +160,27 @@ static void RunRank(ThreadContext *ctx)
     for (uint32_t i = 0; i < ctx->options->warmup; ++i) {
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
+        THREAD_BARRIER_CHECK();
+        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbeReadback(recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
+        THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
+        THREAD_BARRIER_CHECK();
     }
 
     const auto begin = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < ctx->options->iterations; ++i) {
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
+        THREAD_BARRIER_CHECK();
+        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbeReadback(recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
+        THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
+        THREAD_BARRIER_CHECK();
     }
     const auto end = std::chrono::steady_clock::now();
 
     std::vector<float> output(recvBytes / sizeof(float));
     THREAD_ACL_CHECK(aclrtMemcpy(output.data(), recvBytes, recvBuf, recvBytes, ACL_MEMCPY_DEVICE_TO_HOST));
-    for (uint32_t sourceRank = 0; sourceRank < ctx->rankSize; ++sourceRank) {
+    bool verified = true;
+    for (uint32_t sourceRank = 0; sourceRank < ctx->rankSize && verified; ++sourceRank) {
         const float expected = static_cast<float>(sourceRank + 1);
         const uint64_t offset = sourceRank * sendCount;
         for (uint64_t i = 0; i < sendCount; ++i) {
@@ -140,16 +189,19 @@ static void RunRank(ThreadContext *ctx)
                           << " element=" << i << " expected=" << expected
                           << " actual=" << output[offset + i] << std::endl;
                 ctx->failed->store(1);
+                verified = false;
                 break;
             }
         }
     }
 
     const double totalUs = std::chrono::duration<double, std::micro>(end - begin).count();
-    std::cout << "[rank=" << ctx->rank << "] PASS engine=CCU protocol=UBC_CTP route="
-              << ctx->options->routeIndex << " bytes_per_rank=" << ctx->options->bytes
-              << " warmup=" << ctx->options->warmup << " iterations=" << ctx->options->iterations
-              << " avg_us=" << totalUs / ctx->options->iterations << std::endl;
+    if (verified) {
+        std::cout << "[rank=" << ctx->rank << "] PASS engine=CCU protocol=UBC_CTP route="
+                  << ctx->options->routeIndex << " bytes_per_rank=" << ctx->options->bytes
+                  << " warmup=" << ctx->options->warmup << " iterations=" << ctx->options->iterations
+                  << " avg_us=" << totalUs / ctx->options->iterations << std::endl;
+    }
 
     THREAD_HCCL_CHECK(HcclCommDestroy(comm));
     THREAD_ACL_CHECK(aclrtFree(sendBuf));
@@ -201,10 +253,11 @@ int main(int argc, char **argv)
     }
 
     std::atomic<int> failed{0};
+    ReusableBarrier barrier(rankSize);
     std::vector<ThreadContext> contexts(rankSize);
     std::vector<std::thread> threads;
     for (uint32_t rank = 0; rank < rankSize; ++rank) {
-        contexts[rank] = ThreadContext{rootInfo, rank, rankSize, &options, &failed};
+        contexts[rank] = ThreadContext{rootInfo, rank, rankSize, &options, &failed, &barrier};
         threads.emplace_back(RunRank, &contexts[rank]);
     }
     for (auto &thread : threads) {
@@ -214,7 +267,9 @@ int main(int argc, char **argv)
     if (failed.load() != 0) {
         std::cerr << "Probe failed; skip ACL finalization because a rank may still own partially "
                      "initialized HCCL resources." << std::endl;
-        return failed.load();
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(failed.load());
     }
     aclrtFreeHost(rootInfoBuffer);
     aclFinalize();

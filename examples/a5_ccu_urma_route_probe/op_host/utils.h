@@ -13,15 +13,17 @@ namespace a5_ccu_urma_probe {
 struct RouteResources {
     ThreadHandle thread = 0;
     ChannelHandle channel = 0;
-    CommMem remoteRecv{};
+    void *localCclBuffer = nullptr;
+    uint64_t localCclBufferSize = 0;
+    void *remoteCclBuffer = nullptr;
+    uint64_t remoteCclBufferSize = 0;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
 };
 
 HcclResult GetCcuRouteIndex(uint32_t *routeIndex);
 
-HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, void *recvBuf,
-                             uint64_t recvBytes, RouteResources *resources);
+HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *resources);
 
 } // namespace a5_ccu_urma_probe
 

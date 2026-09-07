@@ -6,7 +6,8 @@
 
 - `HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)` 获取 CCU engine thread；
 - `COMM_PROTOCOL_UBC_CTP` 建立 HCOMM channel；
-- `HcommWriteWithNotifyOnThread` 和 `HcommChannelNotifyWaitOnThread` 下发传输与同步；
+- `HcclGetHcclBuffer/HcclChannelGetHcclBuffer` 获取本端和对端 CCL buffer；
+- `HcommWriteOnThread` 从本端 CCL buffer 写入对端 CCL buffer；
 - `HcclRankGraphGetLayers/GetLinks` 枚举 HCCL/HIXL 已经发布的链路；
 - `A5_CCU_ROUTE_INDEX` 从候选链路中选定一条，并打印源/目的 EID、物理卡号和 `hop`。
 
@@ -143,10 +144,19 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 `--bytes 2097152` 表示每个 rank 输入 2 MiB。每个 rank 的接收区为 4 MiB，因为探针当前是两 rank AllGather 语义。
 
+每轮测试分为两个阶段：两端先提交 remote write 并同步 stream；到达进程内 host barrier 后，再把本端 CCL
+buffer 收到的数据拷回输出；最后经过第二个 barrier，避免下一轮覆盖尚未读回的数据。这个两阶段同步仅用于验证
+CCU primitive、CCL buffer 和所选 route 的正确性，输出的 `avg_us` 包含两次 stream 同步、两次 host barrier 和
+读回开销，不能直接当作最终 AllToAll kernel 的性能。
+
 首次创建 channel 时会打印类似：
 
 ```text
 [A5 CCU URMA][rank=0 peer=1] route=0 layer=0 link=0 protocol=4 hop=... src_phy=2 dst_phy=5 src_addr=type=...,raw=... dst_addr=type=...,raw=... SELECTED
+[A5 CCU URMA][rank=0 peer=1] HcclChannelAcquire end: status=0 channel=...
+[A5 CCU URMA][rank=0] local CCL buffer: status=0 addr=... size=...
+[A5 CCU URMA][rank=0] remote CCL buffer: status=0 addr=... size=...
+[A5 CCU URMA][rank=0] HcommWriteOnThread end: status=0
 [rank=0] PASS engine=CCU protocol=UBC_CTP route=0 ...
 ```
 
@@ -204,16 +214,27 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 若 RankGraph 已暴露多条满足要求的链路，下一步把相同的 channel 选择逻辑接入 AllToAll，并按多条 route 并发切片。若只有一条链路，则先在 UVS/HIXL 拓扑配置中创建并发布新的 EID 对/路由，再继续算子实现。
 
-## 9. `remote memory ... not found; memNum=0`
+## 9. 常见失败与阶段性结论
 
-`HcclCommMemReg` 只注册本地内存。要让建链过程把内存描述交换给对端，还必须在
-`HcclChannelAcquire` 前把返回的 handle 填入：
+早期版本直接注册测试程序的 `sendBuf/recvBuf`，并调用 `HcommWriteWithNotifyOnThread`。即使将
+`HcclCommMemReg` 返回的 handle 填入下面字段、解决 `remote memory ... not found; memNum=0`：
 
 ```cpp
 channelDesc.memHandles = &memHandle;
 channelDesc.memHandleNum = 1;
 ```
 
-提交中已经包含该处理。如果仍看到 `memNum=0`，先确认拉取了包含此修复的最新提交、重新编译并安装了
-最新 `.run` 包，再用 `strings` 或文件时间确认 CANN 目录中的 `.so` 不是旧包。测试程序在初始化失败时会跳过
-`aclFinalize`，避免残留的部分初始化 HCCL 资源触发二次 SIGSEGV；首个 HCCL 错误仍是需要分析的根因。
+实机仍在 `HcommWriteWithNotifyOnThread` 返回 status 5。当前版本改为 HCOMM 文档示例要求的 CCL buffer：
+本端地址来自 `HcclGetHcclBuffer`，对端地址来自 `HcclChannelGetHcclBuffer`，传输 primitive 改为
+`HcommWriteOnThread`。因此当前版本不再注册或交换测试程序内存。
+
+排障时按日志中的第一个失败点判断：
+
+- `HcclChannelAcquire end: status=9`：所选 route 建链超时，优先核对两端 route/EID 是否互相匹配；
+- `HcommWriteOnThread failed, status=5`：CANN 9.1 当前 host HCOMM API 组合仍不支持 CCU write。下一步不再改
+  host buffer，而是转为 HCCL native custom-op 的 CCU kernel 注册/编排方式；
+- `host barrier timed out`：通常是另一 rank 已在更早的 HCCL/ACL 调用失败，先查另一 rank 的首个错误；
+- CCL buffer 小于 `2 * --bytes`（含 512-byte 对齐）：减小 `--bytes` 或调整 HCCL CCL buffer 配置。
+
+失败路径使用 `std::_Exit`，避免部分初始化的 HCCL channel 在 C++/ACL 清理阶段再次触发 SIGSEGV；因此应以
+退出前打印的首个 HCCL/ACL 错误为根因。
