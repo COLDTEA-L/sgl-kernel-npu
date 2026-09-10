@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteResources;
@@ -16,6 +17,7 @@ using a5_ccu_urma_probe::RouteResources;
 namespace {
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
+constexpr uint64_t PATH_ALIGNMENT = 256;
 
 bool EnvEnabled(const char *name)
 {
@@ -59,9 +61,27 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
         reinterpret_cast<uint64_t>(sendBuf), bytes);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), bytes * resources.rankSize);
+    uint64_t totalWeight = 0;
+    for (const uint32_t weight : resources.weights) {
+        totalWeight += weight;
+    }
+    std::vector<uint64_t> sourceOffsets;
+    std::vector<uint64_t> remoteOffsets;
+    std::vector<uint64_t> pathBytes;
+    uint64_t assigned = 0;
+    for (size_t i = 0; i < resources.weights.size(); ++i) {
+        uint64_t currentBytes = bytes - assigned;
+        if (i + 1 != resources.weights.size()) {
+            currentBytes = (bytes * resources.weights[i] / totalWeight) / PATH_ALIGNMENT * PATH_ALIGNMENT;
+        }
+        sourceOffsets.push_back(assigned);
+        remoteOffsets.push_back(resources.rank * bytes + assigned);
+        pathBytes.push_back(currentBytes);
+        assigned += currentBytes;
+    }
     a5_ccu_urma_probe::RouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
-        inputToken, outputToken, bytes, resources.rank * bytes);
+        inputToken, outputToken, sourceOffsets, remoteOffsets, pathBytes);
 
     if (resources.routeThread != resources.mainThread) {
         status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(

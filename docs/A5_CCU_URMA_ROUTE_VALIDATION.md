@@ -365,3 +365,75 @@ buffer 的 token 由 `hcomm::CcuRep::GetTokenInfo` 生成，真正的 remote wri
 
 失败路径使用 `std::_Exit`，避免部分初始化的 HCCL channel 在 C++/ACL 清理阶段再次触发 SIGSEGV；因此应以
 退出前打印的首个 HCCL/ACL 错误为根因。
+
+## 10. 多 route CCU 并发
+
+本分支支持把同一 IO Die 上的多条 HCOMM channel 一次交给 CCU kernel。kernel 会先对所有 channel 下发
+非阻塞 `WriteNb`，然后统一等待完成，避免 `write/wait/write/wait` 造成路径串行。
+
+例如 6、7 卡当前的 route0 和 route2 都位于 die1，可直接验证双路径：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 6,7 \
+  --route-indices 0,2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only
+```
+
+数据按权重切分：route0（direct）权重为 2，其余 route 权重为 1。选择 direct 加六条 relay 时总权重为 8，
+direct 搬运总数据的 1/4，每条 relay 搬运 1/8。切片按 256 字节对齐，余数由最后一条路径处理。
+
+当前一个 CCU kernel 只能包含同一 die 的 channel；跨 die 路径会明确返回 `HCCL_E_NOT_SUPPORT`，需要拆成
+die0/die1 两个 kernel 后再并发 launch，不能把跨 die channel 强行交给一个 CCU thread。
+
+## 11. RankGraph 未暴露路径时的 source-route provider
+
+公开 UMDK 的 `uvs_route_t.hops` 当前注明只支持 direct route，URMA WRITE WR 也只有目标 tjetty/segment，
+没有 relay rank 或 hop-list。因此本仓不能仅靠修改算子安装 IO Die forwarding 规则。
+
+本分支新增 `a5_uvs_source_route_provider.h` ABI。平台 UVS/HIXL provider 必须完成两件事：
+
+1. 根据 manifest 在 UVS/驱动/IO Die 中安装正反向 source-route/next-hop 规则；
+2. 返回能够被 `HcclChannelAcquire` 使用的显式 `HcclChannelDesc`、die、relay 物理卡和权重。
+
+provider 不能只替换目标 EID；没有实际安装 forwarding rule 的 descriptor 不满足接口约定。
+
+运行形式：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 6,7 \
+  --source-route-manifest /home/l00934901/routes/6_to_7.yaml \
+  --source-route-provider /usr/local/lib64/liba5_uvs_source_route_provider.so \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only
+```
+
+若 provider 未安装或不支持底层 source-route，程序会明确失败，不会静默退化成 route0。这样可以防止把普通
+直连误判为“0～5 卡均参与了 relay”。
+
+编译并安装最新包：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/build_a5_ccu_urma_route_probe.sh
+
+latest_pkg=$(find /home/l00934901/hccl/build_out -maxdepth 1 -type f \
+  -name 'cann-hccl_custom_ccu_urma_route_probe_linux-aarch64.run' \
+  -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+test -n "${latest_pkg}"
+bash "${latest_pkg}" --install
+```
+
+验收“指定 0～5 转发”必须同时看到 provider 返回六个不同 `relayPhyId`，并通过 IO Die 路径计数器确认对应
+字节增长。只有 CCU kernel PASS 不能证明具体中转卡。

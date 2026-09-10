@@ -1,11 +1,13 @@
 #include "utils.h"
 #include "route_kernel.h"
+#include "source_route_provider.h"
 
 #include <hccl/hccl_rank_graph.h>
 #include <hcomm/hcomm_res.h>
 #include <hcomm/ccu/hccl_ccu_res.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +26,7 @@ constexpr uint32_t EID_BYTE_NUM = 16;
 struct ThreadLocalCache {
     HcclComm comm = nullptr;
     aclrtStream stream = nullptr;
-    uint32_t routeIndex = UINT32_MAX;
+    std::string routeKey;
     RouteResources resources{};
 };
 
@@ -213,17 +215,63 @@ HcclResult GetCcuRouteIndex(uint32_t *routeIndex)
     return HCCL_SUCCESS;
 }
 
+HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices)
+{
+    if (routeIndices == nullptr) {
+        return HCCL_E_PTR;
+    }
+    routeIndices->clear();
+    const char *multiValue = std::getenv("A5_CCU_ROUTE_INDICES");
+    if (multiValue == nullptr || multiValue[0] == '\0') {
+        uint32_t routeIndex = 0;
+        HcclResult status = GetCcuRouteIndex(&routeIndex);
+        if (status == HCCL_SUCCESS) {
+            routeIndices->push_back(routeIndex);
+        }
+        return status;
+    }
+    std::stringstream input(multiValue);
+    std::string item;
+    while (std::getline(input, item, ',')) {
+        if (item.empty()) {
+            return HCCL_E_PARA;
+        }
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(item.c_str(), &end, 10);
+        if (errno != 0 || end == item.c_str() || *end != '\0' || parsed > UINT32_MAX) {
+            std::fprintf(stderr, "[A5 CCU URMA] invalid route list: %s\n", multiValue);
+            return HCCL_E_PARA;
+        }
+        const uint32_t value = static_cast<uint32_t>(parsed);
+        if (std::find(routeIndices->begin(), routeIndices->end(), value) != routeIndices->end()) {
+            std::fprintf(stderr, "[A5 CCU URMA] duplicate route index %u\n", value);
+            return HCCL_E_PARA;
+        }
+        routeIndices->push_back(value);
+    }
+    if (routeIndices->empty() || routeIndices->size() > 8) {
+        return HCCL_E_PARA;
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *resources)
 {
     if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
     }
-    uint32_t routeIndex = 0;
-    HcclResult status = GetCcuRouteIndex(&routeIndex);
+    std::vector<uint32_t> routeIndices;
+    HcclResult status = GetCcuRouteIndices(&routeIndices);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeIndex == routeIndex) {
+    const char *routeKeyValue = std::getenv("A5_CCU_ROUTE_INDICES");
+    const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
+    const std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
+        std::string("provider:") + manifestValue :
+        (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue));
+    if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;
     }
@@ -246,11 +294,49 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     RouteResources created;
     created.rank = rank;
     created.rankSize = rankSize;
-    HcclChannelDesc selectedDesc;
-    status = SelectRoute(comm, rank, 1U - rank, routeIndex,
-                         &selectedDesc, &created.dieId);
-    if (status != HCCL_SUCCESS) {
-        return status;
+    std::vector<HcclChannelDesc> selectedDescs;
+    std::vector<A5UvsSourceRoute> providerRoutes;
+    if (manifestValue != nullptr && manifestValue[0] != '\0') {
+        status = LoadProviderRoutes(comm, rank, 1U - rank, &providerRoutes);
+        if (status != HCCL_SUCCESS) {
+            return status;
+        }
+        for (const auto &route : providerRoutes) {
+            selectedDescs.push_back(route.channel);
+            created.routeIndices.push_back(route.routeId);
+            created.weights.push_back(route.weight == 0 ? 1U : route.weight);
+            if (selectedDescs.size() == 1) {
+                created.dieId = route.dieId;
+            } else if (route.dieId != created.dieId) {
+                std::fprintf(stderr, "[A5 CCU URMA] provider routes span multiple dies; "
+                             "current kernel requires one route group per die\n");
+                return HCCL_E_NOT_SUPPORT;
+            }
+            std::printf("[A5 CCU URMA][rank=%u] provider route=%u relay_phy=%u die=%u weight=%u\n",
+                        rank, route.routeId, route.relayPhyId, route.dieId,
+                        route.weight == 0 ? 1U : route.weight);
+        }
+        routeIndices = created.routeIndices;
+    } else {
+        selectedDescs.resize(routeIndices.size());
+        created.routeIndices = routeIndices;
+        created.weights.reserve(routeIndices.size());
+        for (size_t i = 0; i < routeIndices.size(); ++i) {
+            uint32_t dieId = 0;
+            status = SelectRoute(comm, rank, 1U - rank, routeIndices[i],
+                                 &selectedDescs[i], &dieId);
+            if (status != HCCL_SUCCESS) {
+                return status;
+            }
+            if (i == 0) {
+                created.dieId = dieId;
+            } else if (dieId != created.dieId) {
+                std::fprintf(stderr, "[A5 CCU URMA] selected routes span die %u and die %u; "
+                             "split them into one CCU kernel per die\n", created.dieId, dieId);
+                return HCCL_E_NOT_SUPPORT;
+            }
+            created.weights.push_back(routeIndices[i] == 0 ? 2U : 1U);
+        }
     }
 
     std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread begin\n", rank);
@@ -286,43 +372,48 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
 
     std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u die_id=%u "
                 "after all required CCU threads are ready\n",
-                rank, 1U - rank, routeIndex, created.dieId);
+                rank, 1U - rank, routeIndices.front(), created.dieId);
     std::fflush(stdout);
     const auto acquireBegin = std::chrono::steady_clock::now();
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &selectedDesc, 1, &created.channel);
+    created.channels.resize(selectedDescs.size());
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, selectedDescs.data(),
+                                static_cast<uint32_t>(selectedDescs.size()), created.channels.data());
     const auto acquireEnd = std::chrono::steady_clock::now();
     const double acquireUs = std::chrono::duration<double, std::micro>(
         acquireEnd - acquireBegin).count();
     std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
                 "die_id=%u channel=%lu acquire_us=%.3f\n",
                 rank, 1U - rank, static_cast<int>(status), created.dieId,
-                static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channel : 0), acquireUs);
+                static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channels.front() : 0), acquireUs);
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
     }
 
-    int32_t channelState = -1;
-    const int32_t channelStatus = HcommChannelGetStatus(&created.channel, 1, &channelState);
-    std::printf("[A5 CCU URMA][rank=%u] HcommChannelGetStatus: call_status=%d channel_state=%d\n",
-                rank, channelStatus, channelState);
-    std::fflush(stdout);
+    std::vector<int32_t> channelStates(created.channels.size(), -1);
+    const int32_t channelStatus = HcommChannelGetStatus(created.channels.data(),
+        static_cast<uint32_t>(created.channels.size()), channelStates.data());
     if (channelStatus != 0) {
         return HCCL_E_RUNTIME;
     }
+    for (size_t i = 0; i < channelStates.size(); ++i) {
+        std::printf("[A5 CCU URMA][rank=%u] channel[%zu] route=%u state=%d\n",
+                    rank, i, created.routeIndices[i], channelStates[i]);
+    }
+    std::fflush(stdout);
 
     if (EnvEnabled("A5_CCU_CHANNEL_ONLY")) {
         std::printf("[A5 CCU URMA][rank=%u] channel-only probe passed; skip CCU kernel registration\n", rank);
         std::fflush(stdout);
         g_cache.comm = comm;
         g_cache.stream = stream;
-        g_cache.routeIndex = routeIndex;
+        g_cache.routeKey = routeKey;
         g_cache.resources = created;
         *resources = created;
         return HCCL_SUCCESS;
     }
 
-    RouteKernelArg kernelArg(created.channel, routeIndex);
+    RouteKernelArg kernelArg(created.channels, routeIndices);
     hcomm::KernelCreator creator = CreateRouteKernel;
     CcuKernelHandle kernel = 0;
     std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegister begin\n", rank);
@@ -348,7 +439,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
 
     g_cache.comm = comm;
     g_cache.stream = stream;
-    g_cache.routeIndex = routeIndex;
+    g_cache.routeKey = routeKey;
     g_cache.resources = created;
     *resources = created;
     return HCCL_SUCCESS;

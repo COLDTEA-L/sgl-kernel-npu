@@ -56,6 +56,7 @@ target_link_libraries(a5_ccu_urma_route_probe PRIVATE
     hcomm
     c_sec
     ascendcl
+    ${CMAKE_DL_LIBS}
 )
 install(TARGETS a5_ccu_urma_route_probe
     LIBRARY DESTINATION ${CUSTOM_OPS_OPP_LIB_PATH}
@@ -63,6 +64,7 @@ install(TARGETS a5_ccu_urma_route_probe
 )
 install(FILES
     inc/a5_ccu_urma_route_probe.h
+    inc/a5_uvs_source_route_provider.h
     DESTINATION ${CUSTOM_OPS_OPP_INC_PATH}
     COMPONENT hccl
 )

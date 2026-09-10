@@ -25,6 +25,7 @@ struct Options {
     uint32_t warmup = 10;
     uint32_t iterations = 100;
     uint32_t routeIndex = 0;
+    std::string routeIndices;
     bool remoteOnly = false;
     bool channelOnly = false;
 };
@@ -41,7 +42,7 @@ static void PrintUsage(const char *program)
 {
     std::cout << "Usage: " << program
               << " [--bytes N] [--warmup N] [--iters N] [--route-index N]"
-              << " [--remote-only] [--channel-only]" << std::endl;
+              << " [--route-indices 0,2] [--remote-only] [--channel-only]" << std::endl;
 }
 
 static bool ParseUint(const char *value, uint64_t *result)
@@ -65,6 +66,13 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         }
         if (name == "--channel-only") {
             options->channelOnly = true;
+            continue;
+        }
+        if (name == "--route-indices") {
+            if (i + 1 >= argc) {
+                return false;
+            }
+            options->routeIndices = argv[++i];
             continue;
         }
         if (i + 1 >= argc) {
@@ -187,7 +195,9 @@ static void RunRank(ThreadContext *ctx)
         const double effectiveGbps = ctx->options->channelOnly ? 0.0 :
             static_cast<double>(ctx->options->bytes) * 8.0 / (avgUs * 1000.0);
         std::cout << "[rank=" << ctx->rank << "] PASS engine=CCU protocol=UBC_CTP route="
-                  << ctx->options->routeIndex << " bytes_per_rank=" << ctx->options->bytes
+                  << (ctx->options->routeIndices.empty() ?
+                      std::to_string(ctx->options->routeIndex) : ctx->options->routeIndices)
+                  << " bytes_per_rank=" << ctx->options->bytes
                   << " warmup=" << ctx->options->warmup << " iterations=" << ctx->options->iterations
                   << " mode=" << (ctx->options->channelOnly ? "channel-only" :
                                     (ctx->options->remoteOnly ? "remote-only" : "allgather"))
@@ -218,6 +228,11 @@ int main(int argc, char **argv)
     const std::string route = std::to_string(options.routeIndex);
     if (setenv("A5_CCU_ROUTE_INDEX", route.c_str(), 1) != 0) {
         std::cerr << "Failed to set A5_CCU_ROUTE_INDEX" << std::endl;
+        return 2;
+    }
+    if (!options.routeIndices.empty() &&
+        setenv("A5_CCU_ROUTE_INDICES", options.routeIndices.c_str(), 1) != 0) {
+        std::cerr << "Failed to set A5_CCU_ROUTE_INDICES" << std::endl;
         return 2;
     }
     if (setenv("A5_CCU_REMOTE_ONLY", options.remoteOnly ? "1" : "0", 1) != 0 ||

@@ -11,26 +11,31 @@ namespace a5_ccu_urma_probe {
 
 class RouteKernelArg : public hcomm::CcuKernelArg {
 public:
-    RouteKernelArg(ChannelHandle channel, uint32_t routeIndex);
+    RouteKernelArg(const std::vector<ChannelHandle> &channels,
+                   const std::vector<uint32_t> &routeIndices);
     hcomm::CcuKernelSignature GetKernelSignature() const override;
 
 private:
-    uint32_t routeIndex_;
+    std::vector<uint32_t> routeIndices_;
 };
 
 class RouteTaskArg : public hcomm::CcuTaskArg {
 public:
     RouteTaskArg(uint64_t inputAddr, uint64_t outputAddr, uint64_t inputToken,
-                 uint64_t outputToken, uint64_t bytes, uint64_t remoteOffset)
+                 uint64_t outputToken, const std::vector<uint64_t> &sourceOffsets,
+                 const std::vector<uint64_t> &remoteOffsets,
+                 const std::vector<uint64_t> &pathBytes)
         : inputAddr(inputAddr), outputAddr(outputAddr), inputToken(inputToken),
-          outputToken(outputToken), bytes(bytes), remoteOffset(remoteOffset) {}
+          outputToken(outputToken), sourceOffsets(sourceOffsets),
+          remoteOffsets(remoteOffsets), pathBytes(pathBytes) {}
 
     uint64_t inputAddr;
     uint64_t outputAddr;
     uint64_t inputToken;
     uint64_t outputToken;
-    uint64_t bytes;
-    uint64_t remoteOffset;
+    std::vector<uint64_t> sourceOffsets;
+    std::vector<uint64_t> remoteOffsets;
+    std::vector<uint64_t> pathBytes;
 };
 
 class RouteKernel : public hcomm::CcuKernel {

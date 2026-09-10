@@ -7,6 +7,9 @@ test_dir="${repo_root}/examples/a5_ccu_urma_route_probe/testcase"
 
 devices="2,3"
 route_index=0
+route_indices=""
+source_route_manifest=""
+source_route_provider=""
 bytes=2097152
 warmup=10
 iterations=100
@@ -20,6 +23,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --devices) devices=$2; shift 2 ;;
         --route-index) route_index=$2; shift 2 ;;
+        --route-indices) route_indices=$2; shift 2 ;;
+        --source-route-manifest) source_route_manifest=$2; shift 2 ;;
+        --source-route-provider) source_route_provider=$2; shift 2 ;;
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
@@ -63,6 +69,17 @@ unset ASCEND_CUSTOM_OPP_PATH
 export ASCEND_RT_VISIBLE_DEVICES="${devices}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export A5_CCU_ROUTE_INDEX="${route_index}"
+if [[ -n "${route_indices}" ]]; then
+    export A5_CCU_ROUTE_INDICES="${route_indices}"
+else
+    unset A5_CCU_ROUTE_INDICES
+fi
+if [[ -n "${source_route_manifest}" ]]; then
+    export A5_CCU_SOURCE_ROUTE_MANIFEST="${source_route_manifest}"
+    export A5_CCU_SOURCE_ROUTE_PROVIDER="${source_route_provider}"
+else
+    unset A5_CCU_SOURCE_ROUTE_MANIFEST A5_CCU_SOURCE_ROUTE_PROVIDER
+fi
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 
 make -C "${test_dir}"
@@ -74,13 +91,14 @@ build_command() {
         --warmup "${warmup}"
         --iters "${iterations}"
         --route-index "${route_index}")
+    [[ -z "${route_indices}" ]] || command+=(--route-indices "${route_indices}")
     (( remote_only == 0 )) || command+=(--remote-only)
     (( channel_only == 0 )) || command+=(--channel-only)
 }
 
 if (( sweep != 0 )); then
     echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
-    echo "Selected route  : ${A5_CCU_ROUTE_INDEX}"
+    echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
     echo "Mode            : $([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather)"
     for sweep_bytes in 65536 262144 1048576 2097152 8388608 33554432; do
         echo "===== payload ${sweep_bytes} bytes ====="
@@ -93,7 +111,7 @@ fi
 build_command "${bytes}"
 
 echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
-echo "Selected route  : ${A5_CCU_ROUTE_INDEX}"
+echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
 echo "Payload/rank    : ${bytes} bytes"
 echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
     ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"

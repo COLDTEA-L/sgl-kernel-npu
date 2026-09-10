@@ -11,6 +11,7 @@
 set(op_host_src_list
     ${CMAKE_CURRENT_SOURCE_DIR}/route_probe.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/utils.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/source_route_provider.cc
 )
 
 target_sources(a5_ccu_urma_route_probe PRIVATE
