@@ -6,6 +6,7 @@
 #include <hcomm/ccu/hccl_ccu_res.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
@@ -28,6 +29,48 @@ struct ThreadLocalCache {
 };
 
 thread_local ThreadLocalCache g_cache;
+
+bool EnvEnabled(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
+struct EndpointInfo {
+    uint32_t dieId = UINT32_MAX;
+    uint32_t bwCoeff = UINT32_MAX;
+    uint32_t location = UINT32_MAX;
+    HcclResult dieStatus = HCCL_E_NOT_FOUND;
+    HcclResult bwStatus = HCCL_E_NOT_FOUND;
+    HcclResult locationStatus = HCCL_E_NOT_FOUND;
+};
+
+EndpointInfo QueryEndpointInfo(HcclComm comm, uint32_t ownerRank,
+                               const EndpointDesc &endpoint)
+{
+    EndpointInfo info;
+    EndpointDesc endpointCopy = endpoint;
+    info.dieStatus = HcclRankGraphGetEndpointInfo(
+        comm, ownerRank, &endpointCopy, ENDPOINT_ATTR_DIE_ID,
+        sizeof(info.dieId), static_cast<void *>(&info.dieId));
+    endpointCopy = endpoint;
+    info.bwStatus = HcclRankGraphGetEndpointInfo(
+        comm, ownerRank, &endpointCopy, ENDPOINT_ATTR_BW_COEFF,
+        sizeof(info.bwCoeff), static_cast<void *>(&info.bwCoeff));
+    endpointCopy = endpoint;
+    info.locationStatus = HcclRankGraphGetEndpointInfo(
+        comm, ownerRank, &endpointCopy, ENDPOINT_ATTR_LOCATION,
+        sizeof(info.location), static_cast<void *>(&info.location));
+    return info;
+}
+
+std::string AttrToString(uint32_t value, HcclResult status)
+{
+    if (status != HCCL_SUCCESS) {
+        return "N/A(status=" + std::to_string(static_cast<int>(status)) + ")";
+    }
+    return std::to_string(value) + "(status=0)";
+}
 
 std::string CommAddrToString(const CommAddr &addr)
 {
@@ -79,25 +122,23 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
             const uint32_t ordinal = static_cast<uint32_t>(candidates.size());
             const std::string srcAddr = CommAddrToString(link.srcEndpointDesc.commAddr);
             const std::string dstAddr = CommAddrToString(link.dstEndpointDesc.commAddr);
-            uint32_t srcDieId = UINT32_MAX;
-            uint32_t dstDieId = UINT32_MAX;
-            EndpointDesc srcEndpoint = link.srcEndpointDesc;
-            EndpointDesc dstEndpoint = link.dstEndpointDesc;
-            (void)HcclRankGraphGetEndpointInfo(
-                comm, rank, &srcEndpoint, ENDPOINT_ATTR_DIE_ID,
-                sizeof(srcDieId), static_cast<void *>(&srcDieId));
-            (void)HcclRankGraphGetEndpointInfo(
-                comm, peer, &dstEndpoint, ENDPOINT_ATTR_DIE_ID,
-                sizeof(dstDieId), static_cast<void *>(&dstDieId));
+            const EndpointInfo srcInfo = QueryEndpointInfo(comm, rank, link.srcEndpointDesc);
+            const EndpointInfo dstInfo = QueryEndpointInfo(comm, peer, link.dstEndpointDesc);
             std::printf("[A5 CCU URMA][rank=%u peer=%u] route=%u layer=%u link=%u "
-                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_die=%u dst_die=%u "
+                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_die=%s dst_die=%s "
+                        "src_bw=%s dst_bw=%s src_location=%s dst_location=%s "
                         "src_addr=%s dst_addr=%s%s\n",
                         rank, peer, ordinal, layers[layerIndex], linkIndex,
                         static_cast<int>(link.linkAttr.linkProtocol),
                         static_cast<uint32_t>(link.linkAttr.hop),
                         link.srcEndpointDesc.loc.device.devPhyId,
                         link.dstEndpointDesc.loc.device.devPhyId,
-                        srcDieId, dstDieId,
+                        AttrToString(srcInfo.dieId, srcInfo.dieStatus).c_str(),
+                        AttrToString(dstInfo.dieId, dstInfo.dieStatus).c_str(),
+                        AttrToString(srcInfo.bwCoeff, srcInfo.bwStatus).c_str(),
+                        AttrToString(dstInfo.bwCoeff, dstInfo.bwStatus).c_str(),
+                        AttrToString(srcInfo.location, srcInfo.locationStatus).c_str(),
+                        AttrToString(dstInfo.location, dstInfo.locationStatus).c_str(),
                         srcAddr.c_str(), dstAddr.c_str(),
                         ordinal == routeIndex ? " SELECTED" : "");
             std::fflush(stdout);
@@ -116,16 +157,15 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
 
     const uint32_t selectedLayer = candidateLayers[routeIndex];
     const CommLink &selectedLink = candidates[routeIndex];
-    EndpointDesc selectedEndpoint = selectedLink.srcEndpointDesc;
-    status = HcclRankGraphGetEndpointInfo(
-        comm, rank, &selectedEndpoint, ENDPOINT_ATTR_DIE_ID,
-        sizeof(*dieId), static_cast<void *>(dieId));
+    const EndpointInfo selectedInfo = QueryEndpointInfo(comm, rank, selectedLink.srcEndpointDesc);
+    status = selectedInfo.dieStatus;
     if (status != HCCL_SUCCESS) {
         std::fprintf(stderr,
             "[A5 CCU URMA][rank=%u peer=%u] get selected endpoint die id failed: status=%d\n",
             rank, peer, static_cast<int>(status));
         return status;
     }
+    *dieId = selectedInfo.dieId;
     if (*dieId > 1) {
         std::fprintf(stderr,
             "[A5 CCU URMA][rank=%u peer=%u] unsupported endpoint die id %u\n",
@@ -248,11 +288,15 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
                 "after all required CCU threads are ready\n",
                 rank, 1U - rank, routeIndex, created.dieId);
     std::fflush(stdout);
+    const auto acquireBegin = std::chrono::steady_clock::now();
     status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &selectedDesc, 1, &created.channel);
+    const auto acquireEnd = std::chrono::steady_clock::now();
+    const double acquireUs = std::chrono::duration<double, std::micro>(
+        acquireEnd - acquireBegin).count();
     std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
-                "die_id=%u channel=%lu\n",
+                "die_id=%u channel=%lu acquire_us=%.3f\n",
                 rank, 1U - rank, static_cast<int>(status), created.dieId,
-                static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channel : 0));
+                static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channel : 0), acquireUs);
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
@@ -265,6 +309,17 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     std::fflush(stdout);
     if (channelStatus != 0) {
         return HCCL_E_RUNTIME;
+    }
+
+    if (EnvEnabled("A5_CCU_CHANNEL_ONLY")) {
+        std::printf("[A5 CCU URMA][rank=%u] channel-only probe passed; skip CCU kernel registration\n", rank);
+        std::fflush(stdout);
+        g_cache.comm = comm;
+        g_cache.stream = stream;
+        g_cache.routeIndex = routeIndex;
+        g_cache.resources = created;
+        *resources = created;
+        return HCCL_SUCCESS;
     }
 
     RouteKernelArg kernelArg(created.channel, routeIndex);

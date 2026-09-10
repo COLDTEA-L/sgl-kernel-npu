@@ -9,11 +9,13 @@
 #include <a5_ccu_urma_route_probe.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +25,8 @@ struct Options {
     uint32_t warmup = 10;
     uint32_t iterations = 100;
     uint32_t routeIndex = 0;
+    bool remoteOnly = false;
+    bool channelOnly = false;
 };
 
 struct ThreadContext {
@@ -36,7 +40,8 @@ struct ThreadContext {
 static void PrintUsage(const char *program)
 {
     std::cout << "Usage: " << program
-              << " [--bytes N] [--warmup N] [--iters N] [--route-index N]" << std::endl;
+              << " [--bytes N] [--warmup N] [--iters N] [--route-index N]"
+              << " [--remote-only] [--channel-only]" << std::endl;
 }
 
 static bool ParseUint(const char *value, uint64_t *result)
@@ -53,6 +58,15 @@ static bool ParseUint(const char *value, uint64_t *result)
 static bool ParseOptions(int argc, char **argv, Options *options)
 {
     for (int i = 1; i < argc; ++i) {
+        const std::string name(argv[i]);
+        if (name == "--remote-only") {
+            options->remoteOnly = true;
+            continue;
+        }
+        if (name == "--channel-only") {
+            options->channelOnly = true;
+            continue;
+        }
         if (i + 1 >= argc) {
             return false;
         }
@@ -60,7 +74,6 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         if (!ParseUint(argv[++i], &value)) {
             return false;
         }
-        const std::string name(argv[i - 1]);
         if (name == "--bytes") {
             options->bytes = value;
         } else if (name == "--warmup") {
@@ -73,7 +86,17 @@ static bool ParseOptions(int argc, char **argv, Options *options)
             return false;
         }
     }
-    return options->bytes != 0 && options->bytes % sizeof(float) == 0 && options->iterations != 0;
+    return options->bytes != 0 && options->bytes % sizeof(float) == 0 &&
+           options->iterations != 0 && !(options->remoteOnly && options->channelOnly);
+}
+
+static double Percentile(const std::vector<double> &sorted, double percentile)
+{
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    const size_t index = static_cast<size_t>(percentile * static_cast<double>(sorted.size() - 1));
+    return sorted[index];
 }
 
 #define THREAD_ACL_CHECK(expression)                                                        \
@@ -116,43 +139,66 @@ static void RunRank(ThreadContext *ctx)
     std::vector<float> input(sendCount, static_cast<float>(ctx->rank + 1));
     THREAD_ACL_CHECK(aclrtMemcpy(sendBuf, ctx->options->bytes, input.data(), ctx->options->bytes,
                                 ACL_MEMCPY_HOST_TO_DEVICE));
+    if (ctx->options->remoteOnly) {
+        auto *localDst = static_cast<uint8_t *>(recvBuf) + ctx->rank * ctx->options->bytes;
+        THREAD_ACL_CHECK(aclrtMemcpy(localDst, ctx->options->bytes, sendBuf, ctx->options->bytes,
+                                    ACL_MEMCPY_DEVICE_TO_DEVICE));
+    }
 
     for (uint32_t i = 0; i < ctx->options->warmup; ++i) {
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
     }
 
-    const auto begin = std::chrono::steady_clock::now();
+    std::vector<double> samplesUs;
+    samplesUs.reserve(ctx->options->iterations);
     for (uint32_t i = 0; i < ctx->options->iterations; ++i) {
+        const auto begin = std::chrono::steady_clock::now();
         THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
+        const auto end = std::chrono::steady_clock::now();
+        samplesUs.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
     }
-    const auto end = std::chrono::steady_clock::now();
 
-    std::vector<float> output(recvBytes / sizeof(float));
-    THREAD_ACL_CHECK(aclrtMemcpy(output.data(), recvBytes, recvBuf, recvBytes, ACL_MEMCPY_DEVICE_TO_HOST));
     bool verified = true;
-    for (uint32_t sourceRank = 0; sourceRank < ctx->rankSize && verified; ++sourceRank) {
-        const float expected = static_cast<float>(sourceRank + 1);
-        const uint64_t offset = sourceRank * sendCount;
-        for (uint64_t i = 0; i < sendCount; ++i) {
-            if (std::fabs(output[offset + i] - expected) > 1e-6F) {
-                std::cerr << "[rank=" << ctx->rank << "] mismatch at source_rank=" << sourceRank
-                          << " element=" << i << " expected=" << expected
-                          << " actual=" << output[offset + i] << std::endl;
-                ctx->failed->store(1);
-                verified = false;
-                break;
+    if (!ctx->options->channelOnly) {
+        std::vector<float> output(recvBytes / sizeof(float));
+        THREAD_ACL_CHECK(aclrtMemcpy(output.data(), recvBytes, recvBuf, recvBytes, ACL_MEMCPY_DEVICE_TO_HOST));
+        for (uint32_t sourceRank = 0; sourceRank < ctx->rankSize && verified; ++sourceRank) {
+            const float expected = static_cast<float>(sourceRank + 1);
+            const uint64_t offset = sourceRank * sendCount;
+            for (uint64_t i = 0; i < sendCount; ++i) {
+                if (std::fabs(output[offset + i] - expected) > 1e-6F) {
+                    std::cerr << "[rank=" << ctx->rank << "] mismatch at source_rank=" << sourceRank
+                              << " element=" << i << " expected=" << expected
+                              << " actual=" << output[offset + i] << std::endl;
+                    ctx->failed->store(1);
+                    verified = false;
+                    break;
+                }
             }
         }
     }
 
-    const double totalUs = std::chrono::duration<double, std::micro>(end - begin).count();
     if (verified) {
+        std::sort(samplesUs.begin(), samplesUs.end());
+        const double totalUs = std::accumulate(samplesUs.begin(), samplesUs.end(), 0.0);
+        const double avgUs = totalUs / static_cast<double>(samplesUs.size());
+        const double effectiveGbps = ctx->options->channelOnly ? 0.0 :
+            static_cast<double>(ctx->options->bytes) * 8.0 / (avgUs * 1000.0);
         std::cout << "[rank=" << ctx->rank << "] PASS engine=CCU protocol=UBC_CTP route="
                   << ctx->options->routeIndex << " bytes_per_rank=" << ctx->options->bytes
                   << " warmup=" << ctx->options->warmup << " iterations=" << ctx->options->iterations
-                  << " avg_us=" << totalUs / ctx->options->iterations << std::endl;
+                  << " mode=" << (ctx->options->channelOnly ? "channel-only" :
+                                    (ctx->options->remoteOnly ? "remote-only" : "allgather"))
+                  << " avg_us=" << avgUs
+                  << " min_us=" << samplesUs.front()
+                  << " p50_us=" << Percentile(samplesUs, 0.50)
+                  << " p95_us=" << Percentile(samplesUs, 0.95);
+        if (!ctx->options->channelOnly) {
+            std::cout << " effective_gbps=" << effectiveGbps;
+        }
+        std::cout << std::endl;
     }
 
     THREAD_HCCL_CHECK(HcclCommDestroy(comm));
@@ -172,6 +218,11 @@ int main(int argc, char **argv)
     const std::string route = std::to_string(options.routeIndex);
     if (setenv("A5_CCU_ROUTE_INDEX", route.c_str(), 1) != 0) {
         std::cerr << "Failed to set A5_CCU_ROUTE_INDEX" << std::endl;
+        return 2;
+    }
+    if (setenv("A5_CCU_REMOTE_ONLY", options.remoteOnly ? "1" : "0", 1) != 0 ||
+        setenv("A5_CCU_CHANNEL_ONLY", options.channelOnly ? "1" : "0", 1) != 0) {
+        std::cerr << "Failed to set probe mode environment" << std::endl;
         return 2;
     }
 

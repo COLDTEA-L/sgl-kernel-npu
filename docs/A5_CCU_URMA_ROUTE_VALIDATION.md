@@ -210,7 +210,7 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 如果 route 0 成功，而 route 1 在这种 per-die acquire 模式下仍然稳定返回 `status=9`，说明失败发生在
 HCOMM/UVS 的 hop-2 channel 建链阶段，CCU kernel 和 `WriteNb` 尚未执行。
 
-### 6.1 查询 IO Die 与拓扑的对应关系
+### 6.1 查询 IO Die 与 endpoint 的对应关系
 
 探针会为每条候选 route 打印 `src_die`、`dst_die`、物理卡号以及原始 EID。先把 EID 与 UDMA 设备对应起来：
 
@@ -228,37 +228,80 @@ udmac1... -> IO Die 1
 本机输出中 `003f:0200` 一组对应 `udmac0d1e2`，`007f:0200` 一组对应 `udmac1d1e2`。应以当前机器
 `urma_admin show` 的实际 EID 为准，不要只依赖这一段前缀。
 
-较新 UMDK 使用下面的命令输出端口连接关系：
-
-```bash
-urma_admin show topo
-```
-
-部分版本把它注册为独立子命令：
-
-```bash
-urma_admin show_topo
-```
-
-可以依次尝试：
-
-```bash
-urma_admin show topo 2>/dev/null || urma_admin show_topo
-```
-
-输出中的核心关系是：
+当前环境不能导出整机拓扑，`urma_admin show -a -w` 只能给出本机 endpoint 能力。重点记录：
 
 ```text
-IODie X / Port Y -> Peer Node / Peer IODie / Peer Port
+state / active_width / active_speed / active_mtu
+各 priority 的 tp_type
+max_write_size
 ```
 
-这样可以把探针的 `die_id` 和 EID 映射到本机 IO Die、端口及相邻节点。如果当前安装的
-`urma_admin` 两种命令都不支持，只能从 `/etc/hixlep` 的拓扑配置或平台侧链路计数器补充确认。
+当前 `udmac0d1e2` 和 `udmac1d1e2` 都是 `ACTIVE + LINK_X4 + SP_400G + MTU_4096`，并支持 CTP；
+因此 route 1 建链失败不能简单归因于本地 die 1 端口关闭或不支持 CTP。没有整机拓扑时，使用不同卡对的
+route 枚举结果和端口计数器做黑盒反推。
 
 需要注意：RankGraph 公开接口只提供 endpoint 的 `DIE_ID`、`LOCATION` 和 `BW_COEFF`，没有
 `relay_rank` 属性。因此上述信息可以确认使用哪个 IO Die/端口和相邻节点，但仅凭 probe 日志不一定能直接得出
 “经过物理 NPU 几号卡”。最终应在 route 1/2 分别运行时对比相关 IO Die 端口计数器，并确认中间卡 HBM
 读写量没有随 payload 增加。
+
+### 6.2 仅验证 channel 建链
+
+`--channel-only` 在 `HcclChannelAcquire` 和 `HcommChannelGetStatus` 成功后立即返回，不注册或启动 CCU kernel：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 1 \
+  --bytes 2097152 \
+  --warmup 1 \
+  --iters 3 \
+  --channel-only
+```
+
+如果仍在 `HcclChannelAcquire status=9` 失败，即可确认与 CCU kernel、用户 buffer token 和 `WriteNb` 无关。
+
+### 6.3 纯远端传输与数据量扫描
+
+默认 `allgather` 模式每轮包含本 rank 的 D2D self copy。`--remote-only` 会在计时前一次性初始化本地输出切片，
+正式迭代只测 CCU 对端 write、notify 和 stream 同步：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only
+```
+
+输出增加 `min_us/p50_us/p95_us/effective_gbps`。`effective_gbps` 按每个 rank 单方向发送的 payload 计算，
+不把双向流量相加。
+
+使用固定数据量集合扫描 route 0 或 route 2：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 0 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --sweep
+
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 2 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --sweep
+```
+
+扫描大小依次为 64 KiB、256 KiB、1 MiB、2 MiB、8 MiB 和 32 MiB。对比时间曲线的截距与斜率：截距主要
+反映固定 launch/notify 开销，斜率主要反映实际传输带宽。为减少频率和后台流量影响，建议按
+`route0 -> route2 -> route0 -> route2` 的顺序重复至少两轮。
 
 ## 7. 使用 msprof
 

@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteResources;
@@ -14,6 +16,12 @@ using a5_ccu_urma_probe::RouteResources;
 namespace {
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
+
+bool EnvEnabled(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
 }
 
 extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
@@ -33,13 +41,18 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
     if (status != HCCL_SUCCESS) {
         return status;
     }
+    if (EnvEnabled("A5_CCU_CHANNEL_ONLY")) {
+        return HCCL_SUCCESS;
+    }
     auto *localDst = static_cast<uint8_t *>(recvBuf) + resources.rank * bytes;
-    const aclError copyStatus = aclrtMemcpyAsync(localDst, bytes, sendBuf, bytes,
-                                                  ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
-    if (copyStatus != ACL_SUCCESS) {
-        std::fprintf(stderr, "[A5 CCU URMA][rank=%u] self copy failed: status=%d\n",
-                     resources.rank, static_cast<int>(copyStatus));
-        return HCCL_E_RUNTIME;
+    if (!EnvEnabled("A5_CCU_REMOTE_ONLY")) {
+        const aclError copyStatus = aclrtMemcpyAsync(localDst, bytes, sendBuf, bytes,
+                                                      ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        if (copyStatus != ACL_SUCCESS) {
+            std::fprintf(stderr, "[A5 CCU URMA][rank=%u] self copy failed: status=%d\n",
+                         resources.rank, static_cast<int>(copyStatus));
+            return HCCL_E_RUNTIME;
+        }
     }
 
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(

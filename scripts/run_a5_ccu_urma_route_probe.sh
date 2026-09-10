@@ -11,6 +11,9 @@ bytes=2097152
 warmup=10
 iterations=100
 profile=0
+remote_only=0
+channel_only=0
+sweep=0
 profile_root=/home/l00934901/profiling
 
 while [[ $# -gt 0 ]]; do
@@ -20,11 +23,27 @@ while [[ $# -gt 0 ]]; do
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
+        --remote-only) remote_only=1; shift ;;
+        --channel-only) channel_only=1; shift ;;
+        --sweep) sweep=1; shift ;;
         --profile) profile=1; shift ;;
         --profile-root) profile_root=$2; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+(( remote_only == 0 || channel_only == 0 )) || {
+    echo "--remote-only and --channel-only cannot be used together" >&2
+    exit 2
+}
+(( sweep == 0 || channel_only == 0 )) || {
+    echo "--sweep and --channel-only cannot be used together" >&2
+    exit 2
+}
+(( sweep == 0 || profile == 0 )) || {
+    echo "--sweep and --profile cannot be used together; profile one size at a time" >&2
+    exit 2
+}
 
 if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
     source /usr/local/Ascend/cann/set_env.sh
@@ -47,15 +66,37 @@ export A5_CCU_ROUTE_INDEX="${route_index}"
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 
 make -C "${test_dir}"
-command=("${test_dir}/a5_ccu_urma_route_probe_test"
-    --bytes "${bytes}"
-    --warmup "${warmup}"
-    --iters "${iterations}"
-    --route-index "${route_index}")
+
+build_command() {
+    local payload_bytes=$1
+    command=("${test_dir}/a5_ccu_urma_route_probe_test"
+        --bytes "${payload_bytes}"
+        --warmup "${warmup}"
+        --iters "${iterations}"
+        --route-index "${route_index}")
+    (( remote_only == 0 )) || command+=(--remote-only)
+    (( channel_only == 0 )) || command+=(--channel-only)
+}
+
+if (( sweep != 0 )); then
+    echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
+    echo "Selected route  : ${A5_CCU_ROUTE_INDEX}"
+    echo "Mode            : $([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather)"
+    for sweep_bytes in 65536 262144 1048576 2097152 8388608 33554432; do
+        echo "===== payload ${sweep_bytes} bytes ====="
+        build_command "${sweep_bytes}"
+        "${command[@]}"
+    done
+    exit 0
+fi
+
+build_command "${bytes}"
 
 echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "Selected route  : ${A5_CCU_ROUTE_INDEX}"
 echo "Payload/rank    : ${bytes} bytes"
+echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
+    ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"
 
 if (( profile == 0 )); then
     "${command[@]}"
