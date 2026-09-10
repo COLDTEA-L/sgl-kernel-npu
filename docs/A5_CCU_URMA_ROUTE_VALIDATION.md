@@ -64,8 +64,8 @@ export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 `ASCEND_CUSTOM_OPP_PATH` 指向 DeepEP vendor 目录；未指定 `--install-path` 的 HCCL 安装包会因此被重定向到
 `python/deep_ep/deep_ep/vendors/hwcomputing`，而不是 CANN 的 `opp/vendors/cust`。
 
-编译和运行脚本会自动 source CANN 环境。测试脚本默认选择物理卡 `2,5`，并通过
-`ASCEND_RT_VISIBLE_DEVICES=2,5` 映射成逻辑 rank 0、1。
+编译和运行脚本会自动 source CANN 环境。当前测试默认选择物理卡 `2,3`，并通过
+`ASCEND_RT_VISIBLE_DEVICES=2,3` 映射成逻辑 rank 0、1。
 
 确认 CANN 和 HCOMM：
 
@@ -130,13 +130,13 @@ CANN 根目录。因此，即使当前 shell 以前 source 过 DeepEP vendor 环
 
 ## 6. 两卡运行和候选路由枚举
 
-测试程序是单进程、两线程、两设备程序，不使用 `torchrun`。先在物理卡 2 和 5 上运行 route 0：
+测试程序是单进程、两线程、两设备程序，不使用 `torchrun`。先在物理卡 2 和 3 上运行 route 0：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 
 bash scripts/run_a5_ccu_urma_route_probe.sh \
-  --devices 2,5 \
+  --devices 2,3 \
   --route-index 0 \
   --bytes 2097152 \
   --warmup 10 \
@@ -177,7 +177,7 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 for route in 0 1 2 3; do
   echo "===== route ${route} ====="
   bash scripts/run_a5_ccu_urma_route_probe.sh \
-    --devices 2,5 \
+    --devices 2,3 \
     --route-index "${route}" \
     --bytes 2097152 \
     --warmup 10 \
@@ -187,11 +187,25 @@ done
 
 超出候选数量会明确报 `route index ... is out of range`。两端 rank 必须选择相同序号且形成相互匹配的 EID 对，否则 channel 建链会失败或通信超时。
 
-对于同一 network layer 中的多条链路（A5 的 hop-2/2Die 场景通常如此），探针会仿照 HCCL 原生
-2Die AllToAll，把该 layer 的全部 UBC_CTP channel 作为一个资源组传给 `HcclChannelAcquire`，随后只把
-`--route-index` 选中的 channel 注册进探针 kernel。日志中的 `group_size` 是建链时成组申请的 channel 数，
-`selected_group_index` 是实际用于传输的成员。route 0 所在 layer 只有一条链路时，`group_size=1`；route 1/2
-若位于同一个 hop-2 layer，通常会显示 `group_size=2`。
+对于同一 network layer 中的多条链路（A5 的 hop-2/2Die 场景通常如此），探针会先通过
+`ENDPOINT_ATTR_DIE_ID` 查询选中 link 所属的 IO Die，再仿照 HCCL 原生 2Die AllToAll，将该 link 作为对应
+Die kernel 的单独 channel 请求传给 `HcclChannelAcquire`。它不会再把两个 Die 的 link 合并为一次 acquire。
+日志会显示 `die_id=0/1`；die 0 使用主 CCU thread，die 1 使用独立 slave stream/CCU thread，并通过
+`HcommThreadNotifyRecordOnThread/HcommThreadNotifyWaitOnThread` 与主 thread 做前后同步。
+
+重点验证 route 1：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 1 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100
+```
+
+如果 route 0 成功，而 route 1 在这种 per-die acquire 模式下仍然稳定返回 `status=9`，说明失败发生在
+HCOMM/UVS 的 hop-2 channel 建链阶段，CCU kernel 和 `WriteNb` 尚未执行。
 
 ## 7. 使用 msprof
 
@@ -201,7 +215,7 @@ done
 cd /home/l00934901/sgl-kernel-npu
 
 bash scripts/run_a5_ccu_urma_route_probe.sh \
-  --devices 2,5 \
+  --devices 2,3 \
   --route-index 0 \
   --bytes 2097152 \
   --warmup 10 \

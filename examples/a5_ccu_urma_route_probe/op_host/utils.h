@@ -11,11 +11,14 @@
 namespace a5_ccu_urma_probe {
 
 struct RouteResources {
-    ThreadHandle thread = 0;
+    ThreadHandle mainThread = 0;
+    ThreadHandle routeThread = 0;
+    aclrtStream slaveStream = nullptr;
     ChannelHandle channel = 0;
     uint64_t kernel = 0;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
+    uint32_t dieId = 0;
 };
 
 HcclResult GetCcuRouteIndex(uint32_t *routeIndex);

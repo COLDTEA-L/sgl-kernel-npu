@@ -17,6 +17,7 @@ namespace a5_ccu_urma_probe {
 namespace {
 
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 3;
+constexpr uint32_t THREAD_NOTIFY_NUM = 1;
 constexpr uint32_t EID_BYTE_NUM = 16;
 
 struct ThreadLocalCache {
@@ -43,8 +44,12 @@ std::string CommAddrToString(const CommAddr &addr)
 }
 
 HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, ChannelHandle *channel)
+                         uint32_t routeIndex, ChannelHandle *channel,
+                         uint32_t *dieId)
 {
+    if (channel == nullptr || dieId == nullptr) {
+        return HCCL_E_PTR;
+    }
     uint32_t layerNum = 0;
     uint32_t *layers = nullptr;
     HcclResult status = HcclRankGraphGetLayers(comm, &layers, &layerNum);
@@ -97,51 +102,45 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
         return candidates.empty() ? HCCL_E_NOT_FOUND : HCCL_E_PARA;
     }
 
-    // HCCL's native A5 2Die collectives acquire every UBC_CTP link in the
-    // selected network layer as one resource group.  A hop-2 layer can contain
-    // one link per die; acquiring only one member times out even when the two
-    // ranks chose symmetric endpoint pairs.  Acquire the whole layer, then
-    // expose only the route requested by the user to the probe kernel.
     const uint32_t selectedLayer = candidateLayers[routeIndex];
-    std::vector<HcclChannelDesc> descs;
-    uint32_t selectedGroupIndex = UINT32_MAX;
-    for (uint32_t ordinal = 0; ordinal < candidates.size(); ++ordinal) {
-        if (candidateLayers[ordinal] != selectedLayer) {
-            continue;
-        }
-        HcclChannelDesc desc;
-        status = HcclChannelDescInit(&desc, 1);
-        if (status != HCCL_SUCCESS) {
-            return status;
-        }
-        const CommLink &link = candidates[ordinal];
-        desc.remoteRank = peer;
-        desc.notifyNum = CHANNEL_NOTIFY_NUM;
-        desc.channelProtocol = link.linkAttr.linkProtocol;
-        desc.localEndpoint = link.srcEndpointDesc;
-        desc.remoteEndpoint = link.dstEndpointDesc;
-        if (ordinal == routeIndex) {
-            selectedGroupIndex = static_cast<uint32_t>(descs.size());
-        }
-        descs.push_back(desc);
+    const CommLink &selectedLink = candidates[routeIndex];
+    EndpointDesc selectedEndpoint = selectedLink.srcEndpointDesc;
+    status = HcclRankGraphGetEndpointInfo(
+        comm, rank, &selectedEndpoint, ENDPOINT_ATTR_DIE_ID,
+        sizeof(*dieId), static_cast<void *>(dieId));
+    if (status != HCCL_SUCCESS) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA][rank=%u peer=%u] get selected endpoint die id failed: status=%d\n",
+            rank, peer, static_cast<int>(status));
+        return status;
     }
-    if (selectedGroupIndex == UINT32_MAX || descs.empty()) {
-        return HCCL_E_INTERNAL;
+    if (*dieId > 1) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA][rank=%u peer=%u] unsupported endpoint die id %u\n",
+            rank, peer, *dieId);
+        return HCCL_E_PARA;
     }
 
-    std::vector<ChannelHandle> handles(descs.size(), 0);
-    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u "
-                "as layer group of %zu channel(s)\n",
-                rank, peer, routeIndex, selectedLayer, candidateLinkIndices[routeIndex], descs.size());
-    std::fflush(stdout);
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, descs.data(),
-                                static_cast<uint32_t>(descs.size()), handles.data());
-    if (status == HCCL_SUCCESS) {
-        *channel = handles[selectedGroupIndex];
+    HcclChannelDesc desc;
+    status = HcclChannelDescInit(&desc, 1);
+    if (status != HCCL_SUCCESS) {
+        return status;
     }
+    desc.remoteRank = peer;
+    desc.notifyNum = CHANNEL_NOTIFY_NUM;
+    desc.channelProtocol = selectedLink.linkAttr.linkProtocol;
+    desc.localEndpoint = selectedLink.srcEndpointDesc;
+    desc.remoteEndpoint = selectedLink.dstEndpointDesc;
+
+    *channel = 0;
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u "
+                "die_id=%u as one per-die channel\n",
+                rank, peer, routeIndex, selectedLayer, candidateLinkIndices[routeIndex], *dieId);
+    std::fflush(stdout);
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &desc, 1, channel);
     std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
-                "group_size=%zu selected_group_index=%u channel=%lu\n",
-                rank, peer, static_cast<int>(status), handles.size(), selectedGroupIndex,
+                "die_id=%u channel=%lu\n",
+                rank, peer, static_cast<int>(status), *dieId,
                 static_cast<unsigned long>(status == HCCL_SUCCESS ? *channel : 0));
     std::fflush(stdout);
     return status;
@@ -203,18 +202,41 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     RouteResources created;
     created.rank = rank;
     created.rankSize = rankSize;
-    std::printf("[A5 CCU URMA][rank=%u] HcclThreadAcquireWithStream(CCU) begin\n", rank);
+    std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread begin\n", rank);
     std::fflush(stdout);
-    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, 0, &created.thread);
-    std::printf("[A5 CCU URMA][rank=%u] HcclThreadAcquireWithStream end: status=%d thread=%lu\n",
-                rank, static_cast<int>(status), static_cast<unsigned long>(created.thread));
+    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream,
+                                        THREAD_NOTIFY_NUM, &created.mainThread);
+    std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread end: status=%d thread=%lu\n",
+                rank, static_cast<int>(status), static_cast<unsigned long>(created.mainThread));
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = SelectChannel(comm, rank, 1U - rank, routeIndex, &created.channel);
+    status = SelectChannel(comm, rank, 1U - rank, routeIndex,
+                           &created.channel, &created.dieId);
     if (status != HCCL_SUCCESS) {
         return status;
+    }
+
+    created.routeThread = created.mainThread;
+    if (created.dieId == 1) {
+        const aclError aclStatus = aclrtCreateStream(&created.slaveStream);
+        if (aclStatus != ACL_SUCCESS) {
+            std::fprintf(stderr, "[A5 CCU URMA][rank=%u] create die1 slave stream failed: status=%d\n",
+                         rank, static_cast<int>(aclStatus));
+            return HCCL_E_RUNTIME;
+        }
+        std::printf("[A5 CCU URMA][rank=%u] acquire die1 slave CCU thread begin\n", rank);
+        std::fflush(stdout);
+        status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, created.slaveStream,
+                                            THREAD_NOTIFY_NUM, &created.routeThread);
+        std::printf("[A5 CCU URMA][rank=%u] acquire die1 slave CCU thread end: status=%d thread=%lu\n",
+                    rank, static_cast<int>(status),
+                    static_cast<unsigned long>(created.routeThread));
+        std::fflush(stdout);
+        if (status != HCCL_SUCCESS) {
+            return status;
+        }
     }
 
     int32_t channelState = -1;

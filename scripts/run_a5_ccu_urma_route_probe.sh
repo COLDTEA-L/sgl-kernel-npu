@@ -5,7 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "${script_dir}/.." && pwd)
 test_dir="${repo_root}/examples/a5_ccu_urma_route_probe/testcase"
 
-devices="2,5"
+devices="2,3"
 route_index=0
 bytes=2097152
 warmup=10
@@ -37,7 +37,7 @@ fi
 unset ASCEND_CUSTOM_OPP_PATH
 
 [[ "${devices}" == *,* && "${devices}" != *,*,* ]] || {
-    echo "--devices must contain exactly two physical device IDs, for example 2,5" >&2
+    echo "--devices must contain exactly two physical device IDs, for example 2,3" >&2
     exit 2
 }
 

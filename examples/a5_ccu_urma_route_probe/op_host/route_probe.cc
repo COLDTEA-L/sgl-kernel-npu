@@ -3,12 +3,18 @@
 #include "utils.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
+#include <hcomm/hcomm_res.h>
 
 #include <cstdint>
 #include <cstdio>
 
 using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteResources;
+
+namespace {
+constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
+constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
+}
 
 extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
     uint64_t sendCount, HcclDataType dataType, HcclComm comm, aclrtStream stream)
@@ -44,13 +50,36 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
         inputToken, outputToken, bytes, resources.rank * bytes);
 
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch begin: kernel=%lu bytes=%lu\n",
+    if (resources.routeThread != resources.mainThread) {
+        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+            resources.mainThread, resources.routeThread, THREAD_NOTIFY_INDEX));
+        if (status != HCCL_SUCCESS) {
+            return status;
+        }
+        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+            resources.routeThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+        if (status != HCCL_SUCCESS) {
+            return status;
+        }
+    }
+
+    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch begin: kernel=%lu bytes=%lu die_id=%u\n",
                 resources.rank, static_cast<unsigned long>(resources.kernel),
-                static_cast<unsigned long>(bytes));
+                static_cast<unsigned long>(bytes), resources.dieId);
     std::fflush(stdout);
-    status = HcclCcuKernelLaunch(comm, resources.thread, resources.kernel, &taskArg);
+    status = HcclCcuKernelLaunch(comm, resources.routeThread, resources.kernel, &taskArg);
     std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch end: status=%d\n",
                 resources.rank, static_cast<int>(status));
     std::fflush(stdout);
-    return status;
+    if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
+        return status;
+    }
+
+    status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+        resources.mainThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
 }
