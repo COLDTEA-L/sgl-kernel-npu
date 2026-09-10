@@ -43,11 +43,11 @@ std::string CommAddrToString(const CommAddr &addr)
     return out.str();
 }
 
-HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, ChannelHandle *channel,
+HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
+                         uint32_t routeIndex, HcclChannelDesc *desc,
                          uint32_t *dieId)
 {
-    if (channel == nullptr || dieId == nullptr) {
+    if (desc == nullptr || dieId == nullptr) {
         return HCCL_E_PTR;
     }
     uint32_t layerNum = 0;
@@ -79,13 +79,25 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
             const uint32_t ordinal = static_cast<uint32_t>(candidates.size());
             const std::string srcAddr = CommAddrToString(link.srcEndpointDesc.commAddr);
             const std::string dstAddr = CommAddrToString(link.dstEndpointDesc.commAddr);
+            uint32_t srcDieId = UINT32_MAX;
+            uint32_t dstDieId = UINT32_MAX;
+            EndpointDesc srcEndpoint = link.srcEndpointDesc;
+            EndpointDesc dstEndpoint = link.dstEndpointDesc;
+            (void)HcclRankGraphGetEndpointInfo(
+                comm, rank, &srcEndpoint, ENDPOINT_ATTR_DIE_ID,
+                sizeof(srcDieId), static_cast<void *>(&srcDieId));
+            (void)HcclRankGraphGetEndpointInfo(
+                comm, peer, &dstEndpoint, ENDPOINT_ATTR_DIE_ID,
+                sizeof(dstDieId), static_cast<void *>(&dstDieId));
             std::printf("[A5 CCU URMA][rank=%u peer=%u] route=%u layer=%u link=%u "
-                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_addr=%s dst_addr=%s%s\n",
+                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_die=%u dst_die=%u "
+                        "src_addr=%s dst_addr=%s%s\n",
                         rank, peer, ordinal, layers[layerIndex], linkIndex,
                         static_cast<int>(link.linkAttr.linkProtocol),
                         static_cast<uint32_t>(link.linkAttr.hop),
                         link.srcEndpointDesc.loc.device.devPhyId,
                         link.dstEndpointDesc.loc.device.devPhyId,
+                        srcDieId, dstDieId,
                         srcAddr.c_str(), dstAddr.c_str(),
                         ordinal == routeIndex ? " SELECTED" : "");
             std::fflush(stdout);
@@ -121,29 +133,21 @@ HcclResult SelectChannel(HcclComm comm, uint32_t rank, uint32_t peer,
         return HCCL_E_PARA;
     }
 
-    HcclChannelDesc desc;
-    status = HcclChannelDescInit(&desc, 1);
+    status = HcclChannelDescInit(desc, 1);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    desc.remoteRank = peer;
-    desc.notifyNum = CHANNEL_NOTIFY_NUM;
-    desc.channelProtocol = selectedLink.linkAttr.linkProtocol;
-    desc.localEndpoint = selectedLink.srcEndpointDesc;
-    desc.remoteEndpoint = selectedLink.dstEndpointDesc;
+    desc->remoteRank = peer;
+    desc->notifyNum = CHANNEL_NOTIFY_NUM;
+    desc->channelProtocol = selectedLink.linkAttr.linkProtocol;
+    desc->localEndpoint = selectedLink.srcEndpointDesc;
+    desc->remoteEndpoint = selectedLink.dstEndpointDesc;
 
-    *channel = 0;
-    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u layer=%u link=%u "
-                "die_id=%u as one per-die channel\n",
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] prepared route=%u layer=%u link=%u "
+                "die_id=%u; threads will be acquired before this per-die channel\n",
                 rank, peer, routeIndex, selectedLayer, candidateLinkIndices[routeIndex], *dieId);
     std::fflush(stdout);
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &desc, 1, channel);
-    std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
-                "die_id=%u channel=%lu\n",
-                rank, peer, static_cast<int>(status), *dieId,
-                static_cast<unsigned long>(status == HCCL_SUCCESS ? *channel : 0));
-    std::fflush(stdout);
-    return status;
+    return HCCL_SUCCESS;
 }
 
 } // namespace
@@ -202,6 +206,13 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     RouteResources created;
     created.rank = rank;
     created.rankSize = rankSize;
+    HcclChannelDesc selectedDesc;
+    status = SelectRoute(comm, rank, 1U - rank, routeIndex,
+                         &selectedDesc, &created.dieId);
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+
     std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread begin\n", rank);
     std::fflush(stdout);
     status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream,
@@ -212,12 +223,6 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    status = SelectChannel(comm, rank, 1U - rank, routeIndex,
-                           &created.channel, &created.dieId);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-
     created.routeThread = created.mainThread;
     if (created.dieId == 1) {
         const aclError aclStatus = aclrtCreateStream(&created.slaveStream);
@@ -237,6 +242,20 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
         if (status != HCCL_SUCCESS) {
             return status;
         }
+    }
+
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] acquiring route=%u die_id=%u "
+                "after all required CCU threads are ready\n",
+                rank, 1U - rank, routeIndex, created.dieId);
+    std::fflush(stdout);
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &selectedDesc, 1, &created.channel);
+    std::printf("[A5 CCU URMA][rank=%u peer=%u] HcclChannelAcquire end: status=%d "
+                "die_id=%u channel=%lu\n",
+                rank, 1U - rank, static_cast<int>(status), created.dieId,
+                static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channel : 0));
+    std::fflush(stdout);
+    if (status != HCCL_SUCCESS) {
+        return status;
     }
 
     int32_t channelState = -1;

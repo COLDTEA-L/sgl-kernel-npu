@@ -192,6 +192,9 @@ done
 Die kernel 的单独 channel 请求传给 `HcclChannelAcquire`。它不会再把两个 Die 的 link 合并为一次 acquire。
 日志会显示 `die_id=0/1`；die 0 使用主 CCU thread，die 1 使用独立 slave stream/CCU thread，并通过
 `HcommThreadNotifyRecordOnThread/HcommThreadNotifyWaitOnThread` 与主 thread 做前后同步。
+资源申请顺序与 HCCL 原生 CCU 算子保持一致：先枚举 route 并得到 `die_id`，再申请所需的 main/slave
+CCU thread，最后才调用 `HcclChannelAcquire`。因此 die 1 测试日志必须先出现
+`acquire die1 slave CCU thread end: status=0`，之后才应出现 `acquiring route=... die_id=1`。
 
 重点验证 route 1：
 
@@ -206,6 +209,56 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 如果 route 0 成功，而 route 1 在这种 per-die acquire 模式下仍然稳定返回 `status=9`，说明失败发生在
 HCOMM/UVS 的 hop-2 channel 建链阶段，CCU kernel 和 `WriteNb` 尚未执行。
+
+### 6.1 查询 IO Die 与拓扑的对应关系
+
+探针会为每条候选 route 打印 `src_die`、`dst_die`、物理卡号以及原始 EID。先把 EID 与 UDMA 设备对应起来：
+
+```bash
+urma_admin show
+```
+
+A5 当前命名中通常可按设备名直接判断 IO Die：
+
+```text
+udmac0... -> IO Die 0
+udmac1... -> IO Die 1
+```
+
+本机输出中 `003f:0200` 一组对应 `udmac0d1e2`，`007f:0200` 一组对应 `udmac1d1e2`。应以当前机器
+`urma_admin show` 的实际 EID 为准，不要只依赖这一段前缀。
+
+较新 UMDK 使用下面的命令输出端口连接关系：
+
+```bash
+urma_admin show topo
+```
+
+部分版本把它注册为独立子命令：
+
+```bash
+urma_admin show_topo
+```
+
+可以依次尝试：
+
+```bash
+urma_admin show topo 2>/dev/null || urma_admin show_topo
+```
+
+输出中的核心关系是：
+
+```text
+IODie X / Port Y -> Peer Node / Peer IODie / Peer Port
+```
+
+这样可以把探针的 `die_id` 和 EID 映射到本机 IO Die、端口及相邻节点。如果当前安装的
+`urma_admin` 两种命令都不支持，只能从 `/etc/hixlep` 的拓扑配置或平台侧链路计数器补充确认。
+
+需要注意：RankGraph 公开接口只提供 endpoint 的 `DIE_ID`、`LOCATION` 和 `BW_COEFF`，没有
+`relay_rank` 属性。因此上述信息可以确认使用哪个 IO Die/端口和相邻节点，但仅凭 probe 日志不一定能直接得出
+“经过物理 NPU 几号卡”。最终应在 route 1/2 分别运行时对比相关 IO Die 端口计数器，并确认中间卡 HBM
+读写量没有随 payload 增加。
 
 ## 7. 使用 msprof
 
