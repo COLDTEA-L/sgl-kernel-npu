@@ -371,13 +371,32 @@ buffer 的 token 由 `hcomm::CcuRep::GetTokenInfo` 生成，真正的 remote wri
 本分支支持把同一 IO Die 上的多条 HCOMM channel 一次交给 CCU kernel。kernel 会先对所有 channel 下发
 非阻塞 `WriteNb`，然后统一等待完成，避免 `write/wait/write/wait` 造成路径串行。
 
-例如 6、7 卡当前的 route0 和 route2 都位于 die1，可直接验证双路径：
+首次在有卡服务器拉取本分支（本地尚不存在该分支）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch -c feature/a5-ccu-urma-multirelay-forwarding \
+  --track origin/feature/a5-ccu-urma-multirelay-forwarding
+git rev-parse --short HEAD
+```
+
+如果本地已经存在该分支，则执行：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 git fetch origin
 git switch feature/a5-ccu-urma-multirelay-forwarding
 git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+git rev-parse --short HEAD
+```
+
+当前提交应至少包含 `1d00863 feat: add CCU URMA multiroute forwarding framework`。拉取完成后需要重新编译并安装最新算子包，再运行测试。
+
+例如 6、7 卡当前的 route0 和 route2 都位于 die1，可直接验证双路径：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
 
 bash scripts/run_a5_ccu_urma_route_probe.sh \
   --devices 6,7 \
