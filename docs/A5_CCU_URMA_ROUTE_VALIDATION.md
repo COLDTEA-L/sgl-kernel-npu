@@ -468,3 +468,74 @@ bash "${latest_pkg}" --install
 
 验收“指定 0～5 转发”必须同时看到 provider 返回六个不同 `relayPhyId`，并通过 IO Die 路径计数器确认对应
 字节增长。只有 CCU kernel PASS 不能证明具体中转卡。
+
+## 12. 使用 hccn_tool 对比 route0 和 route2 的报文增量
+
+华为文档给出的网口统计命令是：
+
+```bash
+/usr/local/Ascend/driver/tools/hccn_tool -i DEVICE_ID -stat -g
+```
+
+其中 `-i` 后面是**物理 Device ID**。`nic_tx_all_pkg_num`、`nic_tx_all_oct_num`、
+`nic_rx_all_pkg_num`、`nic_rx_all_oct_num` 分别表示 NIC 累计发送/接收报文数和字节数；
+`roce_new_pkt_rty_num` 可用于观察重传。它们是累计值，因此不能只查看一次绝对值。
+
+运行脚本增加了以下参数：
+
+- `--hccn-stat`：在 workload 前后采集 `hccn_tool -stat -g`，并计算增量；
+- `--hccn-devices 0,1,...`：需要观察的物理卡，默认 `0,1,2,3,4,5,6,7`；
+- `--hccn-tool PATH`：工具不在 `PATH` 或默认驱动目录时显式指定；
+- `--hccn-stat-root PATH`：原始快照和增量表的根目录，默认沿用 `--profile-root`，即
+  `/home/l00934901/profiling`。
+
+先测试 direct route0：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 6,7 \
+  --route-index 0 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --hccn-stat \
+  --hccn-devices 0,1,2,3,4,5,6,7 \
+  --hccn-stat-root /home/l00934901/profiling
+```
+
+确认上一次进程完全退出后，再用完全相同的数据量和迭代次数测试 hop-2 route2：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 6,7 \
+  --route-index 2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --hccn-stat \
+  --hccn-devices 0,1,2,3,4,5,6,7 \
+  --hccn-stat-root /home/l00934901/profiling
+```
+
+脚本不会清零全局计数器，而是保存 `before_deviceN.txt`、`after_deviceN.txt`，并生成：
+
+```text
+/home/l00934901/profiling/hccn_routes_ROUTE_TIMESTAMP/hccn_counter_deltas.tsv
+```
+
+终端也会打印每张物理卡的 TX/RX 报文和字节增量。判读时注意：
+
+1. 在没有其他通信任务的独占窗口执行；否则这些设备级累计计数会混入其他业务流量。
+2. 6、7 卡是通信端点，route0 和 route2 下出现收发增量都是正常的。
+3. 如果 0～5 中某张卡只在 route2 测试中出现与 payload/迭代次数成比例的明显增量，而 route0
+   没有，可作为该卡参与转发的强证据。
+4. `hccn_tool -i DEVICE_ID -stat -g` 是设备/NIC 级统计，公开命令没有 RankGraph `route-index` 或内部
+   IO Die `link` 参数。透明 IO Die forwarding 未必记入中间 NPU 的 host 可见 NIC 计数。因此“中间卡有增量”
+   能增强 relay 判断，但“中间卡无增量”不能单独否定 hop-2 转发；最终仍需结合 RankGraph 的 `hop/src_addr/dst_addr`
+   和平台侧 UDMA/IO Die per-port 计数器。
+5. 单独选择 `--route-index 2` 表示全部 2 MiB 走 route2 这一条 RankGraph route，并不是脚本同时运行
+   route0+route2。要测试 direct 与 relay 并发，使用 `--route-indices 0,2`，此时才按权重切片。

@@ -18,6 +18,10 @@ remote_only=0
 channel_only=0
 sweep=0
 profile_root=/home/l00934901/profiling
+hccn_stat=0
+hccn_devices="0,1,2,3,4,5,6,7"
+hccn_tool_path=""
+hccn_stat_root=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,6 +38,10 @@ while [[ $# -gt 0 ]]; do
         --sweep) sweep=1; shift ;;
         --profile) profile=1; shift ;;
         --profile-root) profile_root=$2; shift 2 ;;
+        --hccn-stat) hccn_stat=1; shift ;;
+        --hccn-devices) hccn_devices=$2; shift 2 ;;
+        --hccn-tool) hccn_tool_path=$2; shift 2 ;;
+        --hccn-stat-root) hccn_stat_root=$2; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -83,6 +91,100 @@ fi
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 
 make -C "${test_dir}"
+
+resolve_hccn_tool() {
+    if [[ -n "${hccn_tool_path}" ]]; then
+        [[ -x "${hccn_tool_path}" ]] || {
+            echo "hccn_tool is not executable: ${hccn_tool_path}" >&2
+            return 1
+        }
+        return 0
+    fi
+    if command -v hccn_tool >/dev/null 2>&1; then
+        hccn_tool_path=$(command -v hccn_tool)
+    elif [[ -x /usr/local/Ascend/driver/tools/hccn_tool ]]; then
+        hccn_tool_path=/usr/local/Ascend/driver/tools/hccn_tool
+    else
+        echo "hccn_tool not found; pass --hccn-tool /path/to/hccn_tool" >&2
+        return 1
+    fi
+}
+
+capture_hccn_stats() {
+    local phase=$1
+    local output_dir=$2
+    local dev
+    local output_file
+    local -a stat_devices
+    IFS=',' read -ra stat_devices <<< "${hccn_devices}"
+    for dev in "${stat_devices[@]}"; do
+        dev=${dev//[[:space:]]/}
+        [[ "${dev}" =~ ^[0-9]+$ ]] || {
+            echo "invalid physical device ID in --hccn-devices: ${dev}" >&2
+            return 1
+        }
+        output_file="${output_dir}/${phase}_device${dev}.txt"
+        echo "HCCN snapshot ${phase}: physical device ${dev}"
+        {
+            echo "# command: ${hccn_tool_path} -i ${dev} -stat -g"
+            echo "# timestamp: $(date --iso-8601=ns)"
+            "${hccn_tool_path}" -i "${dev}" -stat -g
+        } >"${output_file}" 2>&1 || {
+            echo "hccn_tool failed for physical device ${dev}; see ${output_file}" >&2
+            return 1
+        }
+    done
+}
+
+report_hccn_delta() {
+    local output_dir=$1
+    python3 - "${output_dir}" "${hccn_devices}" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+devices = [item.strip() for item in sys.argv[2].split(",") if item.strip()]
+summary_fields = (
+    "nic_tx_all_pkg_num",
+    "nic_tx_all_oct_num",
+    "nic_rx_all_pkg_num",
+    "nic_rx_all_oct_num",
+    "roce_new_pkt_rty_num",
+)
+line_re = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*([0-9]+)\s*$")
+
+def load(path):
+    counters = {}
+    for line in path.read_text(errors="replace").splitlines():
+        match = line_re.match(line)
+        if match:
+            counters[match.group(1)] = int(match.group(2))
+    return counters
+
+rows = []
+print("HCCN counter deltas (after - before):")
+for dev in devices:
+    before = load(root / f"before_device{dev}.txt")
+    after = load(root / f"after_device{dev}.txt")
+    common = sorted(before.keys() & after.keys())
+    deltas = {key: after[key] - before[key] for key in common}
+    shown = " ".join(
+        f"{key}={deltas[key]}" if key in deltas else f"{key}=N/A"
+        for key in summary_fields
+    )
+    print(f"  physical_device={dev} {shown}")
+    for key in common:
+        rows.append((dev, key, before[key], after[key], deltas[key]))
+
+output = root / "hccn_counter_deltas.tsv"
+with output.open("w") as handle:
+    handle.write("physical_device\tcounter\tbefore\tafter\tdelta\n")
+    for row in rows:
+        handle.write("\t".join(map(str, row)) + "\n")
+print(f"HCCN raw snapshots and full delta table: {root}")
+PY
+}
 
 build_command() {
     local payload_bytes=$1
@@ -150,6 +252,7 @@ run_pair() {
     }
 }
 
+run_workload() {
 if (( sweep != 0 )); then
     echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
     echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
@@ -158,7 +261,7 @@ if (( sweep != 0 )); then
         echo "===== payload ${sweep_bytes} bytes ====="
         run_pair "${sweep_bytes}"
     done
-    exit 0
+    return 0
 fi
 
 echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
@@ -168,3 +271,27 @@ echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
     ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"
 
 run_pair "${bytes}"
+}
+
+if (( hccn_stat == 0 )); then
+    run_workload
+    exit $?
+fi
+
+resolve_hccn_tool
+[[ -n "${hccn_stat_root}" ]] || hccn_stat_root="${profile_root}"
+route_label=${route_indices:-${route_index}}
+route_label=${route_label//[^[:alnum:]_-]/_}
+hccn_run_dir="${hccn_stat_root}/hccn_routes_${route_label}_$(date +%Y%m%d_%H%M%S)_$$"
+mkdir -p "${hccn_run_dir}"
+
+capture_hccn_stats before "${hccn_run_dir}"
+workload_status=0
+run_workload || workload_status=$?
+after_status=0
+capture_hccn_stats after "${hccn_run_dir}" || after_status=$?
+if (( after_status == 0 )); then
+    report_hccn_delta "${hccn_run_dir}"
+fi
+(( workload_status == 0 )) || exit "${workload_status}"
+exit "${after_status}"
