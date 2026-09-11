@@ -330,3 +330,9 @@ HCCL 原生 executor 会统一管理：
 ```text
 docs/A5_CCU_URMA_ROUTE_VALIDATION.md
 ```
+
+CCU 与 AIV/MTE 通信模式的调用链、API、执行流程及选型对比见：
+
+```text
+docs/A5_CCU_AND_AIV_COMMUNICATION_GUIDE.md
+```
