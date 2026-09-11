@@ -1,5 +1,8 @@
 # A5 CCU + URMA 显式路由验证
 
+原生 HCCL CCU AllToAll 与本分支多路径 AllToAll 的接口、调用链、同步和选路差异，见
+`docs/A5_CCU_NATIVE_VS_MULTIROUTE_ALLTOALL.md`。
+
 ## 1. 目标和当前边界
 
 本分支 `feature/a5-ccu-urma-multirelay-forwarding` 增加两 rank 的 CCU+URMA 路由验证能力。除了原有
