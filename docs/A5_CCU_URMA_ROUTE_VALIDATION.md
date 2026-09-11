@@ -707,7 +707,10 @@ python3 -m torch.distributed.run \
 ### 13.4 同时采集 CCU profiling 和端口报文
 
 `hccn_tool` 已直接集成到上述 Python 测试。只有 rank0 执行设备级查询，两个 rank 在采集前后通过 HCCL
-barrier 对齐，因此计数窗口只包围正式 `--iters`，不包含 warmup。查询子进程会临时删除
+同步点对齐，因此计数窗口只包围正式 `--iters`，不包含 warmup。首次 CCU route launch 后，脚本使用
+`/tmp/a5_ccu_urma_write_sync_*` 下的共享文件同步，不再在同一个 communicator 上调用 `dist.barrier()` 或
+`dist.all_reduce()`。底层 CCU thread/channel 已经从该 communicator 取得资源，随后混用 PyTorch HCCL collective
+可能在 `HcclAllreduce` 报 `ERR00100`；该错误不代表前面的 CCU write 自身失败。查询子进程会临时删除
 `ASCEND_RT_VISIBLE_DEVICES` 和 `ASCEND_VISIBLE_DEVICES`，所以 `--hccn-devices` 始终填写宿主机
 `npu-smi info` 中的物理 Device ID，不是 torchrun 内部的 0、1。
 

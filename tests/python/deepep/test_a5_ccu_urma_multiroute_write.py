@@ -3,6 +3,7 @@
 
 import argparse
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -195,6 +196,18 @@ def report_hccn_delta(output_dir, devices):
     print(f"HCCN raw snapshots and delta table: {output_dir}", flush=True)
 
 
+def file_barrier(sync_dir, tag, rank, world_size, timeout=180):
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    (sync_dir / f"{tag}.rank{rank}").touch()
+    deadline = time.monotonic() + timeout
+    expected = [sync_dir / f"{tag}.rank{item}" for item in range(world_size)]
+    while not all(path.exists() for path in expected):
+        if time.monotonic() >= deadline:
+            missing = [str(path) for path in expected if not path.exists()]
+            raise TimeoutError(f"file barrier {tag} timed out; missing={missing}")
+        time.sleep(0.01)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024)
@@ -240,8 +253,11 @@ def main():
     dist.init_process_group("hccl")
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     run_id = re.sub(
-        r"[^A-Za-z0-9_.-]", "_", os.environ.get("TORCHELASTIC_RUN_ID", str(os.getppid()))
+        r"[^A-Za-z0-9_.-]",
+        "_",
+        f"{os.environ.get('TORCHELASTIC_RUN_ID', 'standalone')}_{os.environ.get('MASTER_PORT', '0')}",
     )
+    sync_dir = Path("/tmp") / f"a5_ccu_urma_write_sync_{run_id}"
 
     elements = args.bytes // 4
     send = torch.full((elements,), float(rank + 1), dtype=torch.float32, device="npu")
@@ -249,7 +265,7 @@ def main():
     for _ in range(args.warmup):
         recv = buffer.ccu_urma_multiroute_write(send)
         torch.npu.synchronize()
-    dist.barrier()
+    file_barrier(sync_dir, "warmup_done", rank, world_size)
 
     hccn_dir = None
     hccn_before = []
@@ -270,7 +286,7 @@ def main():
             )
             if not hccn_before:
                 print("WARNING: HCCN statistics unavailable on all requested devices", file=sys.stderr)
-    dist.barrier()
+    file_barrier(sync_dir, "hccn_before_done", rank, world_size)
 
     profiler = None
     if args.profile:
@@ -291,7 +307,7 @@ def main():
     if profiler is not None:
         profiler.stop()
 
-    dist.barrier()
+    file_barrier(sync_dir, "timed_run_done", rank, world_size)
     if args.hccn_stat and rank == 0 and hccn_dir is not None and hccn_before:
         hccn_after = capture_hccn_stats(
             hccn_tool, hccn_devices, hccn_dir, "after", set(hccn_before)
@@ -301,10 +317,8 @@ def main():
             report_hccn_delta(hccn_dir, common_devices)
         else:
             print("WARNING: no HCCN device has both before and after snapshots", file=sys.stderr)
-    dist.barrier()
+    file_barrier(sync_dir, "hccn_after_done", rank, world_size)
 
-    sample_tensor = torch.tensor(samples_us, dtype=torch.float32, device="npu")
-    dist.all_reduce(sample_tensor, op=dist.ReduceOp.MAX)
     if args.remote_only:
         peer = 1 - rank
         torch.testing.assert_close(recv[peer], torch.full_like(send, float(peer + 1)))
@@ -313,8 +327,15 @@ def main():
             [torch.full_like(send, float(source_rank + 1)) for source_rank in range(world_size)]
         )
         torch.testing.assert_close(recv, expected)
+    sample_file = sync_dir / f"samples.rank{rank}.json"
+    sample_file.write_text(json.dumps(samples_us))
+    file_barrier(sync_dir, "samples_written", rank, world_size)
     if rank == 0:
-        maximum_rank_samples = sample_tensor.cpu().tolist()
+        rank_samples = [
+            json.loads((sync_dir / f"samples.rank{item}.json").read_text())
+            for item in range(world_size)
+        ]
+        maximum_rank_samples = [max(values) for values in zip(*rank_samples)]
         avg_us = sum(maximum_rank_samples) / len(maximum_rank_samples)
         routes = args.route_indices or str(args.route_index)
         print(
@@ -324,6 +345,7 @@ def main():
         )
         print(f"deep_ep_cpp={EXTENSION}", flush=True)
         print(f"route_library={ROUTE_LIB}", flush=True)
+    file_barrier(sync_dir, "result_reported", rank, world_size)
     dist.destroy_process_group()
 
 
