@@ -54,6 +54,14 @@ def prepare_runtime():
         env_changed = os.environ.get("A5_CCU_ROUTE_PROBE_LIB") != str(route_lib)
         os.environ["A5_CCU_ROUTE_PROBE_LIB"] = str(route_lib)
         old_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        vendor_root = package / "vendors" / "hwcomputing"
+        vendor_lib = vendor_root / "op_api" / "lib"
+        if vendor_root.is_dir():
+            old_opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+            prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor_root))
+            env_changed |= old_opp_path != os.environ["ASCEND_CUSTOM_OPP_PATH"]
+        if vendor_lib.is_dir():
+            prepend_env_path("LD_LIBRARY_PATH", str(vendor_lib))
         prepend_env_path("LD_LIBRARY_PATH", str(route_lib.parent))
         env_changed |= old_ld_path != os.environ["LD_LIBRARY_PATH"]
         if env_changed and os.environ.get("_A5_CCU_PYTHON_REEXEC") != "1":

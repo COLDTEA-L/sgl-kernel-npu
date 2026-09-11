@@ -612,10 +612,22 @@ nm -D /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_rout
   grep HcclCcuUrmaMultiRouteWrite
 
 python3 - <<'PY'
-import deep_ep_cpp
+import deep_ep
+from deep_ep import deep_ep_cpp
 assert hasattr(deep_ep_cpp.Buffer, "ccu_urma_multiroute_write")
 print("deep_ep_cpp CCU Python binding: OK")
 PY
+```
+
+wheel 中扩展模块位于 `deep_ep/deep_ep_cpp*.so`，因此标准导入入口是 `import deep_ep` 或
+`from deep_ep import deep_ep_cpp`，不要用独立的 `import deep_ep_cpp` 判断 wheel 是否安装成功。若仍失败，确认
+安装 wheel 和运行测试使用的是同一个解释器：
+
+```bash
+which python3
+python3 -m pip --version
+python3 -m pip show -f deep-ep | grep -E 'Location|deep_ep_cpp.*\.so'
+python3 -c 'import deep_ep; print(deep_ep.__file__)'
 ```
 
 ### 13.2 功能与性能测试
@@ -625,11 +637,14 @@ PY
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=2300
 ```
+
+该测试会从实际找到的 `deep_ep` 包目录推导 vendor 路径，并在导入扩展前自动补齐
+`ASCEND_CUSTOM_OPP_PATH`、`LD_LIBRARY_PATH` 后重新拉起自身。因此不需要 source 仓库中构建产物里的
+`vendors/hwcomputing/bin/set_env.bash`；该生成文件可能含编译机器的绝对路径。
 
 单 route0：
 
@@ -702,7 +717,6 @@ Python profiler，并查询整机 0～7 卡的端口累计计数：
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 export ASCEND_RT_VISIBLE_DEVICES=4,5
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=2300
