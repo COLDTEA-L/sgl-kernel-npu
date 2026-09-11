@@ -2,8 +2,9 @@
 
 ## 1. 目标和当前边界
 
-本分支 `feature/a5-ccu-urma-multirelay-forwarding` 增加两 rank 的 CCU+URMA 路由验证能力。底层探针采用
-AllGather 语义；同时提供 DeepEP Python 接口，便于直接用 `torch_npu.profiler` 采集 CCU 路径。它使用：
+本分支 `feature/a5-ccu-urma-multirelay-forwarding` 增加两 rank 的 CCU+URMA 路由验证能力。除了原有
+AllGather 风格 Write probe，还提供仿照 HCCL 原生 CCU AllToAll 的两卡多路径算子和 DeepEP Python 接口。
+多路径 AllToAll 使用：
 
 - `HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)` 获取 CCU engine thread；
 - `COMM_PROTOCOL_UBC_CTP` 建立 HCOMM channel；
@@ -12,6 +13,10 @@ AllGather 语义；同时提供 DeepEP Python 接口，便于直接用 `torch_np
 - `HcclCcuKernelRegister/HcclCcuKernelRegisterFinish` 注册真正的 CCU kernel；
 - `HcclCcuKernelLaunch` 把用户 buffer 地址、token 和长度送入 CCU；
 - CCU kernel 使用 `NotifyRecord/NotifyWait` 交换远端地址和 token，并用 `WriteNb/WaitEvent` 完成传输。
+
+新 AllToAll 每个 rank 的输入、输出形状均为 `[2, elements_per_peer]`。输入第 `dst_rank` 块发送给对应 rank，
+输出第 `src_rank` 块保存该来源的数据。本 rank 块使用 CCU `LocalCopyNb`，对端块通过所选 route 写入。
+选择 `0,2` 时暂按 route0:route2=`2:1` 切分，并保持 256 Bytes 对齐。
 
 这一步验证“CCU 能否通过指定的 RankGraph UBC_CTP 链路正确通信”。它不会凭空构造 RankGraph 中不存在的 `1 -> 3 -> 8` 路由，也还不是最终的绕路 AllToAll。若 RankGraph 只返回一条 UBC_CTP 链路，则只能选择 route 0；后续要继续检查 UVS/HIXL 路由配置，而不是仅修改 CCU kernel。
 
@@ -788,3 +793,129 @@ physical_device=N nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
 - CCU Python 测试数据正确；
 - profiling 中两个 rank 都出现 CCU launch/task；
 - 平台可见的 per-port 计数与 route 选择呈可重复的对应关系。
+
+## 14. 两卡多路径 CCU AllToAll
+
+### 14.1 重新编译和安装
+
+新 AllToAll 同时修改了自定义 CCU 包和 DeepEP C++ 扩展，两部分都必须更新：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin feature/a5-ccu-urma-multirelay-forwarding
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
+
+cd /home/l00934901/sgl-kernel-npu
+bash build.sh -a deepep Ascend950
+LATEST_WHEEL=$(find output -maxdepth 1 -type f -name 'deep_ep*.whl' -printf '%T@ %p\n' 2>/dev/null | \
+  sort -nr | head -n 1 | cut -d' ' -f2-)
+test -n "${LATEST_WHEEL}"
+python3 -m pip install --force-reinstall --no-deps "${LATEST_WHEEL}"
+```
+
+关键是最后只安装时间最新的一个 wheel。安装后检查新符号：
+
+```bash
+python3 - <<'PY'
+import deep_ep.deep_ep_cpp as ext
+assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall")
+assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
+print(ext.__file__)
+PY
+
+nm -D /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/\
+liba5_ccu_urma_route_probe.so | grep HcclCcuUrmaMultiRouteAllToAll
+```
+
+### 14.2 数据布局与同步策略
+
+每个 rank 的 `send` 和 `recv` 形状均为 `[2, elements_per_peer]`：
+
+```text
+send[dst_rank] -> dst_rank 上的 recv[src_rank]
+```
+
+`--bytes` 表示每个 peer slice 的字节数。因此 `--bytes 2097152` 时每个 rank 输入、输出各 4 MiB，
+self copy 为 2 MiB，网络发送为 2 MiB。单 route 获得全部对端数据；`--route-indices 0,2` 暂按
+route0:route2=`2:1` 分配对端数据。
+
+CCU kernel 仿照 HCCL 原生 AllToAll：先向所有 route 发布动态 output 地址和 token，再下发本地
+`LocalCopyNb` 与全部远端 `WriteNb`，最后统一等待。output/token 使用同一个 pre-sync notify index 和两个
+bit，一条 route 只执行一次组合 `NotifyWait(mask=3)`。所有 route 写完成后，只通过第一条选中 route 做一次
+peer 级 post-sync。动态地址、token、数据完成事件和 peer 完成同步都不能删除；它们分别保证远端寻址权限、
+写完成以及本 rank 的输入数据已经全部到达。
+
+正式执行默认不输出每次 `HcclCcuKernelLaunch` 日志，也不调用 `fflush(stdout)`。只有排错时传入
+`--debug`，它会设置 `A5_CCU_DEBUG=1`。
+
+### 14.3 在物理卡 4、5 运行
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+```
+
+route0：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-index 0 --bytes 2097152 --warmup 10 --iters 100
+```
+
+route2：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-index 2 --bytes 2097152 --warmup 10 --iters 100
+```
+
+route0+route2：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-indices 0,2 --bytes 2097152 --warmup 10 --iters 100
+```
+
+测试在 warmup 前一次性分配 `recv`，正式阶段调用 `_out` 接口，连续下发全部迭代后只做一次
+`torch.npu.synchronize()`。终端的 `host_batch_avg_us` 是批量摊销 host 时间，不再包含每轮 tensor 分配、
+逐轮 synchronize 和 stdout 刷新。
+
+### 14.4 采集两张卡 profiling
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-indices 0,2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --profile \
+  --profile-root /home/l00934901/profiling
+```
+
+输出按 rank 分开：
+
+```text
+/home/l00934901/profiling/a5_ccu_urma_all2all_routes_0,2_RUN_ID/
+├── rank0/
+└── rank1/
+```
+
+MindStudio 中一个 `CCU Launch` 包含 self `LocalCopyNb` 和所有 route 的 `WriteNb`。对比 route0、route2、
+route0+2 时，应同时记录 CCU Launch 的平均值、P50、P95；不要再用带 `--debug` 的结果做性能结论。

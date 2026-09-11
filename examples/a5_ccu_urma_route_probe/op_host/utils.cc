@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "route_kernel.h"
+#include "all_to_all_multiroute_kernel.h"
 #include "source_route_provider.h"
 
 #include <hccl/hccl_rank_graph.h>
@@ -426,6 +427,15 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
         return status;
     }
     created.kernel = kernel;
+
+    AllToAllMultiRouteKernelArg allToAllKernelArg(created.channels, routeIndices);
+    hcomm::KernelCreator allToAllCreator = CreateAllToAllMultiRouteKernel;
+    CcuKernelHandle allToAllKernel = 0;
+    status = HcclCcuKernelRegister(comm, &allToAllKernel, &allToAllCreator, &allToAllKernelArg);
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+    created.allToAllKernel = allToAllKernel;
 
     std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish begin\n", rank);
     std::fflush(stdout);

@@ -31,6 +31,15 @@ HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCoun
 HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf, uint64_t sendCount,
                                      HcclDataType dataType, HcclComm comm, aclrtStream stream);
 
+/**
+ * Two-rank CCU AllToAll over one or more RankGraph routes.
+ * sendBuf and recvBuf each contain two consecutive elementsPerPeer-element
+ * slices. sendBuf[dstRank] is delivered to recvBuf[srcRank] on dstRank.
+ */
+HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
+                                        uint64_t elementsPerPeer, HcclDataType dataType,
+                                        HcclComm comm, aclrtStream stream);
+
 #ifdef __cplusplus
 }
 #endif

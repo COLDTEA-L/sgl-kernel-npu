@@ -24,6 +24,11 @@ bool EnvEnabled(const char *name)
     const char *value = std::getenv(name);
     return value != nullptr && std::string(value) == "1";
 }
+
+bool DebugEnabled()
+{
+    return EnvEnabled("A5_CCU_DEBUG");
+}
 }
 
 extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
@@ -96,14 +101,16 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
         }
     }
 
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch begin: kernel=%lu bytes=%lu die_id=%u\n",
-                resources.rank, static_cast<unsigned long>(resources.kernel),
-                static_cast<unsigned long>(bytes), resources.dieId);
-    std::fflush(stdout);
+    if (DebugEnabled()) {
+        std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch begin: kernel=%lu bytes=%lu die_id=%u\n",
+                    resources.rank, static_cast<unsigned long>(resources.kernel),
+                    static_cast<unsigned long>(bytes), resources.dieId);
+    }
     status = HcclCcuKernelLaunch(comm, resources.routeThread, resources.kernel, &taskArg);
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch end: status=%d\n",
-                resources.rank, static_cast<int>(status));
-    std::fflush(stdout);
+    if (DebugEnabled()) {
+        std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch end: status=%d\n",
+                    resources.rank, static_cast<int>(status));
+    }
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
         return status;
     }

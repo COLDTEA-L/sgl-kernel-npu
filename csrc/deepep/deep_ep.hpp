@@ -72,6 +72,11 @@ public:
 
     torch::Tensor ccu_urma_multiroute_write(const torch::Tensor &send_data);
 
+    torch::Tensor ccu_urma_multiroute_alltoall(const torch::Tensor &send_data);
+
+    torch::Tensor ccu_urma_multiroute_alltoall_out(const torch::Tensor &send_data,
+                                                   const torch::Tensor &recv_data);
+
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 
     std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,

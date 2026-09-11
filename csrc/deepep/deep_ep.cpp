@@ -78,6 +78,22 @@ CcuUrmaMultiRouteWriteFn GetCcuUrmaMultiRouteWrite()
     return function;
 }
 
+CcuUrmaMultiRouteWriteFn GetCcuUrmaMultiRouteAllToAll()
+{
+    static CcuUrmaMultiRouteWriteFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaMultiRouteAllToAll");
+        EP_HOST_ASSERT_S(symbol != nullptr, "HcclCcuUrmaMultiRouteAllToAll not found in ", library,
+                         "; rebuild and install the latest package");
+        return reinterpret_cast<CcuUrmaMultiRouteWriteFn>(symbol);
+    }();
+    return function;
+}
+
 Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
                std::string moe_all_to_all_group_name)
     : rank(rank),
@@ -187,6 +203,31 @@ torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
                                            static_cast<uint64_t>(send_data.numel()),
                                            HCCL_DATA_TYPE_FP32, comm, stream));
     return recv_data;
+}
+
+torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send_data,
+                                                       const torch::Tensor &recv_data)
+{
+    RECORD_FUNCTION("deep_ep::ccu_urma_multiroute_alltoall", std::vector<c10::IValue>({send_data, recv_data}));
+    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
+    EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
+    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(num_ranks == 2);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
+
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaMultiRouteAllToAll()(send_data.data_ptr(), recv_data.data_ptr(),
+        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32, comm, stream));
+    return recv_data;
+}
+
+torch::Tensor Buffer::ccu_urma_multiroute_alltoall(const torch::Tensor &send_data)
+{
+    auto recv_data = torch::empty_like(send_data);
+    return ccu_urma_multiroute_alltoall_out(send_data, recv_data);
 }
 
 torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)

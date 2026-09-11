@@ -487,6 +487,16 @@ class Buffer:
         """
         return self.runtime.ccu_urma_multiroute_write(send_data)
 
+    def ccu_urma_multiroute_alltoall(self, send_data: torch.Tensor) -> torch.Tensor:
+        """Run two-rank CCU AllToAll over the selected RankGraph route(s)."""
+        return self.runtime.ccu_urma_multiroute_alltoall(send_data)
+
+    def ccu_urma_multiroute_alltoall_out(
+        self, send_data: torch.Tensor, recv_data: torch.Tensor
+    ) -> torch.Tensor:
+        """Out variant used for stable profiling without per-launch allocation."""
+        return self.runtime.ccu_urma_multiroute_alltoall_out(send_data, recv_data)
+
     def all2_all_detour_io_die(
         self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
     ) -> torch.Tensor:
