@@ -477,6 +477,16 @@ class Buffer:
         """
         return self.runtime.hccl_all2_all_ccu(send_data)
 
+    def ccu_urma_multiroute_write(self, send_data: torch.Tensor) -> torch.Tensor:
+        """Write one FP32 payload over selected A5 CCU+URMA RankGraph routes.
+
+        This is a two-rank validation primitive. ``A5_CCU_ROUTE_INDEX`` selects
+        one route and ``A5_CCU_ROUTE_INDICES`` selects same-die concurrent
+        routes. The result is shaped ``[2, send_data.numel()]`` in source-rank
+        order, matching a two-rank AllGather.
+        """
+        return self.runtime.ccu_urma_multiroute_write(send_data)
+
     def all2_all_detour_io_die(
         self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
     ) -> torch.Tensor:

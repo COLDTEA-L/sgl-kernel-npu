@@ -23,6 +23,14 @@ extern "C" {
 HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCount, HcclDataType dataType, HcclComm comm,
                                aclrtStream stream);
 
+/**
+ * Two-rank CCU multi-route write used by the Python/PyTorch validation path.
+ * A5_CCU_ROUTE_INDEX or A5_CCU_ROUTE_INDICES selects the RankGraph channels.
+ * recvBuf contains rankSize consecutive sendCount-element source-rank slices.
+ */
+HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf, uint64_t sendCount,
+                                     HcclDataType dataType, HcclComm comm, aclrtStream stream);
+
 #ifdef __cplusplus
 }
 #endif

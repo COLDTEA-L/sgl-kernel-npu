@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <vector>
+#include <ATen/record_function.h>
 #include <pybind11/functional.h>
 
 #include "hccl/hccl.h"
@@ -35,6 +36,47 @@ constexpr uint32_t MAX_ROUNDS = 256;
 constexpr uint32_t MIN_TOKENS_PER_ROUND = 32;
 constexpr uint32_t MAX_TOKENS_PER_ROUND = 8192;
 constexpr uint32_t MAX_TOTAL_TOKENS = 131072;
+
+using HcomGetCommHandleByGroupFn = HcclResult (*)(const char *, HcclComm *);
+using CcuUrmaMultiRouteWriteFn = HcclResult (*)(void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream);
+
+HcclComm ResolveComm(const std::string &group_name, HcclComm owned_comm)
+{
+    if (group_name.empty()) {
+        EP_HOST_ASSERT(owned_comm != nullptr);
+        return owned_comm;
+    }
+    static auto get_comm = reinterpret_cast<HcomGetCommHandleByGroupFn>(
+        dlsym(RTLD_DEFAULT, "HcomGetCommHandleByGroup"));
+    if (get_comm == nullptr) {
+        static void *hccl_handle = dlopen("libhccl.so", RTLD_NOW | RTLD_GLOBAL);
+        EP_HOST_ASSERT_S(hccl_handle != nullptr, "dlopen libhccl.so failed: ", dlerror());
+        get_comm = reinterpret_cast<HcomGetCommHandleByGroupFn>(
+            dlsym(hccl_handle, "HcomGetCommHandleByGroup"));
+    }
+    EP_HOST_ASSERT_S(get_comm != nullptr, "HcomGetCommHandleByGroup is not exported by libhccl.so");
+    HcclComm comm = nullptr;
+    HCCL_CHECK(get_comm(group_name.c_str(), &comm));
+    EP_HOST_ASSERT(comm != nullptr);
+    return comm;
+}
+
+CcuUrmaMultiRouteWriteFn GetCcuUrmaMultiRouteWrite()
+{
+    static CcuUrmaMultiRouteWriteFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror(),
+                         "; install the latest CCU route probe package or set A5_CCU_ROUTE_PROBE_LIB");
+        void *symbol = dlsym(handle, "HcclCcuUrmaMultiRouteWrite");
+        EP_HOST_ASSERT_S(symbol != nullptr, "HcclCcuUrmaMultiRouteWrite not found in ", library,
+                         "; rebuild and install the latest package");
+        return reinterpret_cast<CcuUrmaMultiRouteWriteFn>(symbol);
+    }();
+    return function;
+}
 
 Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
                std::string moe_all_to_all_group_name)
@@ -125,6 +167,25 @@ torch::Tensor Buffer::hccl_all2_all_ccu(const torch::Tensor &send_data)
 
     auto recv_data = torch::empty_like(send_data);
     EXEC_NPU_CMD(aclnnHcclAll2AllCcu, send_data, hcom_ep_name, num_ranks, rank, recv_data);
+    return recv_data;
+}
+
+torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
+{
+    RECORD_FUNCTION("deep_ep::ccu_urma_multiroute_write", std::vector<c10::IValue>({send_data}));
+    EP_HOST_ASSERT(send_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 1);
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(num_ranks == 2);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data));
+
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto recv_data = torch::empty({num_ranks, send_data.numel()}, send_data.options());
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaMultiRouteWrite()(send_data.data_ptr(), recv_data.data_ptr(),
+                                           static_cast<uint64_t>(send_data.numel()),
+                                           HCCL_DATA_TYPE_FP32, comm, stream));
     return recv_data;
 }
 

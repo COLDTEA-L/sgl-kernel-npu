@@ -2,7 +2,8 @@
 
 ## 1. 目标和当前边界
 
-本分支 `feature/a5-ccu-urma-route-probe` 增加一个两 rank、AllGather 语义的最小探针。它使用：
+本分支 `feature/a5-ccu-urma-multirelay-forwarding` 增加两 rank 的 CCU+URMA 路由验证能力。底层探针采用
+AllGather 语义；同时提供 DeepEP Python 接口，便于直接用 `torch_npu.profiler` 采集 CCU 路径。它使用：
 
 - `HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)` 获取 CCU engine thread；
 - `COMM_PROTOCOL_UBC_CTP` 建立 HCOMM channel；
@@ -32,16 +33,17 @@ docs/A5_CCU_URMA_ROUTE_VALIDATION.md     本文档
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 git status --short
-git fetch origin feature/a5-ccu-urma-route-probe
-git switch --track origin/feature/a5-ccu-urma-route-probe
+git fetch origin feature/a5-ccu-urma-multirelay-forwarding
+git switch -c feature/a5-ccu-urma-multirelay-forwarding \
+  --track origin/feature/a5-ccu-urma-multirelay-forwarding
 ```
 
 本地已经有同名分支时：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-git switch feature/a5-ccu-urma-route-probe
-git pull --ff-only origin feature/a5-ccu-urma-route-probe
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
 git rev-parse --short HEAD
 ```
 
@@ -547,3 +549,142 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 只包含前后两次都查询成功的设备。如果所有设备均失败，算子仍会继续运行并明确打印
 `HCCN statistics unavailable`。这表示当前产品/驱动没有通过该接口提供所需计数，不能把“查询失败”解释成
 “该卡没有流量”。
+
+## 13. Python 直接调用 CCU 多路径 write 并采集 profiling
+
+前面的 C++ 探针仍适合枚举 route、做 `channel-only` 和采集 `hccn_tool`。为了让 CCU 通信进入 Python
+测试进程，本分支另外导出 `HcclCcuUrmaMultiRouteWrite`，并依次接入：
+
+```text
+examples/a5_ccu_urma_route_probe/op_host/route_probe.cc
+    CCU 多 route 切片、HcclCcuKernelLaunch
+csrc/deepep/deep_ep.cpp
+    解析 PyTorch HCCL group、加载探针动态库、取得当前 NPU stream
+csrc/deepep/pybind_extension.cpp
+python/deep_ep/deep_ep/buffer.py
+    Python 接口 Buffer.ccu_urma_multiroute_write
+tests/python/deepep/test_a5_ccu_urma_multiroute_write.py
+    两卡正确性、warmup/计时和 torch_npu.profiler
+```
+
+该接口当前是两 rank、FP32 的 AllGather-like 验证原语：每个 rank 输入 `--bytes` 字节，CCU 把这一整段数据
+按选中的 route 权重切片并写入对端输出；返回张量形状为 `[2, elements]`。它不是 AIV 算子，也不启动两个
+外部 C++ worker。`torchrun` 的两个 Python rank 各自直接调用 CCU library。
+
+### 13.1 拉取并重新编译两个组件
+
+先拉取分支：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+git rev-parse --short HEAD
+```
+
+本次同时修改了 CCU route 动态库和 `deep_ep_cpp`，因此二者都必须重编译。先编译并安装 CCU 包：
+
+```bash
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
+```
+
+再编译并安装 DeepEP wheel。只安装最新生成的一个 wheel，避免通配符同时命中历史包：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash build.sh -a deepep Ascend950
+
+latest_wheel=$(find output -maxdepth 1 -type f -name 'deep_ep*.whl' \
+  -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+test -n "${latest_wheel}"
+python3 -m pip install --force-reinstall --no-deps "${latest_wheel}"
+```
+
+安装后确认两个新符号均存在：
+
+```bash
+nm -D /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so | \
+  grep HcclCcuUrmaMultiRouteWrite
+
+python3 - <<'PY'
+import deep_ep_cpp
+assert hasattr(deep_ep_cpp.Buffer, "ccu_urma_multiroute_write")
+print("deep_ep_cpp CCU Python binding: OK")
+PY
+```
+
+### 13.2 功能与性能测试
+
+先 source CANN 和 DeepEP vendor 环境，并用物理卡 4、5 映射为进程内 device 0、1：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+```
+
+单 route0：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
+  --route-index 0 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only
+```
+
+route0 与 route2 并发：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
+  --route-indices 0,2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only
+```
+
+`--remote-only` 只跳过本 rank 到本 rank 的 D2D self copy；它不会减少 CCU 发往对端的 2 MiB，也不会把
+多 route 测试退化为单 route。
+
+### 13.3 在 Python 进程内采集 CCU profiling
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
+  --route-indices 0,2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --profile \
+  --profile-root /home/l00934901/profiling
+```
+
+结果按 rank 分开保存：
+
+```text
+/home/l00934901/profiling/a5_ccu_urma_write_RUN_ID/
+├── rank0/
+└── rank1/
+```
+
+采集配置使用 `ProfilerLevel.Level1`，活动包含 CPU 和 NPU，并开启 Text（环境支持时同时开启 Db）导出。
+时间线应能看到 `deep_ep::ccu_urma_multiroute_write` 以及其下发的 CCU task。这个接口绕过标准
+`HcclAlltoAll` 算法入口，因此仅设置 profiler 详细度不会自动生成标准 collective 的带宽、通信矩阵或
+`communication.json`；若后续需要这些字段，必须给自定义 CCU kernel 补 HCCL DFX/通信 profiling 上报，不能
+把 AIV 算子的 profiling 当作 CCU 结果。

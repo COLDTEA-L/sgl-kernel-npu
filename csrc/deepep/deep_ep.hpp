@@ -46,7 +46,7 @@ private:
 
     int device_id;
 
-    HcclComm ep_comm;
+    HcclComm ep_comm = nullptr;
 
     bool available = false;
 
@@ -69,6 +69,8 @@ public:
     torch::Tensor get_notify_send_data();
 
     torch::Tensor hccl_all2_all_ccu(const torch::Tensor &send_data);
+
+    torch::Tensor ccu_urma_multiroute_write(const torch::Tensor &send_data);
 
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 

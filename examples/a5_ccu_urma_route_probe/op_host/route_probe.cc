@@ -26,7 +26,7 @@ bool EnvEnabled(const char *name)
 }
 }
 
-extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
+extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
     uint64_t sendCount, HcclDataType dataType, HcclComm comm, aclrtStream stream)
 {
     if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr || stream == nullptr) {
@@ -115,4 +115,10 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
     }
     return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
         resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
+}
+
+extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
+    uint64_t sendCount, HcclDataType dataType, HcclComm comm, aclrtStream stream)
+{
+    return HcclCcuUrmaMultiRouteWrite(sendBuf, recvBuf, sendCount, dataType, comm, stream);
 }
