@@ -564,7 +564,7 @@ csrc/deepep/pybind_extension.cpp
 python/deep_ep/deep_ep/buffer.py
     Python 接口 Buffer.ccu_urma_multiroute_write
 tests/python/deepep/test_a5_ccu_urma_multiroute_write.py
-    两卡正确性、warmup/计时和 torch_npu.profiler
+    两卡正确性、warmup/计时、torch_npu.profiler 和 hccn_tool 前后计数
 ```
 
 该接口当前是两 rank、FP32 的 AllGather-like 验证原语：每个 rank 输入 `--bytes` 字节，CCU 把这一整段数据
@@ -688,3 +688,86 @@ python3 -m torch.distributed.run \
 `HcclAlltoAll` 算法入口，因此仅设置 profiler 详细度不会自动生成标准 collective 的带宽、通信矩阵或
 `communication.json`；若后续需要这些字段，必须给自定义 CCU kernel 补 HCCL DFX/通信 profiling 上报，不能
 把 AIV 算子的 profiling 当作 CCU 结果。
+
+### 13.4 同时采集 CCU profiling 和端口报文
+
+`hccn_tool` 已直接集成到上述 Python 测试。只有 rank0 执行设备级查询，两个 rank 在采集前后通过 HCCL
+barrier 对齐，因此计数窗口只包围正式 `--iters`，不包含 warmup。查询子进程会临时删除
+`ASCEND_RT_VISIBLE_DEVICES` 和 `ASCEND_VISIBLE_DEVICES`，所以 `--hccn-devices` 始终填写宿主机
+`npu-smi info` 中的物理 Device ID，不是 torchrun 内部的 0、1。
+
+推荐在没有其他通信任务的独占时段运行。以下命令在物理卡 4、5 上同时测试 route0+route2、采集两张卡的
+Python profiler，并查询整机 0～7 卡的端口累计计数：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
+  --route-indices 0,2 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --remote-only \
+  --profile \
+  --profile-root /home/l00934901/profiling \
+  --hccn-stat \
+  --hccn-devices 0,1,2,3,4,5,6,7 \
+  --hccn-stat-root /home/l00934901/profiling
+```
+
+如果工具不在 `PATH` 或默认驱动目录，追加：
+
+```bash
+--hccn-tool /usr/local/Ascend/driver/tools/hccn_tool
+```
+
+一次运行会得到两类目录：
+
+```text
+/home/l00934901/profiling/
+├── a5_ccu_urma_write_RUN_ID/
+│   ├── rank0/                         Python/NPU profiling
+│   └── rank1/
+└── hccn_ccu_write_routes_0,2_RUN_ID/
+    ├── before_deviceN.txt             正式迭代前的原始 hccn_tool 输出
+    ├── after_deviceN.txt              正式迭代后的原始 hccn_tool 输出
+    ├── before_supported_devices.txt
+    ├── after_supported_devices.txt
+    └── hccn_counter_deltas.tsv        所有可解析 counter 的 after-before
+```
+
+终端会摘要打印：
+
+```text
+physical_device=N nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
+  nic_rx_all_pkg_num=... nic_rx_all_oct_num=... roce_new_pkt_rty_num=...
+```
+
+### 13.5 如何判断端口是否参与转发
+
+不要只根据一次绝对值判断，必须比较相同 `--bytes/--iters` 的独立 route0 基线与多路径实验：
+
+1. 先运行 `--route-index 0` 并保存它的 `hccn_counter_deltas.tsv`；这是 direct 基线。
+2. 再运行 `--route-index 2`，确认单独的 hop-2 route 可用并记录端口增量。
+3. 最后运行 `--route-indices 0,2`；底层按权重切片，当前 route0 权重为 2、route2 权重为 1。
+4. 通信端点卡 4、5 出现 TX/RX 增量是必然现象，不能据此证明 relay。
+5. 若某张非端点卡在 route0 基线中接近零，而在 route2 或 `0,2` 中出现稳定、可重复且随
+   `bytes × iters` 线性增长的 TX/RX 字节增量，这是它参与转发的强证据。
+6. `roce_new_pkt_rty_num` 明显增加表示发生重传或链路异常；这部分字节不能当成有效多路径带宽。
+7. route0 与 route2 的测试之间应确认旧进程完全退出，且测试期间不要运行其他 HCCL/URMA workload；否则
+   设备级累计计数会混入无关流量。
+
+`hccn_tool -stat -g` 并非所有 A5/950 端口都支持。脚本会保留失败设备的原始回显并继续测试；如果某张
+中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die 透明转发。最终结论需要同时满足：
+
+- RankGraph 日志显示选中的 route、`hop`、die 和地址确实不同；
+- CCU Python 测试数据正确；
+- profiling 中两个 rank 都出现 CCU launch/task；
+- 平台可见的 per-port 计数与 route 选择呈可重复的对应关系。
