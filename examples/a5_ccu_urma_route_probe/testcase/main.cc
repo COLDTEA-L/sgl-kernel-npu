@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 #include <string>
@@ -28,6 +29,8 @@ struct Options {
     std::string routeIndices;
     bool remoteOnly = false;
     bool channelOnly = false;
+    int32_t workerRank = -1;
+    std::string rootInfoFile;
 };
 
 struct ThreadContext {
@@ -43,6 +46,7 @@ static void PrintUsage(const char *program)
     std::cout << "Usage: " << program
               << " [--bytes N] [--warmup N] [--iters N] [--route-index N]"
               << " [--route-indices 0,2] [--remote-only] [--channel-only]" << std::endl;
+    std::cout << "Worker mode requires --worker-rank 0|1 --root-info-file PATH" << std::endl;
 }
 
 static bool ParseUint(const char *value, uint64_t *result)
@@ -75,6 +79,13 @@ static bool ParseOptions(int argc, char **argv, Options *options)
             options->routeIndices = argv[++i];
             continue;
         }
+        if (name == "--root-info-file") {
+            if (i + 1 >= argc) {
+                return false;
+            }
+            options->rootInfoFile = argv[++i];
+            continue;
+        }
         if (i + 1 >= argc) {
             return false;
         }
@@ -90,12 +101,39 @@ static bool ParseOptions(int argc, char **argv, Options *options)
             options->iterations = static_cast<uint32_t>(value);
         } else if (name == "--route-index") {
             options->routeIndex = static_cast<uint32_t>(value);
+        } else if (name == "--worker-rank") {
+            options->workerRank = static_cast<int32_t>(value);
         } else {
             return false;
         }
     }
     return options->bytes != 0 && options->bytes % sizeof(float) == 0 &&
-           options->iterations != 0 && !(options->remoteOnly && options->channelOnly);
+           options->iterations != 0 && !(options->remoteOnly && options->channelOnly) &&
+           options->workerRank >= 0 && options->workerRank < 2 && !options->rootInfoFile.empty();
+}
+
+static bool StoreRootInfo(const std::string &path, const HcclRootInfo &rootInfo)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char *>(&rootInfo), sizeof(rootInfo));
+    output.flush();
+    return output.good();
+}
+
+static bool LoadRootInfo(const std::string &path, HcclRootInfo *rootInfo)
+{
+    constexpr uint32_t maxAttempts = 1200;
+    for (uint32_t attempt = 0; attempt < maxAttempts; ++attempt) {
+        std::ifstream input(path, std::ios::binary);
+        if (input.good()) {
+            input.read(reinterpret_cast<char *>(rootInfo), sizeof(*rootInfo));
+            if (input.gcount() == static_cast<std::streamsize>(sizeof(*rootInfo))) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
 }
 
 static double Percentile(const std::vector<double> &sorted, double percentile)
@@ -246,40 +284,29 @@ int main(int argc, char **argv)
         std::cerr << "aclInit failed, status=" << aclStatus << std::endl;
         return 1;
     }
-    uint32_t rankSize = 0;
-    if (aclrtGetDeviceCount(&rankSize) != ACL_SUCCESS || rankSize != 2) {
+    uint32_t visibleDeviceCount = 0;
+    if (aclrtGetDeviceCount(&visibleDeviceCount) != ACL_SUCCESS || visibleDeviceCount != 2) {
         std::cerr << "Exactly two visible devices are required. Set ASCEND_RT_VISIBLE_DEVICES=src,dst; found "
-                  << rankSize << std::endl;
+                  << visibleDeviceCount << std::endl;
         aclFinalize();
         return 2;
     }
-
-    if (aclrtSetDevice(0) != ACL_SUCCESS) {
+    HcclRootInfo rootInfo{};
+    if (options.workerRank == 0) {
+        if (aclrtSetDevice(0) != ACL_SUCCESS || HcclGetRootInfo(&rootInfo) != HCCL_SUCCESS ||
+            !StoreRootInfo(options.rootInfoFile, rootInfo)) {
+            std::cerr << "rank0 failed to publish HCCL root info to " << options.rootInfoFile << std::endl;
+            aclFinalize();
+            return 1;
+        }
+    } else if (!LoadRootInfo(options.rootInfoFile, &rootInfo)) {
+        std::cerr << "rank1 timed out waiting for HCCL root info: " << options.rootInfoFile << std::endl;
         aclFinalize();
         return 1;
     }
-    void *rootInfoBuffer = nullptr;
-    if (aclrtMallocHost(&rootInfoBuffer, sizeof(HcclRootInfo)) != ACL_SUCCESS) {
-        aclFinalize();
-        return 1;
-    }
-    auto *rootInfo = static_cast<HcclRootInfo *>(rootInfoBuffer);
-    if (HcclGetRootInfo(rootInfo) != HCCL_SUCCESS) {
-        aclrtFreeHost(rootInfoBuffer);
-        aclFinalize();
-        return 1;
-    }
-
     std::atomic<int> failed{0};
-    std::vector<ThreadContext> contexts(rankSize);
-    std::vector<std::thread> threads;
-    for (uint32_t rank = 0; rank < rankSize; ++rank) {
-        contexts[rank] = ThreadContext{rootInfo, rank, rankSize, &options, &failed};
-        threads.emplace_back(RunRank, &contexts[rank]);
-    }
-    for (auto &thread : threads) {
-        thread.join();
-    }
+    ThreadContext context{&rootInfo, static_cast<uint32_t>(options.workerRank), 2U, &options, &failed};
+    RunRank(&context);
 
     if (failed.load() != 0) {
         std::cerr << "Probe failed; skip ACL finalization because a rank may still own partially "
@@ -288,7 +315,6 @@ int main(int argc, char **argv)
         std::cerr.flush();
         std::_Exit(failed.load());
     }
-    aclrtFreeHost(rootInfoBuffer);
     aclFinalize();
     return failed.load();
 }

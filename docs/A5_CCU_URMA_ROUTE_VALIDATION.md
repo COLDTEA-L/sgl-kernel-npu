@@ -130,7 +130,9 @@ CANN 根目录。因此，即使当前 shell 以前 source 过 DeepEP vendor 环
 
 ## 6. 两卡运行和候选路由枚举
 
-测试程序是单进程、两线程、两设备程序，不使用 `torchrun`。先在物理卡 2 和 3 上运行 route 0：
+测试程序采用一张卡一个独立 rank 进程，不使用 `torchrun`。运行脚本会创建临时 root-info 文件，rank0 写入
+`HcclGetRootInfo` 的结果，rank1 读取同一份 root info 后分别调用 `HcclCommInitRootInfo`。先在物理卡 2 和 3
+上运行 route 0：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -320,7 +322,17 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
   --profile-root /home/l00934901/profiling
 ```
 
-探针在一个进程的两个线程中使用两张 NPU；因此一个 `PROF_*` 目录也可能同时包含两张设备的数据。应检查导出的 HCCL、Runtime 和 task CSV 中的 device 字段，而不能用 `PROF_*` 目录数量判断采集了几张卡。
+脚本会分别启动 rank0、rank1 两个 worker 进程，并为每个进程独立启动一次 `msprof`：
+
+```text
+a5_ccu_urma_routes_*/
+├── rank0/PROF_*/
+└── rank1/PROF_*/
+```
+
+因此应当得到两个独立的 `PROF_*` 采集目录。rank0 和 rank1 的退出码会分别检查，任意一个 worker 失败都会使
+脚本返回非 0。官方 HCCL 文档的一进程一卡样例同样通过广播/文件共享 `HcclRootInfo`，再由每个 rank 独立初始化
+通信域；官方 msprof 文档也说明，多 Device 单采集进程只生成一个 `PROF_*`，多采集进程才生成多个目录。
 
 ## 8. 判定标准和下一步
 

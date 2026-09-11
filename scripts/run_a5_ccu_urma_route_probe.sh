@@ -86,14 +86,68 @@ make -C "${test_dir}"
 
 build_command() {
     local payload_bytes=$1
+    local worker_rank=$2
+    local root_info_file=$3
     command=("${test_dir}/a5_ccu_urma_route_probe_test"
         --bytes "${payload_bytes}"
         --warmup "${warmup}"
         --iters "${iterations}"
-        --route-index "${route_index}")
+        --route-index "${route_index}"
+        --worker-rank "${worker_rank}"
+        --root-info-file "${root_info_file}")
     [[ -z "${route_indices}" ]] || command+=(--route-indices "${route_indices}")
     (( remote_only == 0 )) || command+=(--remote-only)
     (( channel_only == 0 )) || command+=(--channel-only)
+}
+
+run_pair() {
+    local payload_bytes=$1
+    local pair_state_dir
+    pair_state_dir=$(mktemp -d /tmp/a5_ccu_urma_pair.XXXXXX)
+    local root_info_file="${pair_state_dir}/root_info.bin"
+    local status0=0
+    local status1=0
+
+    build_command "${payload_bytes}" 0 "${root_info_file}"
+    local rank0_command=("${command[@]}")
+    build_command "${payload_bytes}" 1 "${root_info_file}"
+    local rank1_command=("${command[@]}")
+
+    if (( profile == 0 )); then
+        "${rank0_command[@]}" &
+        local rank0_pid=$!
+        "${rank1_command[@]}" &
+        local rank1_pid=$!
+        wait "${rank0_pid}" || status0=$?
+        wait "${rank1_pid}" || status1=$?
+    else
+        command -v msprof >/dev/null || { echo "msprof not found in PATH" >&2; return 1; }
+        local run_dir="${profile_root}/a5_ccu_urma_routes_${route_indices:-${route_index}}_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "${run_dir}/rank0" "${run_dir}/rank1"
+        msprof --output="${run_dir}/rank0" --ascendcl=on --runtime-api=on \
+            --task-time=l2 --hccl=on --type=text "${rank0_command[@]}" &
+        local rank0_pid=$!
+        msprof --output="${run_dir}/rank1" --ascendcl=on --runtime-api=on \
+            --task-time=l2 --hccl=on --type=text "${rank1_command[@]}" &
+        local rank1_pid=$!
+        wait "${rank0_pid}" || status0=$?
+        wait "${rank1_pid}" || status1=$?
+        if (( status0 == 0 && status1 == 0 )); then
+            mapfile -d '' prof_dirs < <(find "${run_dir}" -type d -name 'PROF_*' -print0 2>/dev/null)
+            (( ${#prof_dirs[@]} > 0 )) || { echo "No PROF_* directory under ${run_dir}" >&2; return 1; }
+            for prof_dir in "${prof_dirs[@]}"; do
+                msprof --export=on --output="${prof_dir}"
+            done
+            echo "Profile output: ${run_dir}"
+            find "${run_dir}" -type f -name '*.csv' | sort
+        fi
+    fi
+    find "${pair_state_dir}" -type f -delete
+    rmdir "${pair_state_dir}"
+    (( status0 == 0 && status1 == 0 )) || {
+        echo "rank workers failed: rank0=${status0}, rank1=${status1}" >&2
+        return 1
+    }
 }
 
 if (( sweep != 0 )); then
@@ -102,13 +156,10 @@ if (( sweep != 0 )); then
     echo "Mode            : $([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather)"
     for sweep_bytes in 65536 262144 1048576 2097152 8388608 33554432; do
         echo "===== payload ${sweep_bytes} bytes ====="
-        build_command "${sweep_bytes}"
-        "${command[@]}"
+        run_pair "${sweep_bytes}"
     done
     exit 0
 fi
-
-build_command "${bytes}"
 
 echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
@@ -116,27 +167,4 @@ echo "Payload/rank    : ${bytes} bytes"
 echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
     ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"
 
-if (( profile == 0 )); then
-    "${command[@]}"
-    exit 0
-fi
-
-command -v msprof >/dev/null || { echo "msprof not found in PATH" >&2; exit 1; }
-run_dir="${profile_root}/a5_ccu_urma_route_${route_index}_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "${run_dir}"
-msprof \
-    --output="${run_dir}" \
-    --ascendcl=on \
-    --runtime-api=on \
-    --task-time=l2 \
-    --hccl=on \
-    --type=text \
-    "${command[@]}"
-
-mapfile -d '' prof_dirs < <(find "${run_dir}" -type d -name 'PROF_*' -print0 2>/dev/null)
-(( ${#prof_dirs[@]} > 0 )) || { echo "No PROF_* directory under ${run_dir}" >&2; exit 1; }
-for prof_dir in "${prof_dirs[@]}"; do
-    msprof --export=on --output="${prof_dir}"
-done
-echo "Profile output: ${run_dir}"
-find "${run_dir}" -type f -name '*.csv' | sort
+run_pair "${bytes}"
