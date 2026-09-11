@@ -469,6 +469,46 @@ grep -Rin 'All2AllDetourIoDie' \
 
 注意：`/home/l00934901/profiling` 必须在有卡Docker内可写。当前Docker已挂载 `/home/l00934901` 时，profiling结果会直接保存在宿主机目录中，容器删除后仍然保留。
 
+### 8.4 在 Python 测试中使用 experimental_config
+
+`test_a5_aiv_urma_all2all_detour.py` 也支持直接使用 Ascend PyTorch Profiler，不需要在外层运行 `msprof`。
+测试先完成 10 次普通 warmup，再启动 profiler 采集正式的 100 次迭代：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_aiv_urma_all2all_detour.py \
+  --comm-ranks 0,1 \
+  --elements-per-peer 11804800 \
+  --warmup 10 \
+  --iters 100 \
+  --profile \
+  --profile-root /home/l00934901/profiling
+```
+
+每个 rank 使用独立目录，目录名包含同一次 `torchrun` 的 `TORCHELASTIC_RUN_ID`：
+
+```text
+/home/l00934901/profiling/a5_aiv_urma_all2all_RUN_ID/
+├── rank0/
+└── rank1/
+```
+
+代码中的 `_ExperimentalConfig` 使用 `ProfilerLevel.Level1`。该等级在 Level0 基础上采集 AscendCL、AI Core
+信息，并请求生成 HCCL `communication.json` 和 `communication_matrix.json`；同时导出 Text，以及当前
+torch_npu 支持时的 Db 格式。测试目标调用之间原有的逐轮 `dist.all_reduce` 已改为 profiler 停止后一次性归并
+全部耗时样本，避免把计时辅助 AllReduce 混入目标算子的通信视图。
+
+需要区分：`experimental_config` 决定采集范围，但不会为自定义 MTE/URMA 或 CCU kernel 自动构造标准 HCCL
+算子元数据。因此 Python 测试可以显示自定义算子、Runtime 和设备任务；只有走标准 HCCL 上报链路的通信才会
+自然出现在 HCCL Communication 视图。当前 `a5_ccu_urma_route_probe` 是独立 C++ worker，不在这个 Python
+进程内，仍必须使用 `scripts/run_a5_ccu_urma_route_probe.sh --profile`；若要让它进入标准 Communication 视图，
+还需要在 CCU probe 内补充 HCCL DFX/profiling 上报，不能只用 Python 启动一个子进程。
+
 ## 9. 代码位置
 
 普通 CCU AllToAll：

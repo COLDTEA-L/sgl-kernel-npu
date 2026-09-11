@@ -116,6 +116,10 @@ capture_hccn_stats() {
     local dev
     local output_file
     local -a stat_devices
+    local before_supported_file="${output_dir}/before_supported_devices.txt"
+    local phase_supported_file="${output_dir}/${phase}_supported_devices.txt"
+    local success_count=0
+    : >"${phase_supported_file}"
     IFS=',' read -ra stat_devices <<< "${hccn_devices}"
     for dev in "${stat_devices[@]}"; do
         dev=${dev//[[:space:]]/}
@@ -123,28 +127,52 @@ capture_hccn_stats() {
             echo "invalid physical device ID in --hccn-devices: ${dev}" >&2
             return 1
         }
+        if [[ "${phase}" == "after" ]] && ! grep -qx "${dev}" "${before_supported_file}"; then
+            continue
+        fi
         output_file="${output_dir}/${phase}_device${dev}.txt"
         echo "HCCN snapshot ${phase}: physical device ${dev}"
         {
             echo "# command: ${hccn_tool_path} -i ${dev} -stat -g"
             echo "# timestamp: $(date --iso-8601=ns)"
-            "${hccn_tool_path}" -i "${dev}" -stat -g
+            # hccn_tool uses the host logical Device ID. Do not let the
+            # workload's visibility mapping (for example 4,5 -> rank 0,1)
+            # change which host device is queried.
+            env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
+                "${hccn_tool_path}" -i "${dev}" -stat -g
         } >"${output_file}" 2>&1 || {
-            echo "hccn_tool failed for physical device ${dev}; see ${output_file}" >&2
-            return 1
+            echo "WARNING: hccn_tool does not provide -stat data for device ${dev}:" >&2
+            sed 's/^/  | /' "${output_file}" >&2
+            continue
         }
+        ((success_count += 1))
+        echo "${dev}" >>"${phase_supported_file}"
     done
+    if (( success_count == 0 )); then
+        echo "WARNING: no requested device returned hccn_tool -stat data" >&2
+        return 1
+    fi
 }
 
 report_hccn_delta() {
     local output_dir=$1
-    python3 - "${output_dir}" "${hccn_devices}" <<'PY'
+    python3 - "${output_dir}" <<'PY'
 import pathlib
 import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
-devices = [item.strip() for item in sys.argv[2].split(",") if item.strip()]
+before_devices = {
+    item.strip()
+    for item in (root / "before_supported_devices.txt").read_text().splitlines()
+    if item.strip()
+}
+after_devices = {
+    item.strip()
+    for item in (root / "after_supported_devices.txt").read_text().splitlines()
+    if item.strip()
+}
+devices = sorted(before_devices & after_devices, key=int)
 summary_fields = (
     "nic_tx_all_pkg_num",
     "nic_tx_all_oct_num",
@@ -285,13 +313,18 @@ route_label=${route_label//[^[:alnum:]_-]/_}
 hccn_run_dir="${hccn_stat_root}/hccn_routes_${route_label}_$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "${hccn_run_dir}"
 
-capture_hccn_stats before "${hccn_run_dir}"
+hccn_available=1
+capture_hccn_stats before "${hccn_run_dir}" || hccn_available=0
 workload_status=0
 run_workload || workload_status=$?
 after_status=0
-capture_hccn_stats after "${hccn_run_dir}" || after_status=$?
-if (( after_status == 0 )); then
+if (( hccn_available != 0 )); then
+    capture_hccn_stats after "${hccn_run_dir}" || after_status=$?
+fi
+if (( hccn_available != 0 && after_status == 0 )); then
     report_hccn_delta "${hccn_run_dir}"
+elif (( hccn_available == 0 )); then
+    echo "HCCN statistics unavailable; workload result is still preserved." >&2
 fi
 (( workload_status == 0 )) || exit "${workload_status}"
 exit "${after_status}"

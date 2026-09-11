@@ -477,7 +477,9 @@ bash "${latest_pkg}" --install
 /usr/local/Ascend/driver/tools/hccn_tool -i DEVICE_ID -stat -g
 ```
 
-其中 `-i` 后面是**物理 Device ID**。`nic_tx_all_pkg_num`、`nic_tx_all_oct_num`、
+其中 `-i` 后面是宿主机的**逻辑 Device ID**（以宿主机 `npu-smi info` 的 NPU ID 为准）。脚本调用
+`hccn_tool` 时会临时取消 `ASCEND_RT_VISIBLE_DEVICES/ASCEND_VISIBLE_DEVICES`，避免 workload 的可见卡映射
+把 `4,5` 重映射成进程内的 `0,1`。`nic_tx_all_pkg_num`、`nic_tx_all_oct_num`、
 `nic_rx_all_pkg_num`、`nic_rx_all_oct_num` 分别表示 NIC 累计发送/接收报文数和字节数；
 `roce_new_pkt_rty_num` 可用于观察重传。它们是累计值，因此不能只查看一次绝对值。
 
@@ -539,3 +541,9 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
    和平台侧 UDMA/IO Die per-port 计数器。
 5. 单独选择 `--route-index 2` 表示全部 2 MiB 走 route2 这一条 RankGraph route，并不是脚本同时运行
    route0+route2。要测试 direct 与 relay 并发，使用 `--route-indices 0,2`，此时才按权重切片。
+
+部分 A5/950 端口不向 `hccn_tool -stat` 暴露传统 NIC 统计。新版脚本遇到单卡查询失败时会把该命令的真实
+回显直接打印到终端、记录原始文件，并继续查询其余卡；不会再因为 device 0 不支持而终止 workload。增量表
+只包含前后两次都查询成功的设备。如果所有设备均失败，算子仍会继续运行并明确打印
+`HCCN statistics unavailable`。这表示当前产品/驱动没有通过该接口提供所需计数，不能把“查询失败”解释成
+“该卡没有流量”。

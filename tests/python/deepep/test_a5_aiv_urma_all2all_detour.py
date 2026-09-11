@@ -5,6 +5,7 @@ import argparse
 import ctypes
 import faulthandler
 import os
+import re
 import site
 import sys
 import time
@@ -94,6 +95,7 @@ EXTENSION, OP_API = prepare_custom_op_runtime()
 
 import torch
 import torch.distributed as dist
+import torch_npu
 import deep_ep
 
 
@@ -122,6 +124,12 @@ def main():
     parser.add_argument("--elements-per-peer", type=int, default=1536)
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Number of benchmark iterations")
+    parser.add_argument("--profile", action="store_true", help="Collect an Ascend PyTorch profile")
+    parser.add_argument(
+        "--profile-root",
+        default="/home/l00934901/profiling",
+        help="Root directory for the integrated PyTorch profiler",
+    )
     args = parser.parse_args()
 
     if args.elements_per_peer <= 0:
@@ -181,8 +189,59 @@ def main():
     if rank == 0:
         print(f"Benchmark: {args.iters} iterations", flush=True)
 
-    global_times_ms = []
-    elapsed_tensor = torch.zeros(1, dtype=torch.float32, device="npu")
+    profiler = None
+    if args.profile:
+        run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getppid()))
+        run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)
+        profile_dir = (
+            Path(args.profile_root)
+            / f"a5_aiv_urma_all2all_{run_id}"
+            / f"rank{rank}"
+        )
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        export_types = [torch_npu.profiler.ExportType.Text]
+        if hasattr(torch_npu.profiler.ExportType, "Db"):
+            export_types.append(torch_npu.profiler.ExportType.Db)
+        config_kwargs = dict(
+            export_type=export_types,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=False,
+            record_op_args=False,
+        )
+        try:
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                mstx=False, **config_kwargs
+            )
+        except TypeError:
+            # torch_npu 6.x used the old keyword; CANN 9.x accepts mstx.
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                msprof_tx=False, **config_kwargs
+            )
+        profiler = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=torch_npu.profiler.schedule(
+                wait=0, warmup=0, active=args.iters, repeat=1
+            ),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                str(profile_dir)
+            ),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            with_modules=False,
+            with_flops=False,
+            experimental_config=experimental_config,
+        )
+        profiler.start()
+        stage(rank, f"integrated profiler started: {profile_dir}")
+
+    local_times_ms = []
 
     for i in range(args.iters):
         torch.npu.synchronize()
@@ -190,18 +249,27 @@ def main():
         recv_data = buffer.all2_all_detour_io_die(send_data, comm_rank_ids)
         torch.npu.synchronize()
         local_elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-        elapsed_tensor.fill_(local_elapsed_ms)
-        dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX, group=group)
-        global_elapsed_ms = elapsed_tensor.item()
+        local_times_ms.append(local_elapsed_ms)
 
         if rank == 0:
-            global_times_ms.append(global_elapsed_ms)
             if (i + 1) % 10 == 0 or i == 0:
                 print(
-                    f"  iter {i + 1:3d}/{args.iters}: {global_elapsed_ms:.3f} ms",
+                    f"  iter {i + 1:3d}/{args.iters}: rank0={local_elapsed_ms:.3f} ms",
                     flush=True,
                 )
+        if profiler is not None:
+            profiler.step()
+
+    if profiler is not None:
+        profiler.stop()
+        stage(rank, "integrated profiler stopped")
+
+    # Reduce all samples in one operation outside the profile window. This keeps
+    # the timing semantics (maximum rank latency) without contaminating the
+    # target operator's communication trace with one AllReduce per iteration.
+    elapsed_tensor = torch.tensor(local_times_ms, dtype=torch.float32, device="npu")
+    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX, group=group)
+    global_times_ms = elapsed_tensor.cpu().tolist() if rank == 0 else []
 
     if rank in comm_ranks:
         expected = torch.stack(
