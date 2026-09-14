@@ -5,8 +5,10 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import time
+from pathlib import Path
 
 os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
 
@@ -40,6 +42,37 @@ def summarize(samples_us):
     }
 
 
+def make_profiler(output_dir, rank):
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not os.access(output_dir, os.W_OK):
+        raise RuntimeError(f"profiling directory is not writable: {output_dir}")
+    export_types = [torch_npu.profiler.ExportType.Text]
+    if hasattr(torch_npu.profiler.ExportType, "Db"):
+        export_types.append(torch_npu.profiler.ExportType.Db)
+    kwargs = dict(
+        export_type=export_types,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=False,
+        record_op_args=False,
+    )
+    try:
+        config = torch_npu.profiler._ExperimentalConfig(mstx=False, **kwargs)
+    except TypeError:
+        config = torch_npu.profiler._ExperimentalConfig(msprof_tx=False, **kwargs)
+    return torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+            str(output_dir), worker_name=f"rank{rank}"),
+        record_shapes=True,
+        experimental_config=config,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
@@ -50,12 +83,17 @@ def parse_args():
                         help="iterations for host batch-average timing")
     parser.add_argument("--sample-iters", type=int, default=100,
                         help="iterations measured separately with NPU events")
+    parser.add_argument("--profile", action="store_true",
+                        help="run a separate profiling pass after timing")
+    parser.add_argument("--profile-iters", type=int, default=20)
+    parser.add_argument("--profile-root", default="/home/l00934901/profiling")
     args = parser.parse_args()
     item_size = 4 if args.dtype == "float32" else 2
     if args.bytes <= 0 or args.bytes % item_size:
         parser.error(f"--bytes must be a positive multiple of {item_size}")
-    if args.warmup < 0 or args.iters <= 0 or args.sample_iters <= 0:
-        parser.error("warmup/iters/sample-iters are invalid")
+    if (args.warmup < 0 or args.iters <= 0 or args.sample_iters <= 0 or
+            args.profile_iters <= 0):
+        parser.error("warmup/iters/sample-iters/profile-iters are invalid")
     return args
 
 
@@ -127,6 +165,23 @@ def main():
         "host_batch_avg_us": host_batch_avg_us,
         "hccl_expansion_mode": os.environ.get("HCCL_OP_EXPANSION_MODE", ""),
     })
+
+    if args.profile:
+        raw_run_id = (f"{os.environ.get('TORCHELASTIC_RUN_ID', 'standalone')}_"
+                      f"{os.environ.get('MASTER_PORT', '0')}")
+        run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_run_id)
+        profile_dir = (Path(args.profile_root) /
+                       f"a5_native_hccl_alltoall_{run_id}" / f"rank{rank}")
+        dist.barrier()
+        profiler = make_profiler(profile_dir, rank)
+        profiler.start()
+        for _ in range(args.profile_iters):
+            run_op()
+        torch.npu.synchronize()
+        profiler.stop()
+        torch.testing.assert_close(recv, expected, rtol=0, atol=0)
+        stats["profiling"] = str(profile_dir.resolve())
+        print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
 
     metric_names = ["host_batch_avg_us", "mean_us", "p50_us", "p95_us",
                     "p99_us", "min_us", "max_us", "cv_percent"]

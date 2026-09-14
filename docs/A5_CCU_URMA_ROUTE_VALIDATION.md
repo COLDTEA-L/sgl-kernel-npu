@@ -1134,7 +1134,10 @@ python3 -m torch.distributed.run \
   --dtype float32 \
   --warmup 10 \
   --iters 100 \
-  --sample-iters 100
+  --sample-iters 100 \
+  --profile \
+  --profile-iters 20 \
+  --profile-root /home/l00934901/profiling
 ```
 
 `--bytes` 是每个目的 rank 的 slice 大小。两卡下每个 rank 的输入总量为 `2 × bytes`，其中网络发送量为
@@ -1145,6 +1148,17 @@ python3 -m torch.distributed.run \
 - `host_batch_avg_us`：连续下发 `iters` 次、首尾同步后的批量摊销时间；
 - `p50/p95/p99/min/max/stddev/cv_percent`：NPU Event 包围单次原生 AllToAll 得到的执行时间分布；
 - `BASELINE_RESULT`：汇总两个 rank，并取较慢 rank 的关键指标。
+
+`--profile` 默认关闭。打开后，脚本会在正常计时结束后单独采集 `--profile-iters` 次原生 AllToAll，因此
+profiling 开销不会污染前面的 `host_batch_avg_us`。两个 rank 分别写入合法、可写的目录：
+
+```text
+/home/l00934901/profiling/a5_native_hccl_alltoall_RUN_ID/rank0/
+/home/l00934901/profiling/a5_native_hccl_alltoall_RUN_ID/rank1/
+```
+
+将整次运行目录导入 MindStudio，重点检查 HCCL AllToAll 对应的调度引擎和 `CCU Launch`。不采集时删除
+`--profile`、`--profile-iters`、`--profile-root` 即可。
 
 建议连续运行 5 次并保存输出。如果原生基线的 P95/P50、CV 和跨进程结果也明显波动，优先排查机器负载、
 链路状态、频率和其他通信任务；如果原生稳定而多路径不稳定，则优先排查多路径 channel、同步和 CCU kernel。
