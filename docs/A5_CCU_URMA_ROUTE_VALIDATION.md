@@ -1113,3 +1113,39 @@ bash scripts/run_a5_ccu_urma_alltoall_concurrency.sh \
 启动前会创建目录并检查可写性；每个 rank 使用独立 `worker_name`。profiler 不再使用非法的逗号目录，也不再
 配置 `warmup=0` 的 schedule。MindStudio 中原生基线应显示 HCCL AllToAll/CCU 活动，多路径 case 则显示自定义
 host op 与 CCU Launch。profiling 结果用于核对调用链，性能数值以 profiling 之外的 `CONCURRENCY_RESULT` 为准。
+
+### 14.7 单独运行原生 HCCL AllToAll 稳定性基线
+
+该脚本完全不导入 DeepEP，也不加载自定义 route 动态库，只调用官方
+`torch.distributed.all_to_all_single`。在物理卡 4、5 上运行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_native_hccl_alltoall_perf.py \
+  --bytes 2097152 \
+  --dtype float32 \
+  --warmup 10 \
+  --iters 100 \
+  --sample-iters 100
+```
+
+`--bytes` 是每个目的 rank 的 slice 大小。两卡下每个 rank 的输入总量为 `2 × bytes`，其中网络发送量为
+`bytes`，与多路径脚本的 `--bytes` 语义一致。
+
+输出包括：
+
+- `host_batch_avg_us`：连续下发 `iters` 次、首尾同步后的批量摊销时间；
+- `p50/p95/p99/min/max/stddev/cv_percent`：NPU Event 包围单次原生 AllToAll 得到的执行时间分布；
+- `BASELINE_RESULT`：汇总两个 rank，并取较慢 rank 的关键指标。
+
+建议连续运行 5 次并保存输出。如果原生基线的 P95/P50、CV 和跨进程结果也明显波动，优先排查机器负载、
+链路状态、频率和其他通信任务；如果原生稳定而多路径不稳定，则优先排查多路径 channel、同步和 CCU kernel。
+`CCU_SCHED` 只是请求 CCU 调度，最终是否命中 CCU 仍应通过一次 profiling 或 HCCL 日志确认。
