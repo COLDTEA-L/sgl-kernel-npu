@@ -13,12 +13,14 @@ PREFERRED_TX = (
     "mac_tx_all_oct_num",
     "tx_all_oct_num",
     "tx_bytes",
+    "tx_busi_flit_num",
 )
 PREFERRED_RX = (
     "nic_rx_all_oct_num",
     "mac_rx_all_oct_num",
     "rx_all_oct_num",
     "rx_bytes",
+    "rx_busi_flit_num",
 )
 
 
@@ -33,6 +35,7 @@ def parse_args():
     parser.add_argument("--rx-counter", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--min-signal-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--min-signal-count", type=int, default=0)
     args = parser.parse_args()
     try:
         args.endpoints = {int(item) for item in args.endpoint_devices.split(",") if item}
@@ -40,8 +43,9 @@ def parse_args():
         parser.error("--endpoint-devices must be comma-separated integers")
     if len(args.endpoints) != 2:
         parser.error("exactly two endpoint devices are required")
-    if args.bytes <= 0 or args.iters <= 0 or args.min_signal_bytes < 0:
-        parser.error("bytes/iters must be positive and min-signal-bytes non-negative")
+    if (args.bytes <= 0 or args.iters <= 0 or args.min_signal_bytes < 0 or
+            args.min_signal_count < 0):
+        parser.error("bytes/iters must be positive and signal thresholds non-negative")
     return args
 
 
@@ -61,7 +65,8 @@ def load_rows(path):
 
 def counter_score(name, direction):
     lowered = name.lower()
-    if direction not in lowered or not ("oct" in lowered or "byte" in lowered):
+    if direction not in lowered or not any(
+            unit in lowered for unit in ("oct", "byte", "flit")):
         return -1
     if any(word in lowered for word in ("err", "drop", "retry", "rty", "pause")):
         return -1
@@ -72,6 +77,8 @@ def counter_score(name, direction):
         score += 20
     if "oct" in lowered:
         score += 10
+    if "busi" in lowered and "flit" in lowered:
+        score += 30
     return score
 
 
@@ -88,9 +95,14 @@ def choose_counter(names, configured, preferred, direction):
     )
     if not candidates or candidates[0][0] < 0:
         raise RuntimeError(
-            f"cannot find a {direction.upper()} byte counter; available={sorted(names)}"
+            f"cannot find a {direction.upper()} byte/flit counter; available={sorted(names)}"
         )
     return candidates[0][1]
+
+
+def metric_unit(tx_counter, rx_counter):
+    names = f"{tx_counter} {rx_counter}".lower()
+    return "flits" if "flit" in names else "bytes"
 
 
 def aggregate(rows, tx_counter, rx_counter):
@@ -115,13 +127,20 @@ def main():
     route2 = aggregate(route2_rows, tx_counter, rx_counter)
     keys = sorted(set(route0) | set(route2))
     expected = args.bytes * args.iters
-    threshold = max(args.min_signal_bytes, expected // 100)
-
     endpoint_route0_max = max(
         (max(values["tx"], values["rx"])
          for key, values in route0.items() if key[0] in args.endpoints),
         default=0,
     )
+    unit = metric_unit(tx_counter, rx_counter)
+    if args.min_signal_count:
+        threshold = args.min_signal_count
+    elif unit == "bytes":
+        threshold = max(args.min_signal_bytes, expected // 100)
+    else:
+        # The driver does not publish the flit width here. Use 1% of the
+        # observed route0 endpoint signal instead of inventing a byte conversion.
+        threshold = max(1, endpoint_route0_max // 100)
     direct_threshold = max(threshold, endpoint_route0_max // 20)
     direct_ports = {
         key for key, values in route0.items()
@@ -171,8 +190,9 @@ def main():
     evidence = {
         "tx_counter": tx_counter,
         "rx_counter": rx_counter,
+        "counter_unit": unit,
         "expected_bytes_per_direction": expected,
-        "signal_threshold_bytes": threshold,
+        "signal_threshold_counter_units": threshold,
         "direct_ports": [list(key) for key in sorted(direct_ports)],
         "direct_ports_active_in_route2": [list(key) for key in sorted(direct_active)],
         "relay_candidate_devices": relay_candidates,
@@ -180,7 +200,8 @@ def main():
         "comparison_tsv": str(output.resolve()),
     }
     print("HCCN_ROUTE_EVIDENCE " + json.dumps(evidence, sort_keys=True))
-    print(f"TX counter: {tx_counter}; RX counter: {rx_counter}")
+    print(f"TX counter: {tx_counter}; RX counter: {rx_counter}; unit={unit}")
+    print(f"Signal threshold: {threshold} {unit}")
     print(f"Route0 direct ports: {sorted(direct_ports)}")
     print(f"Direct ports active in route2: {sorted(direct_active)}")
     print(f"Relay candidate devices: {relay_candidates}")

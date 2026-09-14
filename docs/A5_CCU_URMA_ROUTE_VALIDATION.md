@@ -806,7 +806,7 @@ physical_device=N udie=U port=P nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
 3. 最后运行 `--route-indices 0,2`；底层按权重切片，当前 route0 权重为 2、route2 权重为 1。
 4. 通信端点卡 4、5 出现 TX/RX 增量是必然现象，不能据此证明 relay。
 5. 若某张非端点卡在 route0 基线中接近零，而在 route2 或 `0,2` 中出现稳定、可重复且随
-   `bytes × iters` 线性增长的 TX/RX 字节增量，这是它参与转发的强证据。
+   `bytes × iters` 线性增长的 TX/RX 字节或业务 flit 增量，这是它参与转发的强证据。
 6. `roce_new_pkt_rty_num` 明显增加表示发生重传或链路异常；这部分字节不能当成有效多路径带宽。
 7. route0 与 route2 的测试之间应确认旧进程完全退出，且测试期间不要运行其他 HCCL/URMA workload；否则
    设备级累计计数会混入无关流量。
@@ -827,13 +827,13 @@ echo "${TSV}"
 ```
 
 表格列依次为 `physical_device、udie、port、counter、before、after、delta`。在端点为物理卡 4、5 时，
-只显示非端点卡上字节计数增量大于零的行：
+只显示非端点卡上字节或 flit 计数增量大于零的行：
 
 ```bash
 awk -F'\t' '
 NR == 1 ||
 ($1 != 4 && $1 != 5 && $7 > 0 &&
- tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/)
+ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte|flit)/)
 ' "${TSV}" |
 sort -t $'\t' -k1,1n -k2,2n -k3,3n -k7,7nr |
 column -t -s $'\t'
@@ -847,7 +847,7 @@ NR == 1 {
   printf "%-8s %-6s %-6s %-40s %s\n", "device", "udie", "port", "counter", "delta"
 }
 NR > 1 && $1 != 4 && $1 != 5 && $7 > 0 &&
-tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
+tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte|flit)/ {
   printf "%-8s %-6s %-6s %-40s %s\n", $1, $2, $3, $4, $7
 }
 ' "${TSV}"
@@ -858,7 +858,7 @@ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
 ```bash
 awk -F'\t' '
 NR > 1 && $1 != 4 && $1 != 5 &&
-tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
+tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte|flit)/ {
   print $7 "\tdevice=" $1 "\tudie=" $2 "\tport=" $3 "\t" $4
 }
 ' "${TSV}" | sort -nr | head -30
@@ -870,7 +870,7 @@ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
 awk -F'\t' '
 NR == 1 ||
 ($1 != 4 && $1 != 5 && $7 > 0 &&
- tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/)
+ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte|flit)/)
 ' "${TSV}" > /home/l00934901/profiling/route2_relay_candidates.tsv
 ```
 
@@ -927,7 +927,8 @@ run_hccn_case 2 4194304 route2_4m
 
 测试期间不要运行其他 HCCL/URMA 任务。每组执行结束后函数立即复制 TSV，避免后续运行时混淆目录。
 
-新增的分析器自动选择一对 TX/RX 字节计数器，以 route0 识别直连端口，再检查 route2 是否仍使用这些端口，
+新增的分析器优先选择 TX/RX byte/octet 计数器；本版 950 驱动没有字节计数时，会自动选择
+`tx_busi_flit_num`/`rx_busi_flit_num`。分析器以 route0 识别直连端口，再检查 route2 是否仍使用这些端口，
 并在非端点卡 0、1、2、3、6、7 中寻找同时具有 RX/TX 增量的 relay 候选。分别分析 2 MiB 与 4 MiB：
 
 ```bash
@@ -966,8 +967,10 @@ Direct+relay cumulative evidence: True|False
 5. `True` 只能证明同一正式迭代窗口内两类路径都参与过，不能证明微秒级并发。要证明并发仍需在持续打流期间，
    对候选端口并行执行 `hccn_tool -g -bandwidth -time 100`。
 
-分析器还会生成精简的 `route_compare_2m.tsv` 和 `route_compare_4m.tsv`，无需再逐个打开原始 TXT。若自动选错
-计数器，可从原 TSV 的 `counter` 列确认名称，并显式传入 `--tx-counter NAME --rx-counter NAME`。
+分析器还会生成精简的 `route_compare_2m.tsv` 和 `route_compare_4m.tsv`，无需再逐个打开原始 TXT。flit
+宽度没有通过该接口公开，因此脚本不擅自把 flit 换算成 Byte，而是用 route0 端点观测值的 1% 自动设置检测
+阈值；2 MiB/4 MiB 实验重点比较计数比例是否近似增长。若自动选错计数器，可从原 TSV 的 `counter` 列确认
+名称，并显式传入 `--tx-counter NAME --rx-counter NAME`；也可用 `--min-signal-count N` 覆盖自动阈值。
 
 `hccn_tool -g -stat` 并非所有 A5/950 端口都支持。脚本只查询 `Link Status=UP` 的端口，并保留失败端口的
 原始回显继续测试；如果某张中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die
