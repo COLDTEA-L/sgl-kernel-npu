@@ -662,7 +662,7 @@ python3 -m torch.distributed.run \
   tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
   --route-index 0 \
   --bytes 2097152 \
-  --warmup 10 \
+  --warmup 1000 \
   --iters 100 \
   --remote-only
 ```
@@ -675,13 +675,16 @@ python3 -m torch.distributed.run \
   tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
   --route-indices 0,2 \
   --bytes 2097152 \
-  --warmup 10 \
+  --warmup 1000 \
   --iters 100 \
   --remote-only
 ```
 
 `--remote-only` 只跳过本 rank 到本 rank 的 D2D self copy；它不会减少 CCU 发往对端的 2 MiB，也不会把
 多 route 测试退化为单 route。
+
+两条命令都会在终端打印 `PASS: CCU+URMA multi-route write ... avg_us=...`；性能对比统一记录该
+`avg_us`。1000 次 warmup 不计入平均值，正式计时仍为 100 次。
 
 ### 13.3 在 Python 进程内采集 CCU profiling
 
@@ -691,8 +694,8 @@ python3 -m torch.distributed.run \
   tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
   --route-indices 0,2 \
   --bytes 2097152 \
-  --warmup 10 \
-  --iters 100 \
+  --warmup 1000 \
+  --iters 20 \
   --remote-only \
   --profile \
   --profile-root /home/l00934901/profiling
@@ -711,6 +714,9 @@ python3 -m torch.distributed.run \
 `HcclAlltoAll` 算法入口，因此仅设置 profiler 详细度不会自动生成标准 collective 的带宽、通信矩阵或
 `communication.json`；若后续需要这些字段，必须给自定义 CCU kernel 补 HCCL DFX/通信 profiling 上报，不能
 把 AIV 算子的 profiling 当作 CCU 结果。
+
+该命令先 warmup 1000 次，再采集 20 次正式迭代。终端仍会输出 `avg_us`，但 profiler 会引入固定开销；
+性能结论优先采用上一节不带 `--profile` 的 `avg_us`，这里的平均值用于和 MindStudio 时间线互相核对。
 
 ### 13.4 同时采集 CCU profiling 和端口报文
 
@@ -737,8 +743,8 @@ python3 -m torch.distributed.run \
   tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
   --route-indices 0,2 \
   --bytes 2097152 \
-  --warmup 10 \
-  --iters 100 \
+  --warmup 1000 \
+  --iters 20 \
   --remote-only \
   --profile \
   --profile-root /home/l00934901/profiling \
@@ -873,7 +879,7 @@ route0：
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
   tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
-  --route-index 0 --bytes 2097152 --warmup 10 --iters 100
+  --route-index 0 --bytes 2097152 --warmup 1000 --iters 100
 ```
 
 route2：
@@ -882,7 +888,7 @@ route2：
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
   tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
-  --route-index 2 --bytes 2097152 --warmup 10 --iters 100
+  --route-index 2 --bytes 2097152 --warmup 1000 --iters 100
 ```
 
 route0+route2：
@@ -891,12 +897,13 @@ route0+route2：
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
   tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
-  --route-indices 0,2 --bytes 2097152 --warmup 10 --iters 100
+  --route-indices 0,2 --bytes 2097152 --warmup 1000 --iters 100
 ```
 
 测试在 warmup 前一次性分配 `recv`，正式阶段调用 `_out` 接口，连续下发全部迭代后只做一次
 `torch.npu.synchronize()`。终端的 `host_batch_avg_us` 是批量摊销 host 时间，不再包含每轮 tensor 分配、
-逐轮 synchronize 和 stdout 刷新。
+逐轮 synchronize 和 stdout 刷新。三条性能命令均先 warmup 1000 次、正式计时 100 次；终端比较时使用
+两个 rank 中较大的 `host_batch_avg_us`。
 
 ### 14.4 采集两张卡 profiling
 
@@ -909,9 +916,10 @@ python3 -m torch.distributed.run \
   tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
   --route-indices 0,2 \
   --bytes 2097152 \
-  --warmup 10 \
+  --warmup 1000 \
   --iters 100 \
   --profile \
+  --profile-iters 20 \
   --profile-root /home/l00934901/profiling
 ```
 
@@ -924,7 +932,8 @@ python3 -m torch.distributed.run \
 ```
 
 MindStudio 中一个 `CCU Launch` 包含 self `LocalCopyNb` 和所有 route 的 `WriteNb`。对比 route0、route2、
-route0+2 时，应同时记录 CCU Launch 的平均值、P50、P95；不要再用带 `--debug` 的结果做性能结论。
+route0+2 时，应同时记录 CCU Launch 的平均值、P50、P95；终端会额外打印 `host_batch_avg_us`。该命令
+warmup 1000 次，正式计时 100 次，并单独采集 20 次 profiling；不要再用带 `--debug` 的结果做性能结论。
 
 ### 14.5 旧版同进程并发验证（已废弃）
 
@@ -1072,7 +1081,7 @@ cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_urma_alltoall_concurrency.sh \
   --devices 4,5 \
   --bytes 2097152 \
-  --warmup 10 \
+  --warmup 1000 \
   --iters 100 \
   --rounds 3
 ```
@@ -1088,7 +1097,7 @@ concurrent  : 先提交 route0、route2 的 WriteNb，再统一 WaitEvent
 ```
 
 最终 `CONCURRENCY_RESULT` 给出各组中位数、`serial/concurrent` speedup 和 overlap ratio。只有看到该结果，
-才表示五组实验均真正完成；初始化阶段报错不能作为并发结论。
+才表示五组实验均真正完成；其中各 case 的终端平均值及最终中位数都必须保存，初始化阶段报错不能作为并发结论。
 
 同时采集原生 HCCL 与多路径 concurrent 的 profiling：
 
@@ -1096,12 +1105,14 @@ concurrent  : 先提交 route0、route2 的 WriteNb，再统一 WaitEvent
 bash scripts/run_a5_ccu_urma_alltoall_concurrency.sh \
   --devices 4,5 \
   --bytes 2097152 \
-  --warmup 10 --iters 100 --rounds 3 \
+  --warmup 1000 --iters 100 --rounds 3 \
   --profile --profile-iters 20 \
   --profile-root /home/l00934901/profiling
 ```
 
-脚本先完成纯计时，再额外启动两个独立 profiling 进程。输出目录仅含字母、数字、下划线、点和连字符，例如：
+脚本先以 warmup 1000、正式计时 100 次完成纯计时并在终端输出各 case 平均值与最终
+`CONCURRENCY_RESULT`，再额外启动两个独立 profiling 进程，各采集 20 次。输出目录仅含字母、数字、
+下划线、点和连字符，例如：
 
 ```text
 /home/l00934901/profiling/a5_ccu_alltoall_native_RUN_ID/rank0/
