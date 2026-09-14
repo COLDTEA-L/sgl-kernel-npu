@@ -437,6 +437,15 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     }
     created.allToAllKernel = allToAllKernel;
 
+    AllToAllMultiRouteKernelArg allToAllSerialKernelArg(created.channels, routeIndices, true);
+    CcuKernelHandle allToAllSerialKernel = 0;
+    status = HcclCcuKernelRegister(comm, &allToAllSerialKernel, &allToAllCreator,
+                                   &allToAllSerialKernelArg);
+    if (status != HCCL_SUCCESS) {
+        return status;
+    }
+    created.allToAllSerialKernel = allToAllSerialKernel;
+
     std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish begin\n", rank);
     std::fflush(stdout);
     status = HcclCcuKernelRegisterFinish(comm);

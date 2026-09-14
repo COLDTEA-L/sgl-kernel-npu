@@ -12,11 +12,15 @@ namespace a5_ccu_urma_probe {
 class AllToAllMultiRouteKernelArg : public hcomm::CcuKernelArg {
 public:
     AllToAllMultiRouteKernelArg(const std::vector<ChannelHandle> &channels,
-                                const std::vector<uint32_t> &routeIndices);
+                                const std::vector<uint32_t> &routeIndices,
+                                bool serialized = false);
     hcomm::CcuKernelSignature GetKernelSignature() const override;
+
+    bool IsSerialized() const { return serialized_; }
 
 private:
     std::vector<uint32_t> routeIndices_;
+    bool serialized_ = false;
 };
 
 class AllToAllMultiRouteTaskArg : public hcomm::CcuTaskArg {
@@ -47,11 +51,14 @@ public:
 
 class AllToAllMultiRouteKernel : public hcomm::CcuKernel {
 public:
-    explicit AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg) : hcomm::CcuKernel(arg) {}
+    explicit AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg);
 
 protected:
     HcclResult Algorithm() override;
     std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
+
+private:
+    bool serialized_ = false;
 };
 
 std::unique_ptr<hcomm::CcuKernel> CreateAllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg);

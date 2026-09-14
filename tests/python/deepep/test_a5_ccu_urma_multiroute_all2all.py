@@ -7,6 +7,7 @@ import json
 import os
 import re
 import site
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -108,12 +109,130 @@ def make_profiler(output_dir, iterations):
     )
 
 
+def select_routes(route_indices, route_index, schedule):
+    if route_indices:
+        os.environ["A5_CCU_ROUTE_INDICES"] = route_indices
+        os.environ.pop("A5_CCU_ROUTE_INDEX", None)
+    else:
+        os.environ.pop("A5_CCU_ROUTE_INDICES", None)
+        os.environ["A5_CCU_ROUTE_INDEX"] = str(route_index)
+    os.environ["A5_CCU_ROUTE_SCHEDULE"] = schedule
+
+
+def benchmark_case(buffer, sync_dir, rank, world_size, label, routes, schedule,
+                   bytes_per_peer, warmup, iterations):
+    select_routes(routes, 0, schedule)
+    elements = bytes_per_peer // 4
+    send = torch.stack([
+        torch.full((elements,), float(rank * 100 + dst + 1),
+                   dtype=torch.float32, device="npu")
+        for dst in range(world_size)
+    ])
+    recv = torch.empty_like(send)
+    expected = torch.stack([
+        torch.full((elements,), float(src * 100 + rank + 1),
+                   dtype=torch.float32, device="npu")
+        for src in range(world_size)
+    ])
+    for _ in range(warmup):
+        buffer.ccu_urma_multiroute_alltoall_out(send, recv)
+    torch.npu.synchronize()
+    torch.testing.assert_close(recv, expected)
+    file_barrier(sync_dir, f"{label}_warmup", rank, world_size)
+
+    begin = time.perf_counter()
+    for _ in range(iterations):
+        buffer.ccu_urma_multiroute_alltoall_out(send, recv)
+    torch.npu.synchronize()
+    average_us = (time.perf_counter() - begin) * 1e6 / iterations
+    torch.testing.assert_close(recv, expected)
+
+    result_file = sync_dir / f"{label}.rank{rank}.json"
+    result_file.write_text(json.dumps(average_us))
+    file_barrier(sync_dir, f"{label}_results", rank, world_size)
+    rank_averages = [json.loads((sync_dir / f"{label}.rank{item}.json").read_text())
+                     for item in range(world_size)]
+    result = max(rank_averages)
+    if rank == 0:
+        print(f"CASE label={label} routes={routes} schedule={schedule} "
+              f"bytes_per_peer={bytes_per_peer} host_batch_avg_us={result:.3f}", flush=True)
+    file_barrier(sync_dir, f"{label}_reported", rank, world_size)
+    return result
+
+
+def verify_concurrency(buffer, sync_dir, rank, world_size, args):
+    # Match the C++ splitter exactly: route0 gets floor(2B/3) aligned to
+    # 256 bytes and route2 receives the remainder.
+    route0_bytes = (args.bytes * 2 // 3) // 256 * 256
+    route2_bytes = args.bytes - route0_bytes
+    if route0_bytes <= 0 or route2_bytes <= 0:
+        raise ValueError("--bytes is too small for the aligned 2:1 split")
+
+    route0_us = benchmark_case(
+        buffer, sync_dir, rank, world_size, "route0_share", "0", "concurrent",
+        route0_bytes, args.warmup, args.iters)
+    route2_us = benchmark_case(
+        buffer, sync_dir, rank, world_size, "route2_share", "2", "concurrent",
+        route2_bytes, args.warmup, args.iters)
+
+    serial_samples = []
+    concurrent_samples = []
+    for round_index in range(args.verification_rounds):
+        # Alternate order to reduce thermal/load/order bias. Both kernels were
+        # registered together and share the exact same route resources.
+        schedules = ("serial", "concurrent") if round_index % 2 == 0 else (
+            "concurrent", "serial")
+        for schedule in schedules:
+            value = benchmark_case(
+                buffer, sync_dir, rank, world_size,
+                f"combined_{schedule}_round{round_index}", "0,2", schedule,
+                args.bytes, args.warmup, args.iters)
+            (serial_samples if schedule == "serial" else concurrent_samples).append(value)
+
+    serial_us = statistics.median(serial_samples)
+    concurrent_us = statistics.median(concurrent_samples)
+    shorter_isolated_us = min(route0_us, route2_us)
+    overlap_ratio = ((serial_us - concurrent_us) / shorter_isolated_us
+                     if shorter_isolated_us > 0 else float("nan"))
+    speedup = serial_us / concurrent_us if concurrent_us > 0 else float("inf")
+    if overlap_ratio >= 0.50:
+        evidence = "strong"
+    elif overlap_ratio >= 0.15:
+        evidence = "partial"
+    elif overlap_ratio <= 0.05:
+        evidence = "none"
+    else:
+        evidence = "inconclusive"
+
+    if rank == 0:
+        print("CONCURRENCY_RESULT "
+              f"total_bytes={args.bytes} route0_bytes={route0_bytes} "
+              f"route2_bytes={route2_bytes} route0_share_us={route0_us:.3f} "
+              f"route2_share_us={route2_us:.3f} serial_median_us={serial_us:.3f} "
+              f"concurrent_median_us={concurrent_us:.3f} speedup={speedup:.4f} "
+              f"overlap_ratio={overlap_ratio:.4f} evidence={evidence}", flush=True)
+        print("Interpretation: overlap_ratio=(serial-concurrent)/min(route0_share,route2_share); "
+              "forced serial is the primary control, while port counters are still required "
+              "to prove physical-link overlap.", flush=True)
+    if (args.require_overlap_ratio is not None and
+            overlap_ratio < args.require_overlap_ratio):
+        raise AssertionError(
+            f"overlap_ratio {overlap_ratio:.4f} is below required "
+            f"{args.require_overlap_ratio:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
     parser.add_argument("--route-index", type=int, default=0)
     parser.add_argument("--route-indices", default="")
+    parser.add_argument("--schedule", choices=("concurrent", "serial"),
+                        default="concurrent")
+    parser.add_argument("--verify-concurrency", action="store_true",
+                        help="compare route0/route2 concurrent execution with a forced-serial kernel")
+    parser.add_argument("--verification-rounds", type=int, default=3)
+    parser.add_argument("--require-overlap-ratio", type=float, default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--profile", action="store_true")
@@ -124,12 +243,12 @@ def main():
         parser.error("--bytes must be a positive multiple of sizeof(float)")
     if args.warmup < 0 or args.iters <= 0:
         parser.error("invalid warmup/iters")
+    if args.verification_rounds <= 0:
+        parser.error("--verification-rounds must be positive")
+    if args.verify_concurrency and args.profile:
+        parser.error("run --verify-concurrency without --profile; profile individual modes separately")
 
-    if args.route_indices:
-        os.environ["A5_CCU_ROUTE_INDICES"] = args.route_indices
-    else:
-        os.environ.pop("A5_CCU_ROUTE_INDICES", None)
-        os.environ["A5_CCU_ROUTE_INDEX"] = str(args.route_index)
+    select_routes(args.route_indices, args.route_index, args.schedule)
     if args.debug:
         os.environ["A5_CCU_DEBUG"] = "1"
     else:
@@ -148,6 +267,12 @@ def main():
                     f"{os.environ.get('TORCHELASTIC_RUN_ID', 'standalone')}_"
                     f"{os.environ.get('MASTER_PORT', '0')}")
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_sync_{run_id}"
+    if args.verify_concurrency:
+        verify_concurrency(buffer, sync_dir, rank, world_size, args)
+        file_barrier(sync_dir, "verification_done", rank, world_size)
+        dist.destroy_process_group()
+        return
+
     elements = args.bytes // 4
     send = torch.stack([
         torch.full((elements,), float(rank * 100 + dst + 1),
@@ -196,6 +321,7 @@ def main():
                     for item in range(world_size)]
         routes = args.route_indices or str(args.route_index)
         print(f"PASS: CCU+URMA two-rank AllToAll routes={routes} "
+              f"schedule={args.schedule} "
               f"bytes_per_peer={args.bytes} warmup={args.warmup} iterations={args.iters} "
               f"host_batch_avg_us={max(averages):.3f}", flush=True)
         print(f"deep_ep_cpp={EXTENSION}", flush=True)

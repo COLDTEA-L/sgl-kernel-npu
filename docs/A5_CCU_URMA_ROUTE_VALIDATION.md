@@ -922,3 +922,125 @@ python3 -m torch.distributed.run \
 
 MindStudio 中一个 `CCU Launch` 包含 self `LocalCopyNb` 和所有 route 的 `WriteNb`。对比 route0、route2、
 route0+2 时，应同时记录 CCU Launch 的平均值、P50、P95；不要再用带 `--debug` 的结果做性能结论。
+
+### 14.5 验证 route0 与 route2 是否并发
+
+本分支同时注册两个 CCU AllToAll kernel：
+
+```text
+concurrent：WriteNb(route0) -> WriteNb(route2) -> WaitEvent(route0) -> WaitEvent(route2)
+serial：    WriteNb(route0) -> WaitEvent(route0) -> WriteNb(route2) -> WaitEvent(route2)
+```
+
+两个 kernel 共用相同的 route、channel、远端地址/token、Notify、2:1 分片和 Host 调用链，唯一实验变量是
+`WaitEvent` 的位置。修改涉及 CCU kernel，因此拉取代码后必须重新编译并安装 route probe 包；DeepEP 接口没有
+变化，不需要仅为本次修改重编 wheel：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
+```
+
+在物理卡 4、5 上自动执行受控实验：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --verify-concurrency \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --verification-rounds 3
+```
+
+对于总 peer payload `B`，脚本严格复现 C++ 的 256 Bytes 对齐分片：
+
+```text
+route0_bytes = floor((2B/3) / 256) * 256
+route2_bytes = B - route0_bytes
+```
+
+`B=2097152` 时分别为 `1398016` 和 `699136` Bytes。脚本依次测量：
+
+1. route0 单独发送 `route0_bytes`；
+2. route2 单独发送 `route2_bytes`；
+3. route0+route2 强制串行；
+4. route0+route2 先提交全部 `WriteNb` 再统一等待。
+
+第 3、4 组交替运行三轮并取中位数，减少温度、后台负载和运行顺序偏差。最终输出示例字段：
+
+```text
+CONCURRENCY_RESULT ...
+serial_median_us=...
+concurrent_median_us=...
+speedup=...
+overlap_ratio=...
+evidence=strong|partial|inconclusive|none
+```
+
+脚本定义：
+
+```text
+overlap_ratio =
+    (serial_median_us - concurrent_median_us) /
+    min(route0_share_us, route2_share_us)
+```
+
+判读标准：
+
+- `>= 0.50`：存在较强重叠证据；
+- `0.15 ~ 0.50`：部分重叠；
+- `0.05 ~ 0.15`：结果不明确，建议增大到 32/128/256 MiB 后复测；
+- `<= 0.05`：没有观察到有效重叠，可能被 CCU/UDMA/IO Die 顺序调度或共享瓶颈限制。
+
+如需把最低重叠比例作为自动检查条件：
+
+```bash
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --verify-concurrency \
+  --bytes $((128 * 1024 * 1024)) \
+  --warmup 10 --iters 100 --verification-rounds 3 \
+  --require-overlap-ratio 0.15
+```
+
+也可以单独运行、profiling 两个调度版本：
+
+```bash
+# 允许并发
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-indices 0,2 --schedule concurrent \
+  --bytes 2097152 --warmup 10 --iters 100 \
+  --profile --profile-root /home/l00934901/profiling
+
+# 强制串行
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --route-indices 0,2 --schedule serial \
+  --bytes 2097152 --warmup 10 --iters 100 \
+  --profile --profile-root /home/l00934901/profiling
+```
+
+`--verify-concurrency` 不能与 `--profile` 同时使用，避免 profiler 固定开销污染自动判定。MindStudio 中仍可能只看到
+一个 `CCU Launch`；串行/并发受控对照能证明 CCU kernel 内是否获得执行重叠，但要证明两条物理端口在同一时间窗
+都有流量，仍需 channel 级 CCU trace 或带时间戳的 per-port 计数器。仅有 hccn_tool 前后快照只能证明两条路径都
+传过数据，不能单独证明并发。

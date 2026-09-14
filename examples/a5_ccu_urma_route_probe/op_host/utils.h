@@ -20,6 +20,7 @@ struct RouteResources {
     std::vector<uint32_t> weights;
     uint64_t kernel = 0;
     uint64_t allToAllKernel = 0;
+    uint64_t allToAllSerialKernel = 0;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
     uint32_t dieId = 0;

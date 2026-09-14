@@ -25,6 +25,22 @@ bool DebugEnabled()
     const char *value = std::getenv("A5_CCU_DEBUG");
     return value != nullptr && std::string(value) == "1";
 }
+
+HcclResult GetSerializedSchedule(bool *serialized)
+{
+    if (serialized == nullptr) return HCCL_E_PTR;
+    const char *value = std::getenv("A5_CCU_ROUTE_SCHEDULE");
+    if (value == nullptr || value[0] == '\0' || std::string(value) == "concurrent") {
+        *serialized = false;
+        return HCCL_SUCCESS;
+    }
+    if (std::string(value) == "serial") {
+        *serialized = true;
+        return HCCL_SUCCESS;
+    }
+    std::fprintf(stderr, "[A5 CCU URMA] A5_CCU_ROUTE_SCHEDULE must be concurrent or serial\n");
+    return HCCL_E_PARA;
+}
 }
 
 extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
@@ -42,6 +58,9 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
     if (status != HCCL_SUCCESS) {
         return status;
     }
+    bool serialized = false;
+    status = GetSerializedSchedule(&serialized);
+    if (status != HCCL_SUCCESS) return status;
     const uint64_t bytes = elementsPerPeer * sizeof(float);
     const uint64_t totalBytes = bytes * resources.rankSize;
     const uint32_t peer = 1U - resources.rank;
@@ -86,12 +105,17 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
     }
 
     if (DebugEnabled()) {
-        std::printf("[A5 CCU URMA A2A][rank=%u] launch kernel=%lu peer_bytes=%lu routes=%zu\n",
-                    resources.rank, static_cast<unsigned long>(resources.allToAllKernel),
-                    static_cast<unsigned long>(bytes), resources.channels.size());
+        std::printf("[A5 CCU URMA A2A][rank=%u] launch kernel=%lu peer_bytes=%lu routes=%zu schedule=%s\n",
+                    resources.rank,
+                    static_cast<unsigned long>(serialized ? resources.allToAllSerialKernel
+                                                          : resources.allToAllKernel),
+                    static_cast<unsigned long>(bytes), resources.channels.size(),
+                    serialized ? "serial" : "concurrent");
     }
     status = HcclCcuKernelLaunch(comm, resources.routeThread,
-                                resources.allToAllKernel, &taskArg);
+                                serialized ? resources.allToAllSerialKernel
+                                           : resources.allToAllKernel,
+                                &taskArg);
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
         return status;
     }

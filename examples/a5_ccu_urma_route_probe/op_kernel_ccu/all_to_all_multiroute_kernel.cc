@@ -19,7 +19,8 @@ constexpr uint32_t POST_SYNC_MASK = 1;
 
 AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
     const std::vector<ChannelHandle> &inputChannels,
-    const std::vector<uint32_t> &routeIndices) : routeIndices_(routeIndices)
+    const std::vector<uint32_t> &routeIndices,
+    bool serialized) : routeIndices_(routeIndices), serialized_(serialized)
 {
     channels = inputChannels;
 }
@@ -28,10 +29,18 @@ hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() cons
 {
     hcomm::CcuKernelSignature signature;
     signature.Append("A5CcuUrmaMultiRouteAllToAllV1");
+    signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
     for (const uint32_t routeIndex : routeIndices_) {
         signature.Append(routeIndex);
     }
     return signature;
+}
+
+AllToAllMultiRouteKernel::AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg)
+    : hcomm::CcuKernel(arg)
+{
+    const auto *typedArg = dynamic_cast<const AllToAllMultiRouteKernelArg *>(&arg);
+    serialized_ = typedArg != nullptr && typedArg->IsSerialized();
 }
 
 HcclResult AllToAllMultiRouteKernel::Algorithm()
@@ -89,11 +98,18 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         destination.token = remoteTokens[i];
         remoteEvents.push_back(CreateCompletedEvent());
         CCU_KERNEL_CHECK(WriteNb(channels_[i], destination, source, pathBytes[i], remoteEvents.back()));
+        // The serial kernel is a controlled experiment: it differs from the
+        // production kernel only by waiting after each route submission.
+        if (serialized_) {
+            CCU_KERNEL_CHECK(WaitEvent(remoteEvents.back()));
+        }
     }
 
     CCU_KERNEL_CHECK(WaitEvent(localEvent));
-    for (auto &event : remoteEvents) {
-        CCU_KERNEL_CHECK(WaitEvent(event));
+    if (!serialized_) {
+        for (auto &event : remoteEvents) {
+            CCU_KERNEL_CHECK(WaitEvent(event));
+        }
     }
 
     // All data routes target the same peer. One peer-level completion handshake
