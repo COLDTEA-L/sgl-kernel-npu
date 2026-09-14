@@ -12,6 +12,7 @@
 #include <vector>
 
 using a5_ccu_urma_probe::GetRouteResources;
+using a5_ccu_urma_probe::RouteKernelKind;
 using a5_ccu_urma_probe::RouteResources;
 
 namespace {
@@ -44,7 +45,8 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
 
     const uint64_t bytes = sendCount * sizeof(float);
     RouteResources resources;
-    HcclResult status = GetRouteResources(comm, stream, &resources);
+    HcclResult status = GetRouteResources(
+        comm, stream, RouteKernelKind::ROUTE_WRITE, &resources);
     if (status != HCCL_SUCCESS) {
         return status;
     }

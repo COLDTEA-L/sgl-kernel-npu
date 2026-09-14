@@ -4,8 +4,9 @@
 
 本文对比两条实现链路：
 
-1. `sgl-kernel-npu` 通过 MC2 调用 HCCL 原生 CCU AllToAll；
-2. `feature/a5-ccu-urma-multirelay-forwarding` 中两卡多路径 CCU+URMA AllToAll。
+1. 官方 `torch.distributed.all_to_all_single` 通过 ProcessGroupHCCL 调用原生 HCCL AllToAll；
+2. `sgl-kernel-npu` 通过 MC2 调用 HCCL 原生 CCU AllToAll；
+3. `feature/a5-ccu-urma-multirelay-forwarding` 中两卡多路径 CCU+URMA AllToAll。
 
 二者的数据语义相同：每个 rank 的输入按目标 rank 排列，输出按来源 rank 排列。当前多路径实现只支持
 `world_size=2`、FP32，以及位于同一个 IO Die 的一组 RankGraph route。
@@ -14,7 +15,7 @@
 
 | 层次 | 原生 CCU AllToAll | 多路径 CCU AllToAll |
 |---|---|---|
-| Python | `Buffer.hccl_all2_all_ccu(send)` | `Buffer.ccu_urma_multiroute_alltoall(send)` |
+| Python | 官方基线：`dist.all_to_all_single(recv, send)`；MC2 对照：`Buffer.hccl_all2_all_ccu(send)` | `Buffer.ccu_urma_multiroute_alltoall(send)` |
 | 无分配 Python | 暂无独立 out 接口 | `Buffer.ccu_urma_multiroute_alltoall_out(send, recv)` |
 | 输入布局 | 一维连续 tensor，均分为 `rank_size` 块 | `[2, elements_per_peer]` |
 | C++ Buffer | `Buffer::hccl_all2_all_ccu` | `Buffer::ccu_urma_multiroute_alltoall[_out]` |
@@ -55,6 +56,19 @@ remote destination = peer.recv[rank]
 多路径只切分 `peer source`。self slice 不经过网络。
 
 ## 4. 原生 CCU AllToAll 调用链
+
+### 4.0 官方 PyTorch/HCCL 基线
+
+```text
+torch.distributed.all_to_all_single
+  -> ProcessGroupHCCL
+  -> HcclAlltoAll
+  -> HCCL selector / executor
+  -> CCU kernel（HCCL_OP_EXPANSION_MODE=CCU_SCHED）
+```
+
+测试脚本的 `--implementation native` 使用这条公开接口，不经过 DeepEP，也不依赖自定义 route 动态库。
+因此它适合作为环境和原生性能基线；是否最终选中 CCU，以 profiling 中的 HCCL/CCU task 为准。
 
 ### 4.1 sgl-kernel-npu 到 MC2
 

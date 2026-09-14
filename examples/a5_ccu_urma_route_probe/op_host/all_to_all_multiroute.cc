@@ -13,6 +13,7 @@
 
 using a5_ccu_urma_probe::AllToAllMultiRouteTaskArg;
 using a5_ccu_urma_probe::GetRouteResources;
+using a5_ccu_urma_probe::RouteKernelKind;
 using a5_ccu_urma_probe::RouteResources;
 
 namespace {
@@ -53,14 +54,18 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
         return HCCL_E_NOT_SUPPORT;
     }
 
+    bool serialized = false;
+    HcclResult status = GetSerializedSchedule(&serialized);
+    if (status != HCCL_SUCCESS) return status;
     RouteResources resources;
-    HcclResult status = GetRouteResources(comm, stream, &resources);
+    status = GetRouteResources(
+        comm, stream,
+        serialized ? RouteKernelKind::ALLTOALL_SERIAL
+                   : RouteKernelKind::ALLTOALL_CONCURRENT,
+        &resources);
     if (status != HCCL_SUCCESS) {
         return status;
     }
-    bool serialized = false;
-    status = GetSerializedSchedule(&serialized);
-    if (status != HCCL_SUCCESS) return status;
     const uint64_t bytes = elementsPerPeer * sizeof(float);
     const uint64_t totalBytes = bytes * resources.rankSize;
     const uint32_t peer = 1U - resources.rank;
@@ -107,15 +112,12 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
     if (DebugEnabled()) {
         std::printf("[A5 CCU URMA A2A][rank=%u] launch kernel=%lu peer_bytes=%lu routes=%zu schedule=%s\n",
                     resources.rank,
-                    static_cast<unsigned long>(serialized ? resources.allToAllSerialKernel
-                                                          : resources.allToAllKernel),
+                    static_cast<unsigned long>(resources.kernel),
                     static_cast<unsigned long>(bytes), resources.channels.size(),
                     serialized ? "serial" : "concurrent");
     }
-    status = HcclCcuKernelLaunch(comm, resources.routeThread,
-                                serialized ? resources.allToAllSerialKernel
-                                           : resources.allToAllKernel,
-                                &taskArg);
+    status = HcclCcuKernelLaunch(
+        comm, resources.routeThread, resources.kernel, &taskArg);
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
         return status;
     }

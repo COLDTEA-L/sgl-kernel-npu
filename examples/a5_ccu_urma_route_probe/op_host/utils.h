@@ -11,6 +11,12 @@
 
 namespace a5_ccu_urma_probe {
 
+enum class RouteKernelKind {
+    ROUTE_WRITE,
+    ALLTOALL_CONCURRENT,
+    ALLTOALL_SERIAL,
+};
+
 struct RouteResources {
     ThreadHandle mainThread = 0;
     ThreadHandle routeThread = 0;
@@ -19,8 +25,6 @@ struct RouteResources {
     std::vector<uint32_t> routeIndices;
     std::vector<uint32_t> weights;
     uint64_t kernel = 0;
-    uint64_t allToAllKernel = 0;
-    uint64_t allToAllSerialKernel = 0;
     uint32_t rank = 0;
     uint32_t rankSize = 0;
     uint32_t dieId = 0;
@@ -30,7 +34,8 @@ HcclResult GetCcuRouteIndex(uint32_t *routeIndex);
 
 HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices);
 
-HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *resources);
+HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
+                             RouteKernelKind kernelKind, RouteResources *resources);
 
 } // namespace a5_ccu_urma_probe
 

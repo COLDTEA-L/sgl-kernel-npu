@@ -900,6 +900,9 @@ python3 -m torch.distributed.run \
 
 ### 14.4 采集两张卡 profiling
 
+推荐使用 14.6 的独立进程脚本采集。该脚本会创建合法目录名，把 `0,2` 转换为 `0_2`，并将计时阶段与
+profiling 阶段分开。下面的单 case 命令仍可用于排错。
+
 ```bash
 python3 -m torch.distributed.run \
   --standalone --nproc-per-node=2 \
@@ -923,7 +926,10 @@ python3 -m torch.distributed.run \
 MindStudio 中一个 `CCU Launch` 包含 self `LocalCopyNb` 和所有 route 的 `WriteNb`。对比 route0、route2、
 route0+2 时，应同时记录 CCU Launch 的平均值、P50、P95；不要再用带 `--debug` 的结果做性能结论。
 
-### 14.5 验证 route0 与 route2 是否并发
+### 14.5 旧版同进程并发验证（已废弃）
+
+> 不要再执行本节旧的 `--verify-concurrency` 命令。它会在同一 communicator 中切换 route 并重复注册多个
+> CCU kernel，可能在第二次 `HcclCcuKernelRegister` 返回 `HCCL_E_UNAVAIL(7)`，实验没有进入真正的数据搬运。
 
 本分支同时注册两个 CCU AllToAll kernel：
 
@@ -1044,3 +1050,66 @@ python3 -m torch.distributed.run \
 一个 `CCU Launch`；串行/并发受控对照能证明 CCU kernel 内是否获得执行重叠，但要证明两条物理端口在同一时间窗
 都有流量，仍需 channel 级 CCU trace 或带时间戳的 per-port 计数器。仅有 hccn_tool 前后快照只能证明两条路径都
 传过数据，不能单独证明并发。
+
+### 14.6 独立进程基线、并发对照与合法 profiling 目录
+
+拉取并重新编译自定义 CCU 包（本次修改了 kernel 注册生命周期，必须重编）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-urma-multirelay-forwarding
+git pull --ff-only origin feature/a5-ccu-urma-multirelay-forwarding
+
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install --install-path /usr/local/Ascend/cann-9.1.T560
+```
+
+一键运行原生 HCCL、单路分片、强制串行和并发实验：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_urma_alltoall_concurrency.sh \
+  --devices 4,5 \
+  --bytes 2097152 \
+  --warmup 10 \
+  --iters 100 \
+  --rounds 3
+```
+
+脚本每个 case 都启动全新的 `torchrun`，因此每个 communicator 只注册一个 CCU kernel：
+
+```text
+native      : torch.distributed.all_to_all_single（官方 ProcessGroupHCCL 基线）
+route0_share: route0 只发送总 payload 中按 2:1 切出的部分
+route2_share: route2 只发送剩余部分
+serial      : route0 WriteNb/WaitEvent 完成后再提交 route2
+concurrent  : 先提交 route0、route2 的 WriteNb，再统一 WaitEvent
+```
+
+最终 `CONCURRENCY_RESULT` 给出各组中位数、`serial/concurrent` speedup 和 overlap ratio。只有看到该结果，
+才表示五组实验均真正完成；初始化阶段报错不能作为并发结论。
+
+同时采集原生 HCCL 与多路径 concurrent 的 profiling：
+
+```bash
+bash scripts/run_a5_ccu_urma_alltoall_concurrency.sh \
+  --devices 4,5 \
+  --bytes 2097152 \
+  --warmup 10 --iters 100 --rounds 3 \
+  --profile --profile-iters 20 \
+  --profile-root /home/l00934901/profiling
+```
+
+脚本先完成纯计时，再额外启动两个独立 profiling 进程。输出目录仅含字母、数字、下划线、点和连字符，例如：
+
+```text
+/home/l00934901/profiling/a5_ccu_alltoall_native_RUN_ID/rank0/
+/home/l00934901/profiling/a5_ccu_alltoall_native_RUN_ID/rank1/
+/home/l00934901/profiling/a5_ccu_alltoall_multiroute_0_2_concurrent_RUN_ID/rank0/
+/home/l00934901/profiling/a5_ccu_alltoall_multiroute_0_2_concurrent_RUN_ID/rank1/
+```
+
+启动前会创建目录并检查可写性；每个 rank 使用独立 `worker_name`。profiler 不再使用非法的逗号目录，也不再
+配置 `warmup=0` 的 schedule。MindStudio 中原生基线应显示 HCCL AllToAll/CCU 活动，多路径 case 则显示自定义
+host op 与 CCU Launch。profiling 结果用于核对调用链，性能数值以 profiling 之外的 `CONCURRENCY_RESULT` 为准。

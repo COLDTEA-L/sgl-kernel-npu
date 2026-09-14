@@ -257,7 +257,8 @@ HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices)
     return HCCL_SUCCESS;
 }
 
-HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *resources)
+HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
+                             RouteKernelKind kernelKind, RouteResources *resources)
 {
     if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
@@ -269,9 +270,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
     }
     const char *routeKeyValue = std::getenv("A5_CCU_ROUTE_INDICES");
     const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
-    const std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
+    std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
         (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue));
+    routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;
@@ -414,37 +416,34 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream, RouteResources *
         return HCCL_SUCCESS;
     }
 
-    RouteKernelArg kernelArg(created.channels, routeIndices);
-    hcomm::KernelCreator creator = CreateRouteKernel;
     CcuKernelHandle kernel = 0;
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegister begin\n", rank);
+    HcclResult registerStatus = HCCL_E_INTERNAL;
+    const char *kernelName = "unknown";
+    std::printf("[A5 CCU URMA][rank=%u] register %s begin\n", rank,
+                kernelKind == RouteKernelKind::ROUTE_WRITE ? "route_write" :
+                (kernelKind == RouteKernelKind::ALLTOALL_SERIAL ?
+                    "alltoall_serial" : "alltoall_concurrent"));
     std::fflush(stdout);
-    status = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegister end: status=%d kernel=%lu\n",
-                rank, static_cast<int>(status), static_cast<unsigned long>(kernel));
+    if (kernelKind == RouteKernelKind::ROUTE_WRITE) {
+        kernelName = "route_write";
+        RouteKernelArg kernelArg(created.channels, routeIndices);
+        hcomm::KernelCreator creator = CreateRouteKernel;
+        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+    } else {
+        const bool serialized = kernelKind == RouteKernelKind::ALLTOALL_SERIAL;
+        kernelName = serialized ? "alltoall_serial" : "alltoall_concurrent";
+        AllToAllMultiRouteKernelArg kernelArg(created.channels, routeIndices, serialized);
+        hcomm::KernelCreator creator = CreateAllToAllMultiRouteKernel;
+        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+    }
+    std::printf("[A5 CCU URMA][rank=%u] register %s end: status=%d kernel=%lu\n",
+                rank, kernelName, static_cast<int>(registerStatus),
+                static_cast<unsigned long>(kernel));
     std::fflush(stdout);
-    if (status != HCCL_SUCCESS) {
-        return status;
+    if (registerStatus != HCCL_SUCCESS) {
+        return registerStatus;
     }
     created.kernel = kernel;
-
-    AllToAllMultiRouteKernelArg allToAllKernelArg(created.channels, routeIndices);
-    hcomm::KernelCreator allToAllCreator = CreateAllToAllMultiRouteKernel;
-    CcuKernelHandle allToAllKernel = 0;
-    status = HcclCcuKernelRegister(comm, &allToAllKernel, &allToAllCreator, &allToAllKernelArg);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-    created.allToAllKernel = allToAllKernel;
-
-    AllToAllMultiRouteKernelArg allToAllSerialKernelArg(created.channels, routeIndices, true);
-    CcuKernelHandle allToAllSerialKernel = 0;
-    status = HcclCcuKernelRegister(comm, &allToAllSerialKernel, &allToAllCreator,
-                                   &allToAllSerialKernelArg);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-    created.allToAllSerialKernel = allToAllSerialKernel;
 
     std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish begin\n", rank);
     std::fflush(stdout);
