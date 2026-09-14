@@ -811,6 +811,73 @@ physical_device=N udie=U port=P nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
 7. route0 与 route2 的测试之间应确认旧进程完全退出，且测试期间不要运行其他 HCCL/URMA workload；否则
    设备级累计计数会混入无关流量。
 
+#### 13.5.1 不逐个打开 TXT，直接筛选 TSV
+
+TSV 是以 Tab 分隔的文本表格，`hccn_counter_deltas.tsv` 与 before/after TXT 位于同一运行目录。先定位最新
+结果：
+
+```bash
+TSV=$(
+  find /home/l00934901/profiling \
+    -type f -name 'hccn_counter_deltas.tsv' \
+    -printf '%T@ %p\n' |
+  sort -nr | head -n 1 | cut -d' ' -f2-
+)
+echo "${TSV}"
+```
+
+表格列依次为 `physical_device、udie、port、counter、before、after、delta`。在端点为物理卡 4、5 时，
+只显示非端点卡上字节计数增量大于零的行：
+
+```bash
+awk -F'\t' '
+NR == 1 ||
+($1 != 4 && $1 != 5 && $7 > 0 &&
+ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/)
+' "${TSV}" |
+sort -t $'\t' -k1,1n -k2,2n -k3,3n -k7,7nr |
+column -t -s $'\t'
+```
+
+如果系统没有 `column`，使用格式化 `awk`：
+
+```bash
+awk -F'\t' '
+NR == 1 {
+  printf "%-8s %-6s %-6s %-40s %s\n", "device", "udie", "port", "counter", "delta"
+}
+NR > 1 && $1 != 4 && $1 != 5 && $7 > 0 &&
+tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
+  printf "%-8s %-6s %-6s %-40s %s\n", $1, $2, $3, $4, $7
+}
+' "${TSV}"
+```
+
+只查看增量最大的 30 个非端点端口计数：
+
+```bash
+awk -F'\t' '
+NR > 1 && $1 != 4 && $1 != 5 &&
+tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/ {
+  print $7 "\tdevice=" $1 "\tudie=" $2 "\tport=" $3 "\t" $4
+}
+' "${TSV}" | sort -nr | head -30
+```
+
+如果只方便使用记事本，可以先生成精简文件再下载：
+
+```bash
+awk -F'\t' '
+NR == 1 ||
+($1 != 4 && $1 != 5 && $7 > 0 &&
+ tolower($4) ~ /(tx|rx)/ && tolower($4) ~ /(oct|byte)/)
+' "${TSV}" > /home/l00934901/profiling/route2_relay_candidates.tsv
+```
+
+`.tsv` 可用 Excel 或 WPS 直接打开，导入时选择“制表符/Tab”作为分隔符；VS Code 可使用 Rainbow CSV。
+判断中转卡时，优先寻找同一非端点 Device 上同时存在、数量级接近有效负载的 RX 与 TX 增量。记事本仅适合
+查看上面的精简文件，不建议直接打开完整 TSV。
+
 `hccn_tool -g -stat` 并非所有 A5/950 端口都支持。脚本只查询 `Link Status=UP` 的端口，并保留失败端口的
 原始回显继续测试；如果某张中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die
 透明转发。最终结论需要同时满足：
