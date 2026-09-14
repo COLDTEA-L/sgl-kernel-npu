@@ -124,6 +124,9 @@ HCCN_COUNTERS = (
     "roce_new_pkt_rty_num",
 )
 HCCN_COUNTER_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*([0-9]+)\s*$")
+HCCN_950_PORT_RE = re.compile(
+    r"^\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*[^|]+\|\s*(UP|DOWN)\s*\|"
+)
 
 
 def resolve_hccn_tool(configured):
@@ -131,17 +134,73 @@ def resolve_hccn_tool(configured):
     return next((Path(path).resolve() for path in candidates if path and os.access(path, os.X_OK)), None)
 
 
-def capture_hccn_stats(tool, devices, output_dir, phase, allowed_devices=None):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    supported = []
+def hccn_clean_env():
     clean_env = os.environ.copy()
     clean_env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
     clean_env.pop("ASCEND_VISIBLE_DEVICES", None)
+    return clean_env
+
+
+def discover_hccn_targets(tool, devices, output_dir):
+    """Return (device, udie, port) for 950, or (device, None, None) for legacy."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    targets = []
+    clean_env = hccn_clean_env()
     for device in devices:
-        if allowed_devices is not None and device not in allowed_devices:
-            continue
-        output_file = output_dir / f"{phase}_device{device}.txt"
-        command = [str(tool), "-i", str(device), "-stat", "-g"]
+        output_file = output_dir / f"device_info_device{device}.txt"
+        command = [str(tool), "-g", "-dev_info", "-i", str(device)]
+        result = subprocess.run(command, env=clean_env, text=True, capture_output=True, check=False)
+        header = (
+            f"# command: {' '.join(command)}\n"
+            f"# timestamp: {datetime.now(timezone.utc).astimezone().isoformat()}\n"
+            f"# returncode: {result.returncode}\n"
+        )
+        output_file.write_text(header + result.stdout + result.stderr, errors="replace")
+        ports = []
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                match = HCCN_950_PORT_RE.match(line)
+                if match and match.group(3) == "UP":
+                    ports.append((device, int(match.group(1)), int(match.group(2))))
+        if ports:
+            targets.extend(ports)
+            print(
+                f"HCCN 950 discovery: physical device {device}, "
+                f"UP ports={[(udie, port) for _, udie, port in ports]}",
+                flush=True,
+            )
+        else:
+            # A legacy tool has no -g -dev_info mode and one statistics object per NPU.
+            targets.append((device, None, None))
+            print(
+                f"HCCN 950 port discovery unavailable for physical device {device}; "
+                "trying the legacy statistics command",
+                flush=True,
+            )
+    return targets
+
+
+def hccn_target_name(target):
+    device, udie, port = target
+    if udie is None:
+        return f"device{device}"
+    return f"device{device}_udie{udie}_port{port}"
+
+
+def capture_hccn_stats(tool, targets, output_dir, phase):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    supported = []
+    clean_env = hccn_clean_env()
+    for target in targets:
+        device, udie, port = target
+        output_file = output_dir / f"{phase}_{hccn_target_name(target)}.txt"
+        if udie is None:
+            command = [str(tool), "-i", str(device), "-stat", "-g"]
+        else:
+            command = [
+                str(tool), "-g", "-stat", "-i", str(device),
+                "-u", str(udie), "-p", str(port),
+            ]
         result = subprocess.run(command, env=clean_env, text=True, capture_output=True, check=False)
         header = (
             f"# command: {' '.join(command)}\n"
@@ -150,17 +209,20 @@ def capture_hccn_stats(tool, devices, output_dir, phase, allowed_devices=None):
         )
         output_file.write_text(header + result.stdout + result.stderr, errors="replace")
         if result.returncode == 0:
-            supported.append(device)
-            print(f"HCCN snapshot {phase}: physical device {device} -> {output_file}", flush=True)
+            supported.append(target)
+            print(f"HCCN snapshot {phase}: {hccn_target_name(target)} -> {output_file}", flush=True)
         else:
             print(
-                f"WARNING: hccn_tool -stat unavailable for physical device {device}; "
+                f"WARNING: hccn_tool statistics unavailable for {hccn_target_name(target)}; "
                 f"see {output_file}",
                 file=sys.stderr,
                 flush=True,
             )
-    (output_dir / f"{phase}_supported_devices.txt").write_text(
-        "".join(f"{device}\n" for device in supported)
+    (output_dir / f"{phase}_supported_targets.txt").write_text(
+        "".join(
+            f"{device}\t{'' if udie is None else udie}\t{'' if port is None else port}\n"
+            for device, udie, port in supported
+        )
     )
     return supported
 
@@ -174,23 +236,32 @@ def load_hccn_counters(path):
     return counters
 
 
-def report_hccn_delta(output_dir, devices):
+def report_hccn_delta(output_dir, targets):
     rows = []
     print("HCCN counter deltas (after - before):", flush=True)
-    for device in devices:
-        before = load_hccn_counters(output_dir / f"before_device{device}.txt")
-        after = load_hccn_counters(output_dir / f"after_device{device}.txt")
+    for target in targets:
+        device, udie, port = target
+        name = hccn_target_name(target)
+        before = load_hccn_counters(output_dir / f"before_{name}.txt")
+        after = load_hccn_counters(output_dir / f"after_{name}.txt")
         common = sorted(before.keys() & after.keys())
         deltas = {key: after[key] - before[key] for key in common}
         summary = " ".join(
             f"{key}={deltas[key]}" if key in deltas else f"{key}=N/A"
             for key in HCCN_COUNTERS
         )
-        print(f"  physical_device={device} {summary}", flush=True)
-        rows.extend((device, key, before[key], after[key], deltas[key]) for key in common)
+        location = f"physical_device={device}"
+        if udie is not None:
+            location += f" udie={udie} port={port}"
+        print(f"  {location} {summary}", flush=True)
+        rows.extend(
+            (device, "" if udie is None else udie, "" if port is None else port,
+             key, before[key], after[key], deltas[key])
+            for key in common
+        )
     output = output_dir / "hccn_counter_deltas.tsv"
     with output.open("w") as handle:
-        handle.write("physical_device\tcounter\tbefore\tafter\tdelta\n")
+        handle.write("physical_device\tudie\tport\tcounter\tbefore\tafter\tdelta\n")
         for row in rows:
             handle.write("\t".join(map(str, row)) + "\n")
     print(f"HCCN raw snapshots and delta table: {output_dir}", flush=True)
@@ -281,9 +352,8 @@ def main():
                 flush=True,
             )
         else:
-            hccn_before = capture_hccn_stats(
-                hccn_tool, hccn_devices, hccn_dir, "before"
-            )
+            hccn_targets = discover_hccn_targets(hccn_tool, hccn_devices, hccn_dir)
+            hccn_before = capture_hccn_stats(hccn_tool, hccn_targets, hccn_dir, "before")
             if not hccn_before:
                 print("WARNING: HCCN statistics unavailable on all requested devices", file=sys.stderr)
     file_barrier(sync_dir, "hccn_before_done", rank, world_size)
@@ -309,12 +379,10 @@ def main():
 
     file_barrier(sync_dir, "timed_run_done", rank, world_size)
     if args.hccn_stat and rank == 0 and hccn_dir is not None and hccn_before:
-        hccn_after = capture_hccn_stats(
-            hccn_tool, hccn_devices, hccn_dir, "after", set(hccn_before)
-        )
-        common_devices = sorted(set(hccn_before) & set(hccn_after))
-        if common_devices:
-            report_hccn_delta(hccn_dir, common_devices)
+        hccn_after = capture_hccn_stats(hccn_tool, hccn_before, hccn_dir, "after")
+        common_targets = sorted(set(hccn_before) & set(hccn_after))
+        if common_targets:
+            report_hccn_delta(hccn_dir, common_targets)
         else:
             print("WARNING: no HCCN device has both before and after snapshots", file=sys.stderr)
     file_barrier(sync_dir, "hccn_after_done", rank, world_size)

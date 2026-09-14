@@ -720,13 +720,28 @@ python3 -m torch.distributed.run \
 
 ### 13.4 同时采集 CCU profiling 和端口报文
 
-`hccn_tool` 已直接集成到上述 Python 测试。只有 rank0 执行设备级查询，两个 rank 在采集前后通过 HCCL
+`hccn_tool` 已直接集成到上述 Python 测试。只有 rank0 执行端口级查询，两个 rank 在采集前后通过 HCCL
 同步点对齐，因此计数窗口只包围正式 `--iters`，不包含 warmup。首次 CCU route launch 后，脚本使用
 `/tmp/a5_ccu_urma_write_sync_*` 下的共享文件同步，不再在同一个 communicator 上调用 `dist.barrier()` 或
 `dist.all_reduce()`。底层 CCU thread/channel 已经从该 communicator 取得资源，随后混用 PyTorch HCCL collective
 可能在 `HcclAllreduce` 报 `ERR00100`；该错误不代表前面的 CCU write 自身失败。查询子进程会临时删除
 `ASCEND_RT_VISIBLE_DEVICES` 和 `ASCEND_VISIBLE_DEVICES`，所以 `--hccn-devices` 始终填写宿主机
 `npu-smi info` 中的物理 Device ID，不是 torchrun 内部的 0、1。
+
+Ascend 950 使用新版多端口命令，不能再调用旧格式 `hccn_tool -i DEV -stat -g`。脚本先执行：
+
+```bash
+hccn_tool -g -dev_info -i DEV
+```
+
+从端口表中枚举 `Link Status=UP` 的 `(UDie ID, Port ID)`，再对每个有效端口执行：
+
+```bash
+hccn_tool -g -stat -i DEV -u UDIE -p PORT
+```
+
+如果 `-g -dev_info` 不可用，脚本才回退到旧版单端口命令。route 日志里的 `link` 是 RankGraph route 索引，
+不保证等于 HCCN 的物理 `Port ID`，因此必须对所有 UP 端口做前后差分，不能直接把 `link=2` 写成 `-p 2`。
 
 推荐在没有其他通信任务的独占时段运行。以下命令在物理卡 4、5 上同时测试 route0+route2、采集两张卡的
 Python profiler，并查询整机 0～7 卡的端口累计计数：
@@ -767,17 +782,18 @@ python3 -m torch.distributed.run \
 │   ├── rank0/                         Python/NPU profiling
 │   └── rank1/
 └── hccn_ccu_write_routes_0,2_RUN_ID/
-    ├── before_deviceN.txt             正式迭代前的原始 hccn_tool 输出
-    ├── after_deviceN.txt              正式迭代后的原始 hccn_tool 输出
-    ├── before_supported_devices.txt
-    ├── after_supported_devices.txt
-    └── hccn_counter_deltas.tsv        所有可解析 counter 的 after-before
+    ├── device_info_deviceN.txt                  UDie/Port 枚举结果
+    ├── before_deviceN_udieU_portP.txt            正式迭代前的端口计数
+    ├── after_deviceN_udieU_portP.txt             正式迭代后的端口计数
+    ├── before_supported_targets.txt
+    ├── after_supported_targets.txt
+    └── hccn_counter_deltas.tsv                   所有可解析 counter 的 after-before
 ```
 
 终端会摘要打印：
 
 ```text
-physical_device=N nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
+physical_device=N udie=U port=P nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
   nic_rx_all_pkg_num=... nic_rx_all_oct_num=... roce_new_pkt_rty_num=...
 ```
 
@@ -795,8 +811,9 @@ physical_device=N nic_tx_all_pkg_num=... nic_tx_all_oct_num=... \
 7. route0 与 route2 的测试之间应确认旧进程完全退出，且测试期间不要运行其他 HCCL/URMA workload；否则
    设备级累计计数会混入无关流量。
 
-`hccn_tool -stat -g` 并非所有 A5/950 端口都支持。脚本会保留失败设备的原始回显并继续测试；如果某张
-中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die 透明转发。最终结论需要同时满足：
+`hccn_tool -g -stat` 并非所有 A5/950 端口都支持。脚本只查询 `Link Status=UP` 的端口，并保留失败端口的
+原始回显继续测试；如果某张中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die
+透明转发。最终结论需要同时满足：
 
 - RankGraph 日志显示选中的 route、`hop`、die 和地址确实不同；
 - CCU Python 测试数据正确；
