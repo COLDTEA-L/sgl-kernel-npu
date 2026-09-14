@@ -878,6 +878,97 @@ NR == 1 ||
 判断中转卡时，优先寻找同一非端点 Device 上同时存在、数量级接近有效负载的 RX 与 TX 增量。记事本仅适合
 查看上面的精简文件，不建议直接打开完整 TSV。
 
+#### 13.5.2 route2 是否同时使用 direct 与 relay：2 MiB/4 MiB 完整实验
+
+当前环境使用 `HCCL_BUFFSIZE=2300`，不要从 16 MiB 起测。先只测试每个 rank 对外发送 2 MiB 和 4 MiB；
+四组实验使用相同的 warmup、iters 和物理端点卡 4、5：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=2300
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+run_hccn_case() {
+  route=$1
+  bytes=$2
+  label=$3
+
+  python3 -m torch.distributed.run \
+    --standalone --nproc-per-node=2 \
+    tests/python/deepep/test_a5_ccu_urma_multiroute_write.py \
+    --route-index "${route}" \
+    --bytes "${bytes}" \
+    --warmup 100 \
+    --iters 100 \
+    --remote-only \
+    --hccn-stat \
+    --hccn-devices 0,1,2,3,4,5,6,7 \
+    --hccn-stat-root /home/l00934901/profiling
+
+  latest=$(
+    find /home/l00934901/profiling \
+      -maxdepth 1 -type d -name "hccn_ccu_write_routes_${route}_*" \
+      -printf '%T@ %p\n' |
+    sort -nr | head -n 1 | cut -d' ' -f2-
+  )
+  test -f "${latest}/hccn_counter_deltas.tsv"
+  cp "${latest}/hccn_counter_deltas.tsv" \
+    "/home/l00934901/profiling/${label}.tsv"
+}
+
+run_hccn_case 0 2097152 route0_2m
+run_hccn_case 2 2097152 route2_2m
+run_hccn_case 0 4194304 route0_4m
+run_hccn_case 2 4194304 route2_4m
+```
+
+测试期间不要运行其他 HCCL/URMA 任务。每组执行结束后函数立即复制 TSV，避免后续运行时混淆目录。
+
+新增的分析器自动选择一对 TX/RX 字节计数器，以 route0 识别直连端口，再检查 route2 是否仍使用这些端口，
+并在非端点卡 0、1、2、3、6、7 中寻找同时具有 RX/TX 增量的 relay 候选。分别分析 2 MiB 与 4 MiB：
+
+```bash
+python3 scripts/analyze_a5_hccn_route.py \
+  --route0-tsv /home/l00934901/profiling/route0_2m.tsv \
+  --route2-tsv /home/l00934901/profiling/route2_2m.tsv \
+  --endpoint-devices 4,5 \
+  --bytes 2097152 \
+  --iters 100 \
+  --output /home/l00934901/profiling/route_compare_2m.tsv
+
+python3 scripts/analyze_a5_hccn_route.py \
+  --route0-tsv /home/l00934901/profiling/route0_4m.tsv \
+  --route2-tsv /home/l00934901/profiling/route2_4m.tsv \
+  --endpoint-devices 4,5 \
+  --bytes 4194304 \
+  --iters 100 \
+  --output /home/l00934901/profiling/route_compare_4m.tsv
+```
+
+终端重点看：
+
+```text
+Route0 direct ports: ...
+Direct ports active in route2: ...
+Relay candidate devices: ...
+Direct+relay cumulative evidence: True|False
+```
+
+判读要求：
+
+1. `Direct ports active in route2` 非空，说明 route2 测试期间 route0 的直连端口仍有流量；
+2. `Relay candidate devices` 非空，说明至少一张非端点卡同时出现明显 RX/TX；
+3. 从 2 MiB 增至 4 MiB 后，同一 direct 端口和 relay 候选卡的有效增量应接近同比增长；
+4. 三项同时成立时，才形成 route2 包含 direct+relay 的累计计数证据；
+5. `True` 只能证明同一正式迭代窗口内两类路径都参与过，不能证明微秒级并发。要证明并发仍需在持续打流期间，
+   对候选端口并行执行 `hccn_tool -g -bandwidth -time 100`。
+
+分析器还会生成精简的 `route_compare_2m.tsv` 和 `route_compare_4m.tsv`，无需再逐个打开原始 TXT。若自动选错
+计数器，可从原 TSV 的 `counter` 列确认名称，并显式传入 `--tx-counter NAME --rx-counter NAME`。
+
 `hccn_tool -g -stat` 并非所有 A5/950 端口都支持。脚本只查询 `Link Status=UP` 的端口，并保留失败端口的
 原始回显继续测试；如果某张中转卡没有可见增量，只能说明该驱动接口没有观察到流量，不能单独否定 IO Die
 透明转发。最终结论需要同时满足：
