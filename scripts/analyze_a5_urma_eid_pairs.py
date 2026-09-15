@@ -14,7 +14,9 @@ PREFERRED_RX = ("nic_rx_all_oct_num", "rx_busi_flit_num", "ub_mem_pkt_cnt_rx")
 COUNTER_RE = re.compile(
     r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*(?::|=|\s)\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*$"
 )
-DEVICE_RE = re.compile(r"^(before|after)_device([0-9]+)\.txt$")
+DEVICE_RE = re.compile(
+    r"^(before|after)_device([0-9]+)(?:_udie([0-9]+)_port([0-9]+))?\.txt$"
+)
 
 
 def parse_args():
@@ -53,19 +55,20 @@ def snapshot_delta(snapshot_dir: Path, output: Path):
     for path in snapshot_dir.glob("*_device*.txt"):
         match = DEVICE_RE.match(path.name)
         if match:
-            files[int(match.group(2))][match.group(1)] = path
+            key = (int(match.group(2)), match.group(3) or "", match.group(4) or "")
+            files[key][match.group(1)] = path
     rows = []
-    for device, phases in sorted(files.items()):
+    for (device, udie, port), phases in sorted(files.items()):
         if "before" not in phases or "after" not in phases:
             continue
         before = read_snapshot(phases["before"])
         after = read_snapshot(phases["after"])
         for counter in sorted(before.keys() & after.keys()):
             delta = after[counter] - before[counter]
-            rows.append((device, counter, before[counter], after[counter], max(delta, 0)))
+            rows.append((device, udie, port, counter, before[counter], after[counter], max(delta, 0)))
     with output.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(("physical_device", "counter", "before", "after", "delta"))
+        writer.writerow(("physical_device", "udie", "port", "counter", "before", "after", "delta"))
         writer.writerows(rows)
     if not rows:
         raise RuntimeError(f"no matching HCCN counters in {snapshot_dir}")
@@ -148,7 +151,11 @@ def analyze_scan(args):
     scan_dir = Path(args.scan_dir)
     with (scan_dir / "pairs.tsv").open(newline="") as handle:
         pairs = list(csv.DictReader(handle, delimiter="\t"))
-    successful = [row for row in pairs if row["status"] == "PASS"]
+    successful = [
+        row for row in pairs
+        if row.get("urma_status", row["status"]) == "PASS"
+        and row.get("hccn_status", row["status"]) == "PASS"
+    ]
     if not successful:
         raise RuntimeError(
             f"no successful EID-pair run in {scan_dir}; inspect pairs.tsv and client/server logs"

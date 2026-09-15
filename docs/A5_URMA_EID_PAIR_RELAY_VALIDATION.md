@@ -8,7 +8,7 @@
 
 1. 枚举 `src_eid_idx × dst_eid_idx`。
 2. 每个 EID 对用 `urma_perftest write_bw --ctp` 从源卡向目的卡发送数据。
-3. 通信前后采集 0～7 卡的 HCCN 端口计数。
+3. 先通过 `hccn_tool -g -dev_info` 枚举每张卡的 UP 端口，再在通信前后逐端口采集 HCCN 计数。
 4. 分析非端点卡是否同时出现显著 RX 和 TX 增量。
 5. 将结果分类为直连、稳定单 relay、多 relay/ECMP 或无效。
 
@@ -59,6 +59,15 @@ die1: udmac1d1e6/eid0 -> udmac1d1e6/eid2
 
 实验期间应保证端点卡和候选 relay 卡尽量空闲，否则其他业务流量会污染 HCCN 计数。
 
+A5/950 不支持旧格式 `hccn_tool -i DEV -stat -g`。脚本采用以下流程：
+
+```bash
+hccn_tool -g -dev_info -i DEV
+hccn_tool -g -stat -i DEV -u UDIE -p PORT
+```
+
+第二条命令中的 `UDIE/PORT` 由第一条命令中 `Link Status=UP` 的端口自动生成，不需要手工指定。
+
 ## 4. 扫描 EID 对
 
 以下以物理卡 `6 → 7` 的 die0 为例。先只验证候选 `eid0 → eid2`，不要一开始执行 81 个组合：
@@ -93,7 +102,7 @@ bash scripts/run_a5_urma_eid_pair_scan.sh \
   --output-root /home/l00934901/profiling
 ```
 
-两个候选都能建链后，才扩大到同一 device 内的合法 EID 组合。例如扫描 die0 的 `eid0～eid8` 时，`src-dev` 和 `dst-dev` 都应为 `udmac0d1e6`。脚本最后会打印本次 `RUN_DIR`。目录中包含每个 EID 对的 client/server 日志、HCCN 原始快照、计数差值和汇总结果。
+两个候选都能建链后，才扩大到同一 device 内的合法 EID 组合。例如扫描 die0 的 `eid0～eid8` 时，`src-dev` 和 `dst-dev` 都应为 `udmac0d1e6`。脚本最后会打印本次 `RUN_DIR`。目录中包含每个 EID 对的 client/server 日志、逐 UDie/Port 的 HCCN 原始快照、计数差值和汇总结果。`pairs.tsv` 分开记录 `urma_status` 与 `hccn_status`，HCCN 采集失败不会被误报为 URMA Write 失败。
 
 若某一对失败，直接查看：
 

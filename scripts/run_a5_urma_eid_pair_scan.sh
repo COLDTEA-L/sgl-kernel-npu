@@ -155,22 +155,57 @@ mkdir -p "${run_dir}"
 } >"${run_dir}/run_config.env"
 
 printf '%s\n' "${urma_inventory}" >"${run_dir}/urma_admin_show.txt"
-printf 'pair_id\tsrc_phy\tdst_phy\tsrc_dev\tdst_dev\tsrc_eid_idx\tdst_eid_idx\trepeat\tport\tstatus\tpair_dir\n' \
+printf 'pair_id\tsrc_phy\tdst_phy\tsrc_dev\tdst_dev\tsrc_eid_idx\tdst_eid_idx\trepeat\tport\tstatus\turma_status\thccn_status\tpair_dir\n' \
     >"${run_dir}/pairs.tsv"
+
+declare -a hccn_targets=()
+for device in "${hccn_device_list[@]}"; do
+    device=${device//[[:space:]]/}
+    device_info="${run_dir}/device_info_device${device}.txt"
+    {
+        echo "# command: ${hccn_tool} -g -dev_info -i ${device}"
+        echo "# timestamp: $(date --iso-8601=ns)"
+        env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
+            "${hccn_tool}" -g -dev_info -i "${device}"
+    } >"${device_info}" 2>&1 || true
+    while IFS=$'\t' read -r udie port; do
+        [[ -n "${udie}" && -n "${port}" ]] || continue
+        hccn_targets+=("${device}:${udie}:${port}")
+    done < <(
+        awk -F'|' '
+            /\|/ {
+                udie=$2; port=$3; state=$6
+                gsub(/[[:space:]]/, "", udie)
+                gsub(/[[:space:]]/, "", port)
+                gsub(/[[:space:]]/, "", state)
+                if (udie ~ /^[0-9]+$/ && port ~ /^[0-9]+$/ && state == "UP") {
+                    print udie "\t" port
+                }
+            }
+        ' "${device_info}"
+    )
+done
+(( ${#hccn_targets[@]} > 0 )) || {
+    echo "No A5/950 UP HCCN port discovered; inspect ${run_dir}/device_info_device*.txt" >&2
+    exit 2
+}
 
 capture_hccn() {
     local phase=$1
     local pair_dir=$2
-    local device
-    for device in "${hccn_device_list[@]}"; do
-        device=${device//[[:space:]]/}
+    local target device udie port
+    local success_count=0
+    for target in "${hccn_targets[@]}"; do
+        IFS=: read -r device udie port <<<"${target}"
         {
-            echo "# command: ${hccn_tool} -i ${device} -stat -g"
+            echo "# command: ${hccn_tool} -g -stat -i ${device} -u ${udie} -p ${port}"
             echo "# timestamp: $(date --iso-8601=ns)"
             env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
-                "${hccn_tool}" -i "${device}" -stat -g
-        } >"${pair_dir}/${phase}_device${device}.txt" 2>&1 || true
+                "${hccn_tool}" -g -stat -i "${device}" -u "${udie}" -p "${port}"
+        } >"${pair_dir}/${phase}_device${device}_udie${udie}_port${port}.txt" 2>&1 && \
+            success_count=$((success_count + 1)) || true
     done
+    (( success_count > 0 ))
 }
 
 pair_number=0
@@ -184,10 +219,11 @@ for src_eid in "${src_eid_list[@]}"; do
             mkdir -p "${pair_dir}"
             port=$((port_base + pair_number))
             pair_number=$((pair_number + 1))
-            status=PASS
+            urma_status=PASS
+            hccn_status=PASS
 
             echo "===== ${pair_id}: ${src_dev}/eid${src_eid} -> ${dst_dev}/eid${dst_eid} ====="
-            capture_hccn before "${pair_dir}"
+            capture_hccn before "${pair_dir}" || hccn_status=FAIL
 
             server_cmd=("${perftest}" write_bw -d "${dst_dev}" --eid_idx "${dst_eid}"
                 --ctp -s "${bytes}" -n "${iterations}" -w -P "${port}")
@@ -211,22 +247,25 @@ for src_eid in "${src_eid_list[@]}"; do
             server_rc=0
             wait "${server_pid}" || server_rc=$?
             if (( client_rc != 0 || server_rc != 0 )); then
-                status=FAIL
+                urma_status=FAIL
                 echo "pair failed: client_rc=${client_rc} server_rc=${server_rc}" >&2
             fi
-            capture_hccn after "${pair_dir}"
+            capture_hccn after "${pair_dir}" || hccn_status=FAIL
 
             if ! python3 "${repo_root}/scripts/analyze_a5_urma_eid_pairs.py" \
                 --snapshot-dir "${pair_dir}" \
                 --snapshot-only \
                 --output "${pair_dir}/hccn_counter_deltas.tsv" \
                 >"${pair_dir}/hccn_analysis.log" 2>&1; then
-                status=FAIL
+                hccn_status=FAIL
                 echo "HCCN counters unavailable; see ${pair_dir}/hccn_analysis.log" >&2
             fi
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            status=PASS
+            [[ "${urma_status}" == PASS && "${hccn_status}" == PASS ]] || status=FAIL
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "${pair_id}" "${src_phy}" "${dst_phy}" "${src_dev}" "${dst_dev}" \
-                "${src_eid}" "${dst_eid}" "${repeat}" "${port}" "${status}" "${pair_dir}" \
+                "${src_eid}" "${dst_eid}" "${repeat}" "${port}" "${status}" \
+                "${urma_status}" "${hccn_status}" "${pair_dir}" \
                 >>"${run_dir}/pairs.tsv"
         done
     done
