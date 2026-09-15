@@ -45,7 +45,7 @@ ls scripts/run_a5_urma_eid_pair_scan.sh \
 
 ## 3. 首先执行：完整 EID 可见性门禁
 
-有卡容器需要能访问 URMA 头文件和已安装的 `liburma.so`。脚本会依次检查 `/usr/include/urma`、`/usr/local/include/urma` 和 UMDK 源码目录；系统已经安装开发头文件时，不要求存在 `/home/l00934901/umdk`。
+有卡容器需要能访问 URMA 头文件和已安装的 `liburma.so`。当前环境的头文件位于 `/usr/include/ub/umdk/urma/urma_api.h`，库位于 `/lib64/liburma.so`。脚本会优先自动检查该目录，随后检查 `/usr/include/urma`、`/usr/local/include/urma` 和 UMDK 源码目录；系统已经安装开发头文件时，不要求存在 `/home/l00934901/umdk`。
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -53,6 +53,16 @@ cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --src-phy 6 \
   --dst-phy 7 \
+  --urma-lib-dir /lib64 \
+  --output-root /home/l00934901/profiling
+```
+
+当前有卡环境也可以显式写出已确认的路径：
+
+```bash
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 4 --dst-phy 5 \
+  --urma-include /usr/include/ub/umdk/urma \
   --urma-lib-dir /lib64 \
   --output-root /home/l00934901/profiling
 ```

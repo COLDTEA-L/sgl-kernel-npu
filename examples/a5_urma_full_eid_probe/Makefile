@@ -1,6 +1,7 @@
 CC ?= gcc
 UMDK_ROOT ?= /home/l00934901/umdk
 URMA_HEADER := $(firstword $(wildcard \
+	/usr/include/ub/umdk/urma/urma_api.h \
 	/usr/include/urma/urma_api.h \
 	/usr/local/include/urma/urma_api.h \
 	/usr/include/urma_api.h \
@@ -18,7 +19,7 @@ all: check-env resolve_full_eid
 check-env:
 	@test -n "$(URMA_INCLUDE)" -a -f "$(URMA_INCLUDE)/urma_api.h" || { \
 		echo "ERROR: urma_api.h not found." >&2; \
-		echo "Checked /usr/include/urma, /usr/local/include/urma and $(UMDK_ROOT)/src/urma/lib/urma/core/include." >&2; \
+		echo "Checked /usr/include/ub/umdk/urma, /usr/include/urma, /usr/local/include/urma and $(UMDK_ROOT)/src/urma/lib/urma/core/include." >&2; \
 		echo "Pass URMA_INCLUDE=/actual/header/directory to make." >&2; \
 		exit 1; \
 	}
