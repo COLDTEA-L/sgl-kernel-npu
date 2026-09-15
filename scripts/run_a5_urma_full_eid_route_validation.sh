@@ -4,7 +4,8 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 probe_dir="${repo_root}/examples/a5_urma_full_eid_probe"
 umdk_root=/home/l00934901/umdk
-urma_lib_dir=/usr/lib64
+urma_include=""
+urma_lib_dir=/lib64
 output_root=/home/l00934901/profiling
 src_phy=6
 dst_phy=7
@@ -17,6 +18,7 @@ Usage: run_a5_urma_full_eid_route_validation.sh [options]
   --src-phy N       physical source device (default: 6)
   --dst-phy N       physical destination device (default: 7)
   --umdk-root PATH  UMDK checkout containing URMA headers
+  --urma-include P  directory containing urma_api.h (normally auto-detected)
   --urma-lib-dir P  directory containing liburma.so
   --output-root P   result root
   --route-log FILE  parse an existing HCCL route-probe log instead of running it
@@ -32,6 +34,7 @@ while (($#)); do
     --src-phy) src_phy=$2; shift 2 ;;
     --dst-phy) dst_phy=$2; shift 2 ;;
     --umdk-root) umdk_root=$2; shift 2 ;;
+    --urma-include) urma_include=$2; shift 2 ;;
     --urma-lib-dir) urma_lib_dir=$2; shift 2 ;;
     --output-root) output_root=$2; shift 2 ;;
     --route-log) route_log=$2; shift 2 ;;
@@ -50,7 +53,9 @@ done
   exit 2
 }
 
-make -C "${probe_dir}" UMDK_ROOT="${umdk_root}" URMA_LIB_DIR="${urma_lib_dir}"
+make_args=(UMDK_ROOT="${umdk_root}" URMA_LIB_DIR="${urma_lib_dir}")
+[[ -z "${urma_include}" ]] || make_args+=(URMA_INCLUDE="${urma_include}")
+make -C "${probe_dir}" "${make_args[@]}"
 
 timestamp=$(date +%Y%m%d_%H%M%S)
 run_dir="${output_root}/a5_urma_full_eid_${src_phy}_to_${dst_phy}_${timestamp}"

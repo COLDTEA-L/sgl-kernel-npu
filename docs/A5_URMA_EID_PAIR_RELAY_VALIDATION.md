@@ -45,7 +45,7 @@ ls scripts/run_a5_urma_eid_pair_scan.sh \
 
 ## 3. 首先执行：完整 EID 可见性门禁
 
-有卡容器需要能访问 UMDK 头文件和已安装的 `liburma.so`。如果容器里没有 UMDK 仓，将宿主机仓挂载到 `/home/l00934901/umdk`，或用 `--umdk-root` 指定实际位置。
+有卡容器需要能访问 URMA 头文件和已安装的 `liburma.so`。脚本会依次检查 `/usr/include/urma`、`/usr/local/include/urma` 和 UMDK 源码目录；系统已经安装开发头文件时，不要求存在 `/home/l00934901/umdk`。
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -53,15 +53,26 @@ cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --src-phy 6 \
   --dst-phy 7 \
-  --umdk-root /home/l00934901/umdk \
-  --urma-lib-dir /usr/lib64 \
+  --urma-lib-dir /lib64 \
   --output-root /home/l00934901/profiling
 ```
 
-如果 `liburma.so` 不在 `/usr/lib64`，先定位：
+你当前机器的 `ldconfig` 输出显示 `liburma.so` 位于 `/lib64`。如果其他环境位置不同，先定位：
 
 ```bash
 ldconfig -p | grep liburma
+```
+
+如果仍报告 `urma_api.h not found`，定位头文件并显式传入其所在目录：
+
+```bash
+find /usr/include /usr/local/include /home/l00934901 -name urma_api.h 2>/dev/null
+
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 4 --dst-phy 5 \
+  --urma-include /实际包含urma_api.h的目录 \
+  --urma-lib-dir /lib64 \
+  --output-root /home/l00934901/profiling
 ```
 
 结果保存在：
@@ -83,8 +94,7 @@ ldconfig -p | grep liburma
 ```bash
 bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --src-phy 4 --dst-phy 5 \
-  --umdk-root /home/l00934901/umdk \
-  --urma-lib-dir /usr/lib64 \
+  --urma-lib-dir /lib64 \
   --output-root /home/l00934901/profiling
 ```
 
@@ -93,8 +103,7 @@ bash scripts/run_a5_urma_full_eid_route_validation.sh \
 ```bash
 bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --src-phy 2 --dst-phy 3 \
-  --umdk-root /home/l00934901/umdk \
-  --urma-lib-dir /usr/lib64 \
+  --urma-lib-dir /lib64 \
   --output-root /home/l00934901/profiling
 ```
 
@@ -106,8 +115,7 @@ bash scripts/run_a5_urma_full_eid_route_validation.sh \
 bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --src-phy 4 --dst-phy 5 \
   --route-log /path/to/existing_route_probe.log \
-  --umdk-root /home/l00934901/umdk \
-  --urma-lib-dir /usr/lib64 \
+  --urma-lib-dir /lib64 \
   --output-root /home/l00934901/profiling
 ```
 
