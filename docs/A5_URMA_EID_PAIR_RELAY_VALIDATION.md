@@ -39,20 +39,29 @@ test -x /usr/local/Ascend/driver/tools/hccn_tool
 urma_admin show | tee /home/l00934901/profiling/urma_admin_show.txt
 ```
 
-必须注意：`--eid_idx` 是某一个 `ubep_dev` 内部的 EID 序号，不是 `urma_admin show` 第一列的全局 `num`。例如：
+必须注意：`--eid_idx` 是某一个 `ubep_dev` 内部的 EID 序号，不是 `urma_admin show` 第一列的全局 `num`，而 `udmac...eN` 中的 `N` 也不是物理卡号。脚本启动时会用 `urma_admin show` 自动校验 device/EID 是否真实存在。例如：
 
 ```text
 udmac0d1e6  ... eid0 ...
 udmac0d1e6  ... eid1 ...
 ```
 
-对应 `--src-dev udmac0d1e6 --src-eids 0,1`。同一物理卡如果有 `udmac0...` 和 `udmac1...` 两个 device，需要分别运行扫描，不能把两个 device 的 EID 序号混为一组。
+对应 `--src-dev udmac0d1e6 --src-eids 0,1`。同一端点如果有 `udmac0...` 和 `udmac1...` 两个 IO Die device，需要分别运行扫描，不能把两个 device 的 EID 序号混为一组。
+
+当前机器的清单中没有 `udmac0d1e7`。根据 EID 原始地址，物理卡 `6 → 7` 的首轮候选应在同一个 UDMA device 内验证：
+
+```text
+die0: udmac0d1e6/eid0 -> udmac0d1e6/eid2
+die1: udmac1d1e6/eid0 -> udmac1d1e6/eid2
+```
+
+这里 `eid2` 地址中的 `0007:0600` 或 `0047:0600` 只是“通向物理卡 7”的候选线索，最终仍以 URMA 建链结果和 HCCN RX/TX 增量为准。
 
 实验期间应保证端点卡和候选 relay 卡尽量空闲，否则其他业务流量会污染 HCCN 计数。
 
 ## 4. 扫描 EID 对
 
-以下以物理卡 `6 → 7` 为例。`src-dev`、`dst-dev` 和 EID 范围必须按照本机 `urma_admin show` 替换：
+以下以物理卡 `6 → 7` 的 die0 为例。先只验证候选 `eid0 → eid2`，不要一开始执行 81 个组合：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -62,9 +71,9 @@ bash scripts/run_a5_urma_eid_pair_scan.sh \
   --src-phy 6 \
   --dst-phy 7 \
   --src-dev udmac0d1e6 \
-  --dst-dev udmac0d1e7 \
-  --src-eids 0,1,2,3,4,5,6,7,8 \
-  --dst-eids 0,1,2,3,4,5,6,7,8 \
+  --dst-dev udmac0d1e6 \
+  --src-eids 0 \
+  --dst-eids 2 \
   --bytes 4194304 \
   --iters 100 \
   --repeats 3 \
@@ -72,19 +81,27 @@ bash scripts/run_a5_urma_eid_pair_scan.sh \
   --output-root /home/l00934901/profiling
 ```
 
-这里每次 URMA Write 为 4 MiB，每个 EID 对执行 100 次并重复 3 轮。先用少量 EID 做冒烟测试更稳妥：
+这里每次 URMA Write 为 4 MiB，执行 100 次并重复 3 轮。die1 需要单独执行：
 
 ```bash
 bash scripts/run_a5_urma_eid_pair_scan.sh \
   --src-phy 6 --dst-phy 7 \
-  --src-dev udmac0d1e6 --dst-dev udmac0d1e7 \
-  --src-eids 0,1 --dst-eids 0,1 \
-  --bytes 4194304 --iters 100 --repeats 1 \
+  --src-dev udmac1d1e6 --dst-dev udmac1d1e6 \
+  --src-eids 0 --dst-eids 2 \
+  --bytes 4194304 --iters 100 --repeats 3 \
   --hccn-devices 0,1,2,3,4,5,6,7 \
   --output-root /home/l00934901/profiling
 ```
 
-脚本最后会打印本次 `RUN_DIR`。目录中包含每个 EID 对的 client/server 日志、HCCN 原始快照、计数差值和汇总结果。
+两个候选都能建链后，才扩大到同一 device 内的合法 EID 组合。例如扫描 die0 的 `eid0～eid8` 时，`src-dev` 和 `dst-dev` 都应为 `udmac0d1e6`。脚本最后会打印本次 `RUN_DIR`。目录中包含每个 EID 对的 client/server 日志、HCCN 原始快照、计数差值和汇总结果。
+
+若某一对失败，直接查看：
+
+```bash
+cat "${RUN_DIR}/src0_dst2_r1/server.log"
+cat "${RUN_DIR}/src0_dst2_r1/client.log"
+cat "${RUN_DIR}/src0_dst2_r1/hccn_analysis.log"
+```
 
 若实际工具不在 `PATH`，增加：
 

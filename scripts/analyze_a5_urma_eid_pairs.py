@@ -11,7 +11,9 @@ from pathlib import Path
 
 PREFERRED_TX = ("nic_tx_all_oct_num", "tx_busi_flit_num", "ub_mem_pkt_cnt_tx")
 PREFERRED_RX = ("nic_rx_all_oct_num", "rx_busi_flit_num", "ub_mem_pkt_cnt_rx")
-COUNTER_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*:\s*([0-9]+)\s*$")
+COUNTER_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*(?::|=|\s)\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*$"
+)
 DEVICE_RE = re.compile(r"^(before|after)_device([0-9]+)\.txt$")
 
 
@@ -42,7 +44,7 @@ def read_snapshot(path: Path):
     for line in path.read_text(errors="replace").splitlines():
         match = COUNTER_RE.match(line)
         if match:
-            counters[match.group(1)] += int(match.group(2))
+            counters[match.group(1)] += int(match.group(2), 0)
     return counters
 
 
@@ -147,6 +149,10 @@ def analyze_scan(args):
     with (scan_dir / "pairs.tsv").open(newline="") as handle:
         pairs = list(csv.DictReader(handle, delimiter="\t"))
     successful = [row for row in pairs if row["status"] == "PASS"]
+    if not successful:
+        raise RuntimeError(
+            f"no successful EID-pair run in {scan_dir}; inspect pairs.tsv and client/server logs"
+        )
     all_rows = []
     for pair in successful:
         all_rows.extend(load_delta(Path(pair["pair_dir"]) / "hccn_counter_deltas.tsv"))

@@ -20,6 +20,7 @@ hccn_devices="0,1,2,3,4,5,6,7"
 hccn_tool=""
 perftest=""
 output_root=/home/l00934901/profiling
+urma_inventory=""
 
 usage() {
     cat <<'EOF'
@@ -90,6 +91,7 @@ if [[ -z "${hccn_tool}" ]]; then
 fi
 [[ -x "${hccn_tool}" ]] || { echo "hccn_tool not executable: ${hccn_tool}" >&2; exit 2; }
 command -v timeout >/dev/null || { echo "timeout command is required" >&2; exit 2; }
+command -v urma_admin >/dev/null || { echo "urma_admin is required for device/EID validation" >&2; exit 2; }
 
 IFS=',' read -ra src_eid_list <<<"${src_eids}"
 IFS=',' read -ra dst_eid_list <<<"${dst_eids}"
@@ -97,6 +99,39 @@ IFS=',' read -ra hccn_device_list <<<"${hccn_devices}"
 for list_value in "${src_eid_list[@]}" "${dst_eid_list[@]}" "${hccn_device_list[@]}"; do
     list_value=${list_value//[[:space:]]/}
     [[ "${list_value}" =~ ^[0-9]+$ ]] || { echo "invalid comma-separated index: ${list_value}" >&2; exit 2; }
+done
+
+urma_inventory=$(urma_admin show 2>&1) || {
+    echo "urma_admin show failed:" >&2
+    printf '%s\n' "${urma_inventory}" >&2
+    exit 2
+}
+declare -A available_eids=()
+while read -r inventory_dev inventory_eid; do
+    [[ -n "${inventory_dev}" && -n "${inventory_eid}" ]] || continue
+    available_eids["${inventory_dev}:${inventory_eid}"]=1
+done < <(
+    awk '$2 ~ /^[A-Za-z0-9_.-]+$/ && $4 ~ /^eid[0-9]+$/ {
+             eid = $4; sub(/^eid/, "", eid); print $2, eid
+         }' <<<"${urma_inventory}"
+)
+for src_eid in "${src_eid_list[@]}"; do
+    src_eid=${src_eid//[[:space:]]/}
+    [[ -n "${available_eids[${src_dev}:${src_eid}]:-}" ]] || {
+        echo "URMA endpoint does not exist: ${src_dev}/eid${src_eid}" >&2
+        echo "Available endpoints:" >&2
+        awk '$4 ~ /^eid[0-9]+$/ {print "  " $2 "/" $4, $5}' <<<"${urma_inventory}" >&2
+        exit 2
+    }
+done
+for dst_eid in "${dst_eid_list[@]}"; do
+    dst_eid=${dst_eid//[[:space:]]/}
+    [[ -n "${available_eids[${dst_dev}:${dst_eid}]:-}" ]] || {
+        echo "URMA endpoint does not exist: ${dst_dev}/eid${dst_eid}" >&2
+        echo "Available endpoints:" >&2
+        awk '$4 ~ /^eid[0-9]+$/ {print "  " $2 "/" $4, $5}' <<<"${urma_inventory}" >&2
+        exit 2
+    }
 done
 
 run_id="a5_urma_eid_scan_${src_phy}_to_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
@@ -119,9 +154,7 @@ mkdir -p "${run_dir}"
     echo "hccn_tool=${hccn_tool}"
 } >"${run_dir}/run_config.env"
 
-if command -v urma_admin >/dev/null 2>&1; then
-    urma_admin show >"${run_dir}/urma_admin_show.txt" 2>&1 || true
-fi
+printf '%s\n' "${urma_inventory}" >"${run_dir}/urma_admin_show.txt"
 printf 'pair_id\tsrc_phy\tdst_phy\tsrc_dev\tdst_dev\tsrc_eid_idx\tdst_eid_idx\trepeat\tport\tstatus\tpair_dir\n' \
     >"${run_dir}/pairs.tsv"
 
@@ -183,10 +216,14 @@ for src_eid in "${src_eid_list[@]}"; do
             fi
             capture_hccn after "${pair_dir}"
 
-            python3 "${repo_root}/scripts/analyze_a5_urma_eid_pairs.py" \
+            if ! python3 "${repo_root}/scripts/analyze_a5_urma_eid_pairs.py" \
                 --snapshot-dir "${pair_dir}" \
                 --snapshot-only \
-                --output "${pair_dir}/hccn_counter_deltas.tsv" || status=FAIL
+                --output "${pair_dir}/hccn_counter_deltas.tsv" \
+                >"${pair_dir}/hccn_analysis.log" 2>&1; then
+                status=FAIL
+                echo "HCCN counters unavailable; see ${pair_dir}/hccn_analysis.log" >&2
+            fi
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "${pair_id}" "${src_phy}" "${dst_phy}" "${src_dev}" "${dst_dev}" \
                 "${src_eid}" "${dst_eid}" "${repeat}" "${port}" "${status}" "${pair_dir}" \
