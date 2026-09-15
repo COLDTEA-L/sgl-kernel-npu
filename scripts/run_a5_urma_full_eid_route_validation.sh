@@ -10,7 +10,7 @@ output_root=/home/l00934901/profiling
 src_phy=6
 dst_phy=7
 route_log=""
-route_discovery_timeout=20
+route_discovery_timeout=60
 
 usage() {
   cat <<'EOF'
@@ -64,8 +64,10 @@ result_tsv="${run_dir}/full_eid_visibility.tsv"
 printf 'route\thop\tside\tphysical_device\teid\tstatus\tresolved_device\tresolved_eid_index\tcontext_verified\n' >"${result_tsv}"
 
 # Ask HCCL for the route inventory of the requested physical pair. The probe
-# prints every route before channel acquisition; timeout is expected when a
-# hop-2 channel is unavailable. No EID bit field is used to infer ownership.
+# prints every route before channel acquisition. Select route0 for discovery:
+# all candidates are still printed, while the known-good direct channel avoids
+# waiting on an unavailable hop-2 channel. No EID bit field is used to infer
+# ownership.
 discovery_log="${run_dir}/hccl_route_discovery.log"
 if [[ -n "${route_log}" ]]; then
   [[ -r "${route_log}" ]] || { echo "cannot read --route-log: ${route_log}" >&2; exit 2; }
@@ -74,7 +76,7 @@ else
   set +e
   timeout -k 2 "${route_discovery_timeout}" \
     bash "${repo_root}/scripts/run_a5_ccu_urma_route_probe.sh" \
-      --devices "${src_phy},${dst_phy}" --route-index 1 --bytes 1024 \
+      --devices "${src_phy},${dst_phy}" --route-index 0 --bytes 1024 \
       --warmup 0 --iters 1 --channel-only >"${discovery_log}" 2>&1
   discovery_rc=$?
   set -e
@@ -102,6 +104,11 @@ for line in open(log_path, encoding="utf-8", errors="replace"):
     if actual_src == src_phy and actual_dst == dst_phy:
         routes[int(route)] = (int(hop), src_eid.lower(), dst_eid.lower())
 if not routes:
+    lines = open(log_path, encoding="utf-8", errors="replace").read().splitlines()
+    tail = "\n".join(lines[-80:])
+    print("===== HCCL route discovery log tail =====", file=sys.stderr)
+    print(tail or "<empty log>", file=sys.stderr)
+    print("===== end log tail =====", file=sys.stderr)
     raise SystemExit(
         f"no rank0 route inventory for physical {src_phy}->{dst_phy} in {log_path}; "
         "verify the CCU route-probe package and inspect the log"
@@ -113,6 +120,8 @@ with open(output_path, "w", encoding="utf-8") as out:
         out.write(f"route{route}\t{hop}\tdst\t{dst_phy}\t{dst_eid}\n")
 print(f"Discovered {len(routes)} route(s): {','.join('route'+str(x) for x in sorted(routes))}")
 PY
+echo "Parsed route manifest:"
+cat "${manifest_file}"
 manifest=$(cat "${manifest_file}")
 
 failures=0

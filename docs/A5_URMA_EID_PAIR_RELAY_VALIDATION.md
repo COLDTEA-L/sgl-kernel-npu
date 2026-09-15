@@ -117,7 +117,17 @@ bash scripts/run_a5_urma_full_eid_route_validation.sh \
   --output-root /home/l00934901/profiling
 ```
 
-自动发现会调用现有 `run_a5_ccu_urma_route_probe.sh`。route probe 在 channel acquire 之前已经打印全部 route，外层默认等待 20 秒；即便随后因某条 hop-2 channel 不可用而超时，只要 route 行已经打印，EID解析仍然有效。原始输出保存在本次结果目录的 `hccl_route_discovery.log`。
+自动发现会调用现有 `run_a5_ccu_urma_route_probe.sh`，选择已验证可用的 route0 建立发现通道；选择 route0 时 HCCL 仍会打印当前卡对的全部候选 route，因此无需触发可能卡住的 route1。外层默认等待 60 秒；只要 route 行已经打印，EID解析就有效。原始输出保存在本次结果目录的 `hccl_route_discovery.log`，解析失败时脚本会自动输出日志末尾80行。
+
+如果机器初始化较慢，可以显式延长发现时间：
+
+```bash
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 4 --dst-phy 5 \
+  --route-discovery-timeout 120 \
+  --urma-lib-dir /lib64 \
+  --output-root /home/l00934901/profiling
+```
 
 如果现场已有某卡对的 route-probe 日志，可以避免再次建 channel：
 
