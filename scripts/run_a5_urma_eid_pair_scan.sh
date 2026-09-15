@@ -8,8 +8,8 @@ src_phy=6
 dst_phy=7
 src_dev=""
 dst_dev=""
-src_eids="0"
-dst_eids="0"
+src_eids=""
+dst_eids=""
 bytes=4194304
 iterations=100
 repeats=3
@@ -27,10 +27,10 @@ usage() {
 Usage: run_a5_urma_eid_pair_scan.sh OPTIONS
   --src-phy N             Source physical NPU ID (default 6)
   --dst-phy N             Destination physical NPU ID (default 7)
-  --src-dev NAME          Source URMA device, required
-  --dst-dev NAME          Destination URMA device, required
-  --src-eids LIST         Source per-device EID indices, e.g. 0,1,2
-  --dst-eids LIST         Destination per-device EID indices
+  --src-dev NAME          Manual source URMA device (normally omit)
+  --dst-dev NAME          Manual destination URMA device (normally omit)
+  --src-eids LIST         Manual source EID indices (normally omit)
+  --dst-eids LIST         Manual destination EID indices (normally omit)
   --bytes N               Bytes per URMA Write (default 4194304)
   --iters N               Iterations per pair (default 100)
   --repeats N             Repetitions per EID pair (default 3)
@@ -65,10 +65,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "${src_dev}" && -n "${dst_dev}" ]] || {
-    echo "--src-dev and --dst-dev are required" >&2
-    exit 2
-}
 for value in "${src_phy}" "${dst_phy}" "${bytes}" "${iterations}" \
              "${repeats}" "${port_base}" "${timeout_seconds}"; do
     [[ "${value}" =~ ^[0-9]+$ ]] || { echo "numeric argument expected: ${value}" >&2; exit 2; }
@@ -93,10 +89,8 @@ fi
 command -v timeout >/dev/null || { echo "timeout command is required" >&2; exit 2; }
 command -v urma_admin >/dev/null || { echo "urma_admin is required for device/EID validation" >&2; exit 2; }
 
-IFS=',' read -ra src_eid_list <<<"${src_eids}"
-IFS=',' read -ra dst_eid_list <<<"${dst_eids}"
 IFS=',' read -ra hccn_device_list <<<"${hccn_devices}"
-for list_value in "${src_eid_list[@]}" "${dst_eid_list[@]}" "${hccn_device_list[@]}"; do
+for list_value in "${hccn_device_list[@]}"; do
     list_value=${list_value//[[:space:]]/}
     [[ "${list_value}" =~ ^[0-9]+$ ]] || { echo "invalid comma-separated index: ${list_value}" >&2; exit 2; }
 done
@@ -107,32 +101,76 @@ urma_inventory=$(urma_admin show 2>&1) || {
     exit 2
 }
 declare -A available_eids=()
-while read -r inventory_dev inventory_eid; do
-    [[ -n "${inventory_dev}" && -n "${inventory_eid}" ]] || continue
-    available_eids["${inventory_dev}:${inventory_eid}"]=1
+declare -a inventory_endpoints=()
+while read -r inventory_dev inventory_eid inventory_raw; do
+    [[ -n "${inventory_dev}" && -n "${inventory_eid}" && -n "${inventory_raw}" ]] || continue
+    available_eids["${inventory_dev}:${inventory_eid}"]="${inventory_raw}"
+    inventory_endpoints+=("${inventory_dev},${inventory_eid},${inventory_raw}")
 done < <(
     awk '$2 ~ /^[A-Za-z0-9_.-]+$/ && $4 ~ /^eid[0-9]+$/ {
-             eid = $4; sub(/^eid/, "", eid); print $2, eid
+             eid = $4; sub(/^eid/, "", eid); print $2, eid, $5
          }' <<<"${urma_inventory}"
 )
-for src_eid in "${src_eid_list[@]}"; do
-    src_eid=${src_eid//[[:space:]]/}
-    [[ -n "${available_eids[${src_dev}:${src_eid}]:-}" ]] || {
-        echo "URMA endpoint does not exist: ${src_dev}/eid${src_eid}" >&2
-        echo "Available endpoints:" >&2
-        awk '$4 ~ /^eid[0-9]+$/ {print "  " $2 "/" $4, $5}' <<<"${urma_inventory}" >&2
+
+declare -a src_endpoint_list=()
+declare -a dst_endpoint_list=()
+manual_count=0
+[[ -n "${src_dev}" ]] && manual_count=$((manual_count + 1))
+[[ -n "${dst_dev}" ]] && manual_count=$((manual_count + 1))
+[[ -n "${src_eids}" ]] && manual_count=$((manual_count + 1))
+[[ -n "${dst_eids}" ]] && manual_count=$((manual_count + 1))
+if (( manual_count != 0 && manual_count != 4 )); then
+    echo "Manual mode requires all of --src-dev/--dst-dev/--src-eids/--dst-eids" >&2
+    exit 2
+fi
+
+if (( manual_count == 4 )); then
+    IFS=',' read -ra src_eid_list <<<"${src_eids}"
+    IFS=',' read -ra dst_eid_list <<<"${dst_eids}"
+    for src_eid in "${src_eid_list[@]}"; do
+        src_eid=${src_eid//[[:space:]]/}
+        [[ "${src_eid}" =~ ^[0-9]+$ && -n "${available_eids[${src_dev}:${src_eid}]:-}" ]] || {
+            echo "URMA endpoint does not exist: ${src_dev}/eid${src_eid}" >&2
+            exit 2
+        }
+        src_endpoint_list+=("${src_dev},${src_eid},${available_eids[${src_dev}:${src_eid}]}")
+    done
+    for dst_eid in "${dst_eid_list[@]}"; do
+        dst_eid=${dst_eid//[[:space:]]/}
+        [[ "${dst_eid}" =~ ^[0-9]+$ && -n "${available_eids[${dst_dev}:${dst_eid}]:-}" ]] || {
+            echo "URMA endpoint does not exist: ${dst_dev}/eid${dst_eid}" >&2
+            exit 2
+        }
+        dst_endpoint_list+=("${dst_dev},${dst_eid},${available_eids[${dst_dev}:${dst_eid}]}")
+    done
+    endpoint_mode=manual
+else
+    endpoint_mode=auto
+    for endpoint in "${inventory_endpoints[@]}"; do
+        IFS=',' read -r endpoint_dev endpoint_eid endpoint_raw <<<"${endpoint}"
+        IFS=':' read -ra eid_words <<<"${endpoint_raw}"
+        encoded_phy=${eid_words[2]}
+        [[ "${encoded_phy}" =~ ^[0-9A-Fa-f]{4}$ ]] || continue
+        encoded_value=$((16#${encoded_phy}))
+        # 0x3f/0x7f are aggregate or wildcard EIDs, not physical NPU IDs.
+        (( (encoded_value & 0x3f) != 0x3f )) || continue
+        decoded_phy=$((encoded_value & 0x3f))
+        if (( decoded_phy == src_phy )); then
+            src_endpoint_list+=("${endpoint_dev},${endpoint_eid},${endpoint_raw}")
+        fi
+        if (( decoded_phy == dst_phy )); then
+            dst_endpoint_list+=("${endpoint_dev},${endpoint_eid},${endpoint_raw}")
+        fi
+    done
+    (( ${#src_endpoint_list[@]} > 0 )) || {
+        echo "No URMA EID decodes to physical device ${src_phy}" >&2
         exit 2
     }
-done
-for dst_eid in "${dst_eid_list[@]}"; do
-    dst_eid=${dst_eid//[[:space:]]/}
-    [[ -n "${available_eids[${dst_dev}:${dst_eid}]:-}" ]] || {
-        echo "URMA endpoint does not exist: ${dst_dev}/eid${dst_eid}" >&2
-        echo "Available endpoints:" >&2
-        awk '$4 ~ /^eid[0-9]+$/ {print "  " $2 "/" $4, $5}' <<<"${urma_inventory}" >&2
+    (( ${#dst_endpoint_list[@]} > 0 )) || {
+        echo "No URMA EID decodes to physical device ${dst_phy}" >&2
         exit 2
     }
-done
+fi
 
 run_id="a5_urma_eid_scan_${src_phy}_to_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 run_dir="${output_root}/${run_id}"
@@ -140,6 +178,7 @@ mkdir -p "${run_dir}"
 
 {
     echo "run_id=${run_id}"
+    echo "endpoint_mode=${endpoint_mode}"
     echo "src_phy=${src_phy}"
     echo "dst_phy=${dst_phy}"
     echo "src_dev=${src_dev}"
@@ -155,6 +194,20 @@ mkdir -p "${run_dir}"
 } >"${run_dir}/run_config.env"
 
 printf '%s\n' "${urma_inventory}" >"${run_dir}/urma_admin_show.txt"
+{
+    printf 'role\tphysical_device\tubep_dev\teid_idx\teid\n'
+    for endpoint in "${src_endpoint_list[@]}"; do
+        IFS=',' read -r endpoint_dev endpoint_eid endpoint_raw <<<"${endpoint}"
+        printf 'src\t%s\t%s\t%s\t%s\n' "${src_phy}" "${endpoint_dev}" "${endpoint_eid}" "${endpoint_raw}"
+    done
+    for endpoint in "${dst_endpoint_list[@]}"; do
+        IFS=',' read -r endpoint_dev endpoint_eid endpoint_raw <<<"${endpoint}"
+        printf 'dst\t%s\t%s\t%s\t%s\n' "${dst_phy}" "${endpoint_dev}" "${endpoint_eid}" "${endpoint_raw}"
+    done
+} >"${run_dir}/resolved_endpoints.tsv"
+echo "Resolved URMA endpoints:"
+column -ts $'\t' "${run_dir}/resolved_endpoints.tsv" 2>/dev/null || \
+    sed 's/^/  /' "${run_dir}/resolved_endpoints.tsv"
 printf 'pair_id\tsrc_phy\tdst_phy\tsrc_dev\tdst_dev\tsrc_eid_idx\tdst_eid_idx\trepeat\tport\tstatus\turma_status\thccn_status\tpair_dir\n' \
     >"${run_dir}/pairs.tsv"
 
@@ -209,12 +262,12 @@ capture_hccn() {
 }
 
 pair_number=0
-for src_eid in "${src_eid_list[@]}"; do
-    src_eid=${src_eid//[[:space:]]/}
-    for dst_eid in "${dst_eid_list[@]}"; do
-        dst_eid=${dst_eid//[[:space:]]/}
+for src_endpoint in "${src_endpoint_list[@]}"; do
+    IFS=',' read -r selected_src_dev src_eid src_raw <<<"${src_endpoint}"
+    for dst_endpoint in "${dst_endpoint_list[@]}"; do
+        IFS=',' read -r selected_dst_dev dst_eid dst_raw <<<"${dst_endpoint}"
         for ((repeat = 1; repeat <= repeats; ++repeat)); do
-            pair_id="src${src_eid}_dst${dst_eid}_r${repeat}"
+            pair_id="pair${pair_number}_src_${selected_src_dev}_eid${src_eid}_dst_${selected_dst_dev}_eid${dst_eid}_r${repeat}"
             pair_dir="${run_dir}/${pair_id}"
             mkdir -p "${pair_dir}"
             port=$((port_base + pair_number))
@@ -222,12 +275,12 @@ for src_eid in "${src_eid_list[@]}"; do
             urma_status=PASS
             hccn_status=PASS
 
-            echo "===== ${pair_id}: ${src_dev}/eid${src_eid} -> ${dst_dev}/eid${dst_eid} ====="
+            echo "===== ${pair_id}: ${selected_src_dev}/eid${src_eid} -> ${selected_dst_dev}/eid${dst_eid} ====="
             capture_hccn before "${pair_dir}" || hccn_status=FAIL
 
-            server_cmd=("${perftest}" write_bw -d "${dst_dev}" --eid_idx "${dst_eid}"
+            server_cmd=("${perftest}" write_bw -d "${selected_dst_dev}" --eid_idx "${dst_eid}"
                 --ctp -s "${bytes}" -n "${iterations}" -w -P "${port}")
-            client_cmd=("${perftest}" write_bw -d "${src_dev}" --eid_idx "${src_eid}"
+            client_cmd=("${perftest}" write_bw -d "${selected_src_dev}" --eid_idx "${src_eid}"
                 --ctp -s "${bytes}" -n "${iterations}" -w -P "${port}" -S "${control_ip}")
             printf '%q ' "${server_cmd[@]}" >"${pair_dir}/server_command.txt"
             printf '\n' >>"${pair_dir}/server_command.txt"
@@ -263,7 +316,7 @@ for src_eid in "${src_eid_list[@]}"; do
             status=PASS
             [[ "${urma_status}" == PASS && "${hccn_status}" == PASS ]] || status=FAIL
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "${pair_id}" "${src_phy}" "${dst_phy}" "${src_dev}" "${dst_dev}" \
+                "${pair_id}" "${src_phy}" "${dst_phy}" "${selected_src_dev}" "${selected_dst_dev}" \
                 "${src_eid}" "${dst_eid}" "${repeat}" "${port}" "${status}" \
                 "${urma_status}" "${hccn_status}" "${pair_dir}" \
                 >>"${run_dir}/pairs.tsv"

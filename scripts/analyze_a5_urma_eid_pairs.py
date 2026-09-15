@@ -175,7 +175,10 @@ def analyze_scan(args):
             rows, args.endpoints, tx_counter, rx_counter,
             args.min_count, args.min_ratio, args.dominance_ratio,
         )
-        key = (pair["src_eid_idx"], pair["dst_eid_idx"])
+        key = (
+            pair["src_dev"], pair["src_eid_idx"],
+            pair["dst_dev"], pair["dst_eid_idx"],
+        )
         grouped[key].append((result, relay))
         detail_rows.append({
             **pair,
@@ -195,11 +198,13 @@ def analyze_scan(args):
         writer.writerows(detail_rows)
 
     stable_rows = []
-    for (src_eid, dst_eid), values in sorted(grouped.items(), key=lambda item: tuple(map(int, item[0]))):
+    for (src_dev, src_eid, dst_dev, dst_eid), values in sorted(grouped.items()):
         single_relays = [relay for result, relay in values if result == "SINGLE_RELAY_CANDIDATE"]
         stable = len(single_relays) == len(values) and len(set(single_relays)) == 1
         stable_rows.append({
+            "src_dev": src_dev,
             "src_eid_idx": src_eid,
+            "dst_dev": dst_dev,
             "dst_eid_idx": dst_eid,
             "successful_repeats": len(values),
             "stable_single_relay": int(stable),
@@ -209,7 +214,8 @@ def analyze_scan(args):
     stable_output = output.with_name("stable_eid_pair_relay_map.tsv")
     with stable_output.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=stable_rows[0].keys() if stable_rows else (
-            "src_eid_idx", "dst_eid_idx", "successful_repeats", "stable_single_relay",
+            "src_dev", "src_eid_idx", "dst_dev", "dst_eid_idx",
+            "successful_repeats", "stable_single_relay",
             "relay_phy", "repeat_results"), delimiter="\t")
         writer.writeheader()
         writer.writerows(stable_rows)

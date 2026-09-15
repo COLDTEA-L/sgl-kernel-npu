@@ -6,11 +6,12 @@
 
 脚本执行以下流程：
 
-1. 枚举 `src_eid_idx × dst_eid_idx`。
-2. 每个 EID 对用 `urma_perftest write_bw --ctp` 从源卡向目的卡发送数据。
-3. 先通过 `hccn_tool -g -dev_info` 枚举每张卡的 UP 端口，再在通信前后逐端口采集 HCCN 计数。
-4. 分析非端点卡是否同时出现显著 RX 和 TX 增量。
-5. 将结果分类为直连、稳定单 relay、多 relay/ECMP 或无效。
+1. 根据 `--src-phy/--dst-phy` 从 `urma_admin show` 自动解析两张物理卡在各 IO Die 上的 EID。
+2. 枚举所有匹配到的 `(src_dev, src_eid) × (dst_dev, dst_eid)`。
+3. 每个 EID 对用 `urma_perftest write_bw --ctp` 从源卡向目的卡发送数据。
+4. 先通过 `hccn_tool -g -dev_info` 枚举每张卡的 UP 端口，再在通信前后逐端口采集 HCCN 计数。
+5. 分析非端点卡是否同时出现显著 RX 和 TX 增量。
+6. 将结果分类为直连、稳定单 relay、多 relay/ECMP 或无效。
 
 该实验不依赖 `sgl-kernel-npu` 自定义算子，因此不需要重新编译或安装算子包。
 
@@ -39,23 +40,23 @@ test -x /usr/local/Ascend/driver/tools/hccn_tool
 urma_admin show | tee /home/l00934901/profiling/urma_admin_show.txt
 ```
 
-必须注意：`--eid_idx` 是某一个 `ubep_dev` 内部的 EID 序号，不是 `urma_admin show` 第一列的全局 `num`，而 `udmac...eN` 中的 `N` 也不是物理卡号。脚本启动时会用 `urma_admin show` 自动校验 device/EID 是否真实存在。例如：
+必须注意：`--eid_idx` 是某一个 `ubep_dev` 内部的 EID 序号，不是 `urma_admin show` 第一列的全局 `num`，而 `udmac...eN` 中的 `N` 也不是物理卡号。默认不再手工填写 `--src-dev/--dst-dev/--src-eids/--dst-eids`。
 
 ```text
 udmac0d1e6  ... eid0 ...
 udmac0d1e6  ... eid1 ...
 ```
 
-对应 `--src-dev udmac0d1e6 --src-eids 0,1`。同一端点如果有 `udmac0...` 和 `udmac1...` 两个 IO Die device，需要分别运行扫描，不能把两个 device 的 EID 序号混为一组。
+手工诊断时可用 `--src-dev udmac0d1e6 --src-eids 0,1` 指定端点；正常验证应省略这些参数，由脚本同时发现 `udmac0...` 和 `udmac1...` 下属于目标物理卡的EID，并分别保留完整的 `device+eid_idx` 身份。
 
-当前机器的清单中没有 `udmac0d1e7`。根据 EID 原始地址，物理卡 `6 → 7` 的首轮候选应在同一个 UDMA device 内验证：
+脚本根据 EID 第三个16位字段的低6位解析物理Device，并排除 `0x3f/0x7f` 聚合EID。对当前清单，物理卡 `6 → 7` 会自动解析出：
 
 ```text
-die0: udmac0d1e6/eid0 -> udmac0d1e6/eid2
-die1: udmac1d1e6/eid0 -> udmac1d1e6/eid2
+die0: udmac0d1e6/eid3 (0006:0600) -> udmac0d1e6/eid2 (0007:0600)
+die1: udmac1d1e6/eid3 (0046:0600) -> udmac1d1e6/eid2 (0047:0600)
 ```
 
-这里 `eid2` 地址中的 `0007:0600` 或 `0047:0600` 只是“通向物理卡 7”的候选线索，最终仍以 URMA 建链结果和 HCCN RX/TX 增量为准。
+自动解析结果写入每次运行目录的 `resolved_endpoints.tsv` 并在测试前打印。若没有解析到指定物理卡，脚本直接停止，不会用猜测的EID继续测试。
 
 实验期间应保证端点卡和候选 relay 卡尽量空闲，否则其他业务流量会污染 HCCN 计数。
 
@@ -70,7 +71,7 @@ hccn_tool -g -stat -i DEV -u UDIE -p PORT
 
 ## 4. 扫描 EID 对
 
-以下以物理卡 `6 → 7` 的 die0 为例。先只验证候选 `eid0 → eid2`，不要一开始执行 81 个组合：
+以下命令会自动遍历物理卡 `6 → 7` 在两个 IO Die 上找到的全部EID组合：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -79,37 +80,19 @@ mkdir -p /home/l00934901/profiling
 bash scripts/run_a5_urma_eid_pair_scan.sh \
   --src-phy 6 \
   --dst-phy 7 \
-  --src-dev udmac0d1e6 \
-  --dst-dev udmac0d1e6 \
-  --src-eids 0 \
-  --dst-eids 2 \
   --bytes 4194304 \
-  --iters 100 \
+  --iters 1000 \
   --repeats 3 \
   --hccn-devices 0,1,2,3,4,5,6,7 \
   --output-root /home/l00934901/profiling
 ```
 
-这里每次 URMA Write 为 4 MiB，执行 100 次并重复 3 轮。die1 需要单独执行：
-
-```bash
-bash scripts/run_a5_urma_eid_pair_scan.sh \
-  --src-phy 6 --dst-phy 7 \
-  --src-dev udmac1d1e6 --dst-dev udmac1d1e6 \
-  --src-eids 0 --dst-eids 2 \
-  --bytes 4194304 --iters 100 --repeats 3 \
-  --hccn-devices 0,1,2,3,4,5,6,7 \
-  --output-root /home/l00934901/profiling
-```
-
-两个候选都能建链后，才扩大到同一 device 内的合法 EID 组合。例如扫描 die0 的 `eid0～eid8` 时，`src-dev` 和 `dst-dev` 都应为 `udmac0d1e6`。脚本最后会打印本次 `RUN_DIR`。目录中包含每个 EID 对的 client/server 日志、逐 UDie/Port 的 HCCN 原始快照、计数差值和汇总结果。`pairs.tsv` 分开记录 `urma_status` 与 `hccn_status`，HCCN 采集失败不会被误报为 URMA Write 失败。
+脚本会测试同die和跨die组合；无法建链的组合记录为 `urma_status=FAIL`，其余组合继续执行。脚本最后打印本次 `RUN_DIR`。目录中包含 `resolved_endpoints.tsv`、每个EID对的client/server日志、逐UDie/Port的HCCN快照、计数差值和汇总结果。`pairs.tsv` 分开记录 `urma_status` 与 `hccn_status`。
 
 若某一对失败，直接查看：
 
 ```bash
-cat "${RUN_DIR}/src0_dst2_r1/server.log"
-cat "${RUN_DIR}/src0_dst2_r1/client.log"
-cat "${RUN_DIR}/src0_dst2_r1/hccn_analysis.log"
+find "${RUN_DIR}" -name server.log -o -name client.log -o -name hccn_analysis.log
 ```
 
 若实际工具不在 `PATH`，增加：
