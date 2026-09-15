@@ -76,7 +76,42 @@ ldconfig -p | grep liburma
 - `status=NOT_VISIBLE`：该 HCCL/HCCN 路由 EID没有注册到用户态 URMA。此时仅凭公开 URMA API不能选择这条 route，方案 A 在当前软件栈上不成立。
 - `CONTEXT_FAILED` 或 `CONTEXT_MISMATCH`：EID能枚举但不能可靠建 context，同样不能用于显式选路。
 
-当前 6→7 清单来自两张物理卡各自的 `hccn_tool -g -dev_info` 输出，并与 HCCL route probe 地址逐项匹配：
+脚本支持物理 Device 0～7 中任意两张不同的卡。只需要修改 `--src-phy` 和 `--dst-phy`，脚本会先运行 HCCL route probe，解析当前卡对实际枚举出的完整 route EID，再生成本次 manifest。不会把 6/7 的 EID复用到其他卡。
+
+例如切换为 4→5：
+
+```bash
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 4 --dst-phy 5 \
+  --umdk-root /home/l00934901/umdk \
+  --urma-lib-dir /usr/lib64 \
+  --output-root /home/l00934901/profiling
+```
+
+切换为 2→3：
+
+```bash
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 2 --dst-phy 3 \
+  --umdk-root /home/l00934901/umdk \
+  --urma-lib-dir /usr/lib64 \
+  --output-root /home/l00934901/profiling
+```
+
+自动发现会调用现有 `run_a5_ccu_urma_route_probe.sh`。route probe 在 channel acquire 之前已经打印全部 route，外层默认等待 20 秒；即便随后因某条 hop-2 channel 不可用而超时，只要 route 行已经打印，EID解析仍然有效。原始输出保存在本次结果目录的 `hccl_route_discovery.log`。
+
+如果现场已有某卡对的 route-probe 日志，可以避免再次建 channel：
+
+```bash
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 4 --dst-phy 5 \
+  --route-log /path/to/existing_route_probe.log \
+  --umdk-root /home/l00934901/umdk \
+  --urma-lib-dir /usr/lib64 \
+  --output-root /home/l00934901/profiling
+```
+
+6→7 的已知结果示例如下，但它不再硬编码进执行逻辑：
 
 | route | hop | Device 6 source EID | Device 7 destination EID |
 |---|---:|---|---|
@@ -84,7 +119,7 @@ ldconfig -p | grep liburma
 | route1 | 2 | `003f:0200:...:cb01` | `003f:0200:...:eb01` |
 | route2 | 2 | `007f:0200:...:db01` | `007f:0200:...:fb01` |
 
-脚本使用完整 EID，不再由位字段推断物理卡。
+每次动态生成的完整清单位于 `route_eid_manifest.tsv`；脚本不再由 EID位字段推断物理卡。
 
 ## 4. 环境检查
 
