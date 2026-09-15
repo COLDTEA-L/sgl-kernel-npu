@@ -65,7 +65,34 @@ install(TARGETS a5_ccu_urma_route_probe
 install(FILES
     inc/a5_ccu_urma_route_probe.h
     inc/a5_uvs_source_route_provider.h
+    inc/a5_uvs_explicit_route_backend.h
     DESTINATION ${CUSTOM_OPS_OPP_INC_PATH}
+    COMPONENT hccl
+)
+
+add_library(a5_uvs_manifest_route_provider SHARED
+    op_host/explicit_route_provider.cc
+)
+target_include_directories(a5_uvs_manifest_route_provider PRIVATE
+    ${HCCL_CUSTOM_OPS_INCLUDE_LIST}
+)
+target_compile_options(a5_uvs_manifest_route_provider PRIVATE
+    -U_FORTIFY_SOURCE
+    -Werror
+    -fno-common
+    -fno-strict-aliasing
+    -pipe
+    -O2
+    -std=c++14
+    -fstack-protector-all
+)
+target_compile_definitions(a5_uvs_manifest_route_provider PRIVATE
+    _GLIBCXX_USE_CXX11_ABI=0
+    -DHOST_COMPILE
+)
+target_link_libraries(a5_uvs_manifest_route_provider PRIVATE ${CMAKE_DL_LIBS})
+install(TARGETS a5_uvs_manifest_route_provider
+    LIBRARY DESTINATION ${CUSTOM_OPS_OPP_LIB_PATH}
     COMPONENT hccl
 )
 

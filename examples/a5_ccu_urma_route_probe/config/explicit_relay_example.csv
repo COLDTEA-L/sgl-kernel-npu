@@ -1,0 +1,6 @@
+# route_id,local_rank,peer_rank,src_phy,dst_phy,relay_phy,die_id,weight
+# Both directions must be installed. Replace relay_phy and die_id with values
+# approved by the platform UVS topology/control plane.
+route_id,local_rank,peer_rank,src_phy,dst_phy,relay_phy,die_id,weight
+1002,0,1,6,7,2,0,1
+1002,1,0,7,6,2,0,1

@@ -25,3 +25,8 @@ unless `A5_CCU_DEBUG=1` is set.
 
 See `docs/A5_CCU_URMA_ROUTE_VALIDATION.md` in the sgl-kernel-npu repository for
 build, install, run, profiling, and pass/fail instructions.
+
+The explicit-relay extension is documented in
+`docs/A5_URMA_EXPLICIT_RELAY_STAGES_1_3.md`. It deliberately fails closed
+unless a platform UVS/HIXL backend proves that it can install, query, and
+remove forwarding-only routes without relay HBM staging.

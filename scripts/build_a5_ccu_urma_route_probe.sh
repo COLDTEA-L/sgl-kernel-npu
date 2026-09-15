@@ -85,6 +85,10 @@ env -u ASCEND_CUSTOM_OPP_PATH -u ASCEND_OPP_PATH \
     "${latest_package}" --quiet --install "--install-path=${install_path}"
 
 test -f "${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
+test -f "${install_path}/opp/vendors/cust/include/a5_uvs_explicit_route_backend.h"
 test -f "${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+test -f "${install_path}/opp/vendors/cust/lib64/liba5_uvs_manifest_route_provider.so"
 echo "Installed header: ${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
+echo "Installed backend ABI: ${install_path}/opp/vendors/cust/include/a5_uvs_explicit_route_backend.h"
 echo "Installed library: ${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+echo "Installed provider: ${install_path}/opp/vendors/cust/lib64/liba5_uvs_manifest_route_provider.so"
