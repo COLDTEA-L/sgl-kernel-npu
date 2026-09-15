@@ -1,8 +1,18 @@
 # A5 URMA EID 对与显式 Relay 映射验证
 
-## 1. 验证目标
+## 1. 验证目标与重要修正
 
-本实验验证“方案 A”：不修改 UVS/UMDK 路由表，只选择源端和目的端的 URMA device、`eid_idx`，观察某个 EID 对是否稳定映射到指定物理中转卡。
+本实验验证“方案 A”：不修改 UVS/UMDK 路由表，选择完整的源端/目的端 EID，观察它们是否能被用户态 URMA 精确绑定，并进一步判断该 EID 对是否稳定映射到指定物理中转卡。
+
+旧脚本仅使用 `udmac... + eid_idx`，而 `hccn_tool -g -dev_info -i DEVICE` 已证明同名 `udmac` 会出现在不同物理卡的局部视图中。因此它不能证明进程绑定到了物理卡 6/7，旧结果只保留为探索数据，不能作为方案 A 的可行性结论。
+
+新实验先做完整 EID 可见性门禁：
+
+1. 用 `urma_str_to_eid()` 解析 HCCL route 日志中的完整 128-bit EID。
+2. 用 `urma_get_device_by_eid()` 精确解析 URMA device。
+3. 用 `urma_get_eid_list()` 找到实际 `eid_index`。
+4. 用 `urma_create_context()` 建 context，并逐字节核对 `context->eid`。
+5. 任一步失败即停止，绝不回退到同名 device 或猜测的 `eid_idx`。
 
 脚本执行以下流程：
 
@@ -28,10 +38,55 @@ git pull --ff-only origin feature/a5-urma-explicit-relay-provider
 
 ```bash
 ls scripts/run_a5_urma_eid_pair_scan.sh \
-   scripts/analyze_a5_urma_eid_pairs.py
+   scripts/analyze_a5_urma_eid_pairs.py \
+   scripts/run_a5_urma_full_eid_route_validation.sh \
+   examples/a5_urma_full_eid_probe/resolve_full_eid.c
 ```
 
-## 3. 环境检查
+## 3. 首先执行：完整 EID 可见性门禁
+
+有卡容器需要能访问 UMDK 头文件和已安装的 `liburma.so`。如果容器里没有 UMDK 仓，将宿主机仓挂载到 `/home/l00934901/umdk`，或用 `--umdk-root` 指定实际位置。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+bash scripts/run_a5_urma_full_eid_route_validation.sh \
+  --src-phy 6 \
+  --dst-phy 7 \
+  --umdk-root /home/l00934901/umdk \
+  --urma-lib-dir /usr/lib64 \
+  --output-root /home/l00934901/profiling
+```
+
+如果 `liburma.so` 不在 `/usr/lib64`，先定位：
+
+```bash
+ldconfig -p | grep liburma
+```
+
+结果保存在：
+
+```text
+/home/l00934901/profiling/a5_urma_full_eid_6_to_7_YYYYMMDD_HHMMSS/full_eid_visibility.tsv
+```
+
+判定规则：
+
+- `SCHEME_A_GATE=PASS`：route0/1/2 两端的完整 EID 均能精确解析，并且创建出的 context EID 完全一致；可以进入 WRITE + HCCN 计数验证。
+- `status=NOT_VISIBLE`：该 HCCL/HCCN 路由 EID没有注册到用户态 URMA。此时仅凭公开 URMA API不能选择这条 route，方案 A 在当前软件栈上不成立。
+- `CONTEXT_FAILED` 或 `CONTEXT_MISMATCH`：EID能枚举但不能可靠建 context，同样不能用于显式选路。
+
+当前 6→7 清单来自两张物理卡各自的 `hccn_tool -g -dev_info` 输出，并与 HCCL route probe 地址逐项匹配：
+
+| route | hop | Device 6 source EID | Device 7 destination EID |
+|---|---:|---|---|
+| route0 | 1 | `0046:0300:...:d706` | `0046:0300:...:f707` |
+| route1 | 2 | `003f:0200:...:cb01` | `003f:0200:...:eb01` |
+| route2 | 2 | `007f:0200:...:db01` | `007f:0200:...:fb01` |
+
+脚本使用完整 EID，不再由位字段推断物理卡。
+
+## 4. 环境检查
 
 ```bash
 command -v urma_perftest
@@ -49,7 +104,7 @@ udmac0d1e6  ... eid1 ...
 
 手工诊断时可用 `--src-dev udmac0d1e6 --src-eids 0,1` 指定端点；正常验证应省略这些参数，由脚本同时发现 `udmac0...` 和 `udmac1...` 下属于目标物理卡的EID，并分别保留完整的 `device+eid_idx` 身份。
 
-脚本根据 EID 第三个16位字段的低6位解析物理Device，并排除 `0x3f/0x7f` 聚合EID。对当前清单，物理卡 `6 → 7` 会自动解析出：
+旧扫描脚本曾根据 EID 位字段推断物理 Device；该推断已被完整拓扑证明不可靠。以下自动解析输出不能用于证明物理卡归属：
 
 ```text
 die0: udmac0d1e6/eid3 (0006:0600) -> udmac0d1e6/eid2 (0007:0600)
@@ -69,9 +124,9 @@ hccn_tool -g -stat -i DEV -u UDIE -p PORT
 
 第二条命令中的 `UDIE/PORT` 由第一条命令中 `Link Status=UP` 的端口自动生成，不需要手工指定。
 
-## 4. 扫描 EID 对
+## 5. 旧版探索性 EID-index 扫描
 
-以下命令会自动遍历物理卡 `6 → 7` 在两个 IO Die 上找到的全部EID组合：
+只有完整 EID 门禁通过后，才可将以下命令作为补充探索。它本身不能证明精确物理卡或 route 绑定：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -102,7 +157,7 @@ find "${RUN_DIR}" -name server.log -o -name client.log -o -name hccn_analysis.lo
 --hccn-tool /usr/local/Ascend/driver/tools/hccn_tool
 ```
 
-## 5. 单独重新分析
+## 6. 单独重新分析
 
 ```bash
 RUN_DIR=/home/l00934901/profiling/a5_urma_eid_scan_6_to_7_YYYYMMDD_HHMMSS
@@ -135,7 +190,7 @@ python3 scripts/analyze_a5_urma_eid_pairs.py \
   --output "${RUN_DIR}/eid_pair_relay_map.tsv"
 ```
 
-## 6. 输出与判定
+## 7. 输出与判定
 
 重点查看：
 
@@ -169,8 +224,8 @@ cat "${RUN_DIR}/eid_pair_relay_summary.json"
 --bytes 4194304 --iters 100 --repeats 3
 ```
 
-## 7. 结论边界
+## 8. 结论边界
 
 HCCN 计数能够证明某张物理卡的 IO Die/端口参与了转发，但不能单独证明每个包的完整 hop 顺序。只有当 EID 对、候选 relay、负载缩放和多次重复同时稳定对应时，才能把它作为方案 A 的工程验证结果。
 
-如果所有 EID 对都只能得到固定 route、多个 relay 或不稳定结果，就说明当前 UVS 配置没有提供“通过端点 EID 选择任意 relay 卡”的能力。此时方案 A 不成立，下一阶段才需要扩展 UVS/UMDK 的 route/source-hop 配置；不能仅靠算子侧更换 EID 实现任意 `6 → relay 2 → 7`。
+如果完整 route EID 对用户态不可见，或者精确 EID 对只能得到固定 route、多个 relay 或不稳定结果，就说明当前公开 URMA 配置没有提供“通过端点 EID 选择任意 relay 卡”的能力。此时方案 A 不成立，下一阶段才需要扩展 UVS/UMDK 的 route/source-hop 配置；不能仅靠算子侧更换 EID 实现任意 `6 → relay 2 → 7`。
