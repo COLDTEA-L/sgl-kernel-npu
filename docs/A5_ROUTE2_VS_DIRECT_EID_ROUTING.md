@@ -28,9 +28,12 @@
 
 特别要注意：本测试里的 `route2` 只是 ordinal 2。换物理卡、拓扑、RankGraph 或 CANN/HCOMM 版本后，ordinal 2 不保证仍代表相同路径。
 
-## 3. `route2` 的实际调用链
+## 3. `route2` 从 RankGraph 变成 Channel 的六步溯源
 
-### 3.1 枚举 RankGraph 中已经存在的 CommLink
+这一节按照真实执行顺序展开。最重要的边界是：`route2` 这个名字只存在于本仓 probe 的候选数组中；进入 HCOMM
+以后，继续向下传递的是 endpoint、协议和 channel descriptor，而不是整数 `2`。
+
+### 第1步：从 RankGraph 枚举已经存在的 CommLink
 
 实现位置：
 
@@ -60,9 +63,15 @@ src_addr / dst_addr
 src_phy / dst_phy
 ```
 
-因此，看到 `route2 hop=2` 说明 HCCL RankGraph 已经向上层发布了一条 hop-2 link。它不说明测试代码知道中间 relay 卡是谁，也不说明 route2 的全部数据一定只经过单一 relay；这些信息没有出现在公开的 `CommLink` 字段中。
+因此，看到 `route2 hop=2` 说明 HCCL RankGraph 已经向上层发布了一条 hop-2 link。它不说明测试代码知道中间
+relay 卡是谁，也不说明 route2 的全部数据一定只经过单一 relay；这些信息没有出现在公开的 `CommLink` 字段中。
 
-### 3.2 把已有 CommLink 转成 channel descriptor
+这里还有两个容易误解的点：
+
+1. `route2` 是 `candidates[2]`，不是写入硬件的 `route_addr_idx=2`；
+2. 换卡、换 RankGraph 或换软件版本后，第三条候选 link 不保证仍代表同一底层路径。
+
+### 第2步：把选中的 CommLink 转成 HcclChannelDesc
 
 `SelectRoute` 对选中的 link 执行：
 
@@ -75,9 +84,17 @@ desc->localEndpoint = selectedLink.srcEndpointDesc;
 desc->remoteEndpoint = selectedLink.dstEndpointDesc;
 ```
 
-这里复制的是完整 endpoint descriptor，而不只是 EID。公开的 `HcclChannelDesc` 填充过程没有 `relayPhyId`、`nextHop` 或 hop-list 字段。
+这里复制的是完整 endpoint descriptor，而不只是 EID。公开的 `HcclChannelDesc` 填充过程没有 `routeIndex`、
+`relayPhyId`、`nextHop` 或 hop-list 字段。因此从这一步开始，HCOMM并不知道上层把这条link叫作route2；它只知道：
 
-### 3.3 通过 HCOMM 获取 CCU channel
+```text
+通信域 + remoteRank + engine=CCU + protocol=UB_CTP
++ localEndpoint + remoteEndpoint
+```
+
+这也是后续源码追踪时不能继续搜索变量名 `route2` 的原因。应当使用完整的本端/远端 endpoint pair 作为关联键。
+
+### 第3步：HcclChannelAcquire进入HCOMM资源管理
 
 实现仍在 `utils.cc`：
 
@@ -87,7 +104,65 @@ HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)
   -> HcommChannelGetStatus(channels, ...)
 ```
 
-`HcclChannelAcquire` 成功意味着：底层能够把 descriptor 中的 endpoint pair 映射到一条可用 channel。对于 route2，这个映射依赖已经存在的 RankGraph/UVS/UDMA/固件配置。
+`HcclChannelAcquire` 的公开语义是：在通信域中获取对应 channel；没有时创建。HCCL层把
+`HcclChannelDesc` 交给HCOMM资源管理层，HCOMM根据engine和protocol选择具体channel实现：
+
+```text
+COMM_ENGINE_CCU + COMM_PROTOCOL_UB_CTP
+  -> CcuUrmaChannel
+```
+
+`HcclChannelAcquire` 成功意味着：底层能够把 descriptor 中的 endpoint pair 映射到一条可用 channel。对于
+route2，这个映射依赖已经存在的 RankGraph/UVS/UDMA/固件配置。
+
+channel对象能否复用、需要新建还是进入异步建链，由HCOMM资源管理层判断；上层probe不直接创建URMA TP。
+
+### 第4步：CcuUrmaChannel根据endpoint pair推进URMA建链
+
+HCOMM公开源码所展示的建链模型可以概括为：
+
+```text
+HcommChannelCreate/Acquire
+  -> 创建或取得 CcuUrmaChannel 对象
+  -> 预分配 device 侧 channel/context 资源
+  -> HcommChannelGetStatus
+  -> ConnectChannelsOnce
+  -> 根据 localEndpoint/remoteEndpoint 构造 LinkData/连接资源
+  -> 通过 HCCP/URMA 创建或取得 TP、jetty 等底层资源
+  -> FillDevEntities
+  -> Channel READY
+```
+
+我们的probe在`HcclChannelAcquire`后调用：
+
+```cpp
+HcommChannelGetStatus(created.channels.data(),
+                      static_cast<uint32_t>(created.channels.size()),
+                      channelStates.data());
+```
+
+这一调用不只是“读一个布尔状态”。在当前HCOMM异步建链模型中，它可能推进`ConnectChannelsOnce`并在建链完成后
+填充device侧通信实体。只有状态READY，CCU数据面才能安全使用这个channel。
+
+此处真正值得继续向下追踪的关联信息是：
+
+```text
+localEndpoint完整EID
+remoteEndpoint完整EID
+Channel对象/ChannelHandle
+LinkData
+TP或jetty handle
+```
+
+而不是已经消失的 `routeIndex`。
+
+### 第5步：底层控制面把endpoint pair映射到已有路由资源
+
+在 `CcuUrmaChannel -> HCCP/URMA -> UDMA/固件` 这一段，endpoint pair最终必须落到可发送的TP和硬件路径上。
+结合openEuler UDMA公开结构，可以确认TP context中存在`route_addr_idx`、`sr_en`、`route_type`、
+`switch_mp_en`等路由相关字段，也存在destination-address table和TPM table资源。
+
+但当前公开API看不到底层究竟如何：
 
 从当前公开接口看不到底层究竟如何：
 
@@ -97,9 +172,10 @@ HcclThreadAcquireWithStream(..., COMM_ENGINE_CCU, ...)
 - 解析 next-hop；
 - 选择具体 relay 卡或内部 ECMP 分支。
 
-所以这里是“消费已有路由”，不是“创建新路由”。
+所以这里是“根据endpoint pair消费已有路由”，不是“由probe创建一条新路由”。route2能走通，说明其descriptor
+最终能命中一套可用的底层路由状态；并不表示`HcclChannelAcquire`调用参数中显式携带了relay卡。
 
-### 3.4 CCU kernel 只消费 ChannelHandle
+### 第6步：CCU kernel只消费建好的ChannelHandle
 
 实现位置：
 
@@ -121,7 +197,25 @@ NotifyRecord / NotifyWait 交换远端地址和 token
 WriteNb(channels_[i], destination, source, pathBytes[i], events.back());
 ```
 
-到这一阶段，CCU 只得到 `ChannelHandle`。route2 的 layer、hop、EID 以及可能的 relay 已经在 channel 创建阶段固化，`WriteNb` 没有 relay 参数。
+到这一阶段，CCU只得到`ChannelHandle`。route2的layer、hop、EID以及可能的relay已经在channel创建阶段固化，
+`WriteNb`没有relay参数，也不会重新读取RankGraph。
+
+完整链路可压缩为：
+
+```text
+HcclRankGraphGetLayers
+  -> HcclRankGraphGetLinks
+  -> candidates[2]（probe本地命名route2）
+  -> 复制srcEndpointDesc/dstEndpointDesc
+  -> HcclChannelDesc
+  -> HcclChannelAcquire(COMM_ENGINE_CCU)
+  -> CcuUrmaChannel
+  -> HCCP/URMA建立或取得TP和连接资源
+  -> 底层已有路由状态/route entry
+  -> HcommChannelGetStatus READY
+  -> ChannelHandle
+  -> CCU WriteNb
+```
 
 ## 4. 为什么直接选择完整 EID 仍然失败
 
@@ -159,7 +253,125 @@ DAM/TPM entry
 forwarding-only / no-relay-HBM policy
 ```
 
-EID 回答的是“端点是谁”，而显式 relay 需要回答“包按什么路径到达端点”。
+EID回答的是“端点是谁”，而显式relay需要回答“包按什么路径到达端点”。下面按五层进一步拆解。
+
+### 4.1 第一层：EID解析不等于路径创建
+
+```cpp
+urma_str_to_eid(text, &eid);
+```
+
+只把字符串转换为`urma_eid_t`，不访问网络控制面，也不会安装路径。就像把IP地址解析成二进制地址，并不等于
+创建了一条经过指定路由器的source route。
+
+### 4.2 第二层：查到device/context也只证明本地端点可绑定
+
+```cpp
+urma_get_device_by_eid(eid, URMA_TRANSPORT_UB);
+urma_get_eid_list(device, &count);
+urma_create_context(device, eid_index);
+```
+
+这组API解决的是：
+
+```text
+该EID是否由用户态URMA可见？
+它属于哪个URMA device？
+能否用这个本地EID创建context？
+```
+
+它们没有输入destination，更没有relay。因此即使三步全部成功，也只能得到“本地通信身份”，不能得到
+`src -> relay -> dst`路径。
+
+当前实机更早就被阻断：从HCCL `CommLink`提取的完整EID在`urma_get_device_by_eid`阶段返回`NOT_VISIBLE`。
+这表明RankGraph/HCCL使用的endpoint命名空间或内部注册状态没有等价暴露给普通用户态URMA context。
+
+### 4.3 第三层：目的EID只描述终点，不描述next-hop
+
+假设目的卡7存在某个EID，它表达的是“最终endpoint是这个EID”。它不天然表达：
+
+```text
+先从卡6哪个port发出
+先到卡2还是卡3
+经过一个还是多个hop
+是否允许ECMP/spray
+是否禁止落relay HBM
+```
+
+同一个目的endpoint可以由多条底层路径到达。具体使用哪条路径，需要路由/TP状态，而不是仅由目的EID值决定。
+
+因此不能根据EID字符串里看似包含的device/port数字，推断“把dst设成这个EID就一定经过对应卡”。这些位可能是
+endpoint身份编码，但不是公开的source-route指令格式。
+
+### 4.4 第四层：自主构造HcclChannelDesc仍然缺少relay语义
+
+即使应用自己填充：
+
+```cpp
+desc.localEndpoint = ...;
+desc.remoteEndpoint = ...;
+desc.channelProtocol = COMM_PROTOCOL_UB_CTP;
+```
+
+公开`HcclChannelDesc`也没有：
+
+```text
+relayPhyId
+nextHopEid
+sourceRouteHopList
+routeAddrIndex
+forwardingOnly
+noRelayHbm
+```
+
+所以自主构造descriptor只能请求“在这对endpoint之间建channel”。如果控制面已有可用路径，底层可能选择默认路径；
+如果没有匹配路径，`HcclChannelAcquire`就会失败或超时。它不会因为应用希望relay=2而自动创建这条规则。
+
+### 4.5 第五层：真正缺少的是建链前的路由安装操作
+
+要让EID选择进一步变成显式relay，必须在`HcclChannelAcquire`之前完成类似操作：
+
+```text
+InstallRoute(
+    srcEndpoint,
+    dstEndpoint,
+    relayPhyId=2,
+    dieId,
+    forwardingOnly=true,
+    noRelayHbm=true)
+  -> 返回lease/route handle
+  -> 返回或发布可被HCOMM使用的HcclChannelDesc/CommLink
+```
+
+其内部至少要完成以下一种工作：
+
+- 安装UVS/HCCP source-route或next-hop规则；
+- 创建/更新TP，并为它选择正确`route_addr_idx`；
+- 写入DAM/TPM或等价destination/forwarding表项；
+- 将新路径发布进RankGraph，或直接返回HCOMM可获取的descriptor；
+- 在使用结束后查询和删除这条route lease。
+
+目前公开URMA API没有这类安装接口。因此直接选EID最多能够选择endpoint或命中一条已经存在的默认路径，不能创造
+“6经2到7”这一新路径。
+
+### 4.6 为什么route2没有受到同样限制
+
+route2的顺序恰好相反：
+
+```text
+底层控制面已经配置路径
+  -> RankGraph发布CommLink
+  -> probe再选择这条CommLink
+```
+
+直接EID方案试图做的是：
+
+```text
+probe先选择EID
+  -> 希望底层自动推导并安装指定relay路径
+```
+
+第二条链缺少“安装指定relay路径”的控制面调用。因此两者不能因为都出现EID字段就被视作等价。
 
 ## 5. API 能力对比
 
