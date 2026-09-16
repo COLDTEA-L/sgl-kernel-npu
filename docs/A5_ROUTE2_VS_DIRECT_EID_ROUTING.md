@@ -71,6 +71,57 @@ relay 卡是谁，也不说明 route2 的全部数据一定只经过单一 relay
 1. `route2` 是 `candidates[2]`，不是写入硬件的 `route_addr_idx=2`；
 2. 换卡、换 RankGraph 或换软件版本后，第三条候选 link 不保证仍代表同一底层路径。
 
+#### `HcclRankGraphGetLayers` 在 HCOMM 中如何实现
+
+`SelectRoute` 调用的准确接口名是 `HcclRankGraphGetLayers`。新版 HCOMM/HCCL 源码中的相关文件为：
+
+| 作用 | 源码位置 |
+| --- | --- |
+| 对外声明 | `include/hccl/hccl_rank_graph.h` |
+| C API 入口及从 communicator 取得 RankGraph | `src/coll_communicator_mgr/api_c_adpt/coll_comm_rank_graph_a_adpt.cc` |
+| RankGraph V2 封装 | `src/coll_communicator_mgr/rank_graph/rank_graph_v2.cc` |
+| A5/Ascend 950 实际实现 | `src/legacy/ascend950/interface/rank_graph_interface.cc` |
+| V1 兼容实现 | `src/coll_communicator_mgr/rank_graph/rank_graph.cc` |
+
+V2/A5 调用链如下：
+
+```text
+HcclRankGraphGetLayers(comm, &netLayers, &netLayerNum)
+  -> GetRankGraphFromComm(comm, &rankGraph)
+  -> HcclComm::GetCollComm()
+  -> CollComm::GetRankGraph()
+  -> RankGraphV2::GetNetLayers(...)
+  -> IRankGraph::GetNetLayers(...)
+  -> RankGraph::GetMyRank()
+  -> RankGraph::GetLevels(rankId)
+  -> RankGraph::GetLevelNum()
+```
+
+A5 的 `IRankGraph::GetNetLayers` 只是读取 communicator 初始化阶段已经构造好的 RankGraph：它取得当前
+`rankId`，调用 `GetLevels(rankId)` 得到包含该 rank 的 layer 集合，将集合复制到对象内部的
+`netLayersVec_`，然后返回 `netLayersVec_.data()` 和 layer 数量。该内存由 HCCL 管理，调用方不能释放，并应在
+后续调用可能覆盖它以前完成使用或复制。
+
+因此，`HcclRankGraphGetLayers` 不会在调用时探测物理拓扑、创建 URMA 链路或生成 `route2`；它只读取
+RankGraph 已发布的 layer ID，例如 layer 0 和 layer 1。
+
+具体 `CommLink` 来自随后对每个 layer 的 `HcclRankGraphGetLinks` 调用：
+
+```text
+HcclRankGraphGetLayers
+  -> 返回 layer ID 集合
+
+for each layer:
+  HcclRankGraphGetLinks(comm, layer, rank, peer, &links, &linkNum)
+    -> 返回该 rank pair 在这一层已经发布的 CommLink 数组
+    -> SelectRoute 过滤 UBC_CTP，并读取 protocol/hop/srcAddr/dstAddr/linkId
+    -> probe 按枚举顺序编号为 route0/route1/route2
+```
+
+所以 `GetLayers` 与 `GetLinks` 都是读取已经存在的 RankGraph，而不是路由编程接口。`route2` 能被枚举并成功
+建链，前提是 HCCL/HIXL 在 communicator 初始化阶段已经完成相应底层配置，并将该 `CommLink` 发布到了
+RankGraph。probe 中的 route 编号只是候选数组下标，不是用户可写的 source-route ID。
+
 ### 第2步：把选中的 CommLink 转成 HcclChannelDesc
 
 `SelectRoute` 对选中的 link 执行：
