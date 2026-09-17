@@ -392,7 +392,332 @@ WaitEvent(all)
 
 因此工程上的主要缺口不是 AllToAll 切分或 CCU `WriteNb`，而是创建并绑定 `channel_relay` 的控制面。
 
-## 8. 当前进度可以怎样汇报
+## 8. 为定位路径分叉已经做过哪些尝试
+
+本节按控制链从上到下记录已经做过的实验。目的是避免重复投入，也避免把一次偶然的 handle/TPN 差异误报成
+稳定 selector。
+
+### 8.1 RankGraph 和 CommLink 枚举
+
+**位置：**
+
+```text
+HcclRankGraphGetLayers
+  -> HcclRankGraphGetLinks
+  -> examples/a5_ccu_urma_route_probe/op_host/utils.cc::EnumeratePaths
+```
+
+**做法：**逐 layer 枚举 UBC CTP `CommLink`，记录 layer、link、hop、protocol、两端物理卡、die、带宽系数、
+完整 `CommAddr` 和 `EndpointDesc` raw。
+
+**结果：**route0 与 route2 在这一层已经不同。route0 是 hop-1 direct candidate；route2 是 hop-2 candidate，且
+两端完整 endpoint raw 与 route0 不同。
+
+**结论：**这是目前最早且稳定的公开差异。它证明路径差异在调用 `HcclChannelAcquire` 以前已经存在，但不能说明
+RankGraph 中哪个私有字段编码了 relay 卡。
+
+### 8.2 ChannelDesc 完整差分
+
+**位置：**
+
+```text
+SelectRoute
+  -> HcclChannelDescInit
+  -> localEndpoint = CommLink.srcEndpointDesc
+  -> remoteEndpoint = CommLink.dstEndpointDesc
+  -> HcclChannelAcquire
+```
+
+**做法：**在 Acquire 前输出完整 `HcclChannelDesc` raw、endpoint raw、remote rank、protocol 和 notify 数量。
+
+**结果：**调用的 API 和 engine 相同，但 route0/route2 的 `HcclChannelDesc` 并不相同，主要可解释差异来自完整
+`localEndpoint/remoteEndpoint`。
+
+**结论：**不能表述为“route0 和 route2 传给 Acquire 的参数相同”。准确说法是：Acquire 的调用形式相同，
+但路径相关 descriptor 不同。
+
+### 8.3 `GET_TP_LIST` 多层追踪
+
+**位置：**
+
+```text
+HcclChannelAcquire 下游
+  -> HCCP TpMgr / Ra / Rs
+  -> urma_get_tp_list
+  -> urma_cmd_get_tp_list
+  -> urma_ioctl_get_tp_list
+  -> UDMA CTRLQ GET_TP_LIST opcode 0x21
+```
+
+**做法：**通过 `LD_PRELOAD` 和 provider 边界 hook 记录：
+
+- `flag`、`trans_mode`；
+- `local_eid`、`peer_eid`；
+- 返回 TP handle 集合；
+- caller stack；
+- `urma_cmd_udrv_priv_t` 的 input/output private blob；
+- ioctl command 的前后 raw 数据。
+
+**结果：**
+
+- route0/route2 在可见的 `GET_TP_LIST` 配置中没有稳定的显著差异；
+- 同进程重复实验中，两者可获得完全相同的 TP handle 集合；
+- 个别运行的 handle 尾号变化会随分配顺序变化，不能作为 path ID；
+- 已观察 provider 的 `udata_in_len/udata_out_len` 可以为 0，没有发现隐藏 selector 通过该 private blob 下传。
+
+**结论：**`ChannelDesc` 没有被原样传给 `GET_TP_LIST`。更准确的关系是：Acquire 消费 ChannelDesc，随后其下游
+可能调用 `GET_TP_LIST` 查询 TP 资源池；到这个公开边界时，route0/route2 的路径身份已经不再以可见参数形式
+出现。因此 `GET_TP_LIST` 不是目前证据下的分叉点，继续只分析它不能找到显式 relay selector。
+
+### 8.4 TP attr 查询和修改接口
+
+**位置：**
+
+```text
+urma_get_tp_attr / urma_cmd_get_tp_attr
+urma_set_tp_attr / urma_cmd_set_tp_attr
+urma_modify_tp / urma_cmd_modify_tp
+urma_cmd_exchange_tp_info
+```
+
+**做法：**对 `GET_TP_LIST` 返回的每个 handle 主动查询属性，并拦截 SET、MODIFY、EXCHANGE。
+
+**结果：**
+
+- 可查询时，route0/route2 的公开 attr 没有稳定差异；部分字段为零或仅返回有限 bitmap；
+- 某些环境直接返回 `not support query TP`；
+- `SET_TP_ATTR`、`MODIFY_TP`、`EXCHANGE_TP_INFO` 没有出现可归因于 candidate 的稳定事件；
+- `spray_en`、flow label、UDP source port 等字段没有显示出“relay=某物理卡”的语义；
+- `sr_en` 已确认是 Selective Retransmission，不是 source routing。
+
+**结论：**公开 TP attr 面没有暴露 route0/route2 的稳定物理路径绑定，不能通过这些字段直接复现指定 relay。
+
+### 8.5 import/bind 和 TP 激活追踪
+
+**位置：**
+
+```text
+urma_import_jfr[_ex]
+urma_import_jetty[_ex]
+urma_bind_jetty[_ex]
+```
+
+**做法：**记录 active TP handle、peer TP handle、target TPN、remote ID/EID、caller stack，并给每次 Acquire 添加
+trace label。
+
+**结果：**曾观察到 route0/route2 对应不同 TP/TPN 的事件，但调用栈进一步表明其中至少一部分来自：
+
+```text
+libascend_trace.so
+  -> HDC connect
+  -> import_jfr_ex
+```
+
+这些属于 Ascend Trace/HDC 基础设施，不能作为 CCU Channel 绑定证据。排除该噪声后，尚未得到稳定、可重复且带
+单次 Acquire 标签的 `candidate -> active TP/TPN` 映射。
+
+**结论：**不能把当前捕获到的任意合法 TP/TPN 都解释成 route0/route2 的最终 TP。必须同时满足 Acquire 时间窗口、
+trace label 和 HCOMM/HCCP/URMA caller stack 才是有效证据。
+
+### 8.6 同进程正反顺序实验
+
+**位置：**
+
+```text
+同一 communicator
+  -> candidate 0 后 candidate 2
+  -> candidate 2 后 candidate 0
+  -> 两个 Channel 同时保持存活
+```
+
+**做法：**消除不同进程、communicator 重建和 TP pool 重建带来的影响，比较路径身份与首次/第二次资源分配顺序。
+
+**结果：**公开 TP handle 池可以相同，handle 个别变化与分配顺序相关；实验在 Channel 建链或资源等待处也可能
+长时间停顿。
+
+**结论：**handle 数值不是路径身份；同进程实验没有在公开 URMA 边界找到稳定 selector，但进一步把分叉区间
+限制在 Acquire 内部对象与其私有控制面。
+
+### 8.7 `urma_admin list_res` 资源快照
+
+**位置：**Channel 存活窗口内的用户态管理查询。
+
+**结果：**当前 provider 对 TP/设备统计返回 `not support query` 或 `no device list`。
+
+**结论：**这只说明管理查询面未开放，不能说明不存在 TP、TPG 或 forwarding path；也不能用于建立
+`ChannelHandle -> TP/path` 映射。
+
+### 8.8 完整 EID 可见性实验
+
+**位置：**
+
+```text
+urma_str_to_eid
+  -> urma_get_device_by_eid
+  -> urma_get_eid_list
+  -> urma_create_context
+```
+
+**做法：**把 RankGraph CommLink 中的完整 endpoint EID 交给普通用户态 URMA 查询和绑定。
+
+**结果：**部分 path-specific EID 返回 `NOT_VISIBLE`。
+
+**结论：**这些 identity 没有作为普通本地 URMA EID 暴露。该实验不能证明远端 EID 必须在源卡创建 context，也
+不能单独证明“EID 永远不能参与路径选择”；它证明的是普通用户态 context API 无法复现 RankGraph 的私有
+endpoint/path 注册状态。
+
+### 8.9 HCCN 物理 footprint 与性能实验
+
+**位置：**Channel 建立完成后的数据面，比较 candidate-only 和 concurrent 打流期间的端口计数。
+
+**结果：**结合隔离实验，已经得到 route0 为 direct、route2 使用 direct+relay footprint 的结论；但 HCCN
+计数器曾受命令模式、背景流量、counter 单位和采样窗口影响，不能把任意一次非端点流量上涨直接命名为 relay。
+
+**结论：**HCCN 能验证一个已建 Channel 实际走了哪些物理资源，但不能解释 `EndpointDesc` 如何绑定到这个
+Channel/path object。它属于结果验证，不是控制面 selector 定位工具。
+
+### 8.10 `route_addr_idx` 等 TP context 字段静态分析
+
+**位置：**openEuler/UDMA TP context 与 MUE 相关结构。
+
+**结果：**已经确认存在 `route_addr_idx`、`route_type`、`switch_mp_en`、`lbi`、flow label 等字段，但尚未拿到：
+
+- route0/route2 的可信完整 TP context 对比；
+- 字段 producer/consumer；
+- 索引表格式；
+- host 可写 ABI。
+
+**结论：**这些仍是底层 path binding 的候选字段，但不能把名称当成语义，也不能把 `route2` 的数字映射成
+`route_addr_idx=2`。
+
+## 9. 下一步怎样定位 Acquire 到 ChannelHandle 之间的缺失部分
+
+当前缺口不是“`HcclChannelAcquire` 怎样把参数复制进 `ChannelHandle`”。`ChannelHandle` 是 opaque 标识，真正应
+定位的是：
+
+```text
+HcclChannelDesc 中的哪些字节
+        ↓
+被哪个内部函数读取
+        ↓
+形成什么 cache key / LinkData / path request
+        ↓
+选择或创建哪个内部 path/transport object
+        ↓
+该对象如何被注册为 ChannelHandle
+```
+
+建议按以下优先级执行。
+
+### 9.1 定位 `HcclChannelAcquire` 的真实实现与内部 factory
+
+先使用当前 CANN/HCOMM 版本的二进制，而不是只看头文件：
+
+```text
+libhcomm.so / libhccl.so 导出入口
+  -> API adapter
+  -> communicator resource manager
+  -> channel cache lookup
+  -> CcuUrmaChannel factory / ConnectChannelsOnce
+  -> handle registry insertion
+```
+
+需要输出每一跳的共享库、object-relative offset、符号名和调用关系。目标不是反编译全部函数，而是找到：
+
+- 第一次读取 `localEndpoint/remoteEndpoint` 的内部函数；
+- Channel cache key 的构造函数；
+- 创建 `LinkData` 或连接请求的函数；
+- 返回 `ChannelHandle` 前把内部 Channel 注册到 handle table 的函数。
+
+### 9.2 对 EndpointDesc 做差分数据流追踪
+
+route0/route2 的 endpoint raw 已知且不同，可以把它当作天然标记：
+
+1. 在 Acquire 入口保存 descriptor 地址和两段 endpoint raw；
+2. 对同进程 route0/route2 分别运行；
+3. 在内部调用边界检查哪些参数、内存对象或 hash key仍含这些字节；
+4. 找出 endpoint raw 首次被转换、hash、查表或替换成内部 ID 的位置；
+5. 对该位置之后的返回对象做 route0/route2 差分。
+
+若能使用调试器或动态插桩，可对 endpoint 地址设置硬件 read watchpoint；若优化后二进制无法 watch，则在
+Acquire 子调用边界做有界内存快照和 caller/argument trace。不能用全进程无界内存扫描替代关联分析。
+
+### 9.3 追 Channel cache lookup 与 handle registry
+
+需要分别回答：
+
+```text
+不同 EndpointDesc 是否命中不同 cache key？
+不同 candidate 是否复用同一个 Channel 对象？
+ChannelHandle 是对象地址、registry ID，还是编码句柄？
+HcommChannelGetStatus / WriteNb 如何由 handle 找回对象？
+```
+
+方法是同时追踪：
+
+- Acquire 返回前的 handle 值；
+- `HcommChannelGetStatus(handle)` 的第一层 handle lookup；
+- Channel release/destroy 的反向 lookup；
+- CCU task 构造时 handle 被写入哪个 device-side context。
+
+这里的目的不是解释 handle 数值，而是通过 lookup 找到它引用的真实对象，再比较对象中的 endpoint、link、TP/jetty、
+path 或私有 ID。
+
+### 9.4 追 endpoint matcher 到 HCCP/MUE request 的第一次转换
+
+一旦找到 Channel 内部对象，应继续跟踪：
+
+```text
+EndpointDesc
+  -> LinkData / endpoint key
+  -> HCCP request
+  -> remote endpoint/resource exchange
+  -> path/TP/TPG/jetty selection
+```
+
+重点不是再次记录公开 `GET_TP_LIST`，而是记录它之前的私有请求对象：
+
+- endpoint hash或内部 endpoint ID；
+- layer/link/hop/path metadata；
+- service type、die、remote rank；
+- remote ID、UASID、jetty/TPG identity；
+- path object或route resource handle；
+- 传给 HDC/CTRLQ 的私有 opcode 与 payload。
+
+如果公开 URMA 参数相同，而上面某个内部请求不同，第一处不同字段就是新的 selector 候选。
+
+### 9.5 对闭源二进制进行最小黑箱差分
+
+如果符号被裁剪，应采用同进程、单变量实验：
+
+```text
+固定 communicator、rank pair、engine、protocol、消息长度和调用顺序
+唯一改变：CommLink candidate A / B
+```
+
+对 `HcclChannelAcquire` 时间窗采集：
+
+- 动态库调用图与 object-relative return address；
+- HDC/driver ioctl/CTRLQ opcode、payload 长度和有界 raw；
+- 分配/注册对象的地址、大小和生命周期；
+- endpoint raw 在子调用参数中的出现位置；
+- ChannelHandle 注册前最后一个不同的内部 ID。
+
+只有同时满足“与 Acquire 时间窗相关、正反顺序稳定、排除 HDC trace 噪声”的差异，才可以升级为路径选择证据。
+
+### 9.6 成功判据
+
+下一阶段不是必须一次性解出所有固件表，而是至少回答下列一种：
+
+1. **已有 path object 可枚举/选择：**找到内部 `pathHandle` 或 endpoint-to-path catalog，并能按物理 footprint 区分；
+2. **路径由 endpoint key 唯一决定：**找到 path-specific endpoint 的注册/生成位置及可调用创建接口；
+3. **路径由内部 TP/TPG 字段决定：**找到该字段的 producer、写入请求和与物理出口的映射；
+4. **host 侧无法控制：**证明 selector 仅存在于 MUE/固件，并明确需要新增的最小 opcode/ABI 和字段。
+
+一旦完成其中之一，才能把当前接口从“选择 HCCL 已发布 candidate”推进为“用户指定 relay 后创建或选择对应
+path object”。
+
+## 10. 当前进度可以怎样汇报
 
 可以明确汇报：
 
@@ -415,7 +740,7 @@ WaitEvent(all)
 - 任意 `src -> relay -> dst` 的 forwarding path object 都已预创建；
 - 用户态只靠 EID 可以构造 source route。
 
-## 9. 证据来源
+## 11. 证据来源
 
 本文综合以下材料：
 
