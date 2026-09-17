@@ -48,6 +48,15 @@ struct EndpointInfo {
     HcclResult locationStatus = HCCL_E_NOT_FOUND;
 };
 
+struct PathCandidate {
+    CommLink link{};
+    uint32_t ordinal = 0;
+    uint32_t layer = 0;
+    uint32_t linkIndex = 0;
+    uint32_t dieId = UINT32_MAX;
+    std::string uid;
+};
+
 EndpointInfo QueryEndpointInfo(HcclComm comm, uint32_t ownerRank,
                                const EndpointDesc &endpoint)
 {
@@ -89,49 +98,64 @@ std::string CommAddrToString(const CommAddr &addr)
     return out.str();
 }
 
-HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, HcclChannelDesc *desc,
-                         uint32_t *dieId)
+uint64_t Fnv1a64(const std::string &value)
 {
-    if (desc == nullptr || dieId == nullptr) {
-        return HCCL_E_PTR;
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
     }
+    return hash;
+}
+
+std::string PathUid(const CommLink &link, uint32_t layer)
+{
+    std::string endpointA = CommAddrToString(link.srcEndpointDesc.commAddr);
+    std::string endpointB = CommAddrToString(link.dstEndpointDesc.commAddr);
+    if (endpointB < endpointA) {
+        std::swap(endpointA, endpointB);
+    }
+    const std::string identity = std::to_string(layer) + "|" +
+        std::to_string(static_cast<int>(link.linkAttr.linkProtocol)) + "|" +
+        std::to_string(static_cast<uint32_t>(link.linkAttr.hop)) + "|" +
+        endpointA + "|" + endpointB;
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << Fnv1a64(identity);
+    return out.str();
+}
+
+HcclResult EnumeratePaths(HcclComm comm, uint32_t rank, uint32_t peer,
+                          std::vector<PathCandidate> *candidates)
+{
+    if (candidates == nullptr) return HCCL_E_PTR;
+    candidates->clear();
     uint32_t layerNum = 0;
     uint32_t *layers = nullptr;
     HcclResult status = HcclRankGraphGetLayers(comm, &layers, &layerNum);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
-    if (layerNum == 0 || layers == nullptr) {
-        std::fprintf(stderr, "[A5 CCU URMA] rank graph contains no network layer\n");
-        return HCCL_E_NOT_FOUND;
-    }
-
-    std::vector<CommLink> candidates;
-    std::vector<uint32_t> candidateLayers;
-    std::vector<uint32_t> candidateLinkIndices;
+    if (status != HCCL_SUCCESS) return status;
     for (uint32_t layerIndex = 0; layerIndex < layerNum; ++layerIndex) {
         uint32_t listSize = 0;
         CommLink *linkList = nullptr;
-        status = HcclRankGraphGetLinks(comm, layers[layerIndex], rank, peer, &linkList, &listSize);
-        if (status != HCCL_SUCCESS) {
-            return status;
-        }
+        status = HcclRankGraphGetLinks(comm, layers[layerIndex], rank, peer,
+                                       &linkList, &listSize);
+        if (status != HCCL_SUCCESS) return status;
         for (uint32_t linkIndex = 0; linkIndex < listSize; ++linkIndex) {
             const CommLink &link = linkList[linkIndex];
-            if (link.linkAttr.linkProtocol != COMM_PROTOCOL_UBC_CTP) {
-                continue;
-            }
-            const uint32_t ordinal = static_cast<uint32_t>(candidates.size());
-            const std::string srcAddr = CommAddrToString(link.srcEndpointDesc.commAddr);
-            const std::string dstAddr = CommAddrToString(link.dstEndpointDesc.commAddr);
+            if (link.linkAttr.linkProtocol != COMM_PROTOCOL_UBC_CTP) continue;
+            PathCandidate candidate;
+            candidate.link = link;
+            candidate.ordinal = static_cast<uint32_t>(candidates->size());
+            candidate.layer = layers[layerIndex];
+            candidate.linkIndex = linkIndex;
+            candidate.uid = PathUid(link, candidate.layer);
             const EndpointInfo srcInfo = QueryEndpointInfo(comm, rank, link.srcEndpointDesc);
+            candidate.dieId = srcInfo.dieId;
             const EndpointInfo dstInfo = QueryEndpointInfo(comm, peer, link.dstEndpointDesc);
-            std::printf("[A5 CCU URMA][rank=%u peer=%u] route=%u layer=%u link=%u "
+            std::printf("PATH_CATALOG rank=%u peer=%u path_uid=%s ordinal=%u layer=%u link=%u "
                         "protocol=%d hop=%u src_phy=%u dst_phy=%u src_die=%s dst_die=%s "
-                        "src_bw=%s dst_bw=%s src_location=%s dst_location=%s "
-                        "src_addr=%s dst_addr=%s%s\n",
-                        rank, peer, ordinal, layers[layerIndex], linkIndex,
+                        "src_bw=%s dst_bw=%s src_location=%s dst_location=%s src_addr=%s dst_addr=%s\n",
+                        rank, peer, candidate.uid.c_str(), candidate.ordinal,
+                        candidate.layer, candidate.linkIndex,
                         static_cast<int>(link.linkAttr.linkProtocol),
                         static_cast<uint32_t>(link.linkAttr.hop),
                         link.srcEndpointDesc.loc.device.devPhyId,
@@ -142,14 +166,25 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
                         AttrToString(dstInfo.bwCoeff, dstInfo.bwStatus).c_str(),
                         AttrToString(srcInfo.location, srcInfo.locationStatus).c_str(),
                         AttrToString(dstInfo.location, dstInfo.locationStatus).c_str(),
-                        srcAddr.c_str(), dstAddr.c_str(),
-                        ordinal == routeIndex ? " SELECTED" : "");
-            std::fflush(stdout);
-            candidates.push_back(link);
-            candidateLayers.push_back(layers[layerIndex]);
-            candidateLinkIndices.push_back(linkIndex);
+                        CommAddrToString(link.srcEndpointDesc.commAddr).c_str(),
+                        CommAddrToString(link.dstEndpointDesc.commAddr).c_str());
+            candidates->push_back(candidate);
         }
     }
+    std::fflush(stdout);
+    return candidates->empty() ? HCCL_E_NOT_FOUND : HCCL_SUCCESS;
+}
+
+HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
+                         uint32_t routeIndex, HcclChannelDesc *desc,
+                         uint32_t *dieId, std::string *pathUid)
+{
+    if (desc == nullptr || dieId == nullptr) {
+        return HCCL_E_PTR;
+    }
+    std::vector<PathCandidate> candidates;
+    HcclResult status = EnumeratePaths(comm, rank, peer, &candidates);
+    if (status != HCCL_SUCCESS) return status;
 
     if (routeIndex >= candidates.size()) {
         std::fprintf(stderr,
@@ -158,8 +193,8 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
         return candidates.empty() ? HCCL_E_NOT_FOUND : HCCL_E_PARA;
     }
 
-    const uint32_t selectedLayer = candidateLayers[routeIndex];
-    const CommLink &selectedLink = candidates[routeIndex];
+    const PathCandidate &selected = candidates[routeIndex];
+    const CommLink &selectedLink = selected.link;
     const EndpointInfo selectedInfo = QueryEndpointInfo(comm, rank, selectedLink.srcEndpointDesc);
     status = selectedInfo.dieStatus;
     if (status != HCCL_SUCCESS) {
@@ -169,6 +204,7 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
         return status;
     }
     *dieId = selectedInfo.dieId;
+    if (pathUid != nullptr) *pathUid = selected.uid;
     if (*dieId > 1) {
         std::fprintf(stderr,
             "[A5 CCU URMA][rank=%u peer=%u] unsupported endpoint die id %u\n",
@@ -188,9 +224,69 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
 
     std::printf("[A5 CCU URMA][rank=%u peer=%u] prepared route=%u layer=%u link=%u "
                 "die_id=%u; threads will be acquired before this per-die channel\n",
-                rank, peer, routeIndex, selectedLayer, candidateLinkIndices[routeIndex], *dieId);
+                rank, peer, routeIndex, selected.layer, selected.linkIndex, *dieId);
     std::fflush(stdout);
     return HCCL_SUCCESS;
+}
+
+HcclResult ResolvePathUids(HcclComm comm, uint32_t rank, uint32_t peer,
+                           const std::vector<std::string> &uids,
+                           std::vector<uint32_t> *indices)
+{
+    if (indices == nullptr) return HCCL_E_PTR;
+    std::vector<PathCandidate> candidates;
+    HcclResult status = EnumeratePaths(comm, rank, peer, &candidates);
+    if (status != HCCL_SUCCESS) return status;
+    indices->clear();
+    for (const auto &uid : uids) {
+        auto found = std::find_if(candidates.begin(), candidates.end(),
+            [&uid](const PathCandidate &candidate) { return candidate.uid == uid; });
+        if (found == candidates.end()) {
+            std::fprintf(stderr, "[A5 CCU URMA] path_uid=%s is not in this session catalog\n",
+                         uid.c_str());
+            return HCCL_E_NOT_FOUND;
+        }
+        indices->push_back(found->ordinal);
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult ParseStringList(const char *name, std::vector<std::string> *values)
+{
+    if (values == nullptr) return HCCL_E_PTR;
+    values->clear();
+    const char *raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') return HCCL_E_NOT_FOUND;
+    std::stringstream input(raw);
+    std::string item;
+    while (std::getline(input, item, ',')) {
+        if (item.empty() || std::find(values->begin(), values->end(), item) != values->end()) {
+            return HCCL_E_PARA;
+        }
+        values->push_back(item);
+    }
+    return values->empty() ? HCCL_E_PARA : HCCL_SUCCESS;
+}
+
+HcclResult ParseWeights(size_t count, std::vector<uint32_t> *weights)
+{
+    if (weights == nullptr) return HCCL_E_PTR;
+    weights->assign(count, 1U);
+    const char *raw = std::getenv("A5_CCU_PATH_WEIGHTS");
+    if (raw == nullptr || raw[0] == '\0') return HCCL_SUCCESS;
+    std::stringstream input(raw);
+    std::string item;
+    size_t index = 0;
+    while (std::getline(input, item, ',')) {
+        if (index >= count) return HCCL_E_PARA;
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(item.c_str(), &end, 10);
+        if (end == item.c_str() || *end != '\0' || value == 0 || value > UINT32_MAX) {
+            return HCCL_E_PARA;
+        }
+        (*weights)[index++] = static_cast<uint32_t>(value);
+    }
+    return index == count ? HCCL_SUCCESS : HCCL_E_PARA;
 }
 
 } // namespace
@@ -268,11 +364,19 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     if (status != HCCL_SUCCESS) {
         return status;
     }
+    std::vector<std::string> requestedPathUids;
+    const HcclResult uidStatus = ParseStringList("A5_CCU_PATH_UIDS", &requestedPathUids);
+    if (uidStatus != HCCL_SUCCESS && uidStatus != HCCL_E_NOT_FOUND) return uidStatus;
     const char *routeKeyValue = std::getenv("A5_CCU_ROUTE_INDICES");
+    const char *pathKeyValue = std::getenv("A5_CCU_PATH_UIDS");
+    const char *weightKeyValue = std::getenv("A5_CCU_PATH_WEIGHTS");
     const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
     std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
-        (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue));
+        (pathKeyValue != nullptr && pathKeyValue[0] != '\0' ?
+            std::string("paths:") + pathKeyValue :
+            (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue)));
+    routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
@@ -292,6 +396,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     if (rankSize != 2) {
         std::fprintf(stderr, "[A5 CCU URMA] route probe requires rankSize=2; got %u\n", rankSize);
         return HCCL_E_PARA;
+    }
+    if (!requestedPathUids.empty()) {
+        status = ResolvePathUids(comm, rank, 1U - rank, requestedPathUids, &routeIndices);
+        if (status != HCCL_SUCCESS) return status;
     }
 
     RouteResources created;
@@ -326,8 +434,9 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         created.weights.reserve(routeIndices.size());
         for (size_t i = 0; i < routeIndices.size(); ++i) {
             uint32_t dieId = 0;
+            std::string pathUid;
             status = SelectRoute(comm, rank, 1U - rank, routeIndices[i],
-                                 &selectedDescs[i], &dieId);
+                                 &selectedDescs[i], &dieId, &pathUid);
             if (status != HCCL_SUCCESS) {
                 return status;
             }
@@ -338,7 +447,12 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
                              "split them into one CCU kernel per die\n", created.dieId, dieId);
                 return HCCL_E_NOT_SUPPORT;
             }
-            created.weights.push_back(routeIndices[i] == 0 ? 2U : 1U);
+            created.pathUids.push_back(pathUid);
+        }
+        status = ParseWeights(routeIndices.size(), &created.weights);
+        if (status != HCCL_SUCCESS) {
+            std::fprintf(stderr, "[A5 CCU URMA] A5_CCU_PATH_WEIGHTS must contain one positive integer per selected path\n");
+            return status;
         }
     }
 
@@ -400,8 +514,9 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         return HCCL_E_RUNTIME;
     }
     for (size_t i = 0; i < channelStates.size(); ++i) {
-        std::printf("[A5 CCU URMA][rank=%u] channel[%zu] route=%u state=%d\n",
-                    rank, i, created.routeIndices[i], channelStates[i]);
+        const char *uid = i < created.pathUids.size() ? created.pathUids[i].c_str() : "provider";
+        std::printf("PATH_CHANNEL rank=%u channel_index=%zu path_uid=%s ordinal=%u weight=%u state=%d\n",
+                    rank, i, uid, created.routeIndices[i], created.weights[i], channelStates[i]);
     }
     std::fflush(stdout);
 

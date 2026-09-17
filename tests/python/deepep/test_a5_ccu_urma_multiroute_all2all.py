@@ -137,6 +137,10 @@ def parse_args():
                         help="bytes in each destination slice")
     parser.add_argument("--route-index", type=int, default=0)
     parser.add_argument("--route-indices", default="")
+    parser.add_argument("--path-uids", default="",
+                        help="comma-separated PATH_CATALOG path_uid values; preferred over route ordinals")
+    parser.add_argument("--path-weights", default="",
+                        help="comma-separated positive weights, one per selected path")
     parser.add_argument("--schedule", choices=("concurrent", "serial"),
                         default="concurrent")
     parser.add_argument("--warmup", type=int, default=10)
@@ -156,13 +160,23 @@ def parse_args():
 
 
 def select_routes(args):
-    if args.route_indices:
+    if args.path_uids:
+        os.environ["A5_CCU_PATH_UIDS"] = args.path_uids
+        os.environ.pop("A5_CCU_ROUTE_INDICES", None)
+        os.environ.pop("A5_CCU_ROUTE_INDEX", None)
+    elif args.route_indices:
+        os.environ.pop("A5_CCU_PATH_UIDS", None)
         os.environ["A5_CCU_ROUTE_INDICES"] = args.route_indices
         os.environ.pop("A5_CCU_ROUTE_INDEX", None)
     else:
+        os.environ.pop("A5_CCU_PATH_UIDS", None)
         os.environ.pop("A5_CCU_ROUTE_INDICES", None)
         os.environ["A5_CCU_ROUTE_INDEX"] = str(args.route_index)
     os.environ["A5_CCU_ROUTE_SCHEDULE"] = args.schedule
+    if args.path_weights:
+        os.environ["A5_CCU_PATH_WEIGHTS"] = args.path_weights
+    else:
+        os.environ.pop("A5_CCU_PATH_WEIGHTS", None)
 
 
 def main():
@@ -208,7 +222,7 @@ def main():
         f"{os.environ.get('MASTER_PORT', '0')}")
     case_tag = sanitize(
         "native" if args.implementation == "native" else
-        f"multiroute_{args.route_indices or args.route_index}_{args.schedule}")
+        f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}")
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
     for _ in range(args.warmup):
@@ -246,8 +260,9 @@ def main():
     if rank == 0:
         result = {
             "implementation": args.implementation,
-            "routes": (args.route_indices or str(args.route_index)
+            "paths": (args.path_uids or args.route_indices or str(args.route_index)
                        if args.implementation == "multiroute" else "native"),
+            "weights": args.path_weights or "1",
             "schedule": args.schedule if args.implementation == "multiroute" else "native",
             "bytes_per_peer": args.bytes,
             "warmup": args.warmup,
@@ -255,7 +270,7 @@ def main():
             "host_batch_avg_us": result_us,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
-        print(f"PASS: implementation={result['implementation']} routes={result['routes']} "
+        print(f"PASS: implementation={result['implementation']} paths={result['paths']} "
               f"schedule={result['schedule']} bytes_per_peer={args.bytes} "
               f"host_batch_avg_us={result_us:.3f}", flush=True)
         if args.implementation == "multiroute":

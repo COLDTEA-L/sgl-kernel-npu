@@ -7,6 +7,7 @@
 #include <hccl/hccl_types.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace a5_ccu_urma_probe {
@@ -23,6 +24,7 @@ struct RouteResources {
     aclrtStream slaveStream = nullptr;
     std::vector<ChannelHandle> channels;
     std::vector<uint32_t> routeIndices;
+    std::vector<std::string> pathUids;
     std::vector<uint32_t> weights;
     uint64_t kernel = 0;
     uint32_t rank = 0;
