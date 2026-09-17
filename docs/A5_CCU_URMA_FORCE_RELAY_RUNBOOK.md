@@ -114,28 +114,9 @@ ldd examples/a5_ccu_urma_route_probe/testcase/a5_ccu_urma_route_probe_test
 kernel_patches/openeuler-6.6/0001-a5-ubus-route-override.patch
 ```
 
-先只检查，不改源码：
-
-```bash
-bash scripts/apply_a5_ubus_route_override_patch.sh \
-  --kernel-root /home/l00934901/openeuler-kernel
-```
-
-检查通过后再应用：
-
-```bash
-bash scripts/apply_a5_ubus_route_override_patch.sh \
-  --kernel-root /home/l00934901/openeuler-kernel \
-  --apply
-```
-
-必须使用与运行内核匹配的配置和构建环境。先核对：
-
-```bash
-uname -r
-modinfo ubus | grep -E 'filename|srcversion|vermagic'
-git -C /home/l00934901/openeuler-kernel status --short
-```
+有卡机当前没有 `openeuler-kernel` Git 仓库，因此不能使用一个不存在的
+`/home/l00934901/openeuler-kernel`。下面改为从当前内核 RPM 确认精确 source RPM，展开
+源码后再应用补丁。必须使用与运行内核完全匹配的配置和构建环境。
 
 当前有卡容器的已知状态是：
 
@@ -157,6 +138,21 @@ CONFIG_MODULE_SIG:    y
 `CONFIG_MODVERSIONS=y` 下，即使源码能编译，也很可能因符号 CRC 不匹配而拒绝加载。
 必须另行取得与 `159.4.13.167` 完全匹配的源码、`.config`、完整
 `Module.symvers` 和模块签名/安装条件，再构建并通过宿主机测试内核部署。
+
+退出容器后，宿主机已经进一步确认：
+
+```text
+原模块:      /lib/modules/6.6.0-159.4.13.167.oe2403sp4.aarch64/kernel/drivers/ub/ubus/ubus.ko.xz
+vermagic:    6.6.0-159.4.13.167.oe2403sp4.aarch64 SMP mod_unload modversions aarch64
+srcversion:  88582D41E5ACAA219E4582D
+signer:      openEuler kernel ICA 1
+source RPM:  kernel-6.6.0-159.4.13.167.oe2403sp4.src.rpm
+kernel-devel: 已安装且与运行内核完全匹配
+build link:  /lib/modules/$(uname -r)/build -> /usr/src/kernels/$(uname -r)
+```
+
+因此不需要在有卡机预先 clone `openeuler-kernel` Git 仓库。推荐直接取得上面精确版本的
+source RPM，用其中的 UBUS 源码配合已经安装的 matching `kernel-devel` 编译模块。
 
 ### 4.1 必须在宿主机确认模块来源
 
@@ -218,10 +214,12 @@ dnf repoquery --available --qf '%{name}-%{evr}.%{arch}' kernel-devel 2>/dev/null
   | grep '159\.4\.13\.167' || true
 ```
 
-只有查询到完全一致的包时，才可以安装：
+这台宿主机已经安装完全匹配的 `kernel-devel`，无需重复安装。可再次确认：
 
 ```bash
-dnf install "kernel-devel-$(uname -r)"
+test -d "/usr/src/kernels/$(uname -r)"
+test -f "/usr/src/kernels/$(uname -r)/Module.symvers"
+readlink -f "/lib/modules/$(uname -r)/build"
 ```
 
 `kernel-devel` 通常能提供 prepared build tree 和 `Module.symvers`，但未必包含需要修改的
@@ -230,15 +228,45 @@ dnf install "kernel-devel-$(uname -r)"
 必须向系统镜像/内核提供方索取 source RPM 与 matching `kernel-devel`；不能用
 `159.4.9.163` 替代。
 
+在宿主机下载并展开精确 source RPM 的参考命令如下。如果软件源未保留该版本，向当前
+内核 RPM/系统镜像的提供方索取同名 source RPM：
+
+```bash
+A5_KERNEL_NEVR=6.6.0-159.4.13.167.oe2403sp4
+A5_RPM_ROOT=/root/a5-kernel-rpmbuild
+A5_SRC_RPM_DIR=/root/a5-kernel-source-rpm
+
+dnf install -y dnf-plugins-core rpm-build patch
+mkdir -p "${A5_RPM_ROOT}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+mkdir -p "${A5_SRC_RPM_DIR}"
+
+dnf download --source --destdir "${A5_SRC_RPM_DIR}" \
+  "kernel-${A5_KERNEL_NEVR}"
+
+A5_SRC_RPM=$(find "${A5_SRC_RPM_DIR}" -maxdepth 1 -type f \
+  -name "kernel-${A5_KERNEL_NEVR}.src.rpm" -print -quit)
+test -n "${A5_SRC_RPM}"
+
+rpm -ivh --nodeps --define "_topdir ${A5_RPM_ROOT}" "${A5_SRC_RPM}"
+rpmbuild -bp --nodeps --define "_topdir ${A5_RPM_ROOT}" \
+  "${A5_RPM_ROOT}/SPECS/kernel.spec"
+
+find "${A5_RPM_ROOT}/BUILD" -path '*/drivers/ub/ubus/route.c' -print
+```
+
+最后一条命令输出所在源码树就是下一节的 `A5_KERNEL_SRC`。不同 source RPM 的 spec
+可能需要额外构建依赖或使用不同源码目录名，以实际 `rpmbuild -bp` 输出为准。
+
 ### 4.3 在独立构建目录生成 patched `ubus.ko`
 
-构建可以放在无卡服务器或独立 aarch64 构建容器，不要求放在有卡机上。下面的
-`A5_KERNEL_SRC` 必须指向精确匹配的完整源码树：
+当前宿主机已有精确匹配的 prepared build tree，因此最直接的方式是在宿主机使用
+source RPM 展开的源码编译。下面的 `A5_KERNEL_SRC` 必须替换为上一节 `find` 找到的、
+包含 `drivers/ub/ubus/route.c` 的源码根目录：
 
 ```bash
 A5_KERNEL_SRC=/path/to/exact-6.6.0-159.4.13.167-source
-A5_KERNEL_BUILD=/path/to/exact-6.6.0-159.4.13.167-build
-SGL_KERNEL_NPU=/home/liuyuanwen/sgl-kernel-npu-explicit-relay
+A5_KERNEL_BUILD=/lib/modules/$(uname -r)/build
+SGL_KERNEL_NPU=/path/to/sgl-kernel-npu
 
 # Git 工作树使用仓库辅助脚本：
 bash "${SGL_KERNEL_NPU}/scripts/apply_a5_ubus_route_override_patch.sh" \
@@ -246,10 +274,13 @@ bash "${SGL_KERNEL_NPU}/scripts/apply_a5_ubus_route_override_patch.sh" \
 bash "${SGL_KERNEL_NPU}/scripts/apply_a5_ubus_route_override_patch.sh" \
   --kernel-root "${A5_KERNEL_SRC}" --apply
 
-make -C "${A5_KERNEL_SRC}" O="${A5_KERNEL_BUILD}" \
-  M=drivers/ub/ubus -j"$(nproc)" modules
+make -C "${A5_KERNEL_BUILD}" \
+  M="${A5_KERNEL_SRC}/drivers/ub/ubus" \
+  -j"$(nproc)" modules
 
-modinfo "${A5_KERNEL_BUILD}/drivers/ub/ubus/ubus.ko" | \
+A5_NEW_UBUS="${A5_KERNEL_SRC}/drivers/ub/ubus/ubus.ko"
+test -f "${A5_NEW_UBUS}"
+modinfo "${A5_NEW_UBUS}" | \
   grep -E 'filename|vermagic|srcversion|signer'
 ```
 
@@ -268,6 +299,11 @@ patch -p1 < \
 `6.6.0-159.4.13.167.oe2403sp4.aarch64` 开头，且构建不能存在 modpost
 `undefined symbol`/CRC 错误。只有 `modules_prepare` 而没有原始完整
 `Module.symvers` 不够。
+
+如果外部模块构建报缺少 openEuler 私有头文件，不要从其他内核版本拷贝头文件。改用
+source RPM 准备出的完整源码和匹配 output tree 做 in-tree 构建，或者按该 source RPM 的
+spec 完整执行内核模块构建；核心要求仍然是使用当前 `159.4.13.167` 的配置和
+`Module.symvers`。
 
 ### 4.4 在宿主机以可回滚方式部署
 
@@ -290,6 +326,7 @@ A5_BACKUP_DIR="/root/a5-ubus-backup-${A5_KERNEL_RELEASE}"
 
 test -f "${A5_NEW_UBUS}"
 test "$(modinfo -F vermagic "${A5_NEW_UBUS}" | awk '{print $1}')" = "${A5_KERNEL_RELEASE}"
+test "$(modinfo -F depends "${A5_NEW_UBUS}")" = "$(modinfo -F depends ubus)"
 
 mkdir -p "${A5_BACKUP_DIR}"
 cp -a "$(modinfo -n ubus)" "${A5_BACKUP_DIR}/"
@@ -316,6 +353,11 @@ lsinitrd "/boot/initramfs-${A5_KERNEL_RELEASE}.img" | grep '/ubus\.ko'
 若内核强制模块签名，必须先用该机器信任的证书签名；`CONFIG_MODULE_SIG=y` 本身不等于
 强制签名，最终以 `sig_enforce`、Secure Boot/lockdown 和实际加载策略为准。签名不满足时
 不要重启进入实验环境。
+
+原模块签名者是 `openEuler kernel ICA 1`，但本地重编模块无法获得发行版私钥。部署前必须
+执行第 4.1 节的 `sig_enforce` 检查：若强制验签开启，应为测试模块使用已被内核信任的
+本地证书并完成签名/证书注册，或者改为构建和启动一个具有明确回退项的完整测试内核；
+不能仅复制未签名的 `ubus.ko` 后直接重启。
 
 重启后在宿主机验证：
 
