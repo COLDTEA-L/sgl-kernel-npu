@@ -182,6 +182,55 @@ GET_TP_LIST
 
 本步骤不需要再次执行第 4 步的 100 次 HCCN 打流；`channel-only` 建链成功即可。只有某些 TP 资源在首次数据搬运后才出现时，才将 probe 改成 `--warmup 1 --iters 3` 的少量打流诊断。
 
+### 5.4 同一通信域内按 path 标记并顺序建链
+
+前面的 candidate 0/2 若分别由两次进程启动完成，TP handle/TPN 的差异可能只是 communicator 重建或资源分配顺序造成。使用下面的受控实验，在每个 rank 的**同一个进程、同一个 communicator** 中依次单独 acquire 两个 CommLink，并用 `trace_label` 标记 acquire 窗口；脚本还会自动交换顺序并重复三次：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+# 本功能修改了 route-probe 的 host C++，需重新构建并安装一次。
+bash scripts/build_a5_ccu_urma_route_probe.sh --install
+
+bash scripts/run_a5_ccu_same_process_tp_binding.sh \
+  --devices 6,7 \
+  --routes 0,2 \
+  --repeats 3 \
+  --urma-include /usr/include/ub/umdk/urma \
+  --output-root /home/l00934901/profiling
+```
+
+每个顺序用例实际执行：
+
+```text
+初始化一次 HCCL communicator
+  -> trace_label(path_uid=A, ordinal=A, acquire_order=0)
+  -> HcclChannelAcquire(A, channelNum=1)
+  -> 保留 channel A，不销毁 communicator
+  -> trace_label(path_uid=B, ordinal=B, acquire_order=1)
+  -> HcclChannelAcquire(B, channelNum=1)
+  -> 同时保留 channel A/B 至进程退出
+```
+
+输出目录形如：
+
+```text
+/home/l00934901/profiling/a5_ccu_same_process_tp_6_7_YYYYMMDD_HHMMSS/
+  order_0_2_r1/
+  order_2_0_r1/
+  ...
+  tp_binding_by_path.tsv
+```
+
+重点查看 `tp_binding_by_path.tsv` 的：
+
+- `path_uid/ordinal`：当前 acquire 的 CommLink；
+- `acquire_order`：本次是第一个还是第二个 acquire；
+- `active_tp_handles/target_tpns/target_ids`：该标记窗口内 import/bind 最终激活的资源；
+- `remote_eid`：激活对应的对端 endpoint。
+
+判断规则：若同一个 `path_uid` 在 `0,2` 与 `2,0` 两种顺序、多个 repeat 中仍稳定对应同一类 TP/TPN，而不是稳定对应“第一个/第二个 acquire”，才支持 `CommLink -> active TP` 的稳定绑定结论。若 TP/TPN 随 acquire 顺序变化，则先按资源分配噪声处理。该实验仍不能单独给出 `TPN -> physical port/relay`，后续还必须把各 channel 的单独打流与 HCCN footprint 对齐。
+
 ## 6. 运行显式 path UID AllToAll
 
 从 `path_catalog_4_5.tsv` 选择两个 UID：

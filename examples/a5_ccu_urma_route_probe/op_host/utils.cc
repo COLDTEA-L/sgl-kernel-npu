@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -38,6 +39,14 @@ bool EnvEnabled(const char *name)
 {
     const char *value = std::getenv(name);
     return value != nullptr && std::string(value) == "1";
+}
+
+void SetUrmaTraceLabel(const std::string &label)
+{
+    using SetLabelFn = void (*)(const char *);
+    static SetLabelFn setLabel = reinterpret_cast<SetLabelFn>(
+        dlsym(RTLD_DEFAULT, "A5UrmaTpTraceSetLabel"));
+    if (setLabel != nullptr) setLabel(label.c_str());
 }
 
 struct EndpointInfo {
@@ -530,10 +539,32 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
                 "after all required CCU threads are ready\n",
                 rank, 1U - rank, routeIndices.front(), created.dieId);
     std::fflush(stdout);
-    const auto acquireBegin = std::chrono::steady_clock::now();
     created.channels.resize(selectedDescs.size());
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, selectedDescs.data(),
-                                static_cast<uint32_t>(selectedDescs.size()), created.channels.data());
+    const auto acquireBegin = std::chrono::steady_clock::now();
+    if (EnvEnabled("A5_CCU_SEQUENTIAL_ACQUIRE_TRACE")) {
+        for (size_t i = 0; i < selectedDescs.size(); ++i) {
+            const std::string uid = i < created.pathUids.size() ? created.pathUids[i] : "provider";
+            std::ostringstream label;
+            label << "path_uid=" << uid << ";ordinal=" << routeIndices[i]
+                  << ";acquire_order=" << i;
+            SetUrmaTraceLabel(label.str());
+            std::printf("CHANNEL_ACQUIRE_SCOPE phase=begin rank=%u path_uid=%s ordinal=%u acquire_order=%zu\n",
+                        rank, uid.c_str(), routeIndices[i], i);
+            std::fflush(stdout);
+            status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, &selectedDescs[i], 1U,
+                                        &created.channels[i]);
+            std::printf("CHANNEL_ACQUIRE_SCOPE phase=end rank=%u path_uid=%s ordinal=%u "
+                        "acquire_order=%zu status=%d channel_handle=%lu\n",
+                        rank, uid.c_str(), routeIndices[i], i, static_cast<int>(status),
+                        static_cast<unsigned long>(status == HCCL_SUCCESS ? created.channels[i] : 0));
+            std::fflush(stdout);
+            SetUrmaTraceLabel("");
+            if (status != HCCL_SUCCESS) break;
+        }
+    } else {
+        status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, selectedDescs.data(),
+                                    static_cast<uint32_t>(selectedDescs.size()), created.channels.data());
+    }
     const auto acquireEnd = std::chrono::steady_clock::now();
     const double acquireUs = std::chrono::duration<double, std::micro>(
         acquireEnd - acquireBegin).count();

@@ -14,6 +14,8 @@
 
 namespace {
 std::mutex g_traceMutex;
+std::mutex g_labelMutex;
+std::string g_traceLabel;
 thread_local bool g_insideTrace = false;
 thread_local uint32_t g_publicGetTpListDepth = 0;
 
@@ -45,6 +47,20 @@ void Emit(const std::string &line)
         std::fprintf(file, "%s\n", line.c_str());
         std::fclose(file);
     }
+}
+
+std::string CurrentTraceLabel()
+{
+    std::lock_guard<std::mutex> guard(g_labelMutex);
+    return g_traceLabel;
+}
+
+std::string JsonEscape(const char *value);
+
+void AppendTraceLabel(std::ostringstream &out)
+{
+    const std::string label = CurrentTraceLabel();
+    if (!label.empty()) out << ",\"trace_label\":\"" << JsonEscape(label.c_str()) << "\"";
 }
 
 std::string Handles(const urma_tp_info_t *list, uint32_t count)
@@ -109,7 +125,9 @@ void EmitTpList(const char *api, const urma_get_tp_cfg_t *cfg, uint32_t requeste
         << ",\"local_eid_raw\":\"" << Hex(cfg->local_eid)
         << "\",\"peer_eid_raw\":\"" << Hex(cfg->peer_eid)
         << "\",\"tp_handles\":" << Handles(list, returned)
-        << ",\"caller_frames\":" << CallerFrames() << '}';
+        << ",\"caller_frames\":" << CallerFrames();
+    AppendTraceLabel(out);
+    out << '}';
     Emit(out.str());
 }
 
@@ -141,6 +159,7 @@ void EmitTpAttr(const char *api, uint64_t handle, int status, uint8_t count,
         }
         out << '"';
     }
+    AppendTraceLabel(out);
     out << '}';
     Emit(out.str());
 }
@@ -173,6 +192,7 @@ void EmitSetTpAttr(const char *api, uint64_t handle, int status, uint8_t count,
         << ",\"tp_handle\":" << handle << ",\"attr_count\":"
         << static_cast<uint32_t>(count) << ",\"attr_bitmap\":" << bitmap;
     if (attrs != nullptr) out << ",\"attr_raw\":\"" << Hex(*attrs) << '"';
+    AppendTraceLabel(out);
     out << '}';
     Emit(out.str());
 }
@@ -202,6 +222,7 @@ void EmitModifyTp(const char *api, uint32_t tpn, int status, const urma_tp_cfg_t
             << ",\"port_id\":" << static_cast<uint32_t>(attr->port_id)
             << ",\"attr_raw\":\"" << Hex(*attr) << '"';
     }
+    AppendTraceLabel(out);
     out << '}';
     Emit(out.str());
 }
@@ -220,6 +241,7 @@ void EmitExchange(const urma_get_tp_cfg_t *cfg, uint64_t localHandle, uint32_t t
             << ",\"local_eid_raw\":\"" << Hex(cfg->local_eid)
             << "\",\"peer_eid_raw\":\"" << Hex(cfg->peer_eid) << '"';
     }
+    AppendTraceLabel(out);
     out << '}';
     Emit(out.str());
 }
@@ -250,7 +272,9 @@ void EmitTpActivation(const char *op, const void *ctx, const urma_eid_t *remoteE
             << ",\"target_uasid\":" << target->id.uasid
             << ",\"target_eid_raw\":\"" << Hex(target->id.eid) << "\"";
     }
-    out << ",\"caller_frames\":" << CallerFrames() << '}';
+    out << ",\"caller_frames\":" << CallerFrames();
+    AppendTraceLabel(out);
+    out << '}';
     Emit(out.str());
 }
 
@@ -279,10 +303,24 @@ void EmitJettyBind(const char *op, const urma_jetty_t *jetty,
             << ",\"active_tx_psn\":" << cfg->tp_attr.tx_psn
             << ",\"active_rx_psn\":" << cfg->tp_attr.rx_psn;
     }
-    out << ",\"caller_frames\":" << CallerFrames() << '}';
+    out << ",\"caller_frames\":" << CallerFrames();
+    AppendTraceLabel(out);
+    out << '}';
     Emit(out.str());
 }
 } // namespace
+
+extern "C" void A5UrmaTpTraceSetLabel(const char *label)
+{
+    {
+        std::lock_guard<std::mutex> guard(g_labelMutex);
+        g_traceLabel = label == nullptr ? "" : label;
+    }
+    std::ostringstream out;
+    out << "{\"event\":\"TRACE_SCOPE\",\"pid\":" << getpid()
+        << ",\"trace_label\":\"" << JsonEscape(label == nullptr ? "" : label) << "\"}";
+    Emit(out.str());
+}
 
 extern "C" urma_status_t urma_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
     uint32_t *tp_cnt, urma_tp_info_t *tp_list)

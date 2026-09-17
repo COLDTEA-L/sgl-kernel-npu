@@ -76,6 +76,27 @@ candidate 0/2
 
 HCOMM 若绕过这些公开动态符号，trace 文件会为空；此时必须把追踪点下移至 HIXL/HCCP/MUE，不能认为 Channel 没有使用 URMA TP。
 
+## 同进程 path→TP 绑定实验调用链
+
+`run_a5_ccu_same_process_tp_binding.sh` 用于消除两次独立启动造成的 communicator/TP 池差异：
+
+```text
+run_a5_ccu_same_process_tp_binding.sh
+  -> 正序 route-indices=0,2
+  -> 逆序 route-indices=2,0
+  -> run_a5_ccu_urma_route_probe.sh --channel-only
+  -> route-probe testcase main
+  -> AcquireRouteResources()
+  -> 对每个 HcclChannelDesc：
+       A5UrmaTpTraceSetLabel(path_uid/ordinal/acquire_order)
+       HcclChannelAcquire(desc, 1, &channel)
+       LD_PRELOAD tracer 记录 GET_TP_LIST/TP_ACTIVATION，并附 trace_label
+  -> analyze_a5_ccu_same_process_tp_binding.py
+  -> tp_binding_by_path.tsv
+```
+
+两个 Channel 在第二次 acquire 完成前均保持存活，且 communicator 不重建。正反顺序用于区分“由 CommLink 决定的 TP 绑定”和“由首次/第二次资源分配决定的 handle”。这里的标签只用于观测，不修改 ChannelDesc、TP 或驱动返回值。
+
 `A5_CCU_CHANNEL_HOLD_SECONDS` 让 channel-only probe 在 Channel 存活期间暂停，脚本会同期执行 `urma_admin list_res` 尝试读取 TP/TPG。驱动明确不支持时，原始错误会被保存为“不可见证据”，不会伪造 TPN、TPG 或 path ID。
 
 ## path_uid 的含义
