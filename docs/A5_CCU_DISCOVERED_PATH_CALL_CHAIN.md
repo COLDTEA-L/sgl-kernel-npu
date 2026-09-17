@@ -52,9 +52,14 @@ urma_get_tp_attr / urma_cmd_get_tp_attr
 urma_set_tp_attr / urma_cmd_set_tp_attr
 urma_modify_tp / urma_cmd_modify_tp
 urma_cmd_exchange_tp_info
+urma_import_jfr / urma_import_jfr_ex
+urma_import_jetty / urma_import_jetty_ex
+urma_bind_jetty / urma_bind_jetty_ex
 ```
 
 它记录请求、返回 TP handle 和公开 attr，不修改建链参数或返回值。为确定不同返回 handle 的最终网络属性，GET_TP_LIST 成功后还会立即对每个 handle 执行一次只读 `urma_get_tp_attr()`，并记录 status、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL 和 TTL。若 provider 返回 not support，只表示该只读查询能力未开放。GET_TP_LIST 事件同时保存共享库级调用栈，供后续把公开 liburma 边界定位回实际 HCOMM/HCCP/MUE 调用模块；地址以 object-relative offset 表示，不能跨版本直接比较绝对地址。
+
+UMDK 的兼容实现会先从 TP pool 取 handle，再把它装入 `urma_active_tp_cfg_t` 交给 `import_*_ex/bind_*_ex`。所以 `TP_ACTIVATION` 事件中的 `active_tp_handle`、`active_peer_tp_handle` 和返回 target 的 `tp.tpn`，比单独的 GET_TP_LIST 更接近最终 Channel→TP 绑定。如果 HCCP 直接调用 provider ops 或私有 `ascend_urma_*`，公开 import/bind hook 可能为空；这本身可用于判定下一层边界。
 
 当前已经确认的边界是：
 
@@ -64,10 +69,10 @@ candidate 0/2
   -> 不同 HcclChannelDesc 参数
   -> 相同 HcclChannelAcquire API 行为
   -> 公开 GET_TP_LIST 的 flag/trans_mode/EID pair 可相同
-  -> 返回 TP handle 集合存在差异
+  -> 重复实验中返回 TP handle 集合与公开属性可以完全相同
 ```
 
-因此不能表述为“Acquire 的行为和传参都相同”。准确说法是：调用方式相同、ChannelDesc 输入不同；到公开 GET_TP_LIST 边界时可见配置相同，但隐藏的 Channel/path 上下文使其返回不同 TP 资源。
+因此不能表述为“Acquire 的行为和传参都相同”。准确说法是：调用方式相同、ChannelDesc 输入不同；公开 TP pool 可以相同，路径身份可能由内部 Channel/path object 持有。
 
 HCOMM 若绕过这些公开动态符号，trace 文件会为空；此时必须把追踪点下移至 HIXL/HCCP/MUE，不能认为 Channel 没有使用 URMA TP。
 

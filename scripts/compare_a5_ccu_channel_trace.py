@@ -13,6 +13,7 @@ EVENTS = (
     "SET_TP_ATTR",
     "MODIFY_TP",
     "EXCHANGE_TP_INFO",
+    "TP_ACTIVATION",
 )
 
 
@@ -55,6 +56,9 @@ def event_counts(events):
 def event_signature(event):
     """Remove process-local diagnostics while retaining path-relevant fields."""
     ignored = {"pid", "context", "caller_frames"}
+    if event.get("event") == "TP_ACTIVATION":
+        ignored.update({"target_handle", "local_jetty_handle", "active_tag",
+                        "active_tx_psn", "active_rx_psn"})
     normalized = {key: value for key, value in event.items() if key not in ignored}
     if event.get("event") == "GET_TP_LIST":
         normalized["tp_handles"] = sorted(event.get("tp_handles", []))
@@ -108,8 +112,8 @@ def main():
         raise RuntimeError("at least two candidate trace directories are required")
 
     lines = ["# CCU Channel 建链追踪比较", "", "## 可观测结果", "",
-             "| candidate | path_uid | ordinal | endpoint pair | channel handle | GET_LIST | GET_ATTR | SET_ATTR | MODIFY | EXCHANGE |",
-             "|---|---|---:|---|---|---:|---:|---:|---:|---:|"]
+             "| candidate | path_uid | ordinal | endpoint pair | channel handle | GET_LIST | GET_ATTR | SET_ATTR | MODIFY | EXCHANGE | ACTIVATE |",
+             "|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|"]
     for case in cases:
         link = unique_rank0(case["commlink"])
         handle = unique_rank0(case["channel_handle"])
@@ -120,7 +124,7 @@ def main():
                      f"{handle.get('channel_handle', 'N/A')} | "
                      f"{counts['GET_TP_LIST']} | {counts['GET_TP_ATTR']} | "
                      f"{counts['SET_TP_ATTR']} | {counts['MODIFY_TP']} | "
-                     f"{counts['EXCHANGE_TP_INFO']} |")
+                     f"{counts['EXCHANGE_TP_INFO']} | {counts['TP_ACTIVATION']} |")
 
     lines += ["", "## GET_TP_LIST 返回的 handle 集合", "",
               "同一 EID pair 的 handle 已去重并转成十六进制。这里展示的是返回资源，不把 handle 数值直接解释成 route/path ID。",
@@ -149,6 +153,27 @@ def main():
             attr_rows += 1
     if attr_rows == 0:
         lines.append("| all | N/A | N/A | N/A | 未捕获主动 TP 属性查询 | N/A | N/A |")
+
+    lines += ["", "## import/bind 最终激活的 TP", "",
+              "`*_ex` 的 active handle/peer handle 是最直接的 TP 绑定证据；非 ex 接口只能观察返回 target 的 TPN。",
+              "", "| candidate | op | remote/target EID | active TP | peer TP | target TPN | target ID | status |",
+              "|---|---|---|---|---|---:|---:|---:|"]
+    activation_rows = 0
+    for case in cases:
+        for event in case["tp_events"]:
+            if event.get("event") != "TP_ACTIVATION":
+                continue
+            eid = event.get("target_eid_raw", event.get("remote_eid_raw", "N/A"))
+            active = event.get("active_tp_handle")
+            peer = event.get("active_peer_tp_handle")
+            lines.append(f"| {case['name']} | {event.get('op', 'N/A')} | `{eid}` | "
+                         f"`{format_handle(active) if active is not None else 'N/A'}` | "
+                         f"`{format_handle(peer) if peer is not None else 'N/A'}` | "
+                         f"{event.get('target_tpn', 'N/A')} | {event.get('target_id', 'N/A')} | "
+                         f"{event.get('status', 'N/A')} |")
+            activation_rows += 1
+    if activation_rows == 0:
+        lines.append("| all | N/A | N/A | N/A | N/A | N/A | N/A | 未经过可拦截的公开 import/bind API |")
 
     left, right = cases[:2]
     left_link, right_link = unique_rank0(left["commlink"]), unique_rank0(right["commlink"])

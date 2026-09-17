@@ -223,6 +223,65 @@ void EmitExchange(const urma_get_tp_cfg_t *cfg, uint64_t localHandle, uint32_t t
     out << '}';
     Emit(out.str());
 }
+
+void EmitTpActivation(const char *op, const void *ctx, const urma_eid_t *remoteEid,
+                      uint32_t remoteUasid, uint32_t remoteId, uint32_t transMode,
+                      uint32_t tpType, const urma_active_tp_cfg_t *cfg,
+                      const urma_target_jetty_t *target, int status)
+{
+    std::ostringstream out;
+    out << "{\"event\":\"TP_ACTIVATION\",\"op\":\"" << op
+        << "\",\"pid\":" << getpid() << ",\"context\":\"" << ctx << "\""
+        << ",\"status\":" << status << ",\"remote_uasid\":" << remoteUasid
+        << ",\"remote_id\":" << remoteId << ",\"trans_mode\":" << transMode
+        << ",\"tp_type\":" << tpType;
+    if (remoteEid != nullptr) out << ",\"remote_eid_raw\":\"" << Hex(*remoteEid) << "\"";
+    if (cfg != nullptr) {
+        out << ",\"active_tp_handle\":" << cfg->tp_handle
+            << ",\"active_peer_tp_handle\":" << cfg->peer_tp_handle
+            << ",\"active_tag\":" << cfg->tag
+            << ",\"active_tx_psn\":" << cfg->tp_attr.tx_psn
+            << ",\"active_rx_psn\":" << cfg->tp_attr.rx_psn;
+    }
+    if (target != nullptr) {
+        out << ",\"target_handle\":" << target->handle
+            << ",\"target_tpn\":" << target->tp.tpn
+            << ",\"target_id\":" << target->id.id
+            << ",\"target_uasid\":" << target->id.uasid
+            << ",\"target_eid_raw\":\"" << Hex(target->id.eid) << "\"";
+    }
+    out << ",\"caller_frames\":" << CallerFrames() << '}';
+    Emit(out.str());
+}
+
+void EmitJettyBind(const char *op, const urma_jetty_t *jetty,
+                   const urma_target_jetty_t *target, const urma_active_tp_cfg_t *cfg,
+                   int status)
+{
+    std::ostringstream out;
+    out << "{\"event\":\"TP_ACTIVATION\",\"op\":\"" << op
+        << "\",\"pid\":" << getpid() << ",\"status\":" << status;
+    if (jetty != nullptr) {
+        out << ",\"local_jetty_handle\":" << jetty->handle
+            << ",\"local_jetty_id\":" << jetty->jetty_id.id
+            << ",\"local_eid_raw\":\"" << Hex(jetty->jetty_id.eid) << "\"";
+    }
+    if (target != nullptr) {
+        out << ",\"target_handle\":" << target->handle
+            << ",\"target_tpn\":" << target->tp.tpn
+            << ",\"target_id\":" << target->id.id
+            << ",\"target_eid_raw\":\"" << Hex(target->id.eid) << "\"";
+    }
+    if (cfg != nullptr) {
+        out << ",\"active_tp_handle\":" << cfg->tp_handle
+            << ",\"active_peer_tp_handle\":" << cfg->peer_tp_handle
+            << ",\"active_tag\":" << cfg->tag
+            << ",\"active_tx_psn\":" << cfg->tp_attr.tx_psn
+            << ",\"active_rx_psn\":" << cfg->tp_attr.rx_psn;
+    }
+    out << ",\"caller_frames\":" << CallerFrames() << '}';
+    Emit(out.str());
+}
 } // namespace
 
 extern "C" urma_status_t urma_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
@@ -381,6 +440,120 @@ extern "C" int urma_cmd_exchange_tp_info(urma_context_t *ctx, urma_get_tp_cfg_t 
         g_insideTrace = true;
         EmitExchange(cfg, localHandle, txPsn, status,
                      peerHandle == nullptr ? 0 : *peerHandle, rxPsn == nullptr ? 0 : *rxPsn);
+        g_insideTrace = false;
+    }
+    return status;
+}
+
+extern "C" urma_target_jetty_t *urma_import_jfr(urma_context_t *ctx, urma_rjfr_t *rjfr,
+    urma_token_t *token)
+{
+    using Fn = urma_target_jetty_t *(*)(urma_context_t *, urma_rjfr_t *, urma_token_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_import_jfr"));
+    if (real == nullptr) return nullptr;
+    urma_target_jetty_t *target = real(ctx, rjfr, token);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitTpActivation("urma_import_jfr", ctx, rjfr == nullptr ? nullptr : &rjfr->jfr_id.eid,
+                         rjfr == nullptr ? 0 : rjfr->jfr_id.uasid,
+                         rjfr == nullptr ? 0 : rjfr->jfr_id.id,
+                         rjfr == nullptr ? 0 : static_cast<uint32_t>(rjfr->trans_mode),
+                         rjfr == nullptr ? 0 : static_cast<uint32_t>(rjfr->tp_type),
+                         nullptr, target, target == nullptr ? -1 : 0);
+        g_insideTrace = false;
+    }
+    return target;
+}
+
+extern "C" urma_target_jetty_t *urma_import_jfr_ex(urma_context_t *ctx, urma_rjfr_t *rjfr,
+    urma_token_t *token, urma_import_jfr_ex_cfg_t *cfg)
+{
+    using Fn = urma_target_jetty_t *(*)(urma_context_t *, urma_rjfr_t *, urma_token_t *,
+                                        urma_import_jfr_ex_cfg_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_import_jfr_ex"));
+    if (real == nullptr) return nullptr;
+    urma_target_jetty_t *target = real(ctx, rjfr, token, cfg);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitTpActivation("urma_import_jfr_ex", ctx, rjfr == nullptr ? nullptr : &rjfr->jfr_id.eid,
+                         rjfr == nullptr ? 0 : rjfr->jfr_id.uasid,
+                         rjfr == nullptr ? 0 : rjfr->jfr_id.id,
+                         rjfr == nullptr ? 0 : static_cast<uint32_t>(rjfr->trans_mode),
+                         rjfr == nullptr ? 0 : static_cast<uint32_t>(rjfr->tp_type),
+                         cfg, target, target == nullptr ? -1 : 0);
+        g_insideTrace = false;
+    }
+    return target;
+}
+
+extern "C" urma_target_jetty_t *urma_import_jetty(urma_context_t *ctx, urma_rjetty_t *rjetty,
+    urma_token_t *token)
+{
+    using Fn = urma_target_jetty_t *(*)(urma_context_t *, urma_rjetty_t *, urma_token_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_import_jetty"));
+    if (real == nullptr) return nullptr;
+    urma_target_jetty_t *target = real(ctx, rjetty, token);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitTpActivation("urma_import_jetty", ctx,
+                         rjetty == nullptr ? nullptr : &rjetty->jetty_id.eid,
+                         rjetty == nullptr ? 0 : rjetty->jetty_id.uasid,
+                         rjetty == nullptr ? 0 : rjetty->jetty_id.id,
+                         rjetty == nullptr ? 0 : static_cast<uint32_t>(rjetty->trans_mode),
+                         rjetty == nullptr ? 0 : static_cast<uint32_t>(rjetty->tp_type),
+                         nullptr, target, target == nullptr ? -1 : 0);
+        g_insideTrace = false;
+    }
+    return target;
+}
+
+extern "C" urma_target_jetty_t *urma_import_jetty_ex(urma_context_t *ctx,
+    urma_rjetty_t *rjetty, urma_token_t *token, urma_import_jetty_ex_cfg_t *cfg)
+{
+    using Fn = urma_target_jetty_t *(*)(urma_context_t *, urma_rjetty_t *, urma_token_t *,
+                                        urma_import_jetty_ex_cfg_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_import_jetty_ex"));
+    if (real == nullptr) return nullptr;
+    urma_target_jetty_t *target = real(ctx, rjetty, token, cfg);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitTpActivation("urma_import_jetty_ex", ctx,
+                         rjetty == nullptr ? nullptr : &rjetty->jetty_id.eid,
+                         rjetty == nullptr ? 0 : rjetty->jetty_id.uasid,
+                         rjetty == nullptr ? 0 : rjetty->jetty_id.id,
+                         rjetty == nullptr ? 0 : static_cast<uint32_t>(rjetty->trans_mode),
+                         rjetty == nullptr ? 0 : static_cast<uint32_t>(rjetty->tp_type),
+                         cfg, target, target == nullptr ? -1 : 0);
+        g_insideTrace = false;
+    }
+    return target;
+}
+
+extern "C" urma_status_t urma_bind_jetty(urma_jetty_t *jetty, urma_target_jetty_t *target)
+{
+    using Fn = urma_status_t (*)(urma_jetty_t *, urma_target_jetty_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_bind_jetty"));
+    if (real == nullptr) return static_cast<urma_status_t>(-1);
+    const urma_status_t status = real(jetty, target);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitJettyBind("urma_bind_jetty", jetty, target, nullptr, static_cast<int>(status));
+        g_insideTrace = false;
+    }
+    return status;
+}
+
+extern "C" urma_status_t urma_bind_jetty_ex(urma_jetty_t *jetty,
+    urma_target_jetty_t *target, urma_bind_jetty_ex_cfg_t *cfg)
+{
+    using Fn = urma_status_t (*)(urma_jetty_t *, urma_target_jetty_t *,
+                                 urma_bind_jetty_ex_cfg_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_bind_jetty_ex"));
+    if (real == nullptr) return static_cast<urma_status_t>(-1);
+    const urma_status_t status = real(jetty, target, cfg);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitJettyBind("urma_bind_jetty_ex", jetty, target, cfg, static_cast<int>(status));
         g_insideTrace = false;
     }
     return status;

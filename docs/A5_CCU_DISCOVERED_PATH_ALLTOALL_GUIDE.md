@@ -150,6 +150,7 @@ channel_trace_comparison.json
 - `GET_TP_ATTR`：除记录 HCOMM 自身调用外，追踪器还会在每次 GET_TP_LIST 成功后主动查询每个返回 handle，记录查询状态、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL、TTL；
 - `SET_TP_ATTR/MODIFY_TP`：TP 被选中后写入的属性，包括可见的 `peer_tpn`、`spray_en`、`local_net_addr_idx`、UDP、flow label 和 `port_id`；
 - `EXCHANGE_TP_INFO`：本端/对端 TP handle 与 PSN 的配对边界。
+- `TP_ACTIVATION`：拦截 `urma_import_jfr[_ex]`、`urma_import_jetty[_ex]`、`urma_bind_jetty[_ex]`；其中 ex 接口直接记录 `active_tp_handle/active_peer_tp_handle`，普通接口记录返回 target 的 TPN、target EID 和 ID。
 
 如果 `urma_tp.pid*.jsonl` 不存在，不能解释为“没有 TP”。它表示当前 HCOMM/HCCP/MUE 建链没有经过可拦截的公开 liburma 符号，可能使用隐藏符号、静态绑定或内部控制面接口。
 
@@ -162,6 +163,18 @@ channel_trace_comparison.json
 3. 若主动 `GET_TP_ATTR` 成功，比较只在差异 handle 上出现的 SIP/DIP、MAC、VLAN/DSCP/SL/TTL，建立 `candidate → handle → network attributes` 映射；
 4. 若主动查询也返回 not support，则当前公开 API 最远只能证明“返回了不同 TP handle”。下一步需追踪 GET_TP_LIST ioctl/UDMA/HCCP/MUE 如何把不同 `HcclChannelDesc` 映射到这些 handle；
 5. 若后续三类事件均未出现，或出现但无 candidate 相关差异，则路径绑定位于公开 liburma API 之外。下一步应追踪 HCCP/MUE 消费 `HcclChannelDesc/EndpointDesc` 的内部入口，不能根据 handle 数值猜测 `route_addr_idx`。
+
+UMDK 兼容控制面源码显示，RM/UM 的典型流程为：
+
+```text
+GET_TP_LIST
+  -> active_tp_cfg.tp_handle
+  -> optional EXCHANGE_TP_INFO
+  -> import_jfr_ex / import_jetty_ex / bind_jetty_ex
+  -> returned target_tpn
+```
+
+因此判断 path→TP 绑定时，优先看报告的“import/bind 最终激活的 TP”表，而不是仅凭 GET_TP_LIST 返回池。如果该表为空，表示 HCCP 使用 provider function pointer、隐藏符号或私有 `ascend_urma_*` 路径绕过了公开入口；此时应根据 caller stack 定位实际 provider SO，再对真实导出符号做版本匹配后的 hook。
 
 特别注意：candidate 0/2 的 `HcclChannelAcquire` 行为相同，但传入参数并不相同；两者的 `HcclChannelDesc` 包含不同的 CommLink endpoint。当前重复实验显示，在随后可见的 GET_TP_LIST 中 `flag/trans_mode/local_eid/peer_eid` 相同，TP handle 集合也可以完全相同；个别运行出现的 handle 尾号互换并不稳定，不能当作路径标识。这更支持路径身份由 Acquire 之前的 endpoint/path 上下文及内部 Channel object 持有，而非公开 TP handle/attr 持有。
 
