@@ -6,6 +6,7 @@ routes="0,2"
 hold_seconds=20
 output_root=/home/l00934901/profiling
 urma_include=/usr/include/ub/umdk/urma
+resource_snapshot=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -14,6 +15,7 @@ while [[ $# -gt 0 ]]; do
         --hold-seconds) hold_seconds=$2; shift 2 ;;
         --output-root) output_root=$2; shift 2 ;;
         --urma-include) urma_include=$2; shift 2 ;;
+        --skip-resource-snapshot) resource_snapshot=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -59,7 +61,9 @@ run_case() {
     local route=$1
     local case_dir="$run_dir/candidate_${route}"
     mkdir -p "$case_dir"
-    snapshot_resources "$case_dir" before
+    if (( resource_snapshot )); then
+        snapshot_resources "$case_dir" before
+    fi
     (
         export A5_CCU_TRACE_LINK=1
         export A5_CCU_CHANNEL_HOLD_SECONDS="$hold_seconds"
@@ -87,9 +91,13 @@ run_case() {
         echo "candidate ${route} did not reach channel hold; inspect $case_dir/channel.log" >&2
         return 1
     fi
-    snapshot_resources "$case_dir" active
+    if (( resource_snapshot )); then
+        snapshot_resources "$case_dir" active
+    fi
     wait "$probe_pid"
-    snapshot_resources "$case_dir" after
+    if (( resource_snapshot )); then
+        snapshot_resources "$case_dir" after
+    fi
 }
 
 IFS=',' read -ra route_list <<<"$routes"

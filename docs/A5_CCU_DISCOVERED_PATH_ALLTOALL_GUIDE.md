@@ -111,6 +111,18 @@ bash scripts/run_a5_ccu_channel_trace.sh \
   --output-root /home/l00934901/profiling
 ```
 
+如果已经确认本机所有 `urma_admin list_res` 都返回 `not support query tp/dev stats`，后续复测可跳过这组无效查询：
+
+```bash
+bash scripts/run_a5_ccu_channel_trace.sh \
+  --devices 6,7 \
+  --routes 0,2 \
+  --hold-seconds 5 \
+  --urma-include /usr/include/ub/umdk/urma \
+  --skip-resource-snapshot \
+  --output-root /home/l00934901/profiling
+```
+
 脚本完成以下两次独立实验：
 
 - 第 5.1 步：candidate 0 执行 `--channel-only`，保存 direct 建链诊断；
@@ -133,9 +145,19 @@ channel_trace_comparison.json
 - `COMMLINK_TRACE`：完整对象大小、两端 CommAddr、EndpointDesc raw bytes 和 CommLink raw bytes；
 - `CHANNEL_DESC_TRACE`：传给 `HcclChannelAcquire` 前的完整 ChannelDesc raw bytes及关键字段；
 - `CHANNEL_HANDLE_TRACE`：建链后的 handle、状态和 path UID；
-- `GET_TP_LIST/GET_TP_ATTR`：仅当 HCOMM 实际经过公开、动态链接的 liburma 符号时由 interposer 输出。
+- `GET_TP_LIST/GET_TP_ATTR`：公开 liburma 的 TP 获取/读取边界；
+- `SET_TP_ATTR/MODIFY_TP`：TP 被选中后写入的属性，包括可见的 `peer_tpn`、`spray_en`、`local_net_addr_idx`、UDP、flow label 和 `port_id`；
+- `EXCHANGE_TP_INFO`：本端/对端 TP handle 与 PSN 的配对边界。
 
-如果 `urma_tp.pid*.jsonl` 不存在，不能解释为“没有 TP”。它表示当前 HCOMM/HCCP/MUE 建链没有经过可拦截的公开 liburma 符号，可能使用隐藏符号、静态绑定或内部控制面接口。若 `urma_admin list_res` 返回 not support，则 TPN/TPG、`route_addr_idx` 和内部 path object 仍不可见，必须继续在 HIXL/HCCP/MUE 边界追踪，不能根据 Channel handle 猜测。
+如果 `urma_tp.pid*.jsonl` 不存在，不能解释为“没有 TP”。它表示当前 HCOMM/HCCP/MUE 建链没有经过可拦截的公开 liburma 符号，可能使用隐藏符号、静态绑定或内部控制面接口。
+
+如果 TP 与 DEV stats 全部返回 `not support query`，只说明当前驱动关闭了公共资源查询面；它不否定已经成功的 `HcclChannelAcquire`，也不能作为“没有 TP”或“没有 relay”的证据。已经得到一次该结果后，不必反复执行 resource snapshot，使用 `--skip-resource-snapshot` 即可。
+
+比较报告会分别统计五类 URMA 事件。判断顺序是：
+
+1. 若 candidate 0/2 的 `SET_TP_ATTR`、`MODIFY_TP` 或 `EXCHANGE_TP_INFO` 出现稳定差异，沿差异字段继续定位 TP/path selector；
+2. 若只有 `GET_TP_LIST`，且 local/peer EID、配置与 handle 集合相同，则公开 GET_TP_LIST 不是路径选择点；
+3. 若后续三类事件均未出现，或出现但无 candidate 相关差异，则路径绑定位于公开 liburma API 之外。下一步应追踪 HCCP/MUE 消费 `HcclChannelDesc/EndpointDesc` 的内部入口，不能根据 handle 数值猜测 `route_addr_idx`。
 
 本步骤不需要再次执行第 4 步的 100 次 HCCN 打流；`channel-only` 建链成功即可。只有某些 TP 资源在首次数据搬运后才出现时，才将 probe 改成 `--warmup 1 --iters 3` 的少量打流诊断。
 
