@@ -16,6 +16,7 @@ iterations=100
 profile=0
 remote_only=0
 channel_only=0
+one_way_src_rank=""
 sweep=0
 profile_root=/home/l00934901/profiling
 hccn_stat=0
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --iters) iterations=$2; shift 2 ;;
         --remote-only) remote_only=1; shift ;;
         --channel-only) channel_only=1; shift ;;
+        --one-way-src-rank) one_way_src_rank=$2; shift 2 ;;
         --sweep) sweep=1; shift ;;
         --profile) profile=1; shift ;;
         --profile-root) profile_root=$2; shift 2 ;;
@@ -228,6 +230,7 @@ build_command() {
     [[ -z "${route_indices}" ]] || command+=(--route-indices "${route_indices}")
     (( remote_only == 0 )) || command+=(--remote-only)
     (( channel_only == 0 )) || command+=(--channel-only)
+    [[ -z "${one_way_src_rank}" ]] || command+=(--one-way-src-rank "${one_way_src_rank}")
 }
 
 run_pair() {
@@ -296,7 +299,8 @@ echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
 echo "Payload/rank    : ${bytes} bytes"
 echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
-    ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"
+    ([[ -n "${one_way_src_rank}" ]] && echo one-way || \
+    ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather)))"
 
 run_pair "${bytes}"
 }

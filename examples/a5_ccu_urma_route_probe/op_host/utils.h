@@ -13,6 +13,7 @@ namespace a5_ccu_urma_probe {
 
 enum class RouteKernelKind {
     ROUTE_WRITE,
+    ONE_WAY_WRITE,
     ALLTOALL_CONCURRENT,
     ALLTOALL_SERIAL,
 };
@@ -35,7 +36,8 @@ HcclResult GetCcuRouteIndex(uint32_t *routeIndex);
 HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices);
 
 HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
-                             RouteKernelKind kernelKind, RouteResources *resources);
+                             RouteKernelKind kernelKind, RouteResources *resources,
+                             int32_t oneWaySourceRank = -1);
 
 } // namespace a5_ccu_urma_probe
 

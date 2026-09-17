@@ -29,6 +29,8 @@ struct Options {
     std::string routeIndices;
     bool remoteOnly = false;
     bool channelOnly = false;
+    bool oneWay = false;
+    uint32_t oneWaySourceRank = 0;
     int32_t workerRank = -1;
     std::string rootInfoFile;
 };
@@ -46,6 +48,7 @@ static void PrintUsage(const char *program)
     std::cout << "Usage: " << program
               << " [--bytes N] [--warmup N] [--iters N] [--route-index N]"
               << " [--route-indices 0,2] [--remote-only] [--channel-only]" << std::endl;
+    std::cout << "       add --one-way-src-rank 0 for the UBUS FORCE relay test" << std::endl;
     std::cout << "Worker mode requires --worker-rank 0|1 --root-info-file PATH" << std::endl;
 }
 
@@ -70,6 +73,14 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         }
         if (name == "--channel-only") {
             options->channelOnly = true;
+            continue;
+        }
+        if (name == "--one-way-src-rank") {
+            if (i + 1 >= argc) return false;
+            uint64_t value = 0;
+            if (!ParseUint(argv[++i], &value) || value > 1) return false;
+            options->oneWay = true;
+            options->oneWaySourceRank = static_cast<uint32_t>(value);
             continue;
         }
         if (name == "--route-indices") {
@@ -170,7 +181,8 @@ static double Percentile(const std::vector<double> &sorted, double percentile)
 static void RunRank(ThreadContext *ctx)
 {
     const uint64_t sendCount = ctx->options->bytes / sizeof(float);
-    const uint64_t recvBytes = ctx->options->bytes * ctx->rankSize;
+    const uint64_t recvBytes = ctx->options->oneWay ? ctx->options->bytes :
+        ctx->options->bytes * ctx->rankSize;
     void *sendBuf = nullptr;
     void *recvBuf = nullptr;
     aclrtStream stream = nullptr;
@@ -181,6 +193,7 @@ static void RunRank(ThreadContext *ctx)
     THREAD_ACL_CHECK(aclrtCreateStream(&stream));
     THREAD_ACL_CHECK(aclrtMalloc(&sendBuf, ctx->options->bytes, ACL_MEM_MALLOC_HUGE_ONLY));
     THREAD_ACL_CHECK(aclrtMalloc(&recvBuf, recvBytes, ACL_MEM_MALLOC_HUGE_ONLY));
+    THREAD_ACL_CHECK(aclrtMemset(recvBuf, recvBytes, 0, recvBytes));
 
     std::vector<float> input(sendCount, static_cast<float>(ctx->rank + 1));
     THREAD_ACL_CHECK(aclrtMemcpy(sendBuf, ctx->options->bytes, input.data(), ctx->options->bytes,
@@ -192,7 +205,13 @@ static void RunRank(ThreadContext *ctx)
     }
 
     for (uint32_t i = 0; i < ctx->options->warmup; ++i) {
-        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
+        if (ctx->options->oneWay) {
+            THREAD_HCCL_CHECK(HcclCcuUrmaOneWayWrite(sendBuf, recvBuf, sendCount,
+                HCCL_DATA_TYPE_FP32, ctx->options->oneWaySourceRank, comm, stream));
+        } else {
+            THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount,
+                HCCL_DATA_TYPE_FP32, comm, stream));
+        }
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
     }
 
@@ -200,14 +219,35 @@ static void RunRank(ThreadContext *ctx)
     samplesUs.reserve(ctx->options->iterations);
     for (uint32_t i = 0; i < ctx->options->iterations; ++i) {
         const auto begin = std::chrono::steady_clock::now();
-        THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount, HCCL_DATA_TYPE_FP32, comm, stream));
+        if (ctx->options->oneWay) {
+            THREAD_HCCL_CHECK(HcclCcuUrmaOneWayWrite(sendBuf, recvBuf, sendCount,
+                HCCL_DATA_TYPE_FP32, ctx->options->oneWaySourceRank, comm, stream));
+        } else {
+            THREAD_HCCL_CHECK(HcclCcuUrmaRouteProbe(sendBuf, recvBuf, sendCount,
+                HCCL_DATA_TYPE_FP32, comm, stream));
+        }
         THREAD_ACL_CHECK(aclrtSynchronizeStream(stream));
         const auto end = std::chrono::steady_clock::now();
         samplesUs.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
     }
 
     bool verified = true;
-    if (!ctx->options->channelOnly) {
+    if (!ctx->options->channelOnly && ctx->options->oneWay &&
+        ctx->rank != ctx->options->oneWaySourceRank) {
+        std::vector<float> output(sendCount);
+        THREAD_ACL_CHECK(aclrtMemcpy(output.data(), recvBytes, recvBuf, recvBytes,
+                                    ACL_MEMCPY_DEVICE_TO_HOST));
+        const float expected = static_cast<float>(ctx->options->oneWaySourceRank + 1);
+        for (uint64_t i = 0; i < sendCount; ++i) {
+            if (std::fabs(output[i] - expected) > 1e-6F) {
+                std::cerr << "[rank=" << ctx->rank << "] one-way mismatch element=" << i
+                          << " expected=" << expected << " actual=" << output[i] << std::endl;
+                ctx->failed->store(1);
+                verified = false;
+                break;
+            }
+        }
+    } else if (!ctx->options->channelOnly && !ctx->options->oneWay) {
         std::vector<float> output(recvBytes / sizeof(float));
         THREAD_ACL_CHECK(aclrtMemcpy(output.data(), recvBytes, recvBuf, recvBytes, ACL_MEMCPY_DEVICE_TO_HOST));
         for (uint32_t sourceRank = 0; sourceRank < ctx->rankSize && verified; ++sourceRank) {
@@ -238,7 +278,8 @@ static void RunRank(ThreadContext *ctx)
                   << " bytes_per_rank=" << ctx->options->bytes
                   << " warmup=" << ctx->options->warmup << " iterations=" << ctx->options->iterations
                   << " mode=" << (ctx->options->channelOnly ? "channel-only" :
-                                    (ctx->options->remoteOnly ? "remote-only" : "allgather"))
+                                    (ctx->options->oneWay ? "one-way" :
+                                    (ctx->options->remoteOnly ? "remote-only" : "allgather")))
                   << " avg_us=" << avgUs
                   << " min_us=" << samplesUs.front()
                   << " p50_us=" << Percentile(samplesUs, 0.50)

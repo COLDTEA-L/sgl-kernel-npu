@@ -31,6 +31,11 @@ HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCoun
 HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf, uint64_t sendCount,
                                      HcclDataType dataType, HcclComm comm, aclrtStream stream);
 
+/* Both ranks call this API; only sourceRank issues WriteNb. */
+HcclResult HcclCcuUrmaOneWayWrite(void *sendBuf, void *recvBuf, uint64_t sendCount,
+                                  HcclDataType dataType, uint32_t sourceRank,
+                                  HcclComm comm, aclrtStream stream);
+
 /**
  * Two-rank CCU AllToAll over one or more RankGraph routes.
  * sendBuf and recvBuf each contain two consecutive elementsPerPeer-element

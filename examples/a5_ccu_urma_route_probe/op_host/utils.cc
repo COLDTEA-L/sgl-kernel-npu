@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "route_kernel.h"
+#include "one_way_write_kernel.h"
 #include "all_to_all_multiroute_kernel.h"
 #include "source_route_provider.h"
 
@@ -258,7 +259,8 @@ HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices)
 }
 
 HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
-                             RouteKernelKind kernelKind, RouteResources *resources)
+                             RouteKernelKind kernelKind, RouteResources *resources,
+                             int32_t oneWaySourceRank)
 {
     if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
@@ -274,6 +276,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         std::string("provider:") + manifestValue :
         (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue));
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
+    routeKey += ":one_way_source=" + std::to_string(oneWaySourceRank);
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;
@@ -419,15 +422,27 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     CcuKernelHandle kernel = 0;
     HcclResult registerStatus = HCCL_E_INTERNAL;
     const char *kernelName = "unknown";
+    const char *requestedKernelName = kernelKind == RouteKernelKind::ROUTE_WRITE ?
+        "route_write" : (kernelKind == RouteKernelKind::ONE_WAY_WRITE ?
+        "one_way_write" : (kernelKind == RouteKernelKind::ALLTOALL_SERIAL ?
+        "alltoall_serial" : "alltoall_concurrent"));
     std::printf("[A5 CCU URMA][rank=%u] register %s begin\n", rank,
-                kernelKind == RouteKernelKind::ROUTE_WRITE ? "route_write" :
-                (kernelKind == RouteKernelKind::ALLTOALL_SERIAL ?
-                    "alltoall_serial" : "alltoall_concurrent"));
+                requestedKernelName);
     std::fflush(stdout);
     if (kernelKind == RouteKernelKind::ROUTE_WRITE) {
         kernelName = "route_write";
         RouteKernelArg kernelArg(created.channels, routeIndices);
         hcomm::KernelCreator creator = CreateRouteKernel;
+        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+    } else if (kernelKind == RouteKernelKind::ONE_WAY_WRITE) {
+        if (oneWaySourceRank < 0 || oneWaySourceRank >= static_cast<int32_t>(rankSize)) {
+            return HCCL_E_PARA;
+        }
+        kernelName = rank == static_cast<uint32_t>(oneWaySourceRank) ?
+            "one_way_write_source" : "one_way_write_destination";
+        OneWayWriteKernelArg kernelArg(created.channels.front(),
+            rank == static_cast<uint32_t>(oneWaySourceRank));
+        hcomm::KernelCreator creator = CreateOneWayWriteKernel;
         registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
     } else {
         const bool serialized = kernelKind == RouteKernelKind::ALLTOALL_SERIAL;

@@ -1,0 +1,368 @@
+--- a/drivers/ub/ubus/route.c
++++ b/drivers/ub/ubus/route.c
+@@ -6,6 +6,7 @@
+ #define pr_fmt(fmt)	"ubus route: " fmt
+ 
+ #include <linux/kfifo.h>
++#include <linux/mutex.h>
+ 
+ #include "ubus.h"
+ #include "msg.h"
+@@ -30,6 +31,94 @@
+ 	struct list_head node;
+ };
+ 
++enum ub_route_override_mode {
++	UB_ROUTE_OVERRIDE_FORCE,
++	UB_ROUTE_OVERRIDE_ADD,
++};
++
++struct ub_route_override {
++	u32 src_uent_num;
++	u32 relay_uent_num;
++	u32 dst_uent_num;
++	u32 dst_cna;
++	enum ub_route_override_mode mode;
++	struct list_head node;
++};
++
++static LIST_HEAD(ub_route_overrides);
++static DEFINE_MUTEX(ub_route_override_lock);
++
++static struct ub_port *ub_find_unique_port_to_uent(struct ub_entity *src,
++						   u32 remote_uent_num)
++{
++	struct ub_port *port, *found = NULL;
++
++	for_each_uent_port(port, src) {
++		if (!port->r_uent || port->r_uent->uent_num != remote_uent_num)
++			continue;
++		if (port->link_state != LINK_STATE_NORMAL)
++			continue;
++		if (found) {
++			ub_err(src, "multiple active ports reach uent %#x; refuse ambiguous override\n",
++			       remote_uent_num);
++			return ERR_PTR(-ENOTUNIQ);
++		}
++		found = port;
++	}
++	return found ?: ERR_PTR(-ENOLINK);
++}
++
++static bool ub_native_route_uses_port(struct ub_entity *src, u32 dst_cna,
++					      u16 port_index)
++{
++	struct ub_port *port;
++
++	for_each_uent_port(port, src)
++		if (port->index == port_index)
++			return test_bit(dst_cna, port->cna_maps);
++	return false;
++}
++
++static struct ub_route_override *ub_find_route_override(u32 src_uent_num,
++							u32 dst_cna)
++{
++	struct ub_route_override *override;
++
++	list_for_each_entry(override, &ub_route_overrides, node)
++		if (override->src_uent_num == src_uent_num &&
++		    override->dst_cna == dst_cna)
++			return override;
++	return NULL;
++}
++
++static int ub_apply_route_override(struct ub_entity *uent, u32 dst_cna,
++					   unsigned long *entry)
++{
++	struct ub_route_override *override;
++	struct ub_port *relay_port;
++	int ret = 0;
++
++	mutex_lock(&ub_route_override_lock);
++	override = ub_find_route_override(uent->uent_num, dst_cna);
++	if (!override)
++		goto out;
++	relay_port = ub_find_unique_port_to_uent(uent, override->relay_uent_num);
++	if (IS_ERR(relay_port)) {
++		ret = PTR_ERR(relay_port);
++		goto out;
++	}
++	if (override->mode == UB_ROUTE_OVERRIDE_FORCE)
++		bitmap_zero(entry, UB_ROUTE_TABLE_ENTRY_BITS);
++	set_bit(relay_port->index, entry);
++	pr_info("override mode=%s src=%#x dst_uent=%#x dst_cna=%#x relay=%#x port=%u\n",
++		override->mode == UB_ROUTE_OVERRIDE_FORCE ? "force" : "add",
++		override->src_uent_num, override->dst_uent_num, dst_cna,
++		override->relay_uent_num, relay_port->index);
++out:
++	mutex_unlock(&ub_route_override_lock);
++	return ret;
++}
++
+ static struct cna_node *ub_create_cna_node(u32 cna, short distance)
+ {
+ 	struct cna_node *new_cna;
+@@ -565,6 +654,15 @@
+ 		for_each_uent_port(port, uent)
+ 			if (test_bit(cna, port->cna_maps))
+ 				set_bit(port->index, route_table_entry);
++
++		if (ub_apply_route_override(uent, cna, route_table_entry)) {
++			ub_err(uent, "route override resolution failed for cna %#x; keep native route\n",
++			       cna);
++			bitmap_zero(route_table_entry, UB_ROUTE_TABLE_ENTRY_BITS);
++			for_each_uent_port(port, uent)
++				if (test_bit(cna, port->cna_maps))
++					set_bit(port->index, route_table_entry);
++		}
+ 
+ 		cna_node->need_update = false;
+ set_entry:
+@@ -572,8 +670,176 @@
+ 	}
+ 
+ 	ub_entity_assign_priv_flag(uent, UB_ENTITY_ROUTE_UPDATED, false);
++}
++
++static int ub_validate_route_override(struct ub_entity *src,
++				      struct ub_entity *relay,
++				      struct ub_entity *dst)
++{
++	struct ub_port *src_to_relay, *relay_port;
++	bool relay_reaches_dst = false;
++
++	if (src == relay || src == dst || relay == dst)
++		return -EINVAL;
++	src_to_relay = ub_find_unique_port_to_uent(src, relay->uent_num);
++	if (IS_ERR(src_to_relay))
++		return PTR_ERR(src_to_relay);
++	for_each_uent_port(relay_port, relay) {
++		if (!test_bit(dst->cna, relay_port->cna_maps))
++			continue;
++		if (relay_port->r_uent == src)
++			continue;
++		relay_reaches_dst = true;
++		break;
++	}
++	return relay_reaches_dst ? 0 : -EHOSTUNREACH;
++}
++
++static int ub_mark_cna_for_sync(struct ub_entity *uent, u32 cna)
++{
++	struct cna_node *node = ub_find_cna_node(cna, &uent->cna_list);
++
++	if (!node)
++		return -ENOENT;
++	node->need_update = true;
++	ub_cna_node_put(node);
++	ub_entity_assign_priv_flag(uent, UB_ENTITY_ROUTE_UPDATED, true);
++	return 0;
++}
++
++static ssize_t __ub_route_override_show(struct ub_entity *uent, char *buf)
++{
++	struct ub_route_override *override;
++	ssize_t len = 0;
++
++	mutex_lock(&ub_route_override_lock);
++	list_for_each_entry(override, &ub_route_overrides, node) {
++		if (override->src_uent_num != uent->uent_num)
++			continue;
++		len += sysfs_emit_at(buf, len,
++			"mode=%s src_uent=%u relay_uent=%u dst_uent=%u dst_cna=%u\n",
++			override->mode == UB_ROUTE_OVERRIDE_FORCE ? "force" : "add",
++			override->src_uent_num, override->relay_uent_num,
++			override->dst_uent_num, override->dst_cna);
++	}
++	mutex_unlock(&ub_route_override_lock);
++	return len;
+ }
+ 
++static ssize_t __ub_route_override_store(struct ub_entity *src, const char *buf,
++					 size_t count)
++{
++	struct ub_route_override *override, *old = NULL;
++	struct ub_entity *relay = NULL, *dst = NULL;
++	char command[16] = {};
++	u32 relay_num = 0, dst_num = 0;
++	enum ub_route_override_mode mode;
++	int fields, ret;
++
++	fields = sscanf(buf, "%15s %u %u", command, &relay_num, &dst_num);
++	if (fields < 1)
++		return -EINVAL;
++	if (!strcmp(command, "clear")) {
++		if (fields != 2)
++			return -EINVAL;
++		dst_num = relay_num;
++		dst = ub_get_ent_by_uent_num(dst_num);
++		if (!dst)
++			return -ENODEV;
++		mutex_lock(&ub_route_override_lock);
++		override = ub_find_route_override(src->uent_num, dst->cna);
++		if (override)
++			list_del(&override->node);
++		mutex_unlock(&ub_route_override_lock);
++		if (!override) {
++			put_device(&dst->dev);
++			return -ENOENT;
++		}
++		ret = ub_mark_cna_for_sync(src, dst->cna);
++		kfree(override);
++		put_device(&dst->dev);
++		if (ret)
++			return ret;
++		ub_route_sync_dev(src);
++		return count;
++	}
++	if (fields != 3)
++		return -EINVAL;
++	if (!strcmp(command, "force"))
++		mode = UB_ROUTE_OVERRIDE_FORCE;
++	else if (!strcmp(command, "add"))
++		mode = UB_ROUTE_OVERRIDE_ADD;
++	else
++		return -EINVAL;
++
++	relay = ub_get_ent_by_uent_num(relay_num);
++	dst = ub_get_ent_by_uent_num(dst_num);
++	if (!relay || !dst) {
++		ret = -ENODEV;
++		goto put_devices;
++	}
++	ret = ub_validate_route_override(src, relay, dst);
++	if (ret)
++		goto put_devices;
++	if (mode == UB_ROUTE_OVERRIDE_ADD) {
++		struct ub_port *direct = ub_find_unique_port_to_uent(src, dst->uent_num);
++
++		if (IS_ERR(direct) ||
++		    !ub_native_route_uses_port(src, dst->cna, direct->index)) {
++			ret = -ENOLINK;
++			goto put_devices;
++		}
++	}
++	override = kzalloc(sizeof(*override), GFP_KERNEL);
++	if (!override) {
++		ret = -ENOMEM;
++		goto put_devices;
++	}
++	override->src_uent_num = src->uent_num;
++	override->relay_uent_num = relay->uent_num;
++	override->dst_uent_num = dst->uent_num;
++	override->dst_cna = dst->cna;
++	override->mode = mode;
++	mutex_lock(&ub_route_override_lock);
++	old = ub_find_route_override(src->uent_num, dst->cna);
++	if (old)
++		list_replace(&old->node, &override->node);
++	else
++		list_add_tail(&override->node, &ub_route_overrides);
++	mutex_unlock(&ub_route_override_lock);
++	kfree(old);
++	ret = ub_mark_cna_for_sync(src, dst->cna);
++	if (!ret)
++		ub_route_sync_dev(src);
++put_devices:
++	if (relay)
++		put_device(&relay->dev);
++	if (dst)
++		put_device(&dst->dev);
++	return ret ? ret : count;
++}
++
++ssize_t ub_route_override_show(struct ub_entity *uent, char *buf)
++{
++	ssize_t ret;
++
++	down_read(&ub_bus_sem);
++	ret = __ub_route_override_show(uent, buf);
++	up_read(&ub_bus_sem);
++	return ret;
++}
++
++ssize_t ub_route_override_store(struct ub_entity *uent, const char *buf,
++				size_t count)
++{
++	ssize_t ret;
++
++	down_write(&ub_bus_sem);
++	ret = __ub_route_override_store(uent, buf, count);
++	up_write(&ub_bus_sem);
++	return ret;
++}
++
+ /**
+  * this function sync all updated routing table entry to config space
+  * for devices that aren't in ubc dev list, this function will not update them
+
+--- a/drivers/ub/ubus/route.h
++++ b/drivers/ub/ubus/route.h
+@@ -21,5 +21,8 @@
+ void ub_route_table_clear_for_port(struct ub_port *port,
+ 				   struct ub_port *r_port);
+ int ub_route_table_set_for_port(struct ub_port *port, struct ub_port *r_port);
++ssize_t ub_route_override_show(struct ub_entity *uent, char *buf);
++ssize_t ub_route_override_store(struct ub_entity *uent, const char *buf,
++				size_t count);
+ 
+ #endif /* __ROUTE_H__ */
+
+--- a/drivers/ub/ubus/sysfs.c
++++ b/drivers/ub/ubus/sysfs.c
+@@ -10,6 +10,7 @@
+ #include "instance.h"
+ #include "port.h"
+ #include "resource.h"
++#include "route.h"
+ #include "ubus_driver.h"
+ #include "sysfs.h"
+ 
+@@ -80,7 +81,35 @@
+ 	return sysfs_emit(buf, "%u\n", uent->eid);
+ }
+ static DEVICE_ATTR_RO(eid);
++
++static ssize_t uent_num_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	return sysfs_emit(buf, "%u\n", to_ub_entity(dev)->uent_num);
++}
++static DEVICE_ATTR_RO(uent_num);
++
++static ssize_t user_eid_show(struct device *dev, struct device_attribute *attr,
++			     char *buf)
++{
++	return sysfs_emit(buf, "%u\n", to_ub_entity(dev)->user_eid);
++}
++static DEVICE_ATTR_RO(user_eid);
++
++static ssize_t route_override_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return ub_route_override_show(to_ub_entity(dev), buf);
++}
+ 
++static ssize_t route_override_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	return ub_route_override_store(to_ub_entity(dev), buf, count);
++}
++static DEVICE_ATTR_RW(route_override);
++
+ static ssize_t tid_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	struct ub_entity *uent = to_ub_entity(dev);
+@@ -418,6 +447,9 @@
+ 	&dev_attr_entity_idx.attr,
+ 	&dev_attr_numa.attr,
+ 	&dev_attr_eid.attr,
++	&dev_attr_uent_num.attr,
++	&dev_attr_user_eid.attr,
++	&dev_attr_route_override.attr,
+ 	&dev_attr_tid.attr,
+ 	&dev_attr_primary_entity.attr,
+ 	&dev_attr_kref.attr,
+

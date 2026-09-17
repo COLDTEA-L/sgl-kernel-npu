@@ -1,5 +1,6 @@
 #include "a5_ccu_urma_route_probe.h"
 #include "route_kernel.h"
+#include "one_way_write_kernel.h"
 #include "utils.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -130,4 +131,41 @@ extern "C" HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf,
     uint64_t sendCount, HcclDataType dataType, HcclComm comm, aclrtStream stream)
 {
     return HcclCcuUrmaMultiRouteWrite(sendBuf, recvBuf, sendCount, dataType, comm, stream);
+}
+
+extern "C" HcclResult HcclCcuUrmaOneWayWrite(void *sendBuf, void *recvBuf,
+    uint64_t sendCount, HcclDataType dataType, uint32_t sourceRank,
+    HcclComm comm, aclrtStream stream)
+{
+    if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr || stream == nullptr)
+        return HCCL_E_PTR;
+    if (dataType != HCCL_DATA_TYPE_FP32) return HCCL_E_NOT_SUPPORT;
+    RouteResources resources;
+    HcclResult status = GetRouteResources(comm, stream, RouteKernelKind::ONE_WAY_WRITE,
+                                          &resources, static_cast<int32_t>(sourceRank));
+    if (status != HCCL_SUCCESS) return status;
+    if (sourceRank >= resources.rankSize || resources.channels.size() != 1) return HCCL_E_PARA;
+    const uint64_t bytes = sendCount * sizeof(float);
+    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(sendBuf), bytes);
+    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(recvBuf), bytes);
+    a5_ccu_urma_probe::OneWayWriteTaskArg taskArg(
+        reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
+        inputToken, outputToken, bytes);
+    if (resources.routeThread != resources.mainThread) {
+        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+            resources.mainThread, resources.routeThread, THREAD_NOTIFY_INDEX));
+        if (status != HCCL_SUCCESS) return status;
+        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+            resources.routeThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+        if (status != HCCL_SUCCESS) return status;
+    }
+    status = HcclCcuKernelLaunch(comm, resources.routeThread, resources.kernel, &taskArg);
+    if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) return status;
+    status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+        resources.mainThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+    if (status != HCCL_SUCCESS) return status;
+    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
 }
