@@ -10,6 +10,7 @@ repeats=2
 output_root=/home/l00934901/profiling
 urma_include=/usr/include/ub/umdk/urma
 hccn_devices="0,1,2,3,4,5,6,7"
+umdk_root=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -22,6 +23,7 @@ while [[ $# -gt 0 ]]; do
         --output-root) output_root=$2; shift 2 ;;
         --urma-include) urma_include=$2; shift 2 ;;
         --hccn-devices) hccn_devices=$2; shift 2 ;;
+        --umdk-root) umdk_root=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -52,16 +54,37 @@ make -C examples/a5_urma_tp_trace clean all URMA_INCLUDE="$urma_include" \
     echo "tracer build failed; see $run_dir/inventory/tracer_build.log" >&2; exit 1;
 }
 
+if [[ -z "$umdk_root" ]]; then
+    for candidate in /home/l00934901/umdk /home/liuyuanwen/umdk; do
+        [[ -d "$candidate" ]] && { umdk_root=$candidate; break; }
+    done
+fi
+if [[ -n "$umdk_root" ]]; then
+    {
+        echo "===== urma_cmd_udrv_priv_t ====="
+        grep -R -n -A8 -B2 'typedef struct urma_cmd_udrv_priv' \
+            "$umdk_root/src/urma/lib/urma/core/include" 2>/dev/null || true
+        echo "===== UDMA GET_TP_LIST provider ====="
+        grep -R -n -A20 -B3 'udma_u_ctrlq_get_tp_list' \
+            "$umdk_root/src/urma/hw/udma" 2>/dev/null || true
+    } >"$run_dir/inventory/umdk_private_request_source.txt"
+fi
+
 for library in \
     /usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so \
     /usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so \
     /usr/local/Ascend/driver/lib64/driver/libascend_hal.so \
-    /lib64/liburma.so /lib64/urma/liburma-udma.so; do
+    /lib64/liburma.so /lib64/urma/liburma-udma.so \
+    /usr/lib64/liburma.so /usr/lib64/urma/liburma-udma.so; do
     [[ -e "$library" ]] || continue
     base=$(basename "$library")
     { echo "===== nm -D $library ====="; nm -D "$library" 2>&1 || true;
       echo "===== readelf -Ws $library ====="; readelf -Ws "$library" 2>&1 || true;
+      echo "===== objdump -T $library ====="; objdump -T "$library" 2>&1 || true;
     } >"$run_dir/inventory/${base}.symbols.txt"
+    strings -a "$library" 2>/dev/null | grep -E -i \
+        'channel|endpoint|comm.?addr|tp.?list|path|route|mue|hccp|spray|flow.?label' \
+        >"$run_dir/inventory/${base}.relevant_strings.txt" || true
 done
 
 record_case control_candidates bash scripts/run_a5_ccu_channel_trace.sh \

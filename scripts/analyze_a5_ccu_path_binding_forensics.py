@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 from collections import Counter, defaultdict
@@ -92,7 +93,7 @@ def event_signatures(events, name, include_noise=False):
 
 def write_control_diff(path, candidates, controls):
     names = ["COMMLINK_ENDPOINT", "CHANNEL_DESC", "CHANNEL_HANDLE",
-             "GET_TP_LIST", "GET_TP_ATTR", "SET_TP_ATTR", "MODIFY_TP",
+             "PRIVATE_TP_REQUEST", "GET_TP_LIST", "GET_TP_ATTR", "SET_TP_ATTR", "MODIFY_TP",
              "EXCHANGE_TP_INFO", "TP_ACTIVATION"]
     left, right = (controls[candidates[0]], controls[candidates[1]])
     rows = []
@@ -110,6 +111,18 @@ def write_control_diff(path, candidates, controls):
         elif name == "CHANNEL_HANDLE":
             a = left["handle"].get("channel_handle", "N/A")
             b = right["handle"].get("channel_handle", "N/A")
+        elif name == "PRIVATE_TP_REQUEST":
+            # Compare request input before the ioctl/provider call.  The after
+            # image contains allocated handles and is an output observation,
+            # not evidence that the selector input differed.
+            a = json.dumps(sorted(
+                normalized(event) for event in left["events"]
+                if event.get("event") == name and event.get("phase") == "before"
+                and caller_category(event) != "HDC_TRACE_NOISE"), separators=(",", ":"))
+            b = json.dumps(sorted(
+                normalized(event) for event in right["events"]
+                if event.get("event") == name and event.get("phase") == "before"
+                and caller_category(event) != "HDC_TRACE_NOISE"), separators=(",", ":"))
         else:
             a = json.dumps(event_signatures(left["events"], name), separators=(",", ":"))
             b = json.dumps(event_signatures(right["events"], name), separators=(",", ":"))
@@ -117,6 +130,67 @@ def write_control_diff(path, candidates, controls):
                      f"candidate_{candidates[1]}": b, "differs": "YES" if a != b else "NO"})
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(rows[0]), delimiter="\t")
+        writer.writeheader(); writer.writerows(rows)
+    return rows
+
+
+def digest(value):
+    return hashlib.sha256((value or "").encode()).hexdigest() if value else "EMPTY"
+
+
+def endpoint_tokens(control):
+    tokens = []
+    for key in ("src_addr", "dst_addr"):
+        value = control["link"].get(key, "")
+        if "raw=" in value:
+            token = re.sub(r"[^0-9a-fA-F]", "", value.split("raw=", 1)[1]).lower()
+            if token:
+                tokens.append(token)
+    return tokens
+
+
+def write_private_requests(path, controls):
+    rows = []
+    for candidate, control in controls.items():
+        tokens = endpoint_tokens(control)
+        for event in control["events"]:
+            if event.get("event") != "PRIVATE_TP_REQUEST":
+                continue
+            blobs = {
+                "udata_in_hex": event.get("udata_in_hex", ""),
+                "udata_out_hex": event.get("udata_out_hex", ""),
+                "command_raw": event.get("command_raw", ""),
+            }
+            matched = []
+            for token in tokens:
+                for name, blob in blobs.items():
+                    if token and token in blob.lower():
+                        matched.append(f"{name}:{token}")
+            rows.append({
+                "candidate": candidate,
+                "path_uid": control["link"].get("path_uid", "N/A"),
+                "api": event.get("api", "N/A"),
+                "phase": event.get("phase", "N/A"),
+                "status": event.get("status", "N/A"),
+                "local_eid": event.get("local_eid_raw", "N/A"),
+                "peer_eid": event.get("peer_eid_raw", "N/A"),
+                "udata_present": event.get("udata_present", False),
+                "udata_in_len": event.get("udata_in_len", 0),
+                "udata_out_len": event.get("udata_out_len", 0),
+                "udata_in_sha256": digest(blobs["udata_in_hex"]),
+                "udata_out_sha256": digest(blobs["udata_out_hex"]),
+                "command_sha256": digest(blobs["command_raw"]),
+                "endpoint_token_matches": ",".join(matched) or "NONE",
+                "caller_category": caller_category(event),
+                "trace_label": event.get("trace_label", ""),
+                "source": f"{event.get('_file')}:{event.get('_line')}",
+            })
+    fields = ["candidate", "path_uid", "api", "phase", "status", "local_eid",
+              "peer_eid", "udata_present", "udata_in_len", "udata_out_len",
+              "udata_in_sha256", "udata_out_sha256", "command_sha256",
+              "endpoint_token_matches", "caller_category", "trace_label", "source"]
+    with path.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields, delimiter="\t")
         writer.writeheader(); writer.writerows(rows)
     return rows
 
@@ -186,6 +260,7 @@ def main():
                 for candidate in candidates}
     diff_rows = write_control_diff(args.run_dir / "path_control_diff.tsv", candidates, controls)
     binding_rows = write_bindings(args.run_dir / "channel_resource_binding.tsv", controls)
+    private_rows = write_private_requests(args.run_dir / "private_request_diff.tsv", controls)
     footprint_rows = write_footprints(args.run_dir / "physical_footprint.tsv",
                                       args.run_dir / "footprint")
 
@@ -196,6 +271,10 @@ def main():
     trusted = [row for row in binding_rows if row["confidence"] == "LABEL_AND_COMM_CALLER"]
     noise = sum(row["confidence"] == "EXCLUDED_NOISE" for row in binding_rows)
     event_diff = [row["layer"] for row in diff_rows[3:] if row["differs"] == "YES"]
+    private_nonempty = [row for row in private_rows
+                        if int(row["udata_in_len"] or 0) or int(row["udata_out_len"] or 0)]
+    private_endpoint_match = [row for row in private_rows
+                              if row["endpoint_token_matches"] != "NONE"]
     if trusted and event_diff:
         conclusion = "PROVEN_CONTROL_BINDING"
     elif endpoint_diff and desc_diff and event_diff:
@@ -211,6 +290,9 @@ def main():
              f"- ChannelDesc differs: **{desc_diff}**",
              f"- trusted Channel/TP activation rows: **{len(trusted)}**",
              f"- excluded HDC/trace activation rows: **{noise}**",
+             f"- private request rows: **{len(private_rows)}**",
+             f"- non-empty provider udata rows: **{len(private_nonempty)}**",
+             f"- private blobs containing CommLink endpoint token: **{len(private_endpoint_match)}**",
              f"- visible post-ChannelDesc differing boundaries: **{', '.join(event_diff) or 'none'}**",
              f"- HCCN footprint rows: **{len(footprint_rows)}**", "",
              "## Interpretation", ""]
@@ -223,6 +305,7 @@ def main():
     lines += ["", "## Files", "",
               "- `path_control_diff.tsv`: 控制面逐层差分。",
               "- `channel_resource_binding.tsv`: activation、调用栈分类与置信度。",
+              "- `private_request_diff.tsv`: provider/CTRLQ udata、完整 ioctl command 摘要及 endpoint token 匹配。",
               "- `physical_footprint.tsv`: route0/route2/concurrent 的 HCCN 增量。",
               "- `same_process/`: 正反 acquire 顺序原始数据。"]
     (args.run_dir / "path_binding_report.md").write_text("\n".join(lines) + "\n")

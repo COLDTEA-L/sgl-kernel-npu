@@ -1,8 +1,10 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -20,6 +22,7 @@ std::mutex g_labelMutex;
 std::string g_traceLabel;
 thread_local bool g_insideTrace = false;
 thread_local uint32_t g_publicGetTpListDepth = 0;
+constexpr size_t MAX_PRIVATE_SNAPSHOT = 4096;
 
 template <typename T>
 std::string Hex(const T &value)
@@ -67,6 +70,89 @@ std::string CurrentTraceLabel()
 }
 
 std::string JsonEscape(const char *value);
+std::string CallerFrames();
+void AppendTraceLabel(std::ostringstream &out);
+
+struct PrivateBufferSnapshot {
+    uint64_t address = 0;
+    uint32_t requested = 0;
+    size_t captured = 0;
+    long readStatus = 0;
+    std::string hex;
+};
+
+PrivateBufferSnapshot SnapshotBuffer(uint64_t address, uint32_t length)
+{
+    PrivateBufferSnapshot snapshot;
+    snapshot.address = address;
+    snapshot.requested = length;
+    if (address == 0 || length == 0) return snapshot;
+    const size_t capture = std::min(static_cast<size_t>(length), MAX_PRIVATE_SNAPSHOT);
+    std::string bytes(capture, '\0');
+    iovec local{&bytes[0], capture};
+    iovec remote{reinterpret_cast<void *>(static_cast<uintptr_t>(address)), capture};
+    snapshot.readStatus = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (snapshot.readStatus <= 0) return snapshot;
+    snapshot.captured = static_cast<size_t>(snapshot.readStatus);
+    static const char digits[] = "0123456789abcdef";
+    snapshot.hex.reserve(snapshot.captured * 2);
+    for (size_t i = 0; i < snapshot.captured; ++i) {
+        const auto value = static_cast<unsigned char>(bytes[i]);
+        snapshot.hex.push_back(digits[value >> 4]);
+        snapshot.hex.push_back(digits[value & 0xf]);
+    }
+    return snapshot;
+}
+
+struct UdataSnapshot {
+    bool present = false;
+    PrivateBufferSnapshot input;
+    PrivateBufferSnapshot output;
+};
+
+UdataSnapshot SnapshotUdata(const urma_cmd_udrv_priv_t *udata)
+{
+    UdataSnapshot snapshot;
+    if (udata == nullptr) return snapshot;
+    snapshot.present = true;
+    snapshot.input = SnapshotBuffer(udata->in_addr, udata->in_len);
+    snapshot.output = SnapshotBuffer(udata->out_addr, udata->out_len);
+    return snapshot;
+}
+
+void AppendPrivateBuffer(std::ostringstream &out, const char *name,
+                         const PrivateBufferSnapshot &snapshot)
+{
+    out << ",\"" << name << "_addr\":" << snapshot.address
+        << ",\"" << name << "_len\":" << snapshot.requested
+        << ",\"" << name << "_captured\":" << snapshot.captured
+        << ",\"" << name << "_read_status\":" << snapshot.readStatus
+        << ",\"" << name << "_hex\":\"" << snapshot.hex << '"';
+}
+
+void EmitPrivateTpRequest(const char *api, const char *phase, int status,
+                          const urma_get_tp_cfg_t *cfg, const UdataSnapshot &udata,
+                          const std::string &commandRaw)
+{
+    std::ostringstream out;
+    out << "{\"event\":\"PRIVATE_TP_REQUEST\",\"api\":\"" << api
+        << "\",\"phase\":\"" << phase << "\",\"pid\":" << getpid()
+        << ",\"status\":" << status << ",\"udata_present\":"
+        << (udata.present ? "true" : "false");
+    if (cfg != nullptr) {
+        out << ",\"flag\":" << cfg->flag.value
+            << ",\"trans_mode\":" << static_cast<uint32_t>(cfg->trans_mode)
+            << ",\"local_eid_raw\":\"" << Hex(cfg->local_eid)
+            << "\",\"peer_eid_raw\":\"" << Hex(cfg->peer_eid) << '"';
+    }
+    AppendPrivateBuffer(out, "udata_in", udata.input);
+    AppendPrivateBuffer(out, "udata_out", udata.output);
+    out << ",\"command_raw\":\"" << commandRaw << '"'
+        << ",\"caller_frames\":" << CallerFrames();
+    AppendTraceLabel(out);
+    out << '}';
+    Emit(out.str());
+}
 
 void AppendTraceLabel(std::ostringstream &out)
 {
@@ -364,15 +450,73 @@ extern "C" int urma_cmd_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_cmd_get_tp_list"));
     if (real == nullptr) return -1;
     const uint32_t requested = tp_cnt == nullptr ? 0 : *tp_cnt;
+    const UdataSnapshot before = SnapshotUdata(udata);
     const int status = real(ctx, cfg, tp_cnt, tp_list, udata);
+    const UdataSnapshot after = SnapshotUdata(udata);
     if (!g_insideTrace) {
         g_insideTrace = true;
+        EmitPrivateTpRequest("urma_cmd_get_tp_list", "before", 0, cfg, before, "");
+        EmitPrivateTpRequest("urma_cmd_get_tp_list", "after", status, cfg, after, "");
         EmitTpList("urma_cmd_get_tp_list", cfg, requested, status,
                    tp_cnt == nullptr ? 0 : *tp_cnt, tp_list, ctx);
         if (status == 0 && g_publicGetTpListDepth == 0) {
             ProbeReturnedTpAttrs(ctx, tp_list, tp_cnt == nullptr ? 0 : *tp_cnt,
                                  "urma_cmd_get_tp_list");
         }
+        g_insideTrace = false;
+    }
+    return status;
+}
+
+extern "C" int urma_ioctl_get_tp_list(int ioctlFd, urma_cmd_get_tp_list_t *arg)
+{
+    using Fn = int (*)(int, urma_cmd_get_tp_list_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_ioctl_get_tp_list"));
+    if (real == nullptr) return -1;
+    const std::string beforeRaw = arg == nullptr ? "" : Hex(*arg);
+    const UdataSnapshot before = arg == nullptr ? UdataSnapshot{} : SnapshotUdata(&arg->udata);
+    urma_get_tp_cfg_t cfg = {};
+    if (arg != nullptr) {
+        cfg.flag.value = arg->in.flag;
+        cfg.trans_mode = static_cast<urma_transport_mode_t>(arg->in.trans_mode);
+        (void)std::memcpy(&cfg.local_eid, arg->in.local_eid, sizeof(cfg.local_eid));
+        (void)std::memcpy(&cfg.peer_eid, arg->in.peer_eid, sizeof(cfg.peer_eid));
+    }
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitPrivateTpRequest("urma_ioctl_get_tp_list", "before", 0,
+                             arg == nullptr ? nullptr : &cfg, before, beforeRaw);
+        g_insideTrace = false;
+    }
+    const int status = real(ioctlFd, arg);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        const UdataSnapshot after = arg == nullptr ? UdataSnapshot{} : SnapshotUdata(&arg->udata);
+        EmitPrivateTpRequest("urma_ioctl_get_tp_list", "after", status,
+                             arg == nullptr ? nullptr : &cfg, after,
+                             arg == nullptr ? "" : Hex(*arg));
+        g_insideTrace = false;
+    }
+    return status;
+}
+
+extern "C" int udma_u_ctrlq_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
+    uint32_t *tpCnt, urma_tp_info_t *tpList)
+{
+    using Fn = int (*)(urma_context_t *, urma_get_tp_cfg_t *, uint32_t *, urma_tp_info_t *);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "udma_u_ctrlq_get_tp_list"));
+    if (real == nullptr) return -1;
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitPrivateTpRequest("udma_u_ctrlq_get_tp_list", "before", 0, cfg,
+                             UdataSnapshot{}, "");
+        g_insideTrace = false;
+    }
+    const int status = real(ctx, cfg, tpCnt, tpList);
+    if (!g_insideTrace) {
+        g_insideTrace = true;
+        EmitPrivateTpRequest("udma_u_ctrlq_get_tp_list", "after", status, cfg,
+                             UdataSnapshot{}, "");
         g_insideTrace = false;
     }
     return status;

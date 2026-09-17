@@ -249,6 +249,7 @@ bash scripts/run_a5_ccu_path_binding_forensics.sh \
   --warmup 10 \
   --iters 30 \
   --repeats 2 \
+  --umdk-root /home/l00934901/umdk \
   --hccn-devices 0,1,2,3,4,5,6,7 \
   --output-root /home/l00934901/profiling
 ```
@@ -260,11 +261,14 @@ path_binding_report.md          # 首先阅读
 path_control_diff.tsv           # CommLink→ChannelDesc→URMA 边界逐层差分
 channel_resource_binding.tsv    # activation 调用栈分类和证据置信度
 physical_footprint.tsv          # route0/route2/concurrent HCCN 增量
+private_request_diff.tsv        # provider udata、ioctl command 及 endpoint token 匹配
 same_process/                   # 正反 acquire 顺序原始证据
 inventory/                      # HCCL/HCOMM/HAL/URMA 动态符号清单
 ```
 
 `channel_resource_binding.tsv` 会将 `libascend_trace.so → HDC connect → import_jfr` 标记为 `HDC_TRACE_NOISE/EXCLUDED_NOISE`，禁止将其解释成 CCU Channel TP。只有同时带单次 acquire 标签且 caller 属于 HCCL/HCOMM/HIXL/HAL/URMA 通信链的 activation 才标为高置信证据。若最终结论是 `ENDPOINT_ONLY_PRIVATE_MATCHER`，含义是公开可见的首次差异止于 CommLink/ChannelDesc；实际 path object 由 `HcclChannelAcquire` 后的私有 HCCP/MUE matcher 生成，不能继续用 TP handle 尾号猜路径。
+
+取证器还会拦截三层 GET_TP_LIST 边界：`udma_u_ctrlq_get_tp_list`、`urma_cmd_get_tp_list` 和 `urma_ioctl_get_tp_list`。对 `urma_cmd_udrv_priv_t` 安全读取最多 4096 字节的 input/output private blob，并在 ioctl 前后保存完整 command 结构。分析器只输出 SHA256 和 endpoint token 命中位置，不把任意 blob 偏移直接解释成 route ID。若 `private_request_diff.tsv` 显示所有 `udata_in_len/udata_out_len` 均为 0，这本身证明当前 UDMA provider 未通过 udata 携带 selector，下一层应转向 `HcclChannelAcquire` 内部 HCCP/MUE path object。
 
 ## 6. 运行显式 path UID AllToAll
 

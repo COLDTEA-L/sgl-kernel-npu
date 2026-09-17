@@ -114,6 +114,7 @@ run_a5_ccu_path_binding_forensics.sh
   └─ analyze_a5_ccu_path_binding_forensics.py
        ├─ path_control_diff.tsv
        ├─ channel_resource_binding.tsv
+       ├─ private_request_diff.tsv
        ├─ physical_footprint.tsv
        └─ path_binding_report.md
 ```
@@ -130,6 +131,16 @@ CommLink endpoint
   -> import/bind activation
   -> HCCN physical footprint
 ```
+
+其中 GET_TP_LIST 会进一步展开为：
+
+```text
+udma_u_ctrlq_get_tp_list
+  -> urma_cmd_get_tp_list(cfg, udata)
+       -> urma_ioctl_get_tp_list(full command)
+```
+
+tracer 对 `udata.in_addr/in_len/out_addr/out_len` 做有界、只读的 `process_vm_readv` 快照，并在 ioctl 前后保存 command raw。现有开源 UDMA provider 创建的是零初始化 `urma_cmd_udrv_priv_t`；有卡环境的实际二进制是否一致，由 `private_request_diff.tsv` 实测确认。若 udata 为空且 ioctl command 除公开 EID/返回 handle 外没有 candidate 稳定差异，则阻塞点被进一步压缩到 URMA ioctl 之前的私有 HCCP/MUE matcher。
 
 若 endpoint 与 ChannelDesc 不同，而排除 HDC 噪声后的公开 URMA 事件相同，则当前证据将 selector 定位在 `HcclChannelAcquire` 消费 EndpointDesc 的私有 HCCP/MUE matcher/path object；这比把不同 TP handle 直接解释为 route ID 更严格。
 
