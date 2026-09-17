@@ -158,21 +158,177 @@ CONFIG_MODULE_SIG:    y
 必须另行取得与 `159.4.13.167` 完全匹配的源码、`.config`、完整
 `Module.symvers` 和模块签名/安装条件，再构建并通过宿主机测试内核部署。
 
-模块构建示例：
+### 4.1 必须在宿主机确认模块来源
+
+以下命令要退出 `sglang_yuanwen` 容器后，在有卡服务器宿主机执行。容器内的
+`modinfo ubus` 失败不能说明宿主机没有模块，只说明容器没有挂载宿主机模块目录。
 
 ```bash
-# Ubuntu/aarch64 构建容器缺少工具时先安装：
-apt-get update
-apt-get install -y flex bison bc libelf-dev
+A5_KERNEL_RELEASE=$(uname -r)
 
-cd /home/l00934901/openeuler-kernel
-cp /boot/config-$(uname -r) .config
-make olddefconfig
-make -j"$(nproc)" modules_prepare
-make -j"$(nproc)" M=drivers/ub/ubus modules
+uname -r
+modinfo -n ubus
+modinfo -F vermagic ubus
+modinfo -F srcversion ubus
+modinfo -F signer ubus
+rpm -qf "$(modinfo -n ubus)" || true
+rpm -q --qf '%{NAME} %{VERSION}-%{RELEASE} %{SOURCERPM}\n' \
+  kernel kernel-core kernel-modules kernel-devel 2>/dev/null || true
+
+ls -l "/lib/modules/${A5_KERNEL_RELEASE}/build" \
+      "/lib/modules/${A5_KERNEL_RELEASE}/source" 2>/dev/null || true
+find "/usr/src/kernels/${A5_KERNEL_RELEASE}" \
+  -maxdepth 1 -name Module.symvers -type f -ls 2>/dev/null
+
+cat /sys/module/module/parameters/sig_enforce 2>/dev/null || true
+cat /proc/sys/kernel/tainted
 ```
 
-只执行 `modules_prepare + M=...` 而没有完整内核的 `Module.symvers` 时，源码对象可以编译完成，最终 modpost 会因内核符号表缺失而失败。用于部署的 `ubus.ko` 必须在完整、版本匹配的内核构建目录中生成，不能忽略 modpost 错误。
+预期宿主机上的 `modinfo -n ubus` 会返回类似：
+
+```text
+/lib/modules/6.6.0-159.4.13.167.oe2403sp4.aarch64/kernel/drivers/ub/ubus/ubus.ko.xz
+```
+
+如果宿主机同样找不到它，则先检查模块是否来自 initramfs 或被删除：
+
+```bash
+lsinitrd "/boot/initramfs-${A5_KERNEL_RELEASE}.img" | grep '/ubus\.ko' || true
+find "/lib/modules/${A5_KERNEL_RELEASE}" -type f \
+  \( -name 'ubus.ko' -o -name 'ubus.ko.xz' -o -name 'ubus.ko.zst' \) -print
+```
+
+### 4.2 获取精确匹配的源码和符号表
+
+有卡机不必预先存在 `openeuler-kernel` Git 仓库，但构建机器必须具备：
+
+- `6.6.0-159.4.13.167.oe2403sp4.aarch64` 对应的完整内核源码；
+- 该二进制内核构建生成的 `.config` 和 `Module.symvers`；
+- 对应的 aarch64 编译器及模块签名条件。
+
+先在宿主机查询软件源是否提供精确版本，不要直接安装较旧版本：
+
+```bash
+A5_KERNEL_RELEASE=$(uname -r)
+
+dnf list --showduplicates kernel-devel 2>/dev/null | grep "${A5_KERNEL_RELEASE%.*}" || true
+dnf repoquery --installed --qf '%{name}-%{evr}.%{arch} %{sourcerpm}' \
+  kernel kernel-core kernel-modules 2>/dev/null || true
+dnf repoquery --available --qf '%{name}-%{evr}.%{arch}' kernel-devel 2>/dev/null \
+  | grep '159\.4\.13\.167' || true
+```
+
+只有查询到完全一致的包时，才可以安装：
+
+```bash
+dnf install "kernel-devel-$(uname -r)"
+```
+
+`kernel-devel` 通常能提供 prepared build tree 和 `Module.symvers`，但未必包含需要修改的
+`drivers/ub/ubus/*.c`。仍需根据上一步输出的 `SOURCERPM` 获取完全对应的 source RPM，
+或者从内核维护方取得对应 Git commit。若内部版本 `159.4.13.167` 不在公开软件源中，
+必须向系统镜像/内核提供方索取 source RPM 与 matching `kernel-devel`；不能用
+`159.4.9.163` 替代。
+
+### 4.3 在独立构建目录生成 patched `ubus.ko`
+
+构建可以放在无卡服务器或独立 aarch64 构建容器，不要求放在有卡机上。下面的
+`A5_KERNEL_SRC` 必须指向精确匹配的完整源码树：
+
+```bash
+A5_KERNEL_SRC=/path/to/exact-6.6.0-159.4.13.167-source
+A5_KERNEL_BUILD=/path/to/exact-6.6.0-159.4.13.167-build
+SGL_KERNEL_NPU=/home/liuyuanwen/sgl-kernel-npu-explicit-relay
+
+# Git 工作树使用仓库辅助脚本：
+bash "${SGL_KERNEL_NPU}/scripts/apply_a5_ubus_route_override_patch.sh" \
+  --kernel-root "${A5_KERNEL_SRC}"
+bash "${SGL_KERNEL_NPU}/scripts/apply_a5_ubus_route_override_patch.sh" \
+  --kernel-root "${A5_KERNEL_SRC}" --apply
+
+make -C "${A5_KERNEL_SRC}" O="${A5_KERNEL_BUILD}" \
+  M=drivers/ub/ubus -j"$(nproc)" modules
+
+modinfo "${A5_KERNEL_BUILD}/drivers/ub/ubus/ubus.ko" | \
+  grep -E 'filename|vermagic|srcversion|signer'
+```
+
+如果源码来自解包后的 source RPM 而不是 Git 工作树，辅助脚本中的 `git apply` 不适用，
+改为在源码根目录执行：
+
+```bash
+cd "${A5_KERNEL_SRC}"
+patch -p1 --dry-run < \
+  "${SGL_KERNEL_NPU}/kernel_patches/openeuler-6.6/0001-a5-ubus-route-override.patch"
+patch -p1 < \
+  "${SGL_KERNEL_NPU}/kernel_patches/openeuler-6.6/0001-a5-ubus-route-override.patch"
+```
+
+产物的 `vermagic` 必须以
+`6.6.0-159.4.13.167.oe2403sp4.aarch64` 开头，且构建不能存在 modpost
+`undefined symbol`/CRC 错误。只有 `modules_prepare` 而没有原始完整
+`Module.symvers` 不够。
+
+### 4.4 在宿主机以可回滚方式部署
+
+这是宿主机内核变更，必须安排维护窗口并确保具有串口/BMC/GRUB 回退能力。`ubus`
+引用计数为 17，不能在业务运行期间直接 `rmmod ubus`；应安装模块、重建 initramfs 后重启。
+
+先把构建产物复制到宿主机临时目录，例如：
+
+```text
+/root/a5-ubus-test/ubus.ko
+```
+
+随后在宿主机执行。以下步骤会改变宿主机启动模块，执行前先确认目标路径和维护窗口：
+
+```bash
+A5_KERNEL_RELEASE=$(uname -r)
+A5_NEW_UBUS=/root/a5-ubus-test/ubus.ko
+A5_MODULE_DIR="/lib/modules/${A5_KERNEL_RELEASE}/updates/a5-explicit-relay"
+A5_BACKUP_DIR="/root/a5-ubus-backup-${A5_KERNEL_RELEASE}"
+
+test -f "${A5_NEW_UBUS}"
+test "$(modinfo -F vermagic "${A5_NEW_UBUS}" | awk '{print $1}')" = "${A5_KERNEL_RELEASE}"
+
+mkdir -p "${A5_BACKUP_DIR}"
+cp -a "$(modinfo -n ubus)" "${A5_BACKUP_DIR}/"
+cp -a "/boot/initramfs-${A5_KERNEL_RELEASE}.img" "${A5_BACKUP_DIR}/"
+
+mkdir -p "${A5_MODULE_DIR}"
+install -m 0644 "${A5_NEW_UBUS}" "${A5_MODULE_DIR}/ubus.ko"
+depmod -a "${A5_KERNEL_RELEASE}"
+
+modinfo -n ubus
+modinfo -F vermagic ubus
+```
+
+此时 `modinfo -n ubus` 必须指向 `updates/a5-explicit-relay/ubus.ko`。如果没有指向新模块，
+停止，不要重建 initramfs或重启，先检查 `modules.dep`/`modules.alias` 的模块优先级。
+
+确认路径正确后重建该内核的 initramfs：
+
+```bash
+dracut --force "/boot/initramfs-${A5_KERNEL_RELEASE}.img" "${A5_KERNEL_RELEASE}"
+lsinitrd "/boot/initramfs-${A5_KERNEL_RELEASE}.img" | grep '/ubus\.ko'
+```
+
+若内核强制模块签名，必须先用该机器信任的证书签名；`CONFIG_MODULE_SIG=y` 本身不等于
+强制签名，最终以 `sig_enforce`、Secure Boot/lockdown 和实际加载策略为准。签名不满足时
+不要重启进入实验环境。
+
+重启后在宿主机验证：
+
+```bash
+uname -r
+modinfo -n ubus
+dmesg -T | grep -Ei 'ubus|module verification|invalid module|unknown symbol' | tail -n 100
+find /sys/bus/ub/devices -name route_override -print
+```
+
+只有 `route_override` 属性出现，才能进入第 5 节。若启动或模块加载失败，通过 GRUB/BMC
+回退原内核/initramfs，或从救援环境删除 `updates/a5-explicit-relay` 并恢复备份后执行
+`depmod`、`dracut`。
 
 不要在承载业务的机器上直接卸载 `ubus`：它被 `ubcore/udma/uburma` 等模块依赖。
 推荐把匹配版本的模块安装到测试内核并重启；具体安装方式由机器的内核包、签名和启动策略决定。
