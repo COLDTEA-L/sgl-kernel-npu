@@ -26,15 +26,22 @@ trace_so=$(readlink -f "$trace_dir/liba5_urma_tp_trace.so")
 
 run_dir="${output_root}/a5_ccu_channel_trace_${devices//,/_}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$run_dir"
-env -u LD_PRELOAD urma_admin show -w >"$run_dir/urma_admin_show.txt" 2>&1 || true
+env -u LD_PRELOAD urma_admin show >"$run_dir/urma_admin_show.txt" 2>&1 || true
 
 snapshot_resources() {
     local case_dir=$1
     local phase=$2
     local devices_file="$run_dir/urma_admin_show.txt"
-    mapfile -t ub_devices < <(awk 'NR > 2 && $1 ~ /^[0-9]+$/ {print $2}' "$devices_file" | sort -u)
+    # Different urma_admin builds format `show -w` differently.  The normal
+    # `show` output always carries the ubep device name, so parse that token
+    # instead of assuming a numeric first column/table layout.
+    mapfile -t ub_devices < <(grep -Eo 'udmac[0-9]+d[0-9]+e[0-9]+' "$devices_file" | sort -u || true)
     if (( ${#ub_devices[@]} == 0 )); then
-        echo "URMA_RESOURCE_SNAPSHOT status=NO_DEVICE_LIST" >"$case_dir/${phase}_resources.txt"
+        {
+            echo "URMA_RESOURCE_SNAPSHOT status=NO_DEVICE_LIST source=${devices_file}"
+            echo "===== raw urma_admin show ====="
+            cat "$devices_file"
+        } >"$case_dir/${phase}_resources.txt"
         return
     fi
     : >"$case_dir/${phase}_resources.txt"
@@ -93,4 +100,3 @@ done
 python3 scripts/compare_a5_ccu_channel_trace.py \
     --run-dir "$run_dir" --output "$run_dir/channel_trace_comparison.md"
 echo "Trace result: $run_dir"
-
