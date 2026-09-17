@@ -97,6 +97,42 @@ run_a5_ccu_same_process_tp_binding.sh
 
 两个 Channel 在第二次 acquire 完成前均保持存活，且 communicator 不重建。正反顺序用于区分“由 CommLink 决定的 TP 绑定”和“由首次/第二次资源分配决定的 handle”。这里的标签只用于观测，不修改 ChannelDesc、TP 或驱动返回值。
 
+## 一次性控制面/数据面差分调用链
+
+```text
+run_a5_ccu_path_binding_forensics.sh
+  ├─ run_a5_ccu_channel_trace.sh
+  │    ├─ candidate A 单独 HcclChannelAcquire
+  │    └─ candidate B 单独 HcclChannelAcquire
+  ├─ run_a5_ccu_same_process_tp_binding.sh
+  │    ├─ 同 communicator A→B
+  │    └─ 同 communicator B→A
+  ├─ run_a5_ccu_urma_route_probe.sh --hccn-stat
+  │    ├─ A-only 数据面
+  │    ├─ B-only 数据面
+  │    └─ A+B concurrent 数据面
+  └─ analyze_a5_ccu_path_binding_forensics.py
+       ├─ path_control_diff.tsv
+       ├─ channel_resource_binding.tsv
+       ├─ physical_footprint.tsv
+       └─ path_binding_report.md
+```
+
+tracer 为每条 JSONL 事件添加 `CLOCK_MONOTONIC` 纳秒时间戳与 Linux TID。分析器按 caller stack 区分通信控制面和 Ascend Trace/HDC 基础设施：后者即使调用 `urma_import_jfr_ex` 并返回合法 TP/TPN，也不会被当作 Channel→TP 绑定证据。
+
+差分报告寻找的“首次差异”顺序为：
+
+```text
+CommLink endpoint
+  -> HcclChannelDesc raw
+  -> GET_TP_LIST
+  -> GET/SET/MODIFY/EXCHANGE TP
+  -> import/bind activation
+  -> HCCN physical footprint
+```
+
+若 endpoint 与 ChannelDesc 不同，而排除 HDC 噪声后的公开 URMA 事件相同，则当前证据将 selector 定位在 `HcclChannelAcquire` 消费 EndpointDesc 的私有 HCCP/MUE matcher/path object；这比把不同 TP handle 直接解释为 route ID 更严格。
+
 `A5_CCU_CHANNEL_HOLD_SECONDS` 让 channel-only probe 在 Channel 存活期间暂停，脚本会同期执行 `urma_admin list_res` 尝试读取 TP/TPG。驱动明确不支持时，原始错误会被保存为“不可见证据”，不会伪造 TPN、TPG 或 path ID。
 
 ## path_uid 的含义

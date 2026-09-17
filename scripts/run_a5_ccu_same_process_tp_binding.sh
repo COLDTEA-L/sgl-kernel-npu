@@ -42,6 +42,7 @@ run_order() {
     local repeat=$2
     local case_dir="$run_dir/order_${order//,/_}_r${repeat}"
     mkdir -p "$case_dir"
+    local status=0
     (
         export A5_CCU_TRACE_LINK=1
         export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
@@ -51,7 +52,9 @@ run_order() {
         bash scripts/run_a5_ccu_urma_route_probe.sh \
             --devices "$devices" --route-indices "$order" --bytes 4096 \
             --warmup 1 --iters 1 --channel-only
-    ) >"$case_dir/channel.log" 2>&1
+    ) >"$case_dir/channel.log" 2>&1 || status=$?
+    printf 'case\tstatus\n%s\t%s\n' "${case_dir##*/}" "$status" >"$case_dir/status.tsv"
+    return 0
 }
 
 for repeat in $(seq 1 "$repeats"); do

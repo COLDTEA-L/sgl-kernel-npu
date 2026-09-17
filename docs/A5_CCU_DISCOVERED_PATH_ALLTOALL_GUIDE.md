@@ -231,6 +231,41 @@ bash scripts/run_a5_ccu_same_process_tp_binding.sh \
 
 判断规则：若同一个 `path_uid` 在 `0,2` 与 `2,0` 两种顺序、多个 repeat 中仍稳定对应同一类 TP/TPN，而不是稳定对应“第一个/第二个 acquire”，才支持 `CommLink -> active TP` 的稳定绑定结论。若 TP/TPN 随 acquire 顺序变化，则先按资源分配噪声处理。该实验仍不能单独给出 `TPN -> physical port/relay`，后续还必须把各 channel 的单独打流与 HCCN footprint 对齐。
 
+### 5.5 一次性 path-binding 取证（推荐）
+
+时间有限时不要分别执行 5.1–5.4。下面一个命令会依次完成 candidate 单独建链、同 communicator 正反顺序 acquire、candidate 单独打流、并发打流、HCCN counter 采集、动态库符号清单和最终差分报告：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+
+# 本次修改包含 route-probe host C++，拉取后只需重新安装这一次。
+bash scripts/build_a5_ccu_urma_route_probe.sh --install
+
+bash scripts/run_a5_ccu_path_binding_forensics.sh \
+  --devices 6,7 \
+  --candidates 0,2 \
+  --bytes 4194304 \
+  --warmup 10 \
+  --iters 30 \
+  --repeats 2 \
+  --hccn-devices 0,1,2,3,4,5,6,7 \
+  --output-root /home/l00934901/profiling
+```
+
+总控脚本不会因为单个诊断用例失败而丢弃其他结果，状态保存在 `case_status.tsv`。最终目录包含：
+
+```text
+path_binding_report.md          # 首先阅读
+path_control_diff.tsv           # CommLink→ChannelDesc→URMA 边界逐层差分
+channel_resource_binding.tsv    # activation 调用栈分类和证据置信度
+physical_footprint.tsv          # route0/route2/concurrent HCCN 增量
+same_process/                   # 正反 acquire 顺序原始证据
+inventory/                      # HCCL/HCOMM/HAL/URMA 动态符号清单
+```
+
+`channel_resource_binding.tsv` 会将 `libascend_trace.so → HDC connect → import_jfr` 标记为 `HDC_TRACE_NOISE/EXCLUDED_NOISE`，禁止将其解释成 CCU Channel TP。只有同时带单次 acquire 标签且 caller 属于 HCCL/HCOMM/HIXL/HAL/URMA 通信链的 activation 才标为高置信证据。若最终结论是 `ENDPOINT_ONLY_PRIVATE_MATCHER`，含义是公开可见的首次差异止于 CommLink/ChannelDesc；实际 path object 由 `HcclChannelAcquire` 后的私有 HCCP/MUE matcher 生成，不能继续用 TP handle 尾号猜路径。
+
 ## 6. 运行显式 path UID AllToAll
 
 从 `path_catalog_4_5.tsv` 选择两个 UID：

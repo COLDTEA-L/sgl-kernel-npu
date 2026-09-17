@@ -70,13 +70,21 @@ def main():
                 "activation_events": item["count"],
             })
 
-    if not rows:
-        raise RuntimeError(f"no labelled TP_ACTIVATION events found under {args.run_dir}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "case", "order", "repeat", "acquire_order", "ordinal", "path_uid",
+        "remote_eid", "active_tp_handles", "target_tpns", "target_ids", "ops",
+        "activation_events",
+    ]
     with args.output.open("w", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0]), delimiter="\t")
+        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
+    if not rows:
+        (args.output.parent / "tp_binding_warning.txt").write_text(
+            "No TP_ACTIVATION event carried a per-acquire trace_label. "
+            "Inspect raw JSONL and the unified forensic report; do not infer path-to-TP binding.\n"
+        )
     print(args.output.resolve())
 
 

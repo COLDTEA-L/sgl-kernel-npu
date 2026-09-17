@@ -1,8 +1,10 @@
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -34,17 +36,26 @@ std::string Hex(const T &value)
 
 void Emit(const std::string &line)
 {
+    std::string enriched = line;
+    if (!enriched.empty() && enriched.back() == '}') {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+        std::ostringstream metadata;
+        metadata << ",\"trace_ts_ns\":" << ns
+                 << ",\"trace_tid\":" << static_cast<long>(syscall(SYS_gettid));
+        enriched.insert(enriched.size() - 1, metadata.str());
+    }
     std::lock_guard<std::mutex> guard(g_traceMutex);
     const char *prefix = std::getenv("A5_URMA_TP_TRACE_PREFIX");
     if (prefix == nullptr || prefix[0] == '\0') {
-        std::fprintf(stderr, "%s\n", line.c_str());
+        std::fprintf(stderr, "%s\n", enriched.c_str());
         std::fflush(stderr);
         return;
     }
     const std::string path = std::string(prefix) + ".pid" + std::to_string(getpid()) + ".jsonl";
     FILE *file = std::fopen(path.c_str(), "a");
     if (file != nullptr) {
-        std::fprintf(file, "%s\n", line.c_str());
+        std::fprintf(file, "%s\n", enriched.c_str());
         std::fclose(file);
     }
 }
