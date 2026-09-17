@@ -49,9 +49,27 @@ raw bytes 与 `object_size` 一起记录，目的是在缺少全部私有字段�
 ```text
 urma_get_tp_list / urma_cmd_get_tp_list
 urma_get_tp_attr / urma_cmd_get_tp_attr
+urma_set_tp_attr / urma_cmd_set_tp_attr
+urma_modify_tp / urma_cmd_modify_tp
+urma_cmd_exchange_tp_info
 ```
 
-它只记录请求、返回 TP handle 和公开 attr，不修改参数或返回值。HCOMM 若绕过这些公开动态符号，trace 文件会为空；此时必须把追踪点下移至 HIXL/HCCP/MUE，不能认为 Channel 没有使用 URMA TP。
+它记录请求、返回 TP handle 和公开 attr，不修改建链参数或返回值。为确定不同返回 handle 的最终网络属性，GET_TP_LIST 成功后还会立即对每个 handle 执行一次只读 `urma_get_tp_attr()`，并记录 status、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL 和 TTL。若 provider 返回 not support，只表示该只读查询能力未开放。
+
+当前已经确认的边界是：
+
+```text
+candidate 0/2
+  -> 不同 CommLink EndpointDesc
+  -> 不同 HcclChannelDesc 参数
+  -> 相同 HcclChannelAcquire API 行为
+  -> 公开 GET_TP_LIST 的 flag/trans_mode/EID pair 可相同
+  -> 返回 TP handle 集合存在差异
+```
+
+因此不能表述为“Acquire 的行为和传参都相同”。准确说法是：调用方式相同、ChannelDesc 输入不同；到公开 GET_TP_LIST 边界时可见配置相同，但隐藏的 Channel/path 上下文使其返回不同 TP 资源。
+
+HCOMM 若绕过这些公开动态符号，trace 文件会为空；此时必须把追踪点下移至 HIXL/HCCP/MUE，不能认为 Channel 没有使用 URMA TP。
 
 `A5_CCU_CHANNEL_HOLD_SECONDS` 让 channel-only probe 在 Channel 存活期间暂停，脚本会同期执行 `urma_admin list_res` 尝试读取 TP/TPG。驱动明确不支持时，原始错误会被保存为“不可见证据”，不会伪造 TPN、TPG 或 path ID。
 

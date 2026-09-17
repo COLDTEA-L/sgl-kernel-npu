@@ -14,6 +14,7 @@
 namespace {
 std::mutex g_traceMutex;
 thread_local bool g_insideTrace = false;
+thread_local uint32_t g_publicGetTpListDepth = 0;
 
 template <typename T>
 std::string Hex(const T &value)
@@ -58,12 +59,13 @@ std::string Handles(const urma_tp_info_t *list, uint32_t count)
 }
 
 void EmitTpList(const char *api, const urma_get_tp_cfg_t *cfg, uint32_t requested,
-                int status, uint32_t returned, const urma_tp_info_t *list)
+                int status, uint32_t returned, const urma_tp_info_t *list, const void *ctx)
 {
     if (cfg == nullptr) return;
     std::ostringstream out;
     out << "{\"event\":\"GET_TP_LIST\",\"api\":\"" << api
         << "\",\"pid\":" << getpid() << ",\"status\":" << status
+        << ",\"context\":\"" << ctx << "\""
         << ",\"flag\":" << cfg->flag.value
         << ",\"trans_mode\":" << static_cast<uint32_t>(cfg->trans_mode)
         << ",\"requested\":" << requested << ",\"returned\":" << returned
@@ -82,7 +84,18 @@ void EmitTpAttr(const char *api, uint64_t handle, int status, uint8_t count,
         << ",\"tp_handle\":" << handle << ",\"attr_count\":"
         << static_cast<uint32_t>(count) << ",\"attr_bitmap\":" << bitmap;
     if (attrs != nullptr && count != 0) {
-        out << ",\"attr_raw\":\"";
+        out << ",\"retry_times_init\":" << static_cast<uint32_t>(attrs->retry_times_init)
+            << ",\"address_type\":" << static_cast<uint32_t>(attrs->at)
+            << ",\"sip_raw\":\"" << Hex(attrs->sip)
+            << "\",\"dip_raw\":\"" << Hex(attrs->dip)
+            << "\",\"sma_raw\":\"" << Hex(attrs->sma)
+            << "\",\"dma_raw\":\"" << Hex(attrs->dma)
+            << "\",\"vlan_id\":" << attrs->vlan_id
+            << ",\"vlan_en\":" << static_cast<uint32_t>(attrs->vlan_en)
+            << ",\"dscp\":" << static_cast<uint32_t>(attrs->dscp)
+            << ",\"sl\":" << static_cast<uint32_t>(attrs->sl)
+            << ",\"ttl\":" << static_cast<uint32_t>(attrs->ttl)
+            << ",\"attr_raw\":\"";
         const auto *bytes = reinterpret_cast<const unsigned char *>(attrs);
         static const char digits[] = "0123456789abcdef";
         for (size_t i = 0; i < static_cast<size_t>(count) * sizeof(*attrs); ++i) {
@@ -92,6 +105,25 @@ void EmitTpAttr(const char *api, uint64_t handle, int status, uint8_t count,
     }
     out << '}';
     Emit(out.str());
+}
+
+void ProbeReturnedTpAttrs(const urma_context_t *ctx, const urma_tp_info_t *list,
+                          uint32_t count, const char *sourceApi)
+{
+    using Fn = urma_status_t (*)(const urma_context_t *, uint64_t, uint8_t *, uint32_t *,
+                                 urma_tp_attr_value_t *);
+    static Fn realGetAttr = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_get_tp_attr"));
+    if (realGetAttr == nullptr || ctx == nullptr || list == nullptr) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t attrCount = 0;
+        uint32_t attrBitmap = 0;
+        urma_tp_attr_value_t attr = {};
+        const urma_status_t status = realGetAttr(ctx, list[i].tp_handle, &attrCount,
+                                                 &attrBitmap, &attr);
+        const std::string api = std::string("trace_probe_after_") + sourceApi;
+        EmitTpAttr(api.c_str(), list[i].tp_handle, static_cast<int>(status), attrCount,
+                   attrBitmap, &attr);
+    }
 }
 
 void EmitSetTpAttr(const char *api, uint64_t handle, int status, uint8_t count,
@@ -162,11 +194,17 @@ extern "C" urma_status_t urma_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "urma_get_tp_list"));
     if (real == nullptr) return static_cast<urma_status_t>(-1);
     const uint32_t requested = tp_cnt == nullptr ? 0 : *tp_cnt;
+    ++g_publicGetTpListDepth;
     const urma_status_t status = real(ctx, cfg, tp_cnt, tp_list);
+    --g_publicGetTpListDepth;
     if (!g_insideTrace) {
         g_insideTrace = true;
         EmitTpList("urma_get_tp_list", cfg, requested, static_cast<int>(status),
-                   tp_cnt == nullptr ? 0 : *tp_cnt, tp_list);
+                   tp_cnt == nullptr ? 0 : *tp_cnt, tp_list, ctx);
+        if (status == URMA_SUCCESS) {
+            ProbeReturnedTpAttrs(ctx, tp_list, tp_cnt == nullptr ? 0 : *tp_cnt,
+                                 "urma_get_tp_list");
+        }
         g_insideTrace = false;
     }
     return status;
@@ -184,7 +222,11 @@ extern "C" int urma_cmd_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
     if (!g_insideTrace) {
         g_insideTrace = true;
         EmitTpList("urma_cmd_get_tp_list", cfg, requested, status,
-                   tp_cnt == nullptr ? 0 : *tp_cnt, tp_list);
+                   tp_cnt == nullptr ? 0 : *tp_cnt, tp_list, ctx);
+        if (status == 0 && g_publicGetTpListDepth == 0) {
+            ProbeReturnedTpAttrs(ctx, tp_list, tp_cnt == nullptr ? 0 : *tp_cnt,
+                                 "urma_cmd_get_tp_list");
+        }
         g_insideTrace = false;
     }
     return status;

@@ -67,6 +67,33 @@ def signatures(events, event_name):
     )
 
 
+def format_handle(handle):
+    return f"0x{handle:x}" if isinstance(handle, int) else str(handle)
+
+
+def tp_handle_map(events):
+    public = [event for event in events
+              if event.get("event") == "GET_TP_LIST"
+              and event.get("api") == "urma_get_tp_list"]
+    selected = public or [event for event in events if event.get("event") == "GET_TP_LIST"]
+    result = {}
+    for event in selected:
+        key = (event.get("local_eid_raw", "N/A"), event.get("peer_eid_raw", "N/A"))
+        result.setdefault(key, set()).update(event.get("tp_handles", []))
+    return result
+
+
+def probed_attr_map(events):
+    result = {}
+    for event in events:
+        if event.get("event") != "GET_TP_ATTR":
+            continue
+        if not str(event.get("api", "")).startswith("trace_probe_after_"):
+            continue
+        result.setdefault(event.get("tp_handle"), []).append(event)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -90,6 +117,34 @@ def main():
                      f"{counts['GET_TP_LIST']} | {counts['GET_TP_ATTR']} | "
                      f"{counts['SET_TP_ATTR']} | {counts['MODIFY_TP']} | "
                      f"{counts['EXCHANGE_TP_INFO']} |")
+
+    lines += ["", "## GET_TP_LIST 返回的 handle 集合", "",
+              "同一 EID pair 的 handle 已去重并转成十六进制。这里展示的是返回资源，不把 handle 数值直接解释成 route/path ID。",
+              "", "| candidate | local EID | peer EID | TP handles |",
+              "|---|---|---|---|"]
+    for case in cases:
+        for (local_eid, peer_eid), handles in sorted(tp_handle_map(case["tp_events"]).items()):
+            handle_text = ", ".join(f"`{format_handle(handle)}`" for handle in sorted(handles))
+            lines.append(f"| {case['name']} | `{local_eid}` | `{peer_eid}` | {handle_text} |")
+
+    lines += ["", "## 主动查询返回 handle 的 TP 属性", "",
+              "追踪器会在 GET_TP_LIST 返回后立即调用 `urma_get_tp_attr()`。`status != 0` 表示当前 provider 不允许按 handle 查询，不表示该 TP 无效。",
+              "", "| candidate | TP handle | status | bitmap | SIP → DIP | MAC | VLAN/DSCP/SL/TTL |",
+              "|---|---|---:|---:|---|---|---|"]
+    attr_rows = 0
+    for case in cases:
+        for handle, events in sorted(probed_attr_map(case["tp_events"]).items(), key=lambda item: str(item[0])):
+            event = events[0]
+            address = f"`{event.get('sip_raw', 'N/A')}` → `{event.get('dip_raw', 'N/A')}`"
+            mac = f"`{event.get('sma_raw', 'N/A')}` → `{event.get('dma_raw', 'N/A')}`"
+            qos = (f"{event.get('vlan_id', 'N/A')}/{event.get('dscp', 'N/A')}/"
+                   f"{event.get('sl', 'N/A')}/{event.get('ttl', 'N/A')}")
+            lines.append(f"| {case['name']} | `{format_handle(handle)}` | "
+                         f"{event.get('status', 'N/A')} | {event.get('attr_bitmap', 'N/A')} | "
+                         f"{address} | {mac} | {qos} |")
+            attr_rows += 1
+    if attr_rows == 0:
+        lines.append("| all | N/A | N/A | N/A | 未捕获主动 TP 属性查询 | N/A | N/A |")
 
     left, right = cases[:2]
     left_link, right_link = unique_rank0(left["commlink"]), unique_rank0(right["commlink"])
