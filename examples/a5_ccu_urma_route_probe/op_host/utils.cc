@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace a5_ccu_urma_probe {
@@ -96,6 +97,43 @@ std::string CommAddrToString(const CommAddr &addr)
         out << std::setw(2) << static_cast<uint32_t>(addr.eid[i]);
     }
     return out.str();
+}
+
+template <typename T>
+std::string RawObjectToHex(const T &object)
+{
+    const auto *bytes = reinterpret_cast<const unsigned char *>(&object);
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        out << std::setw(2) << static_cast<uint32_t>(bytes[i]);
+    }
+    return out.str();
+}
+
+void TraceSelectedLink(uint32_t rank, uint32_t peer, const PathCandidate &selected,
+                       const HcclChannelDesc &desc)
+{
+    if (!EnvEnabled("A5_CCU_TRACE_LINK")) return;
+    const CommLink &link = selected.link;
+    std::printf("COMMLINK_TRACE rank=%u peer=%u path_uid=%s ordinal=%u "
+                "object_size=%zu src_endpoint_size=%zu dst_endpoint_size=%zu "
+                "src_addr=%s dst_addr=%s commlink_raw=%s src_endpoint_raw=%s dst_endpoint_raw=%s\n",
+                rank, peer, selected.uid.c_str(), selected.ordinal,
+                sizeof(CommLink), sizeof(link.srcEndpointDesc), sizeof(link.dstEndpointDesc),
+                CommAddrToString(link.srcEndpointDesc.commAddr).c_str(),
+                CommAddrToString(link.dstEndpointDesc.commAddr).c_str(),
+                RawObjectToHex(link).c_str(), RawObjectToHex(link.srcEndpointDesc).c_str(),
+                RawObjectToHex(link.dstEndpointDesc).c_str());
+    std::printf("CHANNEL_DESC_TRACE phase=before_acquire rank=%u peer=%u path_uid=%s ordinal=%u "
+                "object_size=%zu remote_rank=%u notify_num=%u protocol=%d "
+                "local_addr=%s remote_addr=%s channel_desc_raw=%s\n",
+                rank, peer, selected.uid.c_str(), selected.ordinal, sizeof(HcclChannelDesc),
+                desc.remoteRank, desc.notifyNum, static_cast<int>(desc.channelProtocol),
+                CommAddrToString(desc.localEndpoint.commAddr).c_str(),
+                CommAddrToString(desc.remoteEndpoint.commAddr).c_str(),
+                RawObjectToHex(desc).c_str());
+    std::fflush(stdout);
 }
 
 uint64_t Fnv1a64(const std::string &value)
@@ -221,6 +259,7 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
     desc->channelProtocol = selectedLink.linkAttr.linkProtocol;
     desc->localEndpoint = selectedLink.srcEndpointDesc;
     desc->remoteEndpoint = selectedLink.dstEndpointDesc;
+    TraceSelectedLink(rank, peer, selected, *desc);
 
     std::printf("[A5 CCU URMA][rank=%u peer=%u] prepared route=%u layer=%u link=%u "
                 "die_id=%u; threads will be acquired before this per-die channel\n",
@@ -517,12 +556,34 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         const char *uid = i < created.pathUids.size() ? created.pathUids[i].c_str() : "provider";
         std::printf("PATH_CHANNEL rank=%u channel_index=%zu path_uid=%s ordinal=%u weight=%u state=%d\n",
                     rank, i, uid, created.routeIndices[i], created.weights[i], channelStates[i]);
+        if (EnvEnabled("A5_CCU_TRACE_LINK")) {
+            std::printf("CHANNEL_HANDLE_TRACE phase=after_acquire rank=%u peer=%u "
+                        "channel_index=%zu path_uid=%s ordinal=%u channel_handle=%lu state=%d\n",
+                        rank, 1U - rank, i, uid, created.routeIndices[i],
+                        static_cast<unsigned long>(created.channels[i]), channelStates[i]);
+        }
     }
     std::fflush(stdout);
 
     if (EnvEnabled("A5_CCU_CHANNEL_ONLY")) {
         std::printf("[A5 CCU URMA][rank=%u] channel-only probe passed; skip CCU kernel registration\n", rank);
         std::fflush(stdout);
+        const char *holdValue = std::getenv("A5_CCU_CHANNEL_HOLD_SECONDS");
+        if (holdValue != nullptr && holdValue[0] != '\0') {
+            char *end = nullptr;
+            const unsigned long holdSeconds = std::strtoul(holdValue, &end, 10);
+            if (end == holdValue || *end != '\0' || holdSeconds > 600UL) {
+                std::fprintf(stderr, "[A5 CCU URMA] invalid A5_CCU_CHANNEL_HOLD_SECONDS=%s\n",
+                             holdValue);
+                return HCCL_E_PARA;
+            }
+            if (holdSeconds != 0) {
+                std::printf("CHANNEL_TRACE_HOLD rank=%u seconds=%lu channel_count=%zu\n",
+                            rank, holdSeconds, created.channels.size());
+                std::fflush(stdout);
+                std::this_thread::sleep_for(std::chrono::seconds(holdSeconds));
+            }
+        }
         g_cache.comm = comm;
         g_cache.stream = stream;
         g_cache.routeKey = routeKey;

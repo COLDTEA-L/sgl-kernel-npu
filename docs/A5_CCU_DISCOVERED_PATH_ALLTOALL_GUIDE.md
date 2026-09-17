@@ -94,7 +94,52 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 - 直连与 forwarding 端口同时增长：aggregate footprint；
 - 只有全机背景波动：UNKNOWN，不能据此命名 relay。
 
-## 5. 运行显式 path UID AllToAll
+## 5. CommLink → Channel → TP/path object 建链追踪
+
+第 4 步只确认物理 footprint。本步骤比较 pure-direct candidate 与 direct+relay aggregate candidate 在建链调用链中的首次差异，不重复进行大流量 HCCN 实验。
+
+先编译并安装包含诊断输出的最新自定义库，然后执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+bash scripts/run_a5_ccu_channel_trace.sh \
+  --devices 4,5 \
+  --routes 0,2 \
+  --hold-seconds 20 \
+  --urma-include /usr/include/ub/umdk/urma \
+  --output-root /home/l00934901/profiling
+```
+
+脚本完成以下两次独立实验：
+
+- 第 5.1 步：candidate 0 执行 `--channel-only`，保存 direct 建链诊断；
+- 第 5.2 步：candidate 2 执行 `--channel-only`，保存 aggregate 建链诊断；
+- 第 5.3 步：比较两组 `CommLink`、`HcclChannelDesc`、Channel handle、可观察的 URMA TP 事件和 TP/TPG resource snapshot。
+
+结果目录包含：
+
+```text
+candidate_0/channel.log
+candidate_0/urma_tp.pid*.jsonl
+candidate_0/{before,active,after}_resources.txt
+candidate_2/...
+channel_trace_comparison.md
+channel_trace_comparison.json
+```
+
+诊断代码输出：
+
+- `COMMLINK_TRACE`：完整对象大小、两端 CommAddr、EndpointDesc raw bytes 和 CommLink raw bytes；
+- `CHANNEL_DESC_TRACE`：传给 `HcclChannelAcquire` 前的完整 ChannelDesc raw bytes及关键字段；
+- `CHANNEL_HANDLE_TRACE`：建链后的 handle、状态和 path UID；
+- `GET_TP_LIST/GET_TP_ATTR`：仅当 HCOMM 实际经过公开、动态链接的 liburma 符号时由 interposer 输出。
+
+如果 `urma_tp.pid*.jsonl` 不存在，不能解释为“没有 TP”。它表示当前 HCOMM/HCCP/MUE 建链没有经过可拦截的公开 liburma 符号，可能使用隐藏符号、静态绑定或内部控制面接口。若 `urma_admin list_res` 返回 not support，则 TPN/TPG、`route_addr_idx` 和内部 path object 仍不可见，必须继续在 HIXL/HCCP/MUE 边界追踪，不能根据 Channel handle 猜测。
+
+本步骤不需要再次执行第 4 步的 100 次 HCCN 打流；`channel-only` 建链成功即可。只有某些 TP 资源在首次数据搬运后才出现时，才将 probe 改成 `--warmup 1 --iters 3` 的少量打流诊断。
+
+## 6. 运行显式 path UID AllToAll
 
 从 `path_catalog_4_5.tsv` 选择两个 UID：
 
@@ -123,7 +168,7 @@ bash scripts/run_a5_ccu_discovered_path_alltoall.sh \
 
 `T_concurrent ≈ max(T_A_chunk,T_B_chunk)` 只是理想参考，不作为硬性 PASS。若只有前两项而没有物理 counter 证据，只能说 CCU 命令并发提交，不能说物理链路并发。
 
-## 6. 单独调用 Python 接口
+## 7. 单独调用 Python 接口
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=4,5
@@ -140,4 +185,3 @@ python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
 ```
 
 故障判断：`path_uid is not in this session catalog` 表示 UID 已过期或卡对不一致；`selected routes span die` 表示当前实现不能把跨 die path 放进同一个 CCU kernel，需要按 die 分组，不能强行运行。
-

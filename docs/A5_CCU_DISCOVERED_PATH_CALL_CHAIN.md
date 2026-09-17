@@ -32,6 +32,29 @@ Python test
 | CCU kernel | `examples/a5_ccu_urma_route_probe/op_kernel_ccu/all_to_all_multiroute_kernel.cc` | local copy self slice；对每条 Channel 发不重叠的 `WriteNb`；并发或受控串行等待 |
 | HCCL/HCOMM | `HcclChannelAcquire`, `HcclCcuKernelRegister`, `WriteNb` | 把已发现 CommLink endpoint 交给 MUE/HCOMM 建立/获取 TP，并执行 CCU 数据搬运 |
 
+## 建链诊断接口
+
+`A5_CCU_TRACE_LINK=1` 时，Host probe 会在 `HcclChannelAcquire` 前后输出：
+
+```text
+COMMLINK_TRACE
+CHANNEL_DESC_TRACE phase=before_acquire
+CHANNEL_HANDLE_TRACE phase=after_acquire
+```
+
+raw bytes 与 `object_size` 一起记录，目的是在缺少全部私有字段定义时仍能精确比较两个 ABI 对象；raw offset 不能在没有对应版本头文件时自行命名。
+
+`examples/a5_urma_tp_trace/liba5_urma_tp_trace.so` 是可选的 `LD_PRELOAD` 诊断库，拦截公开动态符号：
+
+```text
+urma_get_tp_list / urma_cmd_get_tp_list
+urma_get_tp_attr / urma_cmd_get_tp_attr
+```
+
+它只记录请求、返回 TP handle 和公开 attr，不修改参数或返回值。HCOMM 若绕过这些公开动态符号，trace 文件会为空；此时必须把追踪点下移至 HIXL/HCCP/MUE，不能认为 Channel 没有使用 URMA TP。
+
+`A5_CCU_CHANNEL_HOLD_SECONDS` 让 channel-only probe 在 Channel 存活期间暂停，脚本会同期执行 `urma_admin list_res` 尝试读取 TP/TPG。驱动明确不支持时，原始错误会被保存为“不可见证据”，不会伪造 TPN、TPG 或 path ID。
+
 ## path_uid 的含义
 
 `path_uid` 是从以下信息生成的 64-bit FNV-1a 标识：
