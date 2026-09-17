@@ -25,23 +25,85 @@ git switch -C feature/a5-ccu-urma-path-puncture \
 git rev-parse --short HEAD
 ```
 
-## 3. 编译并安装单向 CCU Write
+## 3. 在有卡容器中编译并安装单向 CCU Write `.so`
+
+这一部分只安装用户态自定义通信库，不安装 DeepEP wheel，也不会生成或替换
+`ubus.ko`。普通 route0 单向 Write 可以先用它独立验证；显式 FORCE relay 仍需第 4 节的
+UBUS 内核补丁。
+
+确认当前 CANN 与 HCCL 源码：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 export HCCL_REPO=/home/l00934901/hccl
 
+test -x "${HCCL_REPO}/build.sh"
+test -d /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust
+echo "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+```
+
+编译并安装到正在使用的 CANN 9.1 目录：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-确认新 API 已安装：
+脚本会在 `/home/l00934901/hccl/build_out` 中选择时间最新的
+`*ccu_urma_route_probe*.run` 包并执行安装。不要使用通配符直接执行多个 `.run` 文件，
+也不要把该包安装到 `python/deep_ep/.../vendors/hwcomputing`。
+
+确认头文件、动态库和导出符号均已安装：
 
 ```bash
+A5_CANN_ROOT=/usr/local/Ascend/cann-9.1.T560
+
+test -f "${A5_CANN_ROOT}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
+test -f "${A5_CANN_ROOT}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+
 grep -n HcclCcuUrmaOneWayWrite \
-  /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/include/a5_ccu_urma_route_probe.h
+  "${A5_CANN_ROOT}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
+nm -D "${A5_CANN_ROOT}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so" \
+  | grep HcclCcuUrmaOneWayWrite
+ldd "${A5_CANN_ROOT}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so" \
+  | grep 'not found' && echo 'ERROR: missing dependency' || true
+```
+
+运行时必须优先加载刚安装的库。DeepEP 的 vendor 环境可能把
+`ASCEND_CUSTOM_OPP_PATH` 指向仓库内部目录，因此这个独立 probe 执行前要清除该重定向：
+
+```bash
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset ASCEND_CUSTOM_OPP_PATH
+export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}
+
+ldd examples/a5_ccu_urma_route_probe/testcase/a5_ccu_urma_route_probe_test \
+  | grep liba5_ccu_urma_route_probe || true
+```
+
+先运行不依赖 UBUS override 的 route0 单向 Write 冒烟测试，例如使用物理卡 4、5：
+
+```bash
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 4,5 \
+  --route-index 0 \
+  --one-way-src-rank 0 \
+  --bytes 4194304 \
+  --warmup 1 \
+  --iters 3
+```
+
+看到 `PASS` 才说明新 `.so` 已成功加载且单向 API 可用。这个 C++ probe 不依赖
+`deep_ep_cpp`，因此不需要重装 DeepEP wheel。若报 `undefined symbol`，优先检查：
+
+```bash
+echo "${LD_LIBRARY_PATH}"
+find /usr/local/Ascend -name liba5_ccu_urma_route_probe.so -type f -print
+ldd examples/a5_ccu_urma_route_probe/testcase/a5_ccu_urma_route_probe_test
 ```
 
 ## 4. 准备带 FORCE override 的 UBUS 内核模块
@@ -74,6 +136,27 @@ uname -r
 modinfo ubus | grep -E 'filename|srcversion|vermagic'
 git -C /home/l00934901/openeuler-kernel status --short
 ```
+
+当前有卡容器的已知状态是：
+
+```text
+运行内核:            6.6.0-159.4.13.167.oe2403sp4.aarch64
+CONFIG_MODVERSIONS:   y
+CONFIG_MODULE_SIG:    y
+容器内匹配 build:    不存在
+容器内匹配 source:   不存在
+现有 Module.symvers: 6.6.0-159.4.9.163（与运行内核不匹配）
+```
+
+虽然 `lsmod` 能看到 `ubus` 已加载，但 `modinfo ubus` 报 `Module ubus not found`，说明
+容器能观察宿主机模块状态，却没有挂载宿主机对应的
+`/lib/modules/6.6.0-159.4.13.167.oe2403sp4.aarch64` 模块树。这不影响第 3 节安装和运行
+用户态 `.so`，但意味着不能在该容器内直接生成或安装可加载的 patched `ubus.ko`。
+
+尤其不能使用现有 `159.4.9.163` 的 `Module.symvers` 为 `159.4.13.167` 编译模块；在
+`CONFIG_MODVERSIONS=y` 下，即使源码能编译，也很可能因符号 CRC 不匹配而拒绝加载。
+必须另行取得与 `159.4.13.167` 完全匹配的源码、`.config`、完整
+`Module.symvers` 和模块签名/安装条件，再构建并通过宿主机测试内核部署。
 
 模块构建示例：
 
