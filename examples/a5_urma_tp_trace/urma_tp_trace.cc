@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -58,6 +59,42 @@ std::string Handles(const urma_tp_info_t *list, uint32_t count)
     return out.str();
 }
 
+std::string JsonEscape(const char *value)
+{
+    std::ostringstream out;
+    for (const char *cursor = value == nullptr ? "" : value; *cursor != '\0'; ++cursor) {
+        if (*cursor == '\\' || *cursor == '"') out << '\\';
+        out << *cursor;
+    }
+    return out.str();
+}
+
+std::string CallerFrames()
+{
+    void *frames[20] = {};
+    const int count = backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
+    std::ostringstream out;
+    out << '[';
+    for (int i = 2; i < count; ++i) {
+        Dl_info info = {};
+        if (dladdr(frames[i], &info) == 0 || info.dli_fname == nullptr) continue;
+        if (out.tellp() > 1) out << ',';
+        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+        const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        out << "{\"object\":\"" << JsonEscape(info.dli_fname)
+            << "\",\"object_offset\":\"0x" << std::hex << (address - base) << std::dec << "\"";
+        if (info.dli_sname != nullptr && info.dli_saddr != nullptr) {
+            const auto symbol = reinterpret_cast<uintptr_t>(info.dli_saddr);
+            out << ",\"symbol\":\"" << JsonEscape(info.dli_sname)
+                << "\",\"symbol_offset\":\"0x" << std::hex << (address - symbol)
+                << std::dec << "\"";
+        }
+        out << '}';
+    }
+    out << ']';
+    return out.str();
+}
+
 void EmitTpList(const char *api, const urma_get_tp_cfg_t *cfg, uint32_t requested,
                 int status, uint32_t returned, const urma_tp_info_t *list, const void *ctx)
 {
@@ -71,7 +108,8 @@ void EmitTpList(const char *api, const urma_get_tp_cfg_t *cfg, uint32_t requeste
         << ",\"requested\":" << requested << ",\"returned\":" << returned
         << ",\"local_eid_raw\":\"" << Hex(cfg->local_eid)
         << "\",\"peer_eid_raw\":\"" << Hex(cfg->peer_eid)
-        << "\",\"tp_handles\":" << Handles(list, returned) << '}';
+        << "\",\"tp_handles\":" << Handles(list, returned)
+        << ",\"caller_frames\":" << CallerFrames() << '}';
     Emit(out.str());
 }
 

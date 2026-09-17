@@ -146,6 +146,7 @@ channel_trace_comparison.json
 - `CHANNEL_DESC_TRACE`：传给 `HcclChannelAcquire` 前的完整 ChannelDesc raw bytes及关键字段；
 - `CHANNEL_HANDLE_TRACE`：建链后的 handle、状态和 path UID；
 - `GET_TP_LIST`：公开 liburma 的 TP 获取边界，记录配置和返回 handle；
+- 每条 `GET_TP_LIST` 还记录 `caller_frames`，包含调用栈中的共享库、object offset，以及可解析时的动态符号名；它用于定位 HCOMM/HCCP/MUE 到 liburma 的最后一个可见调用点；
 - `GET_TP_ATTR`：除记录 HCOMM 自身调用外，追踪器还会在每次 GET_TP_LIST 成功后主动查询每个返回 handle，记录查询状态、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL、TTL；
 - `SET_TP_ATTR/MODIFY_TP`：TP 被选中后写入的属性，包括可见的 `peer_tpn`、`spray_en`、`local_net_addr_idx`、UDP、flow label 和 `port_id`；
 - `EXCHANGE_TP_INFO`：本端/对端 TP handle 与 PSN 的配对边界。
@@ -162,7 +163,9 @@ channel_trace_comparison.json
 4. 若主动查询也返回 not support，则当前公开 API 最远只能证明“返回了不同 TP handle”。下一步需追踪 GET_TP_LIST ioctl/UDMA/HCCP/MUE 如何把不同 `HcclChannelDesc` 映射到这些 handle；
 5. 若后续三类事件均未出现，或出现但无 candidate 相关差异，则路径绑定位于公开 liburma API 之外。下一步应追踪 HCCP/MUE 消费 `HcclChannelDesc/EndpointDesc` 的内部入口，不能根据 handle 数值猜测 `route_addr_idx`。
 
-特别注意：candidate 0/2 的 `HcclChannelAcquire` 行为相同，但传入参数并不相同；两者的 `HcclChannelDesc` 包含不同的 CommLink endpoint。当前实验显示，在随后可见的 GET_TP_LIST 中 `flag/trans_mode/local_eid/peer_eid` 可以相同，而返回的 TP handle 集合不同。这说明差异由 Acquire 之前的 endpoint/path 上下文传入，并在后续 TP 查找中产生不同结果。
+特别注意：candidate 0/2 的 `HcclChannelAcquire` 行为相同，但传入参数并不相同；两者的 `HcclChannelDesc` 包含不同的 CommLink endpoint。当前重复实验显示，在随后可见的 GET_TP_LIST 中 `flag/trans_mode/local_eid/peer_eid` 相同，TP handle 集合也可以完全相同；个别运行出现的 handle 尾号互换并不稳定，不能当作路径标识。这更支持路径身份由 Acquire 之前的 endpoint/path 上下文及内部 Channel object 持有，而非公开 TP handle/attr 持有。
+
+比较器会忽略 PID、context 指针和 backtrace 等进程局部字段，再判断语义事件是否不同。只有重复实验中稳定存在的 EID/配置/handle 集合差异才可继续解释；单次 handle 尾号互换不是路径证据。若 handle 集合与属性最终相同，则不能再假设“final TP 不同”，应根据 `caller_frames` 找到内部 Channel/path object 的消费位置。
 
 本步骤不需要再次执行第 4 步的 100 次 HCCN 打流；`channel-only` 建链成功即可。只有某些 TP 资源在首次数据搬运后才出现时，才将 probe 改成 `--warmup 1 --iters 3` 的少量打流诊断。
 

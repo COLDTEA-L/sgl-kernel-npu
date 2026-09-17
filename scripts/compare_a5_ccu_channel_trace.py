@@ -53,9 +53,13 @@ def event_counts(events):
 
 
 def event_signature(event):
-    """Remove process-local noise while retaining all path-relevant fields."""
+    """Remove process-local diagnostics while retaining path-relevant fields."""
+    ignored = {"pid", "context", "caller_frames"}
+    normalized = {key: value for key, value in event.items() if key not in ignored}
+    if event.get("event") == "GET_TP_LIST":
+        normalized["tp_handles"] = sorted(event.get("tp_handles", []))
     return json.dumps(
-        {key: value for key, value in event.items() if key not in {"pid"}},
+        normalized,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -162,7 +166,7 @@ def main():
     if tp_visible:
         lines.append("已观察到公开 liburma 边界事件。下面比较去除 PID 后的完整事件；handle 数值仍只用于同一次运行内关联，不能直接解释为路径编号。")
         lines += ["", "## 两个 candidate 的 URMA 边界差异", "",
-                  "| event | captured | complete event signatures differ | interpretation |",
+                  "| event | captured | semantic event signatures differ | interpretation |",
                   "|---|---:|---|---|"]
         for event_name in EVENTS:
             left_signatures = signatures(left["tp_events"], event_name)

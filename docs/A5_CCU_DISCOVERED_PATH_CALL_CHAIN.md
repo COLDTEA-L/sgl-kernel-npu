@@ -54,7 +54,7 @@ urma_modify_tp / urma_cmd_modify_tp
 urma_cmd_exchange_tp_info
 ```
 
-它记录请求、返回 TP handle 和公开 attr，不修改建链参数或返回值。为确定不同返回 handle 的最终网络属性，GET_TP_LIST 成功后还会立即对每个 handle 执行一次只读 `urma_get_tp_attr()`，并记录 status、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL 和 TTL。若 provider 返回 not support，只表示该只读查询能力未开放。
+它记录请求、返回 TP handle 和公开 attr，不修改建链参数或返回值。为确定不同返回 handle 的最终网络属性，GET_TP_LIST 成功后还会立即对每个 handle 执行一次只读 `urma_get_tp_attr()`，并记录 status、bitmap、SIP/DIP、MAC、VLAN、DSCP、SL 和 TTL。若 provider 返回 not support，只表示该只读查询能力未开放。GET_TP_LIST 事件同时保存共享库级调用栈，供后续把公开 liburma 边界定位回实际 HCOMM/HCCP/MUE 调用模块；地址以 object-relative offset 表示，不能跨版本直接比较绝对地址。
 
 当前已经确认的边界是：
 
