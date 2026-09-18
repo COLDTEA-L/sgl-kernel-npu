@@ -22,6 +22,8 @@ hccn_stat=0
 hccn_devices="0,1,2,3,4,5,6,7"
 hccn_tool_path=""
 hccn_stat_root=""
+descriptor_mutation=""
+descriptor_donor=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -42,6 +44,8 @@ while [[ $# -gt 0 ]]; do
         --hccn-devices) hccn_devices=$2; shift 2 ;;
         --hccn-tool) hccn_tool_path=$2; shift 2 ;;
         --hccn-stat-root) hccn_stat_root=$2; shift 2 ;;
+        --descriptor-mutation) descriptor_mutation=$2; shift 2 ;;
+        --descriptor-donor) descriptor_donor=$2; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -87,6 +91,20 @@ if [[ -n "${source_route_manifest}" ]]; then
     export A5_CCU_SOURCE_ROUTE_PROVIDER="${source_route_provider}"
 else
     unset A5_CCU_SOURCE_ROUTE_MANIFEST A5_CCU_SOURCE_ROUTE_PROVIDER
+fi
+if [[ -n "${descriptor_mutation}" ]]; then
+    [[ -n "${descriptor_donor}" ]] || {
+        echo "--descriptor-mutation requires --descriptor-donor" >&2
+        exit 2
+    }
+    [[ -z "${route_indices}" ]] || {
+        echo "descriptor mutation only supports --route-index" >&2
+        exit 2
+    }
+    export A5_CCU_DESC_MUTATION="${descriptor_mutation}"
+    export A5_CCU_DESC_DONOR_ROUTE="${descriptor_donor}"
+else
+    unset A5_CCU_DESC_MUTATION A5_CCU_DESC_DONOR_ROUTE
 fi
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 

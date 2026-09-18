@@ -337,6 +337,93 @@ HcclResult ParseWeights(size_t count, std::vector<uint32_t> *weights)
     return index == count ? HCCL_SUCCESS : HCCL_E_PARA;
 }
 
+HcclResult ParseUint32Value(const char *name, uint32_t *value)
+{
+    if (value == nullptr) return HCCL_E_PTR;
+    const char *raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') return HCCL_E_NOT_FOUND;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || parsed > UINT32_MAX) {
+        std::fprintf(stderr, "[A5 CCU URMA] invalid %s=%s\n", name, raw);
+        return HCCL_E_PARA;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return HCCL_SUCCESS;
+}
+
+HcclResult ApplyChannelDescMutation(HcclComm comm, uint32_t rank, uint32_t peer,
+                                    uint32_t baseRoute, HcclChannelDesc *desc,
+                                    uint32_t *dieId)
+{
+    if (desc == nullptr || dieId == nullptr) return HCCL_E_PTR;
+    const char *mutationValue = std::getenv("A5_CCU_DESC_MUTATION");
+    if (mutationValue == nullptr || mutationValue[0] == '\0' ||
+        std::string(mutationValue) == "none") {
+        return HCCL_SUCCESS;
+    }
+    uint32_t donorRoute = 0;
+    HcclResult status = ParseUint32Value("A5_CCU_DESC_DONOR_ROUTE", &donorRoute);
+    if (status != HCCL_SUCCESS) {
+        std::fprintf(stderr, "[A5 CCU URMA] descriptor mutation requires "
+                     "A5_CCU_DESC_DONOR_ROUTE\n");
+        return status == HCCL_E_NOT_FOUND ? HCCL_E_PARA : status;
+    }
+    if (donorRoute == baseRoute) {
+        std::fprintf(stderr, "[A5 CCU URMA] descriptor donor route must differ from base route\n");
+        return HCCL_E_PARA;
+    }
+
+    HcclChannelDesc donor{};
+    uint32_t donorDie = 0;
+    std::string donorUid;
+    status = SelectRoute(comm, rank, peer, donorRoute, &donor, &donorDie, &donorUid);
+    if (status != HCCL_SUCCESS) return status;
+
+    const std::string mutation(mutationValue);
+    const std::string beforeRaw = RawObjectToHex(*desc);
+    bool donorLocalIdentity = false;
+    if (mutation == "local_endpoint") {
+        desc->localEndpoint = donor.localEndpoint;
+        donorLocalIdentity = true;
+    } else if (mutation == "remote_endpoint") {
+        desc->remoteEndpoint = donor.remoteEndpoint;
+    } else if (mutation == "both_endpoints") {
+        desc->localEndpoint = donor.localEndpoint;
+        desc->remoteEndpoint = donor.remoteEndpoint;
+        donorLocalIdentity = true;
+    } else if (mutation == "local_comm_addr") {
+        desc->localEndpoint.commAddr = donor.localEndpoint.commAddr;
+        donorLocalIdentity = true;
+    } else if (mutation == "remote_comm_addr") {
+        desc->remoteEndpoint.commAddr = donor.remoteEndpoint.commAddr;
+    } else if (mutation == "both_comm_addrs") {
+        desc->localEndpoint.commAddr = donor.localEndpoint.commAddr;
+        desc->remoteEndpoint.commAddr = donor.remoteEndpoint.commAddr;
+        donorLocalIdentity = true;
+    } else if (mutation == "locations") {
+        desc->localEndpoint.loc = donor.localEndpoint.loc;
+        desc->remoteEndpoint.loc = donor.remoteEndpoint.loc;
+        donorLocalIdentity = true;
+    } else {
+        std::fprintf(stderr, "[A5 CCU URMA] unsupported A5_CCU_DESC_MUTATION=%s\n",
+                     mutationValue);
+        return HCCL_E_PARA;
+    }
+    if (donorLocalIdentity) *dieId = donorDie;
+
+    std::printf("CHANNEL_DESC_VARIANT_TRACE rank=%u peer=%u base_ordinal=%u "
+                "donor_ordinal=%u donor_path_uid=%s mutation=%s die_id=%u "
+                "before_raw=%s donor_raw=%s after_raw=%s local_addr=%s remote_addr=%s\n",
+                rank, peer, baseRoute, donorRoute, donorUid.c_str(), mutationValue, *dieId,
+                beforeRaw.c_str(), RawObjectToHex(donor).c_str(), RawObjectToHex(*desc).c_str(),
+                CommAddrToString(desc->localEndpoint.commAddr).c_str(),
+                CommAddrToString(desc->remoteEndpoint.commAddr).c_str());
+    std::fflush(stdout);
+    return HCCL_SUCCESS;
+}
+
 } // namespace
 
 HcclResult GetCcuRouteIndex(uint32_t *routeIndex)
@@ -419,6 +506,8 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const char *pathKeyValue = std::getenv("A5_CCU_PATH_UIDS");
     const char *weightKeyValue = std::getenv("A5_CCU_PATH_WEIGHTS");
     const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
+    const char *mutationKeyValue = std::getenv("A5_CCU_DESC_MUTATION");
+    const char *donorKeyValue = std::getenv("A5_CCU_DESC_DONOR_ROUTE");
     std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
         (pathKeyValue != nullptr && pathKeyValue[0] != '\0' ?
@@ -426,6 +515,8 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
             (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue)));
     routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
+    routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
+    routeKey += ":donor=" + std::string(donorKeyValue == nullptr ? "none" : donorKeyValue);
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;
@@ -501,6 +592,15 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         if (status != HCCL_SUCCESS) {
             std::fprintf(stderr, "[A5 CCU URMA] A5_CCU_PATH_WEIGHTS must contain one positive integer per selected path\n");
             return status;
+        }
+        if (selectedDescs.size() == 1) {
+            status = ApplyChannelDescMutation(comm, rank, 1U - rank, routeIndices.front(),
+                                              &selectedDescs.front(), &created.dieId);
+            if (status != HCCL_SUCCESS) return status;
+        } else if (mutationKeyValue != nullptr && mutationKeyValue[0] != '\0' &&
+                   std::string(mutationKeyValue) != "none") {
+            std::fprintf(stderr, "[A5 CCU URMA] descriptor mutation only supports one selected route\n");
+            return HCCL_E_NOT_SUPPORT;
         }
     }
 

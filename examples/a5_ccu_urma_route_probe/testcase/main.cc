@@ -177,7 +177,15 @@ static void RunRank(ThreadContext *ctx)
     HcclComm comm = nullptr;
 
     THREAD_ACL_CHECK(aclrtSetDevice(static_cast<int32_t>(ctx->rank)));
+    std::cout << "COMM_INIT_SCOPE phase=begin rank=" << ctx->rank << std::endl;
+    const auto commInitBegin = std::chrono::steady_clock::now();
     THREAD_HCCL_CHECK(HcclCommInitRootInfo(ctx->rankSize, ctx->rootInfo, ctx->rank, &comm));
+    const auto commInitEnd = std::chrono::steady_clock::now();
+    std::cout << "COMM_INIT_SCOPE phase=end rank=" << ctx->rank
+              << " status=0 comm=" << comm
+              << " elapsed_us="
+              << std::chrono::duration<double, std::micro>(commInitEnd - commInitBegin).count()
+              << std::endl;
     THREAD_ACL_CHECK(aclrtCreateStream(&stream));
     THREAD_ACL_CHECK(aclrtMalloc(&sendBuf, ctx->options->bytes, ACL_MEM_MALLOC_HUGE_ONLY));
     THREAD_ACL_CHECK(aclrtMalloc(&recvBuf, recvBytes, ACL_MEM_MALLOC_HUGE_ONLY));

@@ -753,3 +753,9 @@ path object”。
 - route0/route2 的 CommLink、ChannelDesc、URMA 边界与物理路径实验结果。
 
 所有“可能字段”均在表格中标记为候选，不把字段名、handle 数值或 ordinal 当作已经证明的硬件语义。
+
+本结论对应的一次性实验流程见：
+
+- `docs/A5_CCU_CHANNEL_PATH_SELECTOR_FORENSICS_GUIDE.md`
+- `scripts/run_a5_ccu_channel_path_selector_forensics.sh`
+- `scripts/analyze_a5_ccu_channel_path_selector.py`
