@@ -51,6 +51,9 @@ liba5_ccu_urma_route_probe.so
 先确认 12 个 case 哪些能够 READY，避免一开始就执行全部端口采样：
 
 ```bash
+unset LD_PRELOAD
+unset A5_URMA_TP_TRACE_PREFIX
+
 mkdir -p /home/l00934901/profiling
 
 bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
@@ -92,17 +95,23 @@ direct+relay；ordinal 会随卡对、拓扑和软件版本变化。
 /home/l00934901/profiling/a5_ccu_channel_selector_6_7_YYYYMMDD_HHMMSS/
 ```
 
-先查看：
+脚本结束后，直接定位本次最新实验目录并查看状态、因果表和自动生成的 Markdown 报告：
 
 ```bash
-RUN_DIR=$(ls -1dt /home/l00934901/profiling/a5_ccu_channel_selector_6_7_* | head -n 1)
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_channel_selector_* \
+  | head -1)
 
-column -t -s $'\t' "${RUN_DIR}/case_status.tsv" | less -S
-column -t -s $'\t' "${RUN_DIR}/parameter_causality.tsv" | less -S
+echo "RUN_DIR=${RUN_DIR}"
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+column -s $'\t' -t "${RUN_DIR}/parameter_causality.tsv" | less -S
+sed -n '1,240p' "${RUN_DIR}/channel_path_selector_report.md"
 ```
 
-`channel_status=124` 表示被 `timeout` 终止；这通常说明混合 endpoint 无法命中合法建链资源，不要等待默认的
-120 秒 Channel 超时。
+先确认 `c00_base_a` 和 `c01_base_b` 的 `channel_status` 均为 `0`。只有两个未修改基线成功后，
+c02--c11 的结果才具有字段因果意义。变体 case 的 `channel_status=124` 表示它被 `timeout` 终止，
+可能说明该字段组合无法命中合法建链资源；如果基线也是 `124`，则是实验框架或环境异常，不能归因于字段穿刺。
 
 ## 5. 完整因果与 footprint 实验
 
