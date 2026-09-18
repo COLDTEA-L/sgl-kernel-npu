@@ -348,6 +348,50 @@ request entry
 若 host 请求 payload 没有 candidate 差异，selector 就位于 MUE/固件内部；此时需要新增最小 HCCP/MUE
 opcode/ABI，而不是继续猜 TPN、handle 尾号或普通 URMA `flow_label`。
 
+### 8.5 ChannelAcquire 定向 ioctl payload 黑箱
+
+request 编号和次数未随 CommAddr pair 稳定翻转后，执行下面的 payload 因果实验：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
+  --devices 2,3 \
+  --repeats 3 \
+  --timeout-seconds 180 \
+  --max-per-request 64 \
+  --output-root /home/l00934901/profiling
+```
+
+脚本运行 candidate0、candidate2、`base2+addr0` 和 `base0+addr2` 四组对照。`LD_PRELOAD` 只注入最终
+rank worker；只在 Acquire 标签窗口中读取 `_IOC_SIZE` 声明的顶层 payload，不递归读取未知指针。
+
+默认每个 worker 最多记录 2048 次 ioctl、每种 request 最多64次，并且每种 request 只解析一次调用栈。
+终端会输出每个 case 的 `BEGIN/END`；单个成功 case 不应停留数分钟。
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_ioctl_payload_* \
+  | head -1)
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+column -s $'\t' -t "${RUN_DIR}/ioctl_payload_inventory.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/commaddr_causal_payload_offsets.tsv" | less -S
+sed -n '1,260p' "${RUN_DIR}/ioctl_payload_report.md"
+```
+
+候选偏移必须满足：
+
+```text
+candidate0 == c20_addr0
+candidate2 == c21_addr2
+candidate0 != candidate2
+```
+
+并优先检查 `min_modal_confidence >= 0.90` 的记录。它们仍只是私有 ABI 候选，不能直接命名为 path ID。
+
 ## 9. 失败处理
 
 - 某个 mutation Channel 超时：保留 `channel.log`，继续其他 case；总脚本不会因单 case 失败停止。

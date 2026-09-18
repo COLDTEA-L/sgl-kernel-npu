@@ -272,63 +272,8 @@ inventory/                      # HCCL/HCOMM/HAL/URMA 动态符号清单
 
 ### 5.6 ChannelAcquire 定向 ioctl payload 黑箱
 
-前一步只比较 ioctl request 的编号和次数，结果没有找到随 CommAddr pair 翻转的 request。不要继续扩大
-strace 次数统计；改用下面的一次性实验读取 **Acquire 标签窗口内**的顶层 ioctl payload：
-
-```bash
-cd /home/l00934901/sgl-kernel-npu
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
-unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
-
-bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
-  --devices 2,3 \
-  --repeats 3 \
-  --timeout-seconds 180 \
-  --max-per-request 64 \
-  --output-root /home/l00934901/profiling
-```
-
-脚本会自动构建 tracer 和 testcase，并依次运行：
-
-```text
-candidate0
-candidate2
-c20: base2 + candidate0 完整 CommAddr pair
-c21: base0 + candidate2 完整 CommAddr pair
-```
-
-`LD_PRELOAD` 只注入最终两个 worker，不注入外层 bash/make，避免再次破坏 root-info 发布。tracer 只在
-`A5UrmaTpTraceSetLabel()` 已设置时记录 ioctl；快照长度不超过 request 编码的 `_IOC_SIZE` 和 512 字节，
-不递归解引用未知指针。
-
-默认每个 worker 最多记录 2048 次 ioctl、每种 request 最多记录 64 次，并且每种 request 只在第一次
-before 事件解析一次调用栈。终端会打印每个 case 的 `BEGIN/END`。单个成功 case 通常不应停留数分钟；若
-180 秒后显示 status=124，应检查相应 case 目录的 `run.log`，而不是继续等待。
-
-运行结束后直接查看：
-
-```bash
-RUN_DIR=$(ls -dt \
-  /home/l00934901/profiling/a5_ccu_ioctl_payload_* \
-  | head -1)
-
-column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
-column -s $'\t' -t "${RUN_DIR}/ioctl_payload_inventory.tsv" | less -S
-column -s $'\t' -t "${RUN_DIR}/commaddr_causal_payload_offsets.tsv" | less -S
-sed -n '1,260p' "${RUN_DIR}/ioctl_payload_report.md"
-```
-
-分析器只把同时满足下面关系的偏移列为候选：
-
-```text
-candidate0 == c20_addr0
-candidate2 == c21_addr2
-candidate0 != candidate2
-```
-
-并要求查看 `min_modal_confidence`。高置信偏移仍不能直接命名为 `path_id`；必须先按 request、fd 和 caller
-确认对应私有 ABI。若顶层 payload 没有候选，结论是 selector 位于 payload 指向的私有对象或 ioctl 之前的
-HCCP/MUE request builder，下一步只能对已确认的结构字段做 Build-ID 绑定解码，不能做任意指针扫描。
+该实验属于 Channel path selector 取证，不属于 AllToAll 性能流程。完整命令、输出和判读统一维护在
+`A5_CCU_CHANNEL_PATH_SELECTOR_FORENSICS_GUIDE.md` 第 8.5 节；本指南不再复制两套容易失配的步骤。
 
 ## 6. 运行显式 path UID AllToAll
 
