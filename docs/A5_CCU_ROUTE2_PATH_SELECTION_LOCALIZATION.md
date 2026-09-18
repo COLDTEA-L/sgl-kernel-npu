@@ -717,6 +717,48 @@ EndpointDesc
 一旦完成其中之一，才能把当前接口从“选择 HCCL 已发布 candidate”推进为“用户指定 relay 后创建或选择对应
 path object”。
 
+### 9.7 定向 ioctl payload 黑箱：从 request 次数推进到参数字节
+
+最新的 raw ioctl 统计已经确认：candidate0、candidate2、c20、c21 使用基本相同的 request 集合，调用次数没有
+可靠地随 CommAddr pair 翻转。candidate1 的几十万次调用来自 status=9 的超时轮询，不能解释为 relay 协议。
+因此路径分叉若穿过 ioctl 边界，更可能表现为**相同 request 的 payload 不同**，而不是不同 opcode。
+
+本仓新增：
+
+- `examples/a5_urma_tp_trace/urma_tp_trace.cc`：在已有 acquire `trace_label` 内拦截 ioctl，记录 before/after；
+- `scripts/run_a5_ccu_ioctl_payload_forensics.sh`：执行四组因果对照并重复三次；
+- `scripts/analyze_a5_ccu_ioctl_payload.py`：输出 payload inventory、原始事件和因果偏移；
+- `scripts/run_a5_ccu_urma_route_probe.sh --worker-preload/--worker-trace-prefix`：只向最终 rank worker 注入 tracer。
+
+安全边界：
+
+1. 仅记录 request 白名单；
+2. 仅在 `HcclChannelAcquire` 标签窗口内记录；
+3. 仅读取 `_IOC_SIZE` 声明的顶层参数，最多 512 字节；
+4. 使用 `process_vm_readv` 失败即停止，不直接解引用未知地址；
+5. 不修改 payload，不递归扫描指针，不触碰全局 UBUS route table；
+6. 保留 request、fd 目标、caller stack、before/after、rank、PID、occurrence。
+
+实验命令与结果查看见 `A5_CCU_DISCOVERED_PATH_ALLTOALL_GUIDE.md` 第 5.6 节。判定一个偏移与 CommAddr/path
+选择有关，最低要求为：
+
+```text
+modal(candidate0) == modal(c20_addr0)
+modal(candidate2) == modal(c21_addr2)
+modal(candidate0) != modal(candidate2)
+min confidence >= 0.90
+```
+
+该实验可能得到两类结果：
+
+- **有高稳定偏移：**将 request code、fd、caller SO/Build ID 和偏移组合成版本绑定的 ABI 候选，再通过只读结构
+  解码确认它是 endpoint hash、path object、TPG/TPN、route context 还是普通状态字段；
+- **没有高稳定偏移：**证明顶层 ioctl 不是可见分叉点。下一步沿 caller 返回地址定位 ioctl 之前的
+  HCCP/MUE request builder，或在已确认的顶层结构中识别指针字段后做单字段、固定长度的二级快照。
+
+这里仍不能仅凭某个变化字节宣称已经找到 relay selector。只有该字段能够生成新的合法 path object，并经 HCCN
+footprint 验证 first-hop/relay 改变，才满足显式 relay 的最终判据。
+
 ## 10. 当前进度可以怎样汇报
 
 可以明确汇报：

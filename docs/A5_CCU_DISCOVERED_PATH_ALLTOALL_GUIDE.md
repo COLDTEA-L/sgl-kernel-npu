@@ -270,6 +270,61 @@ inventory/                      # HCCL/HCOMM/HAL/URMA 动态符号清单
 
 取证器还会拦截三层 GET_TP_LIST 边界：`udma_u_ctrlq_get_tp_list`、`urma_cmd_get_tp_list` 和 `urma_ioctl_get_tp_list`。对 `urma_cmd_udrv_priv_t` 安全读取最多 4096 字节的 input/output private blob，并在 ioctl 前后保存完整 command 结构。分析器只输出 SHA256 和 endpoint token 命中位置，不把任意 blob 偏移直接解释成 route ID。若 `private_request_diff.tsv` 显示所有 `udata_in_len/udata_out_len` 均为 0，这本身证明当前 UDMA provider 未通过 udata 携带 selector，下一层应转向 `HcclChannelAcquire` 内部 HCCP/MUE path object。
 
+### 5.6 ChannelAcquire 定向 ioctl payload 黑箱
+
+前一步只比较 ioctl request 的编号和次数，结果没有找到随 CommAddr pair 翻转的 request。不要继续扩大
+strace 次数统计；改用下面的一次性实验读取 **Acquire 标签窗口内**的顶层 ioctl payload：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
+  --devices 2,3 \
+  --repeats 3 \
+  --timeout-seconds 180 \
+  --output-root /home/l00934901/profiling
+```
+
+脚本会自动构建 tracer 和 testcase，并依次运行：
+
+```text
+candidate0
+candidate2
+c20: base2 + candidate0 完整 CommAddr pair
+c21: base0 + candidate2 完整 CommAddr pair
+```
+
+`LD_PRELOAD` 只注入最终两个 worker，不注入外层 bash/make，避免再次破坏 root-info 发布。tracer 只在
+`A5UrmaTpTraceSetLabel()` 已设置时记录 ioctl；快照长度不超过 request 编码的 `_IOC_SIZE` 和 512 字节，
+不递归解引用未知指针。
+
+运行结束后直接查看：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_ioctl_payload_* \
+  | head -1)
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+column -s $'\t' -t "${RUN_DIR}/ioctl_payload_inventory.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/commaddr_causal_payload_offsets.tsv" | less -S
+sed -n '1,260p' "${RUN_DIR}/ioctl_payload_report.md"
+```
+
+分析器只把同时满足下面关系的偏移列为候选：
+
+```text
+candidate0 == c20_addr0
+candidate2 == c21_addr2
+candidate0 != candidate2
+```
+
+并要求查看 `min_modal_confidence`。高置信偏移仍不能直接命名为 `path_id`；必须先按 request、fd 和 caller
+确认对应私有 ABI。若顶层 payload 没有候选，结论是 selector 位于 payload 指向的私有对象或 ioctl 之前的
+HCCP/MUE request builder，下一步只能对已确认的结构字段做 Build-ID 绑定解码，不能做任意指针扫描。
+
 ## 6. 运行显式 path UID AllToAll
 
 从 `path_catalog_4_5.tsv` 选择两个 UID：

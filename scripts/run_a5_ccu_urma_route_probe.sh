@@ -26,6 +26,8 @@ hccn_tool_path=""
 hccn_stat_root=""
 descriptor_mutation=""
 descriptor_donor=""
+worker_preload=""
+worker_trace_prefix=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --hccn-stat-root) hccn_stat_root=$2; shift 2 ;;
         --descriptor-mutation) descriptor_mutation=$2; shift 2 ;;
         --descriptor-donor) descriptor_donor=$2; shift 2 ;;
+        --worker-preload) worker_preload=$2; shift 2 ;;
+        --worker-trace-prefix) worker_trace_prefix=$2; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -291,7 +295,17 @@ build_command() {
     local payload_bytes=$1
     local worker_rank=$2
     local root_info_file=$3
-    command=("${test_dir}/a5_ccu_urma_route_probe_test"
+    command=()
+    if [[ -n "${worker_preload}" ]]; then
+        [[ -f "${worker_preload}" ]] || {
+            echo "worker preload library not found: ${worker_preload}" >&2
+            return 1
+        }
+        command+=(env "LD_PRELOAD=${worker_preload}")
+        [[ -z "${worker_trace_prefix}" ]] || \
+            command+=("A5_URMA_TP_TRACE_PREFIX=${worker_trace_prefix}.rank${worker_rank}")
+    fi
+    command+=("${test_dir}/a5_ccu_urma_route_probe_test"
         --bytes "${payload_bytes}"
         --warmup "${warmup}"
         --iters "${iterations}"

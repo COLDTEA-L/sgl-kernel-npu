@@ -1,10 +1,13 @@
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <stdarg.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -12,6 +15,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <urma_api.h>
 #include <urma_cmd.h>
@@ -23,6 +28,10 @@ std::string g_traceLabel;
 thread_local bool g_insideTrace = false;
 thread_local uint32_t g_publicGetTpListDepth = 0;
 constexpr size_t MAX_PRIVATE_SNAPSHOT = 4096;
+constexpr size_t MAX_IOCTL_SNAPSHOT = 512;
+std::mutex g_ioctlMutex;
+std::unordered_map<unsigned long, uint64_t> g_ioctlOccurrences;
+uint64_t g_ioctlEvents = 0;
 
 template <typename T>
 std::string Hex(const T &value)
@@ -81,6 +90,9 @@ struct PrivateBufferSnapshot {
     std::string hex;
 };
 
+void AppendPrivateBuffer(std::ostringstream &out, const char *name,
+                         const PrivateBufferSnapshot &snapshot);
+
 PrivateBufferSnapshot SnapshotBuffer(uint64_t address, uint32_t length)
 {
     PrivateBufferSnapshot snapshot;
@@ -102,6 +114,74 @@ PrivateBufferSnapshot SnapshotBuffer(uint64_t address, uint32_t length)
         snapshot.hex.push_back(digits[value & 0xf]);
     }
     return snapshot;
+}
+
+uint64_t ParsePositiveEnv(const char *name, uint64_t fallback)
+{
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 0);
+    return end != value && *end == '\0' && parsed > 0 ? parsed : fallback;
+}
+
+const std::unordered_set<unsigned long> &IoctlRequestFilter()
+{
+    static const std::unordered_set<unsigned long> requests = [] {
+        std::unordered_set<unsigned long> result;
+        const char *text = std::getenv("A5_IOCTL_PAYLOAD_REQUESTS");
+        if (text == nullptr) return result;
+        std::istringstream input(text);
+        std::string token;
+        while (std::getline(input, token, ',')) {
+            char *end = nullptr;
+            const unsigned long request = std::strtoul(token.c_str(), &end, 0);
+            if (end != token.c_str() && *end == '\0') result.insert(request);
+        }
+        return result;
+    }();
+    return requests;
+}
+
+bool ShouldTraceIoctl(unsigned long request)
+{
+    if (CurrentTraceLabel().empty()) return false;
+    const auto &filter = IoctlRequestFilter();
+    if (!filter.empty() && filter.count(request) == 0) return false;
+    if (_IOC_SIZE(request) == 0) return false;
+    std::lock_guard<std::mutex> guard(g_ioctlMutex);
+    return g_ioctlEvents < ParsePositiveEnv("A5_IOCTL_PAYLOAD_MAX_EVENTS", 1024);
+}
+
+void EmitIoctlPayload(const char *phase, int fd, unsigned long request, uintptr_t argument,
+                      int status, int savedErrno, uint64_t occurrence)
+{
+    const size_t configured = static_cast<size_t>(
+        ParsePositiveEnv("A5_IOCTL_PAYLOAD_CAPTURE_BYTES", MAX_IOCTL_SNAPSHOT));
+    const uint32_t capture = static_cast<uint32_t>(
+        std::min({static_cast<size_t>(_IOC_SIZE(request)), configured, MAX_IOCTL_SNAPSHOT}));
+    const PrivateBufferSnapshot snapshot = SnapshotBuffer(argument, capture);
+    char fdPath[256] = {};
+    char linkPath[64] = {};
+    std::snprintf(linkPath, sizeof(linkPath), "/proc/self/fd/%d", fd);
+    const ssize_t pathLength = readlink(linkPath, fdPath, sizeof(fdPath) - 1);
+    if (pathLength > 0) fdPath[pathLength] = '\0';
+    std::ostringstream out;
+    out << "{\"event\":\"IOCTL_PAYLOAD\",\"phase\":\"" << phase
+        << "\",\"pid\":" << getpid() << ",\"fd\":" << fd
+        << ",\"fd_path\":\"" << JsonEscape(pathLength > 0 ? fdPath : "")
+        << "\",\"request\":\"0x" << std::hex << request << std::dec
+        << "\",\"ioc_dir\":" << _IOC_DIR(request)
+        << ",\"ioc_type\":" << _IOC_TYPE(request)
+        << ",\"ioc_nr\":" << _IOC_NR(request)
+        << ",\"ioc_size\":" << _IOC_SIZE(request)
+        << ",\"argument\":" << argument << ",\"occurrence\":" << occurrence
+        << ",\"status\":" << status << ",\"errno\":" << savedErrno;
+    AppendPrivateBuffer(out, "payload", snapshot);
+    out << ",\"caller_frames\":" << CallerFrames();
+    AppendTraceLabel(out);
+    out << '}';
+    Emit(out.str());
 }
 
 struct UdataSnapshot {
@@ -417,6 +497,40 @@ extern "C" void A5UrmaTpTraceSetLabel(const char *label)
     out << "{\"event\":\"TRACE_SCOPE\",\"pid\":" << getpid()
         << ",\"trace_label\":\"" << JsonEscape(label == nullptr ? "" : label) << "\"}";
     Emit(out.str());
+}
+
+extern "C" int ioctl(int fd, unsigned long request, ...)
+{
+    using Fn = int (*)(int, unsigned long, ...);
+    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "ioctl"));
+    if (real == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    va_list args;
+    va_start(args, request);
+    const uintptr_t argument = va_arg(args, uintptr_t);
+    va_end(args);
+
+    const bool trace = !g_insideTrace && ShouldTraceIoctl(request);
+    uint64_t occurrence = 0;
+    if (trace) {
+        std::lock_guard<std::mutex> guard(g_ioctlMutex);
+        occurrence = ++g_ioctlOccurrences[request];
+        ++g_ioctlEvents;
+        g_insideTrace = true;
+        EmitIoctlPayload("before", fd, request, argument, 0, 0, occurrence);
+        g_insideTrace = false;
+    }
+    const int status = real(fd, request, argument);
+    const int savedErrno = errno;
+    if (trace) {
+        g_insideTrace = true;
+        EmitIoctlPayload("after", fd, request, argument, status, savedErrno, occurrence);
+        g_insideTrace = false;
+    }
+    errno = savedErrno;
+    return status;
 }
 
 extern "C" urma_status_t urma_get_tp_list(urma_context_t *ctx, urma_get_tp_cfg_t *cfg,
