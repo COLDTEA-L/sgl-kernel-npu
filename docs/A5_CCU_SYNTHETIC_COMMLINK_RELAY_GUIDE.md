@@ -5,15 +5,19 @@
 本实验验证：不修改 `ubus.ko` 和全局 route table，仅根据整机拓扑为通信两端选择一对具有相同 relay route-key
 的 EID，构造 `HcclChannelDesc`，能否让 `HcclChannelAcquire` 建立一条新的 forwarding Channel。
 
-例如物理卡 `6 -> relay 2 -> 7`，拓扑记录中可解析出两组候选：
+当前实验使用物理卡2、3，并选择物理卡4作为待验证relay，即 `2 -> relay 4 -> 3`。拓扑记录中可解析出
+两组与现有route0/1/2 EID均不同的候选：
 
 ```text
-plane0: 0002...c301 -> 0002...e301, die0
-plane1: 0042...d301 -> 0042...f301, die1
+plane0: 0004...4502 -> 0004...6503, die0
+plane1: 0044...5501 -> 0044...7501, die1
 ```
 
 EID 不在代码中硬编码；解析器按 `src/dst/relay/plane` 从拓扑文件动态选择两端同一 `udmac`、同一 die、同一
 route-key 的 EID。这里的 route-key 是实验性拓扑编码解释，最终 relay 必须由 HCCN 端口计数确认。
+
+`2/3/4` 仅是本轮实验参数，不是代码常量。通信卡变化时修改 `--src-phy/--dst-phy`，relay变化时修改
+`--relay-phy`；解析器会重新选择对应EID，并拒绝src、dst、relay三者重复。
 
 ## 2. 拉取、编译和安装
 
@@ -34,13 +38,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
 
 ## 3. 先验证三条已发现 CommLink
 
-以当前可用物理卡6、7为例：
+以当前可用物理卡2、3为例：
 
 ```bash
 for route in 0 1 2; do
   timeout --signal=TERM --kill-after=5 180 \
     bash scripts/run_a5_ccu_urma_route_probe.sh \
-      --devices 6,7 --route-index "${route}" \
+      --devices 2,3 --route-index "${route}" \
       --bytes 4096 --warmup 1 --iters 1 --channel-only \
     2>&1 | tee "/home/l00934901/profiling/discovered_route${route}.log"
 done
@@ -50,6 +54,18 @@ done
 `HcclChannelAcquire end`。candidate 1 已被 RankGraph 发布却不能建链，是判断“catalog entry 是否等于可用
 provision”的负对照。
 
+2026-09-18在物理卡2、3上的实测结果为：
+
+| route | layer/hop/die | endpoint protocol | ChannelAcquire | 结论 |
+|---|---|---|---|---|
+| 0 | layer0 / hop1 / die0 | link/src/dst均为UBC_CTP(4) | status 0 | 可用直连基线 |
+| 1 | layer1 / hop2 / die1 | link/src/dst均为UBC_CTP(4) | status 9，约120秒 | 已发布但未形成可用Channel |
+| 2 | layer1 / hop2 / die0 | link/src/dst均为UBC_CTP(4) | status 0 | 可用forwarding基线 |
+
+所以 route1 的问题不在“RankGraph漏生成CommLink”：它已经具有完整EID、protocol和hop信息。失败点位于
+`HcclChannelAcquire` 的endpoint-pair provision/匹配阶段。后续生成新的 synthetic CommLink 时必须同时检查
+“被枚举”和“可Acquire”，不能只统计RankGraph中的link数量。
+
 ## 4. 公共字段重建对照
 
 下面不复制完整 `EndpointDesc` 对象，而是清零后仅重新填写公开的 `protocol/commAddr/loc`：
@@ -57,7 +73,7 @@ provision”的负对照。
 ```bash
 timeout --signal=TERM --kill-after=5 180 \
   bash scripts/run_a5_ccu_urma_route_probe.sh \
-    --devices 6,7 --route-index 2 --rebuild-public \
+    --devices 2,3 --route-index 2 --rebuild-public \
     --bytes 4096 --warmup 1 --iters 3 --channel-only
 ```
 
@@ -71,7 +87,7 @@ timeout --signal=TERM --kill-after=5 180 \
 ```bash
 python3 scripts/resolve_a5_synthetic_relay_eids.py \
   --topology docs/topology/a5_hccn_device_topology_raw.txt \
-  --src-phy 6 --dst-phy 7 --relay-phy 2 --plane all
+  --src-phy 2 --dst-phy 3 --relay-phy 4 --plane all
 ```
 
 输出中的 `udmac`、die、两端 EID 必须成对一致。换成物理卡2、3或4、5时，只修改三个 physical-device 参数，
@@ -83,7 +99,7 @@ python3 scripts/resolve_a5_synthetic_relay_eids.py \
 
 ```bash
 bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
-  --src-phy 6 --dst-phy 7 --relay-phy 2 \
+  --src-phy 2 --dst-phy 3 --relay-phy 4 \
   --plane all --base-route 0 \
   --bytes 4096 --warmup 1 --iters 1 \
   --channel-only --timeout-seconds 180 \
@@ -94,7 +110,7 @@ bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
 
 ```bash
 bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
-  --src-phy 6 --dst-phy 7 --relay-phy 2 \
+  --src-phy 2 --dst-phy 3 --relay-phy 4 \
   --plane all --base-route 0 \
   --bytes 4194304 --warmup 10 --iters 100 \
   --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
@@ -134,7 +150,7 @@ grep -RHnE 'SYNTHETIC_COMMLINK_TRACE|HcclChannelAcquire end|PASS|failure' "${RUN
 
 1. rank0/rank1 的 synthetic endpoint 查询和 ChannelAcquire 成功；
 2. 4MiB 数据校验通过；
-3. HCCN 同一实验窗口中，源到指定 relay、指定 relay 到目的的对应端口计数明显增加；
+3. HCCN 同一实验窗口中，源2到指定relay4、relay4到目的3的对应端口计数明显增加；
 4. 非指定 relay 没有同量级增量；
 5. relay 卡没有用户进程，也没有中转 HBM buffer；
 6. 至少三次重复结果稳定。
