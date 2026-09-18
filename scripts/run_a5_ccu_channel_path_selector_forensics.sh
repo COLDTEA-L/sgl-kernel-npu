@@ -7,13 +7,14 @@ bytes=4194304
 warmup=3
 iterations=20
 repeats=1
-timeout_seconds=45
+timeout_seconds=180
 output_root=/home/l00934901/profiling
 urma_include=/usr/include/ub/umdk/urma
 hccn_devices="0,1,2,3,4,5,6,7"
 skip_footprint=0
 syscall_trace=0
 perf_callgraph=0
+urma_trace=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --skip-footprint) skip_footprint=1; shift ;;
         --syscall-trace) syscall_trace=1; shift ;;
         --perf-callgraph) perf_callgraph=1; shift ;;
+        --urma-trace) urma_trace=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -49,17 +51,24 @@ mkdir -p "$run_dir"/{inventory,cases}
 status_file="$run_dir/case_status.tsv"
 printf 'case\trepeat\tbase\tdonor\tmutation\tchannel_status\tdata_status\n' >"$status_file"
 
-make -C examples/a5_urma_tp_trace clean all URMA_INCLUDE="$urma_include" \
-    >"$run_dir/inventory/urma_trace_build.log" 2>&1 || {
-    echo "URMA tracer build failed: $run_dir/inventory/urma_trace_build.log" >&2
-    exit 1
-}
-trace_so=$(readlink -f examples/a5_urma_tp_trace/liba5_urma_tp_trace.so)
+trace_so=""
+if (( urma_trace )); then
+    make -C examples/a5_urma_tp_trace clean all URMA_INCLUDE="$urma_include" \
+        >"$run_dir/inventory/urma_trace_build.log" 2>&1 || {
+        echo "URMA tracer build failed: $run_dir/inventory/urma_trace_build.log" >&2
+        exit 1
+    }
+    trace_so=$(readlink -f examples/a5_urma_tp_trace/liba5_urma_tp_trace.so)
+else
+    printf '%s\n' 'disabled: use --urma-trace only for targeted follow-up runs' \
+        >"$run_dir/inventory/urma_trace_build.log"
+fi
 
 {
     echo "timestamp=$(date --iso-8601=ns)"
     echo "devices=$devices"
     echo "candidates=$candidates"
+    echo "urma_trace=$urma_trace"
     echo "kernel=$(uname -r)"
     echo "machine=$(uname -m)"
     echo "cann=${ASCEND_HOME_PATH:-unset}"
@@ -137,9 +146,13 @@ run_one_case() {
         export A5_CCU_TRACE_LINK=1
         export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
         export A5_CCU_CHANNEL_HOLD_SECONDS=0
-        export A5_URMA_TP_TRACE_PREFIX="$case_dir/urma_tp"
-        export LD_PRELOAD="$trace_so${LD_PRELOAD:+:$LD_PRELOAD}"
-        run_command "$case_dir/channel" bash scripts/run_a5_ccu_urma_route_probe.sh \
+        unset A5_URMA_TP_TRACE_PREFIX LD_PRELOAD
+        if (( urma_trace )); then
+            export A5_URMA_TP_TRACE_PREFIX="$case_dir/urma_tp"
+            export LD_PRELOAD="$trace_so"
+        fi
+        run_command "$case_dir/channel" stdbuf -oL -eL \
+            bash scripts/run_a5_ccu_urma_route_probe.sh \
             --devices "$devices" --route-index "$base" --bytes 4096 \
             --warmup 1 --iters 1 --channel-only "${mutation_args[@]}"
     ) >"$case_dir/channel.log" 2>&1 || channel_status=$?
@@ -150,9 +163,13 @@ run_one_case() {
         data_status=0
         (
             export A5_CCU_TRACE_LINK=1
-            export A5_URMA_TP_TRACE_PREFIX="$case_dir/data_urma_tp"
-            export LD_PRELOAD="$trace_so${LD_PRELOAD:+:$LD_PRELOAD}"
-            run_command "$case_dir/data" bash scripts/run_a5_ccu_urma_route_probe.sh \
+            unset A5_URMA_TP_TRACE_PREFIX LD_PRELOAD
+            if (( urma_trace )); then
+                export A5_URMA_TP_TRACE_PREFIX="$case_dir/data_urma_tp"
+                export LD_PRELOAD="$trace_so"
+            fi
+            run_command "$case_dir/data" stdbuf -oL -eL \
+                bash scripts/run_a5_ccu_urma_route_probe.sh \
                 --devices "$devices" --route-index "$base" --bytes "$bytes" \
                 --warmup "$warmup" --iters "$iterations" --remote-only \
                 --hccn-stat --hccn-devices "$hccn_devices" \

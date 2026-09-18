@@ -9,7 +9,7 @@
 绑定 direct 或 direct+relay 的既有 path object？
 ```
 
-实验同时保存 communicator 初始化、RankGraph、CommLink、ChannelDesc、Acquire/ChannelHandle、可见 URMA 边界、
+实验同时保存 communicator 初始化、RankGraph、CommLink、ChannelDesc 和 Acquire/ChannelHandle；可见 URMA 边界追踪改为显式可选，
 可选系统调用/调用图以及 HCCN footprint，最终生成因果比较表。
 
 边界：该实验选择和拆解已有 candidate，不会创建新的 relay path，不修改 `ubus.ko` 或全局路由表。
@@ -57,10 +57,31 @@ bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
   --devices 6,7 \
   --candidates 0,2 \
   --repeats 1 \
-  --timeout-seconds 45 \
+  --timeout-seconds 180 \
   --skip-footprint \
   --output-root /home/l00934901/profiling
 ```
+
+快速扫描默认**不加载**仓库自带的 `liba5_urma_tp_trace.so`。该 `LD_PRELOAD` tracer 曾在
+root-info/communicator 初始化阶段干扰基线进程；本步骤只验证 ChannelDesc 字段变化是否改变
+`HcclChannelAcquire`，不依赖 URMA API 追踪。脚本还会清除调用环境里遗留的 `LD_PRELOAD`，并用
+行缓冲写入每个 case 的 `channel.log`。
+
+正常情况下，至少以下两个基线必须为 `channel_status=0`：
+
+```text
+c00_base_a
+c01_base_b
+```
+
+若基线仍为 `124`，先看：
+
+```bash
+tail -n 120 "${RUN_DIR}/cases/c00_base_a_r1/channel.log"
+tail -n 120 "${RUN_DIR}/cases/c01_base_b_r1/channel.log"
+```
+
+不要把 `124` 解释为字段穿刺失败；它表示整个 case 被外层 timeout 终止。
 
 换成其他空闲卡时只修改 `--devices`。但必须先确认在当前卡对上 candidate 0 是 direct、candidate 2 是
 direct+relay；ordinal 会随卡对、拓扑和软件版本变化。
@@ -95,7 +116,7 @@ bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
   --warmup 3 \
   --iters 20 \
   --repeats 3 \
-  --timeout-seconds 45 \
+  --timeout-seconds 180 \
   --hccn-devices 0,1,2,3,4,5,6,7 \
   --output-root /home/l00934901/profiling
 ```
@@ -202,6 +223,16 @@ bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
   --syscall-trace \
   --output-root /home/l00934901/profiling
 ```
+
+只有在快速扫描得到稳定结果、并且只需要对少量关键 case 补充公开 URMA 边界事件时，才增加：
+
+```bash
+--urma-trace
+```
+
+不要在 shell 中全局 `export LD_PRELOAD=liba5_urma_tp_trace.so`。该开关仍属于辅助黑箱手段，
+不是第四步字段因果扫描的必要条件；若它再次导致 root-info 初始化失败，以无 tracer 的
+ChannelDesc/Acquire 结果为准。
 
 需要系统存在 `perf`、`strace`，并允许跟踪子进程。输出：
 
