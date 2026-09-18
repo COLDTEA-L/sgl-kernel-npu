@@ -365,8 +365,13 @@ bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
   --output-root /home/l00934901/profiling
 ```
 
-脚本运行 candidate0、candidate2、`base2+addr0` 和 `base0+addr2` 四组对照。`LD_PRELOAD` 只注入最终
-rank worker；只在 Acquire 标签窗口中读取 `_IOC_SIZE` 声明的顶层 payload，不递归读取未知指针。
+脚本首先运行 `preload_smoke`：只预加载最小 `liba5_ioctl_payload_trace.so`，但不开启 Acquire 标签和 payload
+采集；它必须正常完成 root-info、communicator 初始化和 candidate0 ChannelAcquire。冒烟失败时脚本立即终止，
+不会继续执行整批实验。
+
+冒烟成功后才运行 candidate0、candidate2、`base2+addr0` 和 `base0+addr2` 四组对照。`LD_PRELOAD` 只注入最终
+rank worker；只在 Acquire 标签窗口中读取 `_IOC_SIZE` 声明的顶层 payload，不递归读取未知指针。最小 SO 不再
+包含旧 tracer 的 `urma_get_tp_list/import/bind/modify` 等 hook，避免在 root-info 初始化期间介入 URMA 控制面。
 
 默认每个 worker 最多记录 2048 次 ioctl、每种 request 最多64次，并且每种 request 只解析一次调用栈。
 终端会输出每个 case 的 `BEGIN/END`；单个成功 case 不应停留数分钟。
@@ -396,7 +401,8 @@ candidate0 != candidate2
 
 ### 9.1 payload 实验连续出现 `status=1`
 
-四组 payload case 的成功状态都应为 `0`。如果实验尚未结束，但已完成的 case 全部是 `status=1`，应立即
+`preload_smoke` 和四组 payload case 的成功状态都应为 `0`。如果实验尚未结束，但已完成的 case 全部是
+`status=1`，应立即
 `Ctrl+C` 停止；这通常表示 tracer 系统性干扰 worker，继续运行不会产生可用的因果数据。
 
 先查看最新运行和第一个基线 case：
@@ -424,7 +430,8 @@ grep -RHniE \
 ```
 
 不要使用含 `status=1` 的 case 运行 payload 因果分析。若 candidate0 基线也失败，应先修 tracer 的透明转发；
-重点检查通用 `ioctl()` 可变参数 ABI、无第三参数的 ioctl，以及 `LD_PRELOAD` 是否只注入最终 worker。
+重点检查最小 tracer 的通用 `ioctl()` 可变参数 ABI、无第三参数的 ioctl，以及 `LD_PRELOAD` 是否只注入最终
+worker。不要退回包含所有 URMA hooks 的 `liba5_urma_tp_trace.so`。
 
 - 某个 mutation Channel 超时：保留 `channel.log`，继续其他 case；总脚本不会因单 case 失败停止。
 - HCCN 不可用：Channel 因果实验仍有效，但不能给出物理路径结论。

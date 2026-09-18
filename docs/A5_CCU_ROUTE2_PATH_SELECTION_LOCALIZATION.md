@@ -725,7 +725,8 @@ path object”。
 
 本仓新增：
 
-- `examples/a5_urma_tp_trace/urma_tp_trace.cc`：在已有 acquire `trace_label` 内拦截 ioctl，记录 before/after；
+- `examples/a5_ioctl_payload_trace/ioctl_payload_trace.cc`：独立最小 tracer，只在 acquire `trace_label` 内拦截
+  ioctl 并记录 before/after，不包含任何 URMA API hook；
 - `scripts/run_a5_ccu_ioctl_payload_forensics.sh`：执行四组因果对照并重复三次；
 - `scripts/analyze_a5_ccu_ioctl_payload.py`：输出 payload inventory、原始事件和因果偏移；
 - `scripts/run_a5_ccu_urma_route_probe.sh --worker-preload/--worker-trace-prefix`：只向最终 rank worker 注入 tracer。
@@ -738,6 +739,7 @@ path object”。
 4. 使用 `process_vm_readv` 失败即停止，不直接解引用未知地址；
 5. 不修改 payload，不递归扫描指针，不触碰全局 UBUS route table；
 6. 保留 request、fd 目标、caller stack、before/after、rank、PID、occurrence。
+7. 正式采集前必须通过无标签 `preload_smoke`，证明预加载本身不破坏 root-info 和 ChannelAcquire。
 
 性能控制：每种 request 默认只取前 64 次、每个 worker 总计最多 2048 次；调用栈只在该 request 的首个
 before 事件解析一次。此前“每次 ioctl 都 backtrace，并对每条 before/after 单独打开 JSONL 文件”的版本会把

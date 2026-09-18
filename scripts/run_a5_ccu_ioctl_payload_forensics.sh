@@ -31,9 +31,9 @@ printf 'case\trepeat\tbase\tdonor\tmutation\tstatus\n' >"$run_dir/case_status.ts
 # Never preload the outer shell/build process.  The route runner injects this
 # library only into its two final worker executables.
 unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
-make -C examples/a5_urma_tp_trace >"$run_dir/tracer_build.log" 2>&1
+make -C examples/a5_ioctl_payload_trace >"$run_dir/tracer_build.log" 2>&1
 make -C examples/a5_ccu_urma_route_probe/testcase >"$run_dir/testcase_build.log" 2>&1
-trace_so=$(readlink -f examples/a5_urma_tp_trace/liba5_urma_tp_trace.so)
+trace_so=$(readlink -f examples/a5_ioctl_payload_trace/liba5_ioctl_payload_trace.so)
 
 export A5_CCU_TRACE_LINK=1
 export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
@@ -63,6 +63,16 @@ run_case() {
         "$name" "$repeat" "$base" "$donor" "$mutation" "$status" >>"$run_dir/case_status.tsv"
     printf '%s\n' "$status" >"$case_dir/status.txt"
 }
+
+# Gate 0: preload the minimal interposer but never set an acquire label.  This
+# must preserve root-info publication and a normal candidate0 ChannelAcquire.
+export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=0
+run_case preload_smoke 0 0 NA none
+if ! tail -n 1 "$run_dir/case_status.tsv" | grep -q $'\t0$'; then
+    echo "Preload smoke test failed; stop before payload cases: $run_dir" >&2
+    exit 1
+fi
+export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
 
 for ((repeat=1; repeat<=repeats; ++repeat)); do
     run_case candidate0 "$repeat" 0 NA none

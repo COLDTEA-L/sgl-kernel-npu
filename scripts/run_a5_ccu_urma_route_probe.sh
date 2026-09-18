@@ -303,7 +303,8 @@ build_command() {
         }
         command+=(env "LD_PRELOAD=${worker_preload}")
         [[ -z "${worker_trace_prefix}" ]] || \
-            command+=("A5_URMA_TP_TRACE_PREFIX=${worker_trace_prefix}.rank${worker_rank}")
+            command+=("A5_URMA_TP_TRACE_PREFIX=${worker_trace_prefix}.rank${worker_rank}"
+                "A5_IOCTL_PAYLOAD_TRACE_PREFIX=${worker_trace_prefix}.rank${worker_rank}")
     fi
     command+=("${test_dir}/a5_ccu_urma_route_probe_test"
         --bytes "${payload_bytes}"
