@@ -6,7 +6,8 @@ repeats=3
 timeout_seconds=180
 output_root=/home/l00934901/profiling
 requests="0x402c5801,0x402c580a,0x40345810,0x40806b05,0x40806b06,0x40806b07,0xc0085707,0xc0085708,0xc008570a,0xc0104500,0xc0105501,0xc020550c,0xc02c5800,0xc0345812,0xc060580f"
-max_events=10000
+max_events=2048
+max_per_request=64
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -16,6 +17,7 @@ while [[ $# -gt 0 ]]; do
         --output-root) output_root=$2; shift 2 ;;
         --requests) requests=$2; shift 2 ;;
         --max-events) max_events=$2; shift 2 ;;
+        --max-per-request) max_per_request=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -38,6 +40,7 @@ export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
 export A5_CCU_CHANNEL_HOLD_SECONDS=0
 export A5_IOCTL_PAYLOAD_REQUESTS="$requests"
 export A5_IOCTL_PAYLOAD_MAX_EVENTS="$max_events"
+export A5_IOCTL_PAYLOAD_MAX_PER_REQUEST="$max_per_request"
 export A5_IOCTL_PAYLOAD_CAPTURE_BYTES=512
 
 run_case() {
@@ -52,8 +55,10 @@ run_case() {
         command+=(--descriptor-mutation "$mutation" --descriptor-donor "$donor")
     fi
     local status=0
+    echo "[$(date --iso-8601=seconds)] BEGIN ${name}_r${repeat}"
     timeout --signal=TERM --kill-after=5 "$timeout_seconds" \
         stdbuf -oL -eL "${command[@]}" >"$case_dir/run.log" 2>&1 || status=$?
+    echo "[$(date --iso-8601=seconds)] END   ${name}_r${repeat} status=${status}"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$name" "$repeat" "$base" "$donor" "$mutation" "$status" >>"$run_dir/case_status.tsv"
     printf '%s\n' "$status" >"$case_dir/status.txt"

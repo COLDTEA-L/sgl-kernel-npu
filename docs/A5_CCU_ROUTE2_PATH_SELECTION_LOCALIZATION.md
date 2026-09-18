@@ -739,6 +739,10 @@ path object”。
 5. 不修改 payload，不递归扫描指针，不触碰全局 UBUS route table；
 6. 保留 request、fd 目标、caller stack、before/after、rank、PID、occurrence。
 
+性能控制：每种 request 默认只取前 64 次、每个 worker 总计最多 2048 次；调用栈只在该 request 的首个
+before 事件解析一次。此前“每次 ioctl 都 backtrace，并对每条 before/after 单独打开 JSONL 文件”的版本会把
+数千次状态查询放大成数万次昂贵操作，可能让 12 个 case 看起来卡住，不能用于正式取证。
+
 实验命令与结果查看见 `A5_CCU_DISCOVERED_PATH_ALLTOALL_GUIDE.md` 第 5.6 节。判定一个偏移与 CommAddr/path
 选择有关，最低要求为：
 

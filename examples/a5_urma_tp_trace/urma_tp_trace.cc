@@ -150,7 +150,8 @@ bool ShouldTraceIoctl(unsigned long request)
     if (!filter.empty() && filter.count(request) == 0) return false;
     if (_IOC_SIZE(request) == 0) return false;
     std::lock_guard<std::mutex> guard(g_ioctlMutex);
-    return g_ioctlEvents < ParsePositiveEnv("A5_IOCTL_PAYLOAD_MAX_EVENTS", 1024);
+    return g_ioctlEvents < ParsePositiveEnv("A5_IOCTL_PAYLOAD_MAX_EVENTS", 2048) &&
+        g_ioctlOccurrences[request] < ParsePositiveEnv("A5_IOCTL_PAYLOAD_MAX_PER_REQUEST", 64);
 }
 
 void EmitIoctlPayload(const char *phase, int fd, unsigned long request, uintptr_t argument,
@@ -178,7 +179,10 @@ void EmitIoctlPayload(const char *phase, int fd, unsigned long request, uintptr_
         << ",\"argument\":" << argument << ",\"occurrence\":" << occurrence
         << ",\"status\":" << status << ",\"errno\":" << savedErrno;
     AppendPrivateBuffer(out, "payload", snapshot);
-    out << ",\"caller_frames\":" << CallerFrames();
+    // Stack unwinding is substantially more expensive than the ioctl itself.
+    // One pre-call stack per request is enough to identify its submitting SO.
+    out << ",\"caller_frames\":"
+        << ((occurrence == 1 && std::strcmp(phase, "before") == 0) ? CallerFrames() : "[]");
     AppendTraceLabel(out);
     out << '}';
     Emit(out.str());

@@ -284,6 +284,7 @@ bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
   --devices 2,3 \
   --repeats 3 \
   --timeout-seconds 180 \
+  --max-per-request 64 \
   --output-root /home/l00934901/profiling
 ```
 
@@ -299,6 +300,10 @@ c21: base0 + candidate2 完整 CommAddr pair
 `LD_PRELOAD` 只注入最终两个 worker，不注入外层 bash/make，避免再次破坏 root-info 发布。tracer 只在
 `A5UrmaTpTraceSetLabel()` 已设置时记录 ioctl；快照长度不超过 request 编码的 `_IOC_SIZE` 和 512 字节，
 不递归解引用未知指针。
+
+默认每个 worker 最多记录 2048 次 ioctl、每种 request 最多记录 64 次，并且每种 request 只在第一次
+before 事件解析一次调用栈。终端会打印每个 case 的 `BEGIN/END`。单个成功 case 通常不应停留数分钟；若
+180 秒后显示 status=124，应检查相应 case 目录的 `run.log`，而不是继续等待。
 
 运行结束后直接查看：
 
