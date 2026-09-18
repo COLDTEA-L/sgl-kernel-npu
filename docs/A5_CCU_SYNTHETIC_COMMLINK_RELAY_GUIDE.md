@@ -129,6 +129,10 @@ plane*_*.log
 hccn/
 ```
 
+自动脚本会为每条 synthetic candidate 强制加入 `--rebuild-public`，避免 plane1 的EID错误继承base route中
+可能存在的die0私有尾部字节。`--base-route`只提供remote rank、protocol和两端device location模板，不代表
+synthetic流量仍走该base route。
+
 查看：
 
 ```bash

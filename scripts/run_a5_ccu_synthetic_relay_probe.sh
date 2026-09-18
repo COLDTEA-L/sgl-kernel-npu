@@ -67,6 +67,7 @@ while IFS=$'\t' read -r selected_plane route_key die udmac src_index dst_index s
     log="${run_dir}/${case_name}.log"
     command=(bash "${script_dir}/run_a5_ccu_urma_route_probe.sh"
         --devices "${src_phy},${dst_phy}" --route-index "${base_route}"
+        --rebuild-public
         --synthetic-rank0-local-eid "${src_eid}"
         --synthetic-rank0-remote-eid "${dst_eid}"
         --synthetic-die "${die}" --synthetic-hop 2
