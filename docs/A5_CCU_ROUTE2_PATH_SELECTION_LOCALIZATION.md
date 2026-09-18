@@ -740,6 +740,10 @@ path object”。
 5. 不修改 payload，不递归扫描指针，不触碰全局 UBUS route table；
 6. 保留 request、fd 目标、caller stack、before/after、rank、PID、occurrence。
 7. 正式采集前必须通过无标签 `preload_smoke`，证明预加载本身不破坏 root-info 和 ChannelAcquire。
+8. 单独标记 `HcclCommInitRootInfo` 窗口，建立 communicator/path provisioning request inventory；不要把
+   ChannelAcquire 内的 `anon_inode:[jfce]` 高频完成事件误认为 route selector。
+9. 对顶层 payload 中可验证为本进程可读映射的对齐指针，最多读取128字节、每条最多8个对象，并对二级内容执行
+   同样的四组因果检验；禁止全地址空间扫描。
 
 性能控制：每种 request 默认只取前 64 次、每个 worker 总计最多 2048 次；调用栈只在该 request 的首个
 before 事件解析一次。此前“每次 ioctl 都 backtrace，并对每条 before/after 单独打开 JSONL 文件”的版本会把

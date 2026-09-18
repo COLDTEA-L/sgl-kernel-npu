@@ -42,6 +42,7 @@ export A5_IOCTL_PAYLOAD_REQUESTS="$requests"
 export A5_IOCTL_PAYLOAD_MAX_EVENTS="$max_events"
 export A5_IOCTL_PAYLOAD_MAX_PER_REQUEST="$max_per_request"
 export A5_IOCTL_PAYLOAD_CAPTURE_BYTES=512
+export A5_IOCTL_PAYLOAD_NESTED_BYTES=128
 
 run_case() {
     local name=$1 repeat=$2 base=$3 donor=$4 mutation=$5
@@ -72,6 +73,17 @@ if ! tail -n 1 "$run_dir/case_status.tsv" | grep -q $'\t0$'; then
     echo "Preload smoke test failed; stop before payload cases: $run_dir" >&2
     exit 1
 fi
+
+# Gate 1: capture communicator/path-provisioning control requests.  Both runs
+# should build the same path catalog; this window is used to inventory private
+# requests and nested command buffers, not to pretend the route ordinal is an
+# input to communicator initialization.
+export A5_IOCTL_TRACE_COMM_INIT=1
+saved_requests=$A5_IOCTL_PAYLOAD_REQUESTS
+export A5_IOCTL_PAYLOAD_REQUESTS=""
+run_case comm_init_inventory 0 0 NA none
+export A5_IOCTL_PAYLOAD_REQUESTS=$saved_requests
+unset A5_IOCTL_TRACE_COMM_INIT
 export A5_CCU_SEQUENTIAL_ACQUIRE_TRACE=1
 
 for ((repeat=1; repeat<=repeats; ++repeat)); do

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -41,6 +42,20 @@ struct ThreadContext {
     const Options *options = nullptr;
     std::atomic<int> *failed = nullptr;
 };
+
+static bool EnvEnabled(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
+static void SetControlTraceLabel(const std::string &label)
+{
+    using SetLabelFn = void (*)(const char *);
+    static SetLabelFn setLabel = reinterpret_cast<SetLabelFn>(
+        dlsym(RTLD_DEFAULT, "A5UrmaTpTraceSetLabel"));
+    if (setLabel != nullptr) setLabel(label.c_str());
+}
 
 static void PrintUsage(const char *program)
 {
@@ -185,7 +200,11 @@ static void RunRank(ThreadContext *ctx)
     THREAD_ACL_CHECK(aclrtSetDevice(static_cast<int32_t>(ctx->rank)));
     std::cout << "COMM_INIT_SCOPE phase=begin rank=" << ctx->rank << std::endl;
     const auto commInitBegin = std::chrono::steady_clock::now();
+    if (EnvEnabled("A5_IOCTL_TRACE_COMM_INIT")) {
+        SetControlTraceLabel("phase=comm_init;rank=" + std::to_string(ctx->rank));
+    }
     THREAD_HCCL_CHECK(HcclCommInitRootInfo(ctx->rankSize, ctx->rootInfo, ctx->rank, &comm));
+    SetControlTraceLabel("");
     const auto commInitEnd = std::chrono::steady_clock::now();
     std::cout << "COMM_INIT_SCOPE phase=end rank=" << ctx->rank
               << " status=0 comm=" << comm

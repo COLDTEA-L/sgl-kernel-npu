@@ -88,6 +88,35 @@ std::string Snapshot(uintptr_t address, size_t length)
     return hex;
 }
 
+std::string NestedSnapshots(const std::string &payload_hex)
+{
+    const size_t byte_count = payload_hex.size() / 2;
+    if (byte_count < sizeof(uintptr_t)) return "[]";
+    std::string bytes(byte_count, '\0');
+    for (size_t i = 0; i < byte_count; ++i) {
+        bytes[i] = static_cast<char>(std::strtoul(payload_hex.substr(i * 2, 2).c_str(), nullptr, 16));
+    }
+    std::ostringstream out;
+    out << '[';
+    size_t emitted = 0;
+    const size_t nested_size = std::min(static_cast<size_t>(
+        EnvU64("A5_IOCTL_PAYLOAD_NESTED_BYTES", 128)), MAX_SNAPSHOT);
+    for (size_t offset = 0; offset + sizeof(uintptr_t) <= bytes.size() && emitted < 8;
+         offset += sizeof(uintptr_t)) {
+        uintptr_t address = 0;
+        std::memcpy(&address, bytes.data() + offset, sizeof(address));
+        if (address < 0x10000) continue;
+        const std::string nested = Snapshot(address, nested_size);
+        if (nested.empty()) continue;
+        if (emitted++ != 0) out << ',';
+        out << "{\"word_offset\":" << offset << ",\"address\":" << address
+            << ",\"captured\":" << nested.size() / 2
+            << ",\"hex\":\"" << nested << "\"}";
+    }
+    out << ']';
+    return out.str();
+}
+
 std::string Caller(uintptr_t address_value)
 {
     Dl_info info{};
@@ -128,7 +157,8 @@ void Emit(const char *phase, int fd, unsigned long request, uintptr_t argument,
         << ",\"occurrence\":" << occurrence << ",\"status\":" << status
         << ",\"errno\":" << saved_errno << ",\"payload_captured\":"
         << payload.size() / 2 << ",\"payload_hex\":\"" << payload
-        << "\",\"caller_frames\":[" << (include_caller ? Caller(caller) : "") << "]}";
+        << "\",\"nested_snapshots\":" << NestedSnapshots(payload)
+        << ",\"caller_frames\":[" << (include_caller ? Caller(caller) : "") << "]}";
     const char *prefix = std::getenv("A5_IOCTL_PAYLOAD_TRACE_PREFIX");
     if (prefix == nullptr || *prefix == '\0') return;
     const std::string path = std::string(prefix) + ".pid" + std::to_string(getpid()) + ".jsonl";

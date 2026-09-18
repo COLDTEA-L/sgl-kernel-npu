@@ -373,6 +373,10 @@ bash scripts/run_a5_ccu_ioctl_payload_forensics.sh \
 rank worker；只在 Acquire 标签窗口中读取 `_IOC_SIZE` 声明的顶层 payload，不递归读取未知指针。最小 SO 不再
 包含旧 tracer 的 `urma_get_tp_list/import/bind/modify` 等 hook，避免在 root-info 初始化期间介入 URMA 控制面。
 
+随后脚本额外运行一次 `comm_init_inventory`，在 `HcclCommInitRootInfo` 周围设置独立标签，并临时取消 request
+白名单，以收集 communicator/path catalog provisioning 阶段所有带 `_IOC_SIZE` 的控制请求。正式四组实验继续只
+采集已经筛选过的 request，避免高频无关调用淹没结果。
+
 默认每个 worker 最多记录 2048 次 ioctl、每种 request 最多64次，并且每种 request 只解析一次调用栈。
 终端会输出每个 case 的 `BEGIN/END`；单个成功 case 不应停留数分钟。
 
@@ -383,7 +387,9 @@ RUN_DIR=$(ls -dt \
 
 column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
 column -s $'\t' -t "${RUN_DIR}/ioctl_payload_inventory.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/control_window_inventory.tsv" | less -S
 column -s $'\t' -t "${RUN_DIR}/commaddr_causal_payload_offsets.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/commaddr_causal_nested_offsets.tsv" | less -S
 sed -n '1,260p' "${RUN_DIR}/ioctl_payload_report.md"
 ```
 
@@ -396,6 +402,9 @@ candidate0 != candidate2
 ```
 
 并优先检查 `min_modal_confidence >= 0.90` 的记录。它们仍只是私有 ABI 候选，不能直接命名为 path ID。
+`ioctl_nested_snapshots.tsv` 只对顶层 payload 中按指针宽度对齐、且能被 `process_vm_readv` 安全读取的地址保存
+最多128字节；每条 payload 最多8个二级对象。它不是全进程内存扫描。若唯一 request 仍是
+`anon_inode:[jfce]` 且二级内容没有四组因果差异，应将它判为完成事件路径，转向 HCOMM/HCCP matcher。
 
 ## 9. 失败处理
 

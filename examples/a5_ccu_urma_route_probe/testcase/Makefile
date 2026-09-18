@@ -30,7 +30,7 @@ ASCEND_INC_DIR = ${ASCEND_HOME_PATH}/include
 ASCEND_LIB_DIR = ${ASCEND_HOME_PATH}/lib64
 CUSTOM_PROBE_INC_DIR = ${ASCEND_HOME_PATH}/opp/vendors/cust/include
 CUSTOM_PROBE_LIB_DIR = ${ASCEND_HOME_PATH}/opp/vendors/cust/lib64
-LIBS = -L$(ASCEND_LIB_DIR) -lacl_rt -L${CUSTOM_PROBE_LIB_DIR} -la5_ccu_urma_route_probe
+LIBS = -L$(ASCEND_LIB_DIR) -lacl_rt -ldl -L${CUSTOM_PROBE_LIB_DIR} -la5_ccu_urma_route_probe
 INCS = -I$(ASCEND_INC_DIR) -I${CUSTOM_PROBE_INC_DIR}
 TARGET = a5_ccu_urma_route_probe_test
 
