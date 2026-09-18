@@ -57,7 +57,7 @@ unset A5_URMA_TP_TRACE_PREFIX
 mkdir -p /home/l00934901/profiling
 
 bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
-  --devices 6,7 \
+  --devices 2,3 \
   --candidates 0,2 \
   --repeats 1 \
   --timeout-seconds 180 \
@@ -136,7 +136,7 @@ unset LD_PRELOAD
 unset A5_URMA_TP_TRACE_PREFIX
 
 bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
-  --devices 6,7 \
+  --devices 2,3 \
   --candidates 0,2 \
   --cases c00_base_a,c01_base_b,c04_b_both_endpoints_from_a,c07_a_both_endpoints_from_b,c10_b_both_comm_addrs_from_a,c11_b_locations_from_a \
   --bytes 4194304 \
@@ -166,6 +166,20 @@ sed -n '1,280p' "${RUN_DIR}/channel_path_selector_report.md"
 
 第五步有效的最低条件是六个 case 的 `channel_status=0` 且 `data_status=0`。如果 channel 成功但
 `data_status` 非零，先看相应 `cases/<case>_r<repeat>/data.log`，不要用不完整的 HCCN delta 判断路径。
+
+当前实验窗口使用物理卡 2、3，因此第五步命令写为 `--devices 2,3`。换卡后必须重新执行本步骤，
+不能复用 6、7 卡的 endpoint 或 footprint；并应先从 `PATH_CATALOG` 确认 candidate 0/2 在新卡对上的含义。
+
+旧版本 C++ probe 使用了不适用于 A5/950 的无端口 `hccn_tool -i DEV -stat -g`，会出现 workload
+成功但报告全部为 `NO_HCCN`。当前版本先执行 `hccn_tool -g -dev_info -i DEV` 枚举每张卡的 UP
+端口，再对每个 `(device, udie, port)` 执行：
+
+```text
+hccn_tool -g -stat -i DEV -u UDIE -p PORT
+```
+
+若 workload 成功但未生成 `hccn_counter_deltas.tsv`，取证脚本会将 `data_status` 置为 `126`，
+不再把缺失 footprint 误报成完整成功。
 
 ## 6. 12 个 case 分别测试什么
 
@@ -258,7 +272,7 @@ c07: base A + B 的完整 endpoint pair
 
 ```bash
 bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
-  --devices 6,7 \
+  --devices 2,3 \
   --candidates 0,2 \
   --repeats 1 \
   --skip-footprint \

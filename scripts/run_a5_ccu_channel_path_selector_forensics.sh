@@ -192,6 +192,12 @@ run_one_case() {
                 --hccn-stat --hccn-devices "$hccn_devices" \
                 --hccn-stat-root "$case_dir" "${mutation_args[@]}"
         ) >"$case_dir/data.log" 2>&1 || data_status=$?
+        if (( data_status == 0 )) && \
+           ! find "$case_dir" -path '*/hccn_routes_*/hccn_counter_deltas.tsv' -print -quit \
+                | grep -q .; then
+            echo "HCCN delta table missing after successful workload" >>"$case_dir/data.log"
+            data_status=126
+        fi
     fi
     printf '%s\n' "$data_status" >"$case_dir/data_status.txt"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

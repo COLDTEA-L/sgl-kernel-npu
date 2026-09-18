@@ -128,16 +128,13 @@ resolve_hccn_tool() {
     fi
 }
 
-capture_hccn_stats() {
-    local phase=$1
-    local output_dir=$2
-    local dev
-    local output_file
+declare -a hccn_targets=()
+
+discover_hccn_targets() {
+    local output_dir=$1
+    local dev output_file
     local -a stat_devices
-    local before_supported_file="${output_dir}/before_supported_devices.txt"
-    local phase_supported_file="${output_dir}/${phase}_supported_devices.txt"
-    local success_count=0
-    : >"${phase_supported_file}"
+    hccn_targets=()
     IFS=',' read -ra stat_devices <<< "${hccn_devices}"
     for dev in "${stat_devices[@]}"; do
         dev=${dev//[[:space:]]/}
@@ -145,26 +142,70 @@ capture_hccn_stats() {
             echo "invalid physical device ID in --hccn-devices: ${dev}" >&2
             return 1
         }
-        if [[ "${phase}" == "after" ]] && ! grep -qx "${dev}" "${before_supported_file}"; then
+        output_file="${output_dir}/device_info_device${dev}.txt"
+        {
+            echo "# command: ${hccn_tool_path} -g -dev_info -i ${dev}"
+            echo "# timestamp: $(date --iso-8601=ns)"
+            env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
+                "${hccn_tool_path}" -g -dev_info -i "${dev}"
+        } >"${output_file}" 2>&1 || true
+
+        local found=0 udie port state
+        while read -r udie port state; do
+            [[ "$state" == "UP" ]] || continue
+            hccn_targets+=("${dev}:${udie}:${port}")
+            found=1
+        done < <(awk -F'|' '
+            /^\|[[:space:]]*[0-9]+[[:space:]]*\|[[:space:]]*[0-9]+[[:space:]]*\|/ {
+                gsub(/[[:space:]]/, "", $2); gsub(/[[:space:]]/, "", $3);
+                gsub(/[[:space:]]/, "", $6); print $2, $3, $6
+            }' "${output_file}")
+        if (( found == 0 )); then
+            echo "WARNING: no A5 UP ports discovered for device ${dev}; trying legacy statistics mode" >&2
+            hccn_targets+=("${dev}::")
+        fi
+    done
+    (( ${#hccn_targets[@]} > 0 ))
+}
+
+capture_hccn_stats() {
+    local phase=$1
+    local output_dir=$2
+    local target dev udie port target_name output_file
+    local before_supported_file="${output_dir}/before_supported_targets.txt"
+    local phase_supported_file="${output_dir}/${phase}_supported_targets.txt"
+    local success_count=0
+    : >"${phase_supported_file}"
+    for target in "${hccn_targets[@]}"; do
+        IFS=':' read -r dev udie port <<<"$target"
+        if [[ -n "$udie" ]]; then
+            target_name="device${dev}_udie${udie}_port${port}"
+        else
+            target_name="device${dev}"
+        fi
+        if [[ "${phase}" == "after" ]] && ! grep -qx "${target}" "${before_supported_file}"; then
             continue
         fi
-        output_file="${output_dir}/${phase}_device${dev}.txt"
-        echo "HCCN snapshot ${phase}: physical device ${dev}"
+        output_file="${output_dir}/${phase}_${target_name}.txt"
+        echo "HCCN snapshot ${phase}: ${target_name}"
         {
-            echo "# command: ${hccn_tool_path} -i ${dev} -stat -g"
             echo "# timestamp: $(date --iso-8601=ns)"
-            # hccn_tool uses the host logical Device ID. Do not let the
-            # workload's visibility mapping (for example 4,5 -> rank 0,1)
-            # change which host device is queried.
-            env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
-                "${hccn_tool_path}" -i "${dev}" -stat -g
+            if [[ -n "$udie" ]]; then
+                echo "# command: ${hccn_tool_path} -g -stat -i ${dev} -u ${udie} -p ${port}"
+                env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
+                    "${hccn_tool_path}" -g -stat -i "${dev}" -u "${udie}" -p "${port}"
+            else
+                echo "# command: ${hccn_tool_path} -i ${dev} -stat -g"
+                env -u ASCEND_RT_VISIBLE_DEVICES -u ASCEND_VISIBLE_DEVICES \
+                    "${hccn_tool_path}" -i "${dev}" -stat -g
+            fi
         } >"${output_file}" 2>&1 || {
-            echo "WARNING: hccn_tool does not provide -stat data for device ${dev}:" >&2
+            echo "WARNING: hccn_tool does not provide -stat data for ${target_name}:" >&2
             sed 's/^/  | /' "${output_file}" >&2
             continue
         }
         ((success_count += 1))
-        echo "${dev}" >>"${phase_supported_file}"
+        echo "${target}" >>"${phase_supported_file}"
     done
     if (( success_count == 0 )); then
         echo "WARNING: no requested device returned hccn_tool -stat data" >&2
@@ -180,17 +221,16 @@ import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
-before_devices = {
+targets = [
+    line.strip()
+    for line in (root / "before_supported_targets.txt").read_text().splitlines()
+    if line.strip()
+]
+after_targets = {
     item.strip()
-    for item in (root / "before_supported_devices.txt").read_text().splitlines()
+    for item in (root / "after_supported_targets.txt").read_text().splitlines()
     if item.strip()
 }
-after_devices = {
-    item.strip()
-    for item in (root / "after_supported_devices.txt").read_text().splitlines()
-    if item.strip()
-}
-devices = sorted(before_devices & after_devices, key=int)
 summary_fields = (
     "nic_tx_all_pkg_num",
     "nic_tx_all_oct_num",
@@ -210,22 +250,29 @@ def load(path):
 
 rows = []
 print("HCCN counter deltas (after - before):")
-for dev in devices:
-    before = load(root / f"before_device{dev}.txt")
-    after = load(root / f"after_device{dev}.txt")
+for target in targets:
+    if target not in after_targets:
+        continue
+    dev, udie, port = target.split(":")
+    name = f"device{dev}" if not udie else f"device{dev}_udie{udie}_port{port}"
+    before = load(root / f"before_{name}.txt")
+    after = load(root / f"after_{name}.txt")
     common = sorted(before.keys() & after.keys())
     deltas = {key: after[key] - before[key] for key in common}
     shown = " ".join(
         f"{key}={deltas[key]}" if key in deltas else f"{key}=N/A"
         for key in summary_fields
     )
-    print(f"  physical_device={dev} {shown}")
+    location = f"physical_device={dev}"
+    if udie:
+        location += f" udie={udie} port={port}"
+    print(f"  {location} {shown}")
     for key in common:
-        rows.append((dev, key, before[key], after[key], deltas[key]))
+        rows.append((dev, udie, port, key, before[key], after[key], deltas[key]))
 
 output = root / "hccn_counter_deltas.tsv"
 with output.open("w") as handle:
-    handle.write("physical_device\tcounter\tbefore\tafter\tdelta\n")
+    handle.write("physical_device\tudie\tport\tcounter\tbefore\tafter\tdelta\n")
     for row in rows:
         handle.write("\t".join(map(str, row)) + "\n")
 print(f"HCCN raw snapshots and full delta table: {root}")
@@ -332,6 +379,7 @@ hccn_run_dir="${hccn_stat_root}/hccn_routes_${route_label}_$(date +%Y%m%d_%H%M%S
 mkdir -p "${hccn_run_dir}"
 
 hccn_available=1
+discover_hccn_targets "${hccn_run_dir}" || hccn_available=0
 capture_hccn_stats before "${hccn_run_dir}" || hccn_available=0
 workload_status=0
 run_workload || workload_status=$?
