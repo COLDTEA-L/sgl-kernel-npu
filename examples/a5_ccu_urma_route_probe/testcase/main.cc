@@ -29,6 +29,7 @@ struct Options {
     std::string routeIndices;
     bool remoteOnly = false;
     bool channelOnly = false;
+    bool commInitOnly = false;
     int32_t workerRank = -1;
     std::string rootInfoFile;
 };
@@ -45,7 +46,7 @@ static void PrintUsage(const char *program)
 {
     std::cout << "Usage: " << program
               << " [--bytes N] [--warmup N] [--iters N] [--route-index N]"
-              << " [--route-indices 0,2] [--remote-only] [--channel-only]" << std::endl;
+              << " [--route-indices 0,2] [--remote-only] [--channel-only] [--comm-init-only]" << std::endl;
     std::cout << "Worker mode requires --worker-rank 0|1 --root-info-file PATH" << std::endl;
 }
 
@@ -70,6 +71,10 @@ static bool ParseOptions(int argc, char **argv, Options *options)
         }
         if (name == "--channel-only") {
             options->channelOnly = true;
+            continue;
+        }
+        if (name == "--comm-init-only") {
+            options->commInitOnly = true;
             continue;
         }
         if (name == "--route-indices") {
@@ -109,6 +114,7 @@ static bool ParseOptions(int argc, char **argv, Options *options)
     }
     return options->bytes != 0 && options->bytes % sizeof(float) == 0 &&
            options->iterations != 0 && !(options->remoteOnly && options->channelOnly) &&
+           !(options->commInitOnly && (options->remoteOnly || options->channelOnly)) &&
            options->workerRank >= 0 && options->workerRank < 2 && !options->rootInfoFile.empty();
 }
 
@@ -186,6 +192,12 @@ static void RunRank(ThreadContext *ctx)
               << " elapsed_us="
               << std::chrono::duration<double, std::micro>(commInitEnd - commInitBegin).count()
               << std::endl;
+    if (ctx->options->commInitOnly) {
+        std::cout << "[rank=" << ctx->rank << "] PASS mode=comm-init-only" << std::endl;
+        THREAD_HCCL_CHECK(HcclCommDestroy(comm));
+        THREAD_ACL_CHECK(aclrtResetDevice(static_cast<int32_t>(ctx->rank)));
+        return;
+    }
     THREAD_ACL_CHECK(aclrtCreateStream(&stream));
     THREAD_ACL_CHECK(aclrtMalloc(&sendBuf, ctx->options->bytes, ACL_MEM_MALLOC_HUGE_ONLY));
     THREAD_ACL_CHECK(aclrtMalloc(&recvBuf, recvBytes, ACL_MEM_MALLOC_HUGE_ONLY));

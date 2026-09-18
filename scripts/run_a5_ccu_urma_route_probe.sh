@@ -16,6 +16,8 @@ iterations=100
 profile=0
 remote_only=0
 channel_only=0
+comm_init_only=0
+skip_build=0
 sweep=0
 profile_root=/home/l00934901/profiling
 hccn_stat=0
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do
         --iters) iterations=$2; shift 2 ;;
         --remote-only) remote_only=1; shift ;;
         --channel-only) channel_only=1; shift ;;
+        --comm-init-only) comm_init_only=1; shift ;;
+        --skip-build) skip_build=1; shift ;;
         --sweep) sweep=1; shift ;;
         --profile) profile=1; shift ;;
         --profile-root) profile_root=$2; shift 2 ;;
@@ -52,6 +56,10 @@ done
 
 (( remote_only == 0 || channel_only == 0 )) || {
     echo "--remote-only and --channel-only cannot be used together" >&2
+    exit 2
+}
+(( comm_init_only == 0 || (remote_only == 0 && channel_only == 0) )) || {
+    echo "--comm-init-only cannot be combined with --remote-only or --channel-only" >&2
     exit 2
 }
 (( sweep == 0 || channel_only == 0 )) || {
@@ -108,7 +116,7 @@ else
 fi
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 
-make -C "${test_dir}"
+(( skip_build != 0 )) || make -C "${test_dir}"
 
 resolve_hccn_tool() {
     if [[ -n "${hccn_tool_path}" ]]; then
@@ -293,6 +301,7 @@ build_command() {
     [[ -z "${route_indices}" ]] || command+=(--route-indices "${route_indices}")
     (( remote_only == 0 )) || command+=(--remote-only)
     (( channel_only == 0 )) || command+=(--channel-only)
+    (( comm_init_only == 0 )) || command+=(--comm-init-only)
 }
 
 run_pair() {
@@ -361,7 +370,8 @@ echo "Physical devices : ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "Selected routes : ${route_indices:-${A5_CCU_ROUTE_INDEX}}"
 echo "Payload/rank    : ${bytes} bytes"
 echo "Mode            : $([[ ${channel_only} -eq 1 ]] && echo channel-only || \
-    ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather))"
+    ([[ ${comm_init_only} -eq 1 ]] && echo comm-init-only || \
+    ([[ ${remote_only} -eq 1 ]] && echo remote-only || echo allgather)))"
 
 run_pair "${bytes}"
 }

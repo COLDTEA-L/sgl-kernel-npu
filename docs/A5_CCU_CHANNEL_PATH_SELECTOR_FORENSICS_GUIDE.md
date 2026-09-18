@@ -202,133 +202,141 @@ hccn_tool -g -stat -i DEV -u UDIE -p PORT
 
 每个 case 在独立两进程通信域运行，防止前一个 case 的 Channel cache 污染后一个 case。
 
-## 7. 结果文件
+## 7. 从既有 path matching 前移到 path provisioning
+
+第四、第五步只证明成对 `CommAddr` 能选择一个**已经存在**的 path object，不能创建新的
+`src -> 指定 relay -> dst`。下一步必须分离两个时间窗：
 
 ```text
-case_status.tsv
-parameter_causality.tsv
-channel_desc_variant_raw.tsv
-channel_path_selector_report.md
-summary.json
-inventory/
-cases/<case>_r<repeat>/
-  case_meta.tsv
-  channel.log
-  channel_status.txt
-  urma_tp.pid*.jsonl
-  data.log
-  data_status.txt
-  hccn_routes_*/hccn_counter_deltas.tsv
+窗口 A：HcclCommInitRootInfo
+        -> communicator / topology / path catalog provisioning
+
+窗口 B：HcclRankGraphGetLinks
+        -> HcclChannelAcquire
+        -> endpoint pair 匹配既有 path object
 ```
 
-关键日志标记：
+新增脚本运行以下对照：
 
-```text
-COMM_INIT_SCOPE
-PATH_CATALOG
-COMMLINK_TRACE
-CHANNEL_DESC_TRACE
-CHANNEL_DESC_VARIANT_TRACE
-CHANNEL_ACQUIRE_SCOPE
-CHANNEL_HANDLE_TRACE
-```
+| case | 操作 | 用途 |
+|---|---|---|
+| `c00_comm_init_only` | 只初始化/销毁 communicator | 隔离初始化期 provisioning |
+| `c1_candidate_0` | Acquire direct candidate | direct 正对照 |
+| `c1_candidate_1` | Acquire hop-2 candidate 1 | 可见但不可用时作为负对照 |
+| `c1_candidate_2` | Acquire working forwarding candidate | forwarding 正对照 |
+| `c20_base2_addrpair_from0` | base=2，换 candidate 0 CommAddr pair | request 是否随地址对翻转 |
+| `c21_base0_addrpair_from2` | base=0，换 candidate 2 CommAddr pair | 反向因果验证 |
 
-`CHANNEL_DESC_VARIANT_TRACE` 同时保存 base raw、donor raw 和 mutation 后 raw，确保分析时知道实际传给 Acquire 的
-对象，而不是仅凭 case 名推测。
+### 7.1 拉取与执行
 
-## 8. 如何判断哪个参数控制路径
-
-严格按以下顺序判断：
-
-1. `channel_status=0`：混合 descriptor 能建立 Channel；否则该组合不是合法 path key。
-2. `data_status=0`：数据正确；错误数据不进入路径判断。
-3. 比较 `closer_footprint`：归一化 HCCN 计数更接近 candidate A 还是 B。
-4. 检查至少 3 次 repeat 是否一致。
-5. 查看非端点卡 counter 是否随 payload/iterations 近似线性增长，排除背景业务。
-
-重要判据：
-
-```text
-c07: base A + B 的完整 endpoint pair
-```
-
-如果它稳定表现为 candidate B footprint，则 path-specific endpoint pair 很可能足以选择既有 path object。下一步应
-定位 endpoint pair 的生成和注册接口。
-
-如果 `c07` 仍保持 A、失败或结果不稳定，则路径还依赖：
-
-- communicator side table；
-- RankGraph 内部 path identity；
-- Channel cache key；
-- 未复制到公开字段的 pathHandle；
-- HCCP/MUE 私有上下文。
-
-`closer_footprint` 只是相对基线距离，不自动证明经过某张 relay 卡。最终 relay 身份仍需结合端口拓扑和隔离 HCCN
-计数确认。
-
-## 9. 可选 Acquire 窗口调用图与 ioctl 追踪
-
-快速实验可以增加：
+本阶段新增 testcase 的 `--comm-init-only`，统一脚本会自动重新编译 testcase；不需要重新安装 DeepEP wheel
+或自定义算子包。
 
 ```bash
-bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
+cd /home/l00934901/sgl-kernel-npu
+git pull origin feature/a5-ccu-discovered-path-alltoall
+
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+unset A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_path_provisioning_forensics.sh \
   --devices 2,3 \
-  --candidates 0,2 \
-  --repeats 1 \
-  --skip-footprint \
-  --perf-callgraph \
-  --syscall-trace \
+  --candidates 0,1,2 \
+  --timeout-seconds 180 \
   --output-root /home/l00934901/profiling
 ```
 
-只有在快速扫描得到稳定结果、并且只需要对少量关键 case 补充公开 URMA 边界事件时，才增加：
+默认使用 `strace -ff` 记录子进程的 `ioctl/connect/send/recv/read/write`，并保存 HCCL/HCOMM/HAL/HCCP/URMA
+相关 SO 的 Build ID、动态符号和字符串。若容器没有 `strace`，可用 `--no-strace` 验证 case，但不能定位
+私有 request code。
+
+### 7.2 查看结果
 
 ```bash
---urma-trace
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_path_provisioning_* \
+  | head -1)
+
+echo "RUN_DIR=${RUN_DIR}"
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+column -s $'\t' -t "${RUN_DIR}/provisioning_cases.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/candidate_ioctl_differences.tsv" | less -S
+sed -n '1,320p' "${RUN_DIR}/path_provisioning_report.md"
 ```
 
-不要在 shell 中全局 `export LD_PRELOAD=liba5_urma_tp_trace.so`。该开关仍属于辅助黑箱手段，
-不是第四步字段因果扫描的必要条件；若它再次导致 root-info 初始化失败，以无 tracer 的
-ChannelDesc/Acquire 结果为准。
-
-需要系统存在 `perf`、`strace`，并允许跟踪子进程。输出：
+主要文件：
 
 ```text
-cases/<case>/channel.perf.data
-cases/<case>/channel.perf.txt
-cases/<case>/channel.strace.*
+path_provisioning_report.md
+provisioning_cases.tsv
+ioctl_request_matrix.tsv
+candidate_ioctl_differences.tsv
+case_status.tsv
+inventory/
+cases/<case>/run.log
+cases/<case>/syscall.strace.<pid>
 ```
 
-这些文件用于比较 route0/route2 及最小因果 mutation 的调用图和 ioctl/connect 差异。它们不是自动解析出的
-`path ID`；需要结合 Build ID 和 object-relative offset 分析。
+## 8. 如何从结果定位可注入 first-hop/relay 的请求
 
-## 10. 从实验结果继续定位 Acquire 内部
+### 8.1 先确认边界有效
 
-选出“能够稳定改变 footprint 的最小 mutation”，然后只对基线 A、基线 B 和该 mutation 做聚焦追踪：
+最低要求：
 
 ```text
-HcclChannelDesc 中发生变化的 endpoint bytes
-  -> 第一次 read/copy/hash
-  -> Channel cache key
-  -> LinkData/HCCP private request
-  -> internal path object
-  -> handle registry
-  -> ChannelHandle
+c00_comm_init_only status=0
+c1_candidate_0    status=0
+c1_candidate_2    status=0
 ```
 
-优先检查：
+`c1_candidate_1` 可以失败；若它仍是 RankGraph 可见的 hop-2 link，它正好作为“可见但没有可用 Channel”的
+provisioning 负对照。
 
-1. 当前版本 `HcclChannelAcquire` 的真实 SO、Build ID 和内部调用图；
-2. 第一个读取不同 endpoint 字节的内部函数；
-3. Channel cache lookup 的输入、hit/miss 和返回对象；
-4. `HcommChannelGetStatus(handle)` 如何从 handle registry 找回对象；
-5. `GET_TP_LIST` 之前的 HCCP/HDC/MUE 私有请求；
-6. 内部对象中的 endpoint key、remote ID、UASID、TPG/jetty/path resource ID。
+### 8.2 筛选 request code
 
-如果 endpoint pair 足以复现路径，最终显式 relay 的改造点是 path-specific endpoint 的创建/注册控制面；如果不
-足够，则应给 HCOMM 增加明确的 `pathHandle` 绑定，而不是继续猜 TP handle 或 `route_addr_idx` 数值。
+`candidate_ioctl_differences.tsv` 保留 Channel 窗口相对 comm-init-only 新增、或 candidate 间次数不同的 ioctl。
+优先查看同时满足以下模式的 request：
 
-## 11. 失败处理
+```text
+candidate 0 != candidate 2
+candidate 1 与成功 candidate 2 不同
+c20/c21 随 CommAddr pair 翻转
+caller SO 属于 HCOMM/HCCP/HAL/UDMA
+```
+
+调用次数差异只能定位 request，不能把它直接命名为 path ID。
+
+### 8.3 从 request 定位 producer 与 payload
+
+使用 `syscall.strace.<pid>` 的时间、fd 和 `-k` 调用栈，结合 `inventory/*.inventory.txt` 找到第一个提交该
+request 的 SO。随后只针对筛出的 Build ID + request code 增加版本绑定的只读 hook：
+
+```text
+request entry
+  -> 有界复制顶层 command struct
+  -> 按已验证 length 字段复制 input/output blob
+  -> candidate 0/1/2/c20/c21 raw diff
+  -> 找 host 写入且随 forwarding candidate 稳定变化的字段
+```
+
+不得盲目解引用未知指针，也不能把某个偏移直接叫 `route_addr_idx/path_id`。
+
+### 8.4 可注入 relay 参数的最终判据
+
+字段必须同时满足：
+
+- host 在 provisioning/channel 创建请求中写入；
+- candidate 0 与 working forwarding candidate 2 稳定不同；
+- candidate 1 提供合理负对照；
+- 修改后创建新的合法 path object/CommAddr pair，而非只匹配已有 candidate；
+- HCCN footprint 随指定 first-hop/relay 改变且数据正确；
+- 不修改全局 UBUS route table。
+
+若 host 请求 payload 没有 candidate 差异，selector 就位于 MUE/固件内部；此时需要新增最小 HCCP/MUE
+opcode/ABI，而不是继续猜 TPN、handle 尾号或普通 URMA `flow_label`。
+
+## 9. 失败处理
 
 - 某个 mutation Channel 超时：保留 `channel.log`，继续其他 case；总脚本不会因单 case 失败停止。
 - HCCN 不可用：Channel 因果实验仍有效，但不能给出物理路径结论。
