@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +67,10 @@ struct PathCandidate {
     uint32_t dieId = UINT32_MAX;
     std::string uid;
 };
+
+HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
+                                 HcclChannelDesc *desc, uint32_t *dieId,
+                                 std::string *pathUid);
 
 EndpointInfo QueryEndpointInfo(HcclComm comm, uint32_t ownerRank,
                                const EndpointDesc &endpoint)
@@ -199,11 +204,14 @@ HcclResult EnumeratePaths(HcclComm comm, uint32_t rank, uint32_t peer,
             candidate.dieId = srcInfo.dieId;
             const EndpointInfo dstInfo = QueryEndpointInfo(comm, peer, link.dstEndpointDesc);
             std::printf("PATH_CATALOG rank=%u peer=%u path_uid=%s ordinal=%u layer=%u link=%u "
-                        "protocol=%d hop=%u src_phy=%u dst_phy=%u src_die=%s dst_die=%s "
+                        "protocol=%d src_protocol=%d dst_protocol=%d hop=%u "
+                        "src_phy=%u dst_phy=%u src_die=%s dst_die=%s "
                         "src_bw=%s dst_bw=%s src_location=%s dst_location=%s src_addr=%s dst_addr=%s\n",
                         rank, peer, candidate.uid.c_str(), candidate.ordinal,
                         candidate.layer, candidate.linkIndex,
                         static_cast<int>(link.linkAttr.linkProtocol),
+                        static_cast<int>(link.srcEndpointDesc.protocol),
+                        static_cast<int>(link.dstEndpointDesc.protocol),
                         static_cast<uint32_t>(link.linkAttr.hop),
                         link.srcEndpointDesc.loc.device.devPhyId,
                         link.dstEndpointDesc.loc.device.devPhyId,
@@ -266,8 +274,25 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
     desc->remoteRank = peer;
     desc->notifyNum = CHANNEL_NOTIFY_NUM;
     desc->channelProtocol = selectedLink.linkAttr.linkProtocol;
-    desc->localEndpoint = selectedLink.srcEndpointDesc;
-    desc->remoteEndpoint = selectedLink.dstEndpointDesc;
+    if (EnvEnabled("A5_CCU_REBUILD_PUBLIC_FIELDS")) {
+        EndpointDesc local{};
+        local.protocol = selectedLink.srcEndpointDesc.protocol;
+        local.commAddr = selectedLink.srcEndpointDesc.commAddr;
+        local.loc = selectedLink.srcEndpointDesc.loc;
+        EndpointDesc remote{};
+        remote.protocol = selectedLink.dstEndpointDesc.protocol;
+        remote.commAddr = selectedLink.dstEndpointDesc.commAddr;
+        remote.loc = selectedLink.dstEndpointDesc.loc;
+        desc->localEndpoint = local;
+        desc->remoteEndpoint = remote;
+        std::printf("REBUILT_COMMLINK_TRACE rank=%u peer=%u route=%u public_fields_only=1\n",
+                    rank, peer, routeIndex);
+    } else {
+        desc->localEndpoint = selectedLink.srcEndpointDesc;
+        desc->remoteEndpoint = selectedLink.dstEndpointDesc;
+    }
+    status = ApplySyntheticEidPair(comm, rank, peer, desc, dieId, pathUid);
+    if (status != HCCL_SUCCESS) return status;
     TraceSelectedLink(rank, peer, selected, *desc);
 
     std::printf("[A5 CCU URMA][rank=%u peer=%u] prepared route=%u layer=%u link=%u "
@@ -350,6 +375,94 @@ HcclResult ParseUint32Value(const char *name, uint32_t *value)
         return HCCL_E_PARA;
     }
     *value = static_cast<uint32_t>(parsed);
+    return HCCL_SUCCESS;
+}
+
+HcclResult ParseEidValue(const char *name, uint8_t *eid)
+{
+    if (eid == nullptr) return HCCL_E_PTR;
+    const char *raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') return HCCL_E_NOT_FOUND;
+    std::string compact;
+    for (const char *cursor = raw; *cursor != '\0'; ++cursor) {
+        if (*cursor == ':') continue;
+        if (!std::isxdigit(static_cast<unsigned char>(*cursor))) {
+            std::fprintf(stderr, "[A5 CCU URMA] invalid %s=%s\n", name, raw);
+            return HCCL_E_PARA;
+        }
+        compact.push_back(*cursor);
+    }
+    if (compact.size() != EID_BYTE_NUM * 2U) {
+        std::fprintf(stderr, "[A5 CCU URMA] %s must contain exactly 16 bytes: %s\n", name, raw);
+        return HCCL_E_PARA;
+    }
+    for (uint32_t index = 0; index < EID_BYTE_NUM; ++index) {
+        const std::string byteText = compact.substr(index * 2U, 2U);
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(byteText.c_str(), &end, 16);
+        if (end == byteText.c_str() || *end != '\0' || value > 0xffUL) return HCCL_E_PARA;
+        eid[index] = static_cast<uint8_t>(value);
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
+                                 HcclChannelDesc *desc, uint32_t *dieId,
+                                 std::string *pathUid)
+{
+    if (desc == nullptr || dieId == nullptr) return HCCL_E_PTR;
+    const char *rank0Local = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
+    const char *rank0Remote = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID");
+    if ((rank0Local == nullptr || rank0Local[0] == '\0') &&
+        (rank0Remote == nullptr || rank0Remote[0] == '\0')) {
+        return HCCL_SUCCESS;
+    }
+    if (rank0Local == nullptr || rank0Local[0] == '\0' ||
+        rank0Remote == nullptr || rank0Remote[0] == '\0') {
+        std::fprintf(stderr, "[A5 CCU URMA] synthetic mode requires both rank0 EIDs\n");
+        return HCCL_E_PARA;
+    }
+
+    uint8_t first[EID_BYTE_NUM] = {};
+    uint8_t second[EID_BYTE_NUM] = {};
+    HcclResult status = ParseEidValue("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID", first);
+    if (status != HCCL_SUCCESS) return status;
+    status = ParseEidValue("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID", second);
+    if (status != HCCL_SUCCESS) return status;
+    const uint8_t *local = rank == 0 ? first : second;
+    const uint8_t *remote = rank == 0 ? second : first;
+    std::copy(local, local + EID_BYTE_NUM, desc->localEndpoint.commAddr.eid);
+    std::copy(remote, remote + EID_BYTE_NUM, desc->remoteEndpoint.commAddr.eid);
+
+    uint32_t configuredDie = 0;
+    status = ParseUint32Value("A5_CCU_SYNTHETIC_DIE_ID", &configuredDie);
+    if (status != HCCL_SUCCESS || configuredDie > 1U) {
+        std::fprintf(stderr, "[A5 CCU URMA] synthetic mode requires die id 0 or 1\n");
+        return status == HCCL_E_NOT_FOUND ? HCCL_E_PARA : status;
+    }
+    *dieId = configuredDie;
+    uint32_t hop = 2;
+    const HcclResult hopStatus = ParseUint32Value("A5_CCU_SYNTHETIC_HOP", &hop);
+    if (hopStatus != HCCL_SUCCESS && hopStatus != HCCL_E_NOT_FOUND) return hopStatus;
+
+    EndpointInfo localInfo = QueryEndpointInfo(comm, rank, desc->localEndpoint);
+    EndpointInfo remoteInfo = QueryEndpointInfo(comm, peer, desc->remoteEndpoint);
+    const std::string identity = CommAddrToString(desc->localEndpoint.commAddr) + "|" +
+        CommAddrToString(desc->remoteEndpoint.commAddr) + "|" + std::to_string(hop);
+    std::ostringstream uid;
+    uid << "synthetic-" << std::hex << Fnv1a64(identity);
+    if (pathUid != nullptr) *pathUid = uid.str();
+    std::printf("SYNTHETIC_COMMLINK_TRACE rank=%u peer=%u path_uid=%s protocol=%d hop=%u "
+                "die_id=%u local_query_status=%d local_query_die=%s "
+                "remote_query_status=%d remote_query_die=%s local_addr=%s remote_addr=%s\n",
+                rank, peer, uid.str().c_str(), static_cast<int>(desc->channelProtocol), hop,
+                *dieId, static_cast<int>(localInfo.dieStatus),
+                AttrToString(localInfo.dieId, localInfo.dieStatus).c_str(),
+                static_cast<int>(remoteInfo.dieStatus),
+                AttrToString(remoteInfo.dieId, remoteInfo.dieStatus).c_str(),
+                CommAddrToString(desc->localEndpoint.commAddr).c_str(),
+                CommAddrToString(desc->remoteEndpoint.commAddr).c_str());
+    std::fflush(stdout);
     return HCCL_SUCCESS;
 }
 
@@ -508,6 +621,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
     const char *mutationKeyValue = std::getenv("A5_CCU_DESC_MUTATION");
     const char *donorKeyValue = std::getenv("A5_CCU_DESC_DONOR_ROUTE");
+    const char *syntheticLocal = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
+    const char *syntheticRemote = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID");
+    const char *syntheticDie = std::getenv("A5_CCU_SYNTHETIC_DIE_ID");
+    const char *syntheticHop = std::getenv("A5_CCU_SYNTHETIC_HOP");
     std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
         (pathKeyValue != nullptr && pathKeyValue[0] != '\0' ?
@@ -517,6 +634,11 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
     routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
     routeKey += ":donor=" + std::string(donorKeyValue == nullptr ? "none" : donorKeyValue);
+    routeKey += ":synthetic_local=" + std::string(syntheticLocal == nullptr ? "none" : syntheticLocal);
+    routeKey += ":synthetic_remote=" + std::string(syntheticRemote == nullptr ? "none" : syntheticRemote);
+    routeKey += ":synthetic_die=" + std::string(syntheticDie == nullptr ? "none" : syntheticDie);
+    routeKey += ":synthetic_hop=" + std::string(syntheticHop == nullptr ? "default" : syntheticHop);
+    routeKey += ":rebuild=" + std::to_string(EnvEnabled("A5_CCU_REBUILD_PUBLIC_FIELDS") ? 1 : 0);
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {
         *resources = g_cache.resources;
         return HCCL_SUCCESS;

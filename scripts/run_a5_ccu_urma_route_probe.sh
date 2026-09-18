@@ -28,6 +28,11 @@ descriptor_mutation=""
 descriptor_donor=""
 worker_preload=""
 worker_trace_prefix=""
+synthetic_rank0_local_eid=""
+synthetic_rank0_remote_eid=""
+synthetic_die=""
+synthetic_hop=2
+rebuild_public=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +59,11 @@ while [[ $# -gt 0 ]]; do
         --descriptor-donor) descriptor_donor=$2; shift 2 ;;
         --worker-preload) worker_preload=$2; shift 2 ;;
         --worker-trace-prefix) worker_trace_prefix=$2; shift 2 ;;
+        --synthetic-rank0-local-eid) synthetic_rank0_local_eid=$2; shift 2 ;;
+        --synthetic-rank0-remote-eid) synthetic_rank0_remote_eid=$2; shift 2 ;;
+        --synthetic-die) synthetic_die=$2; shift 2 ;;
+        --synthetic-hop) synthetic_hop=$2; shift 2 ;;
+        --rebuild-public) rebuild_public=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -117,6 +127,29 @@ if [[ -n "${descriptor_mutation}" ]]; then
     export A5_CCU_DESC_DONOR_ROUTE="${descriptor_donor}"
 else
     unset A5_CCU_DESC_MUTATION A5_CCU_DESC_DONOR_ROUTE
+fi
+if [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]; then
+    [[ -n "${synthetic_rank0_local_eid}" && -n "${synthetic_rank0_remote_eid}" &&
+       "${synthetic_die}" =~ ^[01]$ ]] || {
+        echo "synthetic mode requires both rank0 EIDs and --synthetic-die 0|1" >&2
+        exit 2
+    }
+    [[ -z "${route_indices}" ]] || {
+        echo "synthetic mode currently supports one --route-index only" >&2
+        exit 2
+    }
+    export A5_CCU_SYNTHETIC_RANK0_LOCAL_EID="${synthetic_rank0_local_eid}"
+    export A5_CCU_SYNTHETIC_RANK0_REMOTE_EID="${synthetic_rank0_remote_eid}"
+    export A5_CCU_SYNTHETIC_DIE_ID="${synthetic_die}"
+    export A5_CCU_SYNTHETIC_HOP="${synthetic_hop}"
+else
+    unset A5_CCU_SYNTHETIC_RANK0_LOCAL_EID A5_CCU_SYNTHETIC_RANK0_REMOTE_EID
+    unset A5_CCU_SYNTHETIC_DIE_ID A5_CCU_SYNTHETIC_HOP
+fi
+if (( rebuild_public != 0 )); then
+    export A5_CCU_REBUILD_PUBLIC_FIELDS=1
+else
+    unset A5_CCU_REBUILD_PUBLIC_FIELDS
 fi
 export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
 

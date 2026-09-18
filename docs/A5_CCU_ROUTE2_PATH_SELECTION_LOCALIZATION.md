@@ -799,6 +799,23 @@ footprint 验证 first-hop/relay 改变，才满足显式 relay 的最终判据�
 7. 下一实现点是暴露或补充 HIXL/HCCP/MUE 的 path object 枚举/创建接口，并让 HCOMM Channel 显式绑定
    `pathHandle`。
 
+## 11. 新方向：以 EID pair 合成 CommLink
+
+后续获得的硬件信息表明，目的EID本身可能已经编码转发出口：若rank7连接relay2的EID被用作destination，硬件
+可透明执行 `6 -> 2 -> 7`。因此当前优先级调整为：先验证一对拓扑中已存在、protocol/die/plane相容的src/dst
+EID是否能够直接被 `HcclChannelAcquire` 接受，而不是继续把私有TP字段作为第一主线。
+
+仓库新增 synthetic CommLink 穿刺，但不宣称未经 HCCN 验证的 route-key 就是物理relay：
+
+- `resolve_a5_synthetic_relay_eids.py` 从整机拓扑按src/dst/relay动态生成成对EID；
+- `--rebuild-public` 验证现有 candidate 2 是否只依赖公开 EndpointDesc 字段；
+- `--synthetic-rank0-local-eid/--synthetic-rank0-remote-eid` 成对替换 ChannelDesc 地址；
+- `SYNTHETIC_COMMLINK_TRACE` 输出 endpoint查询状态、protocol、hop和die；
+- `run_a5_ccu_synthetic_relay_probe.sh` 依次验证两个网络平面并保存结果。
+
+candidate 1 仍是必要负对照：它说明 RankGraph 发布一个带EID和protocol的 CommLink，不必然代表对应path已经
+完成 provision。完整实验步骤和判据见 `A5_CCU_SYNTHETIC_COMMLINK_RELAY_GUIDE.md`。
+
 尚不能声称：
 
 - 已经能够从应用任意指定一张 relay 卡；
