@@ -115,12 +115,30 @@ c02--c11 的结果才具有字段因果意义。变体 case 的 `channel_status=
 
 ## 5. 完整因果与 footprint 实验
 
-快速扫描正常后执行完整实验：
+本次第四步已经得到：
+
+- `c00/c01` 两个原始 candidate 均可建链；
+- `c02/c03/c05/c06/c08/c09` 的单边 endpoint/CommAddr 混搭均返回 HCCL status 9；
+- `c04/c07/c10` 的成对 endpoint/CommAddr 替换均可建链；
+- `c11` 只替换 location 仍可建链。
+
+这说明建链 matcher 要求 local/remote path-specific 地址成对匹配，单边地址不构成合法 path；同时 location
+并不是区分 candidate 0/2 的必要 selector。第五步的目标是确认成功变体的**物理端口 footprint 是否随地址对一起切换**：
+
+- `c04`、`c10` 是否从 candidate B 的 footprint 切到 A；
+- `c07` 是否从 candidate A 的 footprint 切到 B；
+- `c11` 是否仍保持 B 的 footprint。
+
+只运行两个基线和四个成功变体，避免重复执行已经确定必败的单边混搭：
 
 ```bash
+unset LD_PRELOAD
+unset A5_URMA_TP_TRACE_PREFIX
+
 bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
   --devices 6,7 \
   --candidates 0,2 \
+  --cases c00_base_a,c01_base_b,c04_b_both_endpoints_from_a,c07_a_both_endpoints_from_b,c10_b_both_comm_addrs_from_a,c11_b_locations_from_a \
   --bytes 4194304 \
   --warmup 3 \
   --iters 20 \
@@ -132,6 +150,22 @@ bash scripts/run_a5_ccu_channel_path_selector_forensics.sh \
 
 脚本对每个 Channel READY 的 case 执行数据正确性和 HCCN before/after 采样。为降低共享机器背景流量影响，完整
 实验应尽量在低负载窗口执行，并至少重复 3 次。
+
+完成后查看：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_channel_selector_* \
+  | head -1)
+
+echo "RUN_DIR=${RUN_DIR}"
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+column -s $'\t' -t "${RUN_DIR}/parameter_causality.tsv" | less -S
+sed -n '1,280p' "${RUN_DIR}/channel_path_selector_report.md"
+```
+
+第五步有效的最低条件是六个 case 的 `channel_status=0` 且 `data_status=0`。如果 channel 成功但
+`data_status` 非零，先看相应 `cases/<case>_r<repeat>/data.log`，不要用不完整的 HCCN delta 判断路径。
 
 ## 6. 12 个 case 分别测试什么
 

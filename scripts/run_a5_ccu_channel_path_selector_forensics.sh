@@ -15,6 +15,7 @@ skip_footprint=0
 syscall_trace=0
 perf_callgraph=0
 urma_trace=0
+cases_filter=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --syscall-trace) syscall_trace=1; shift ;;
         --perf-callgraph) perf_callgraph=1; shift ;;
         --urma-trace) urma_trace=1; shift ;;
+        --cases) cases_filter=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -69,6 +71,7 @@ fi
     echo "devices=$devices"
     echo "candidates=$candidates"
     echo "urma_trace=$urma_trace"
+    echo "cases=${cases_filter:-all}"
     echo "kernel=$(uname -r)"
     echo "machine=$(uname -m)"
     echo "cann=${ASCEND_HOME_PATH:-unset}"
@@ -110,6 +113,20 @@ declare -a case_specs=(
     "c10_b_both_comm_addrs_from_a|${candidate_b}|${candidate_a}|both_comm_addrs"
     "c11_b_locations_from_a|${candidate_b}|${candidate_a}|locations"
 )
+
+if [[ -n "$cases_filter" ]]; then
+    IFS=',' read -r -a requested_cases <<<"$cases_filter"
+    for requested_case in "${requested_cases[@]}"; do
+        found=0
+        for spec in "${case_specs[@]}"; do
+            [[ "${spec%%|*}" == "$requested_case" ]] && { found=1; break; }
+        done
+        (( found == 1 )) || {
+            echo "unknown case in --cases: $requested_case" >&2
+            exit 2
+        }
+    done
+fi
 
 run_command() {
     local output_prefix=$1
@@ -189,6 +206,12 @@ run_one_case() {
 for repeat in $(seq 1 "$repeats"); do
     for spec in "${case_specs[@]}"; do
         IFS='|' read -r case_name base donor mutation <<<"$spec"
+        if [[ -n "$cases_filter" ]]; then
+            case ",$cases_filter," in
+                *",$case_name,"*) ;;
+                *) continue ;;
+            esac
+        fi
         echo "===== ${case_name} repeat=${repeat} base=${base} donor=${donor:-NA} mutation=${mutation} ====="
         run_one_case "$case_name" "$base" "$donor" "$mutation" "$repeat"
     done
