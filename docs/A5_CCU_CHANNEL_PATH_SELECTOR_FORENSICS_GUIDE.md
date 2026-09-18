@@ -394,6 +394,38 @@ candidate0 != candidate2
 
 ## 9. 失败处理
 
+### 9.1 payload 实验连续出现 `status=1`
+
+四组 payload case 的成功状态都应为 `0`。如果实验尚未结束，但已完成的 case 全部是 `status=1`，应立即
+`Ctrl+C` 停止；这通常表示 tracer 系统性干扰 worker，继续运行不会产生可用的因果数据。
+
+先查看最新运行和第一个基线 case：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_ioctl_payload_* \
+  | head -1)
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+
+sed -n '1,300p' \
+  "${RUN_DIR}/cases/candidate0_r1/run.log"
+
+ls -lh \
+  "${RUN_DIR}/cases/candidate0_r1"
+```
+
+再统一搜索建链、动态加载及进程错误：
+
+```bash
+grep -RHniE \
+'Segmentation|failed|error|undefined symbol|HcclChannelAcquire|rank workers|status=|LD_PRELOAD' \
+"${RUN_DIR}/cases"/*/run.log
+```
+
+不要使用含 `status=1` 的 case 运行 payload 因果分析。若 candidate0 基线也失败，应先修 tracer 的透明转发；
+重点检查通用 `ioctl()` 可变参数 ABI、无第三参数的 ioctl，以及 `LD_PRELOAD` 是否只注入最终 worker。
+
 - 某个 mutation Channel 超时：保留 `channel.log`，继续其他 case；总脚本不会因单 case 失败停止。
 - HCCN 不可用：Channel 因果实验仍有效，但不能给出物理路径结论。
 - `perf` 权限不足：去掉 `--perf-callgraph`，不影响 descriptor mutation 主实验。

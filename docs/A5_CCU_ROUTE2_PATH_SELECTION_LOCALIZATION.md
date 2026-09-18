@@ -743,6 +743,10 @@ path object”。
 before 事件解析一次。此前“每次 ioctl 都 backtrace，并对每条 before/after 单独打开 JSONL 文件”的版本会把
 数千次状态查询放大成数万次昂贵操作，可能让 12 个 case 看起来卡住，不能用于正式取证。
 
+若已完成的 payload case 全部返回 `status=1`，应立即停止实验并按
+`A5_CCU_CHANNEL_PATH_SELECTOR_FORENSICS_GUIDE.md` 第 9.1 节检查 `candidate0_r1/run.log`；失败 case 不可用于
+payload 因果结论。
+
 实验命令与结果查看见 `A5_CCU_DISCOVERED_PATH_ALLTOALL_GUIDE.md` 第 5.6 节。判定一个偏移与 CommAddr/path
 选择有关，最低要求为：
 
