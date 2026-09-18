@@ -5,8 +5,12 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
+
+PATH_CATALOG_RE = re.compile(r"PATH_CATALOG\s+(.*)")
+FIELD_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 
 def load_events(run_dir):
@@ -52,11 +56,47 @@ def modal_bytes(records):
     return result
 
 
+def endpoint_tokens(run_dir):
+    result, seen = [], set()
+    for log in sorted((run_dir / "cases").glob("*/run.log")):
+        for line in log.read_text(errors="replace").splitlines():
+            match = PATH_CATALOG_RE.search(line)
+            if not match:
+                continue
+            fields = dict(FIELD_RE.findall(match.group(1)))
+            for role in ("src", "dst"):
+                raw = fields.get(f"{role}_addr", "").split("raw=", 1)[-1].replace(":", "")
+                if len(raw) != 32:
+                    continue
+                key = (fields.get("rank", ""), fields.get("peer", ""),
+                       fields.get("ordinal", ""), role, raw)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append({"rank": key[0], "peer": key[1], "ordinal": key[2],
+                               "role": role, "raw": raw, "source": str(log)})
+    return result
+
+
+def token_forms(raw):
+    value = bytes.fromhex(raw)
+    forms = [("as_printed", value), ("reverse_16", value[::-1]),
+             ("reverse_each_u64", value[:8][::-1] + value[8:][::-1]),
+             ("swap_u64", value[8:] + value[:8])]
+    result, seen = [], set()
+    for name, token in forms:
+        if token not in seen:
+            seen.add(token)
+            result.append((name, token))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True, type=Path)
     args = parser.parse_args()
     events = load_events(args.run_dir)
+    tokens = endpoint_tokens(args.run_dir)
 
     nested_rows = []
     for item in events:
@@ -154,6 +194,69 @@ def main():
                              item["word_offset"], hex(item["nested_address"]), len(item["nested"]),
                              hashlib.sha256(item["nested"]).hexdigest(), item["nested"].hex()])
 
+    token_hits = []
+    for item in events:
+        buffers = [("top", -1, item["payload"])]
+        for nested in item.get("nested_snapshots", []):
+            try:
+                nested_raw = bytes.fromhex(nested.get("hex", ""))
+            except ValueError:
+                nested_raw = b""
+            buffers.append(("nested", int(nested.get("word_offset", -1)), nested_raw))
+        for token in tokens:
+            for representation, needle in token_forms(token["raw"]):
+                for level, word_offset, haystack in buffers:
+                    start = 0
+                    offset = haystack.find(needle, start) if needle else -1
+                    while offset >= 0:
+                        token_hits.append({**token, "case": item["case"], "repeat": item["repeat"],
+                                           "worker_rank": item["rank"],
+                                           "trace_label": item.get("trace_label", ""),
+                                           "request": item.get("request", ""),
+                                           "phase": item.get("phase", ""),
+                                           "fd_path": item.get("fd_path", ""),
+                                           "occurrence": item.get("occurrence", ""),
+                                           "level": level, "pointer_word_offset": word_offset,
+                                           "byte_offset": offset, "representation": representation})
+                        start = offset + 1
+                        offset = haystack.find(needle, start)
+    with (args.run_dir / "endpoint_token_hits.tsv").open("w", newline="") as handle:
+        fields = ["case", "repeat", "worker_rank", "trace_label", "request", "phase", "fd_path",
+                  "occurrence", "level", "pointer_word_offset", "byte_offset", "representation",
+                  "rank", "peer", "ordinal", "role", "raw", "source"]
+        writer = csv.DictWriter(handle, fields, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(token_hits)
+
+    hit_summary = Counter(
+        ("comm_init" if row["trace_label"].startswith("phase=comm_init") else "channel_acquire",
+         row["request"], row["fd_path"], row["ordinal"], row["role"], row["representation"],
+         row["level"])
+        for row in token_hits
+    )
+    with (args.run_dir / "endpoint_token_hit_summary.tsv").open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["window", "request", "fd_path", "candidate_ordinal", "endpoint_role",
+                         "representation", "payload_level", "hits"])
+        for key, count in sorted(hit_summary.items()):
+            writer.writerow([*key, count])
+
+    with (args.run_dir / "udmac_ioctl_layout.tsv").open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["case", "repeat", "worker_rank", "trace_label", "request", "phase",
+                         "fd_path", "occurrence", "payload_bytes", "u64_words", "nested_count"])
+        for item in events:
+            if "/dev/uburma/" not in item.get("fd_path", ""):
+                continue
+            raw = item["payload"]
+            words = [f"0x{int.from_bytes(raw[i:i + 8], 'little'):016x}"
+                     for i in range(0, len(raw) - 7, 8)]
+            writer.writerow([item["case"], item["repeat"], item["rank"],
+                             item.get("trace_label", ""), item.get("request", ""),
+                             item.get("phase", ""), item.get("fd_path", ""),
+                             item.get("occurrence", ""), len(raw), ",".join(words),
+                             len(item.get("nested_snapshots", []))])
+
     nested_groups = defaultdict(list)
     for item in nested_rows:
         nested_groups[(item.get("request", ""), item.get("phase", ""),
@@ -185,13 +288,16 @@ def main():
     report = [
         "# A5 CCU ChannelAcquire 定向 ioctl payload 黑箱报告", "",
         "## 边界", "",
-        "仅记录 `A5UrmaTpTraceSetLabel()` 标记的单次 `HcclChannelAcquire` 时间窗；",
-        "只读取 ioctl request 编码声明的顶层 `_IOC_SIZE`，不递归解引用未知指针。", "",
+        "记录 communicator 初始化和单次 `HcclChannelAcquire` 两个受控时间窗；",
+        "只读取 ioctl request 编码声明的顶层 `_IOC_SIZE`，以及该顶层结构中可读、对齐指针",
+        "指向的有限长度快照，不递归追踪二级指针。", "",
         f"- payload 事件数：`{len(events)}`",
         f"- 满足四组 CommAddr 因果关系的字节：`{len(causal)}`",
         f"- 其中 modal confidence >= 0.90：`{len(high)}`", "",
         f"- 有界二级 pointer 快照数：`{len(nested_rows)}`",
         f"- 二级快照中的四组因果候选字节：`{len(nested_causal)}`", "",
+        f"- 从 PATH_CATALOG 提取的 128-bit endpoint token：`{len(tokens)}`",
+        f"- endpoint token 命中：`{len(token_hits)}`", "",
         "四组关系为：`candidate0 == c20_addr0`、`candidate2 == c21_addr2`，且两组不同。", "",
         "## 判读", "",
     ]
@@ -207,12 +313,34 @@ def main():
             "对已确认的顶层结构中指针字段做 Build-ID 绑定的定点解码，或转向 ioctl 之前的",
             "HCCP/MUE request builder；不能扩大为任意指针扫描。",
         ]
+    comm_hits = [row for row in token_hits if row["trace_label"].startswith("phase=comm_init")]
+    report += ["", "## Endpoint token 归因", ""]
+    if comm_hits:
+        requests = sorted({row["request"] for row in comm_hits})
+        paths = sorted({row["fd_path"] for row in comm_hits})
+        report += [
+            f"communicator 初始化窗口命中 `{len(comm_hits)}` 次完整 endpoint token。",
+            f"相关 request：`{', '.join(requests)}`；设备：`{', '.join(paths)}`。",
+            "请先看 `endpoint_token_hit_summary.tsv`，再用 `endpoint_token_hits.tsv` 定位",
+            "candidate ordinal、src/dst、顶层或二级 payload 以及精确字节偏移。",
+            "这能把 RankGraph endpoint 收敛到具体 request，但仍不能把 token 数值直接命名为 relay ID。",
+        ]
+    else:
+        report += [
+            "communicator 初始化窗口的顶层与有限二级 payload 中均未出现完整 endpoint token。",
+            "这说明 endpoint 很可能在进入当前 ioctl 前已被 HCOMM/HCCP/HAL 转换成私有对象 ID、",
+            "handle 或索引。下一步应定点追踪 `/dev/uburma/*` request 的用户态构造者及其输入，",
+            "而不是继续扩大 JFCE payload 或无界扫描指针。",
+        ]
     report += ["", "## 输出", "", "- `ioctl_payload_inventory.tsv`：request、phase、四组事件数和设备节点。",
                "- `control_window_inventory.tsv`：comm-init与ChannelAcquire窗口的request/fd/caller。",
                "- `ioctl_payload_events.tsv`：所有有界原始快照。",
                "- `commaddr_causal_payload_offsets.tsv`：顶层payload的四组因果候选字节。",
                "- `ioctl_nested_snapshots.tsv`：顶层结构中合法指针指向的最多128字节快照。",
-               "- `commaddr_causal_nested_offsets.tsv`：二级快照的四组因果候选字节。"]
+               "- `commaddr_causal_nested_offsets.tsv`：二级快照的四组因果候选字节。",
+               "- `endpoint_token_hits.tsv`：PATH_CATALOG endpoint 在顶层/二级payload中的逐次命中。",
+               "- `endpoint_token_hit_summary.tsv`：按窗口、request、设备、candidate、角色聚合的命中。",
+               "- `udmac_ioctl_layout.tsv`：`/dev/uburma/*` 顶层payload的little-endian u64布局。"]
     (args.run_dir / "ioctl_payload_report.md").write_text("\n".join(report) + "\n")
     print(args.run_dir / "ioctl_payload_report.md")
 

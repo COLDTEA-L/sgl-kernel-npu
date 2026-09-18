@@ -390,6 +390,8 @@ column -s $'\t' -t "${RUN_DIR}/ioctl_payload_inventory.tsv" | less -S
 column -s $'\t' -t "${RUN_DIR}/control_window_inventory.tsv" | less -S
 column -s $'\t' -t "${RUN_DIR}/commaddr_causal_payload_offsets.tsv" | less -S
 column -s $'\t' -t "${RUN_DIR}/commaddr_causal_nested_offsets.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/endpoint_token_hit_summary.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/udmac_ioctl_layout.tsv" | less -S
 sed -n '1,260p' "${RUN_DIR}/ioctl_payload_report.md"
 ```
 
@@ -405,6 +407,25 @@ candidate0 != candidate2
 `ioctl_nested_snapshots.tsv` 只对顶层 payload 中按指针宽度对齐、且能被 `process_vm_readv` 安全读取的地址保存
 最多128字节；每条 payload 最多8个二级对象。它不是全进程内存扫描。若唯一 request 仍是
 `anon_inode:[jfce]` 且二级内容没有四组因果差异，应将它判为完成事件路径，转向 HCOMM/HCCP matcher。
+
+分析器还会从每个 case 的 `PATH_CATALOG` 提取 candidate 0/2 的完整128-bit src/dst endpoint，并检查它的
+原始字节、16字节整体倒序、每个u64倒序和两个u64互换四种表示是否出现在 communicator 初始化或 Acquire
+payload 中：
+
+- `endpoint_token_hit_summary.tsv` 非空：先按 `window=comm_init`、`/dev/uburma/*` 过滤，定位 endpoint
+  首次跨越的 request、顶层/二级结构和偏移；
+- 只有 `channel_acquire + anon_inode:[jfce]` 命中：不能把它当 selector，仍应回到初始化期；
+- 完全无命中：说明 endpoint 在 ioctl 前已经被转换成内部 object ID/handle/index。下一步追 `/dev/uburma/*`
+  request 的用户态 builder 输入，而不是扩大 JFCE 采集。
+
+`udmac_ioctl_layout.tsv` 将 `/dev/uburma/*` 顶层 payload 同时打印为 little-endian u64 words，便于把固定字段、
+指针和疑似 handle 与反汇编中的结构访问偏移对齐。它只是布局证据，不能单独把某个 word 解释为 path ID。
+
+如果已经完成了一轮实验，不需要重新占卡即可使用新版分析器重新生成这些结果：
+
+```bash
+python3 scripts/analyze_a5_ccu_ioctl_payload.py --run-dir "${RUN_DIR}"
+```
 
 ## 9. 失败处理
 

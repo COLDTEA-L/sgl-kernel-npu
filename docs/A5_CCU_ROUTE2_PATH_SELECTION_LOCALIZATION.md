@@ -744,6 +744,8 @@ path object”。
    ChannelAcquire 内的 `anon_inode:[jfce]` 高频完成事件误认为 route selector。
 9. 对顶层 payload 中可验证为本进程可读映射的对齐指针，最多读取128字节、每条最多8个对象，并对二级内容执行
    同样的四组因果检验；禁止全地址空间扫描。
+10. 从 `PATH_CATALOG` 提取 candidate endpoint token，并在 comm-init/Acquire 的顶层和有限二级 payload 中执行
+    完整字节归因；同时单独导出 `/dev/uburma/*` payload 的 u64 布局。
 
 性能控制：每种 request 默认只取前 64 次、每个 worker 总计最多 2048 次；调用栈只在该 request 的首个
 before 事件解析一次。此前“每次 ioctl 都 backtrace，并对每条 before/after 单独打开 JSONL 文件”的版本会把
@@ -769,6 +771,14 @@ min confidence >= 0.90
   解码确认它是 endpoint hash、path object、TPG/TPN、route context 还是普通状态字段；
 - **没有高稳定偏移：**证明顶层 ioctl 不是可见分叉点。下一步沿 caller 返回地址定位 ioctl 之前的
   HCCP/MUE request builder，或在已确认的顶层结构中识别指针字段后做单字段、固定长度的二级快照。
+
+新增的 `endpoint_token_hit_summary.tsv` 用来回答更具体的问题：RankGraph 的128-bit endpoint 是否原样进入
+某个控制请求。若初始化窗口的 `/dev/uburma/*` request 命中，可把 endpoint-to-private-object 转换范围收敛到该
+request producer；若顶层和有限二级对象均不命中，则 endpoint 已在 ioctl 之前被编码为内部 ID/handle/index，
+下一黑箱点应放在 HCOMM/HCCP/HAL 用户态 request builder，而不是 `anon_inode:[jfce]` 完成队列。
+
+`udmac_ioctl_layout.tsv` 提供 comm-init `/dev/uburma/*` payload 的 little-endian u64 视图，用于与固定版本
+`liburma.so/libascend_hal.so` 的反汇编字段偏移对齐。这里的 u64 数值仍不能凭形状命名为 route/path ID。
 
 这里仍不能仅凭某个变化字节宣称已经找到 relay selector。只有该字段能够生成新的合法 path object，并经 HCCN
 footprint 验证 first-hop/relay 改变，才满足显式 relay 的最终判据。
