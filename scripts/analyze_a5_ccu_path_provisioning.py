@@ -9,7 +9,8 @@ from collections import Counter
 from pathlib import Path
 
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
-IOCTL_RE = re.compile(r"ioctl\([^,]+,\s*([^,\)]+)")
+IOCTL_RE = re.compile(r"ioctl\([^,]+,\s*(0x[0-9a-fA-F]+)")
+STACK_RE = re.compile(r"^\s*>\s+([^\s(]+)")
 
 
 def kv(line):
@@ -36,6 +37,24 @@ def ioctl_counts(case_dir):
     return counts
 
 
+def ioctl_callers(case_dir):
+    callers = {}
+    for path in strace_files(case_dir):
+        current = None
+        for line in path.read_text(errors="replace").splitlines():
+            match = IOCTL_RE.search(line)
+            if match:
+                current = match.group(1).lower()
+                callers.setdefault(current, Counter())
+                continue
+            stack = STACK_RE.match(line)
+            if current and stack:
+                callers[current][stack.group(1)] += 1
+            elif line and not line.startswith(" "):
+                current = None
+    return callers
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True, type=Path)
@@ -45,6 +64,7 @@ def main():
 
     rows = []
     request_counts = {}
+    request_callers = {}
     for case_dir in sorted((args.run_dir / "cases").iterdir()):
         if not case_dir.is_dir():
             continue
@@ -61,6 +81,7 @@ def main():
         comm = lines_with(log, "COMM_INIT_SCOPE phase=end")
         counts = ioctl_counts(case_dir)
         request_counts[case_dir.name] = counts
+        request_callers[case_dir.name] = ioctl_callers(case_dir)
         chosen = variant[0] if variant else (desc[0] if desc else {})
         rows.append({
             "case": case_dir.name,
@@ -103,10 +124,36 @@ def main():
         for request, init_count, values in differential:
             writer.writerow([request, init_count, *(values[name] for name in channel_cases)])
 
+    causal_rows = []
+    required = ("c1_candidate_0", "c1_candidate_2",
+                "c20_base2_addrpair_from0", "c21_base0_addrpair_from2")
+    if all(name in request_counts for name in required):
+        for request in all_requests:
+            a = request_counts[required[0]][request]
+            b = request_counts[required[1]][request]
+            x_a = request_counts[required[2]][request]
+            x_b = request_counts[required[3]][request]
+            if a == b and x_a == x_b:
+                continue
+            pair_score = abs(x_a - a) + abs(x_b - b)
+            base_score = abs(x_a - b) + abs(x_b - a)
+            caller_counts = Counter()
+            for name in required:
+                caller_counts.update(request_callers[name].get(request, {}))
+            causal_rows.append((request, a, b, x_a, x_b, pair_score, base_score,
+                                caller_counts.most_common(1)[0][0] if caller_counts else ""))
+    causal_rows.sort(key=lambda row: (row[5] - row[6], row[0]))
+    with (args.run_dir / "commaddr_causal_ioctl.tsv").open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["request", "candidate0", "candidate2", "c20_addr0", "c21_addr2",
+                         "commaddr_pair_score", "base_ordinal_score", "top_caller"])
+        writer.writerows(causal_rows)
+
     summary = {
         "run_dir": str(args.run_dir), "devices": args.devices,
         "candidates": args.candidates, "cases": len(rows),
         "differential_ioctl_requests": len(differential),
+        "commaddr_causal_requests": len(causal_rows),
     }
     (args.run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
@@ -129,6 +176,8 @@ def main():
         "", "## 差分 ioctl/request 候选", "",
         f"共发现 `{len(differential)}` 个在 Channel 窗口新增或在 candidate 间计数不同的 ioctl request。",
         "详见 `candidate_ioctl_differences.tsv`；完整矩阵见 `ioctl_request_matrix.tsv`。", "",
+        "`commaddr_causal_ioctl.tsv` 使用 c20/c21 交叉替换计算因果得分：`commaddr_pair_score` 越小且",
+        "明显小于 `base_ordinal_score`，request 行为越跟随 CommAddr pair，而不是 base ordinal。", "",
         "## 如何使用本报告", "",
         "1. 先确认 comm-init-only 成功，且 candidate 0/2 的 ChannelAcquire 成功。",
         "2. candidate 1 若失败，将它作为‘RankGraph 可见但未 provision 可用 Channel’的负对照。",

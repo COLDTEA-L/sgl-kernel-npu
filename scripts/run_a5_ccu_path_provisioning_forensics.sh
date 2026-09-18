@@ -71,8 +71,9 @@ run_case() {
     local -a command=(bash scripts/run_a5_ccu_urma_route_probe.sh
         --devices "$devices" --bytes 4096 --warmup 1 --iters 1 --skip-build "$@")
     if (( with_strace )); then
-        command=(strace -ff -ttt -T -yy -k -s 512
+        command=(strace -ff -ttt -T -yy -k -X raw -s 512
             -e trace=ioctl,connect,sendto,recvfrom,sendmsg,recvmsg,read,write
+            -e raw=ioctl
             -o "$case_dir/syscall.strace" "${command[@]}")
     fi
     local status=0

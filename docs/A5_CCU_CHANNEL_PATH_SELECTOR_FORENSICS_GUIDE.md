@@ -262,6 +262,7 @@ echo "RUN_DIR=${RUN_DIR}"
 column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
 column -s $'\t' -t "${RUN_DIR}/provisioning_cases.tsv" | less -S
 column -s $'\t' -t "${RUN_DIR}/candidate_ioctl_differences.tsv" | less -S
+column -s $'\t' -t "${RUN_DIR}/commaddr_causal_ioctl.tsv" | less -S
 sed -n '1,320p' "${RUN_DIR}/path_provisioning_report.md"
 ```
 
@@ -272,6 +273,7 @@ path_provisioning_report.md
 provisioning_cases.tsv
 ioctl_request_matrix.tsv
 candidate_ioctl_differences.tsv
+commaddr_causal_ioctl.tsv
 case_status.tsv
 inventory/
 cases/<case>/run.log
@@ -306,6 +308,16 @@ caller SO 属于 HCOMM/HCCP/HAL/UDMA
 ```
 
 调用次数差异只能定位 request，不能把它直接命名为 path ID。
+
+新版本使用 `strace -X raw -e raw=ioctl`，因此 request 应显示为真实十六进制值，而不再出现误导性的
+`ZFS_IOC_*`、`VT_GETMODE` 等跨子系统宏名。`commaddr_causal_ioctl.tsv` 中优先查看：
+
+```text
+commaddr_pair_score << base_ordinal_score
+top_caller 属于 HCOMM/HCCP/HAL/UDMA
+```
+
+这表示 request 的行为随 CommAddr pair 交叉替换，而不是随原始 candidate ordinal。
 
 ### 8.3 从 request 定位 producer 与 payload
 
