@@ -106,17 +106,30 @@ bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
   --output-root /home/l00934901/profiling
 ```
 
-再进行数据正确性和端口 footprint 验证：
+物理卡2、3当前已经确认只有 plane0 synthetic candidate 可以建链；plane1 会在
+`HcclChannelAcquire` 等待约120秒后返回status 9。因此正式数据和端口footprint实验只运行plane0：
 
 ```bash
 bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
   --src-phy 2 --dst-phy 3 --relay-phy 4 \
-  --plane all --base-route 0 \
+  --plane 0 --base-route 0 \
   --bytes 4194304 --warmup 10 --iters 100 \
   --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
   --timeout-seconds 300 \
   --output-root /home/l00934901/profiling
+
+echo "exit_status=$?"
 ```
+
+这里必须区分两个参数：
+
+- `--plane 0`：只生成die0/plane0的synthetic EID pair，不再尝试失败的plane1；
+- `--base-route 0`：只表示使用原生route0的protocol、rank location等公共字段作为
+  `HcclChannelDesc`模板，不表示数据仍走原生direct route0。
+
+2026-09-20在物理卡2、3、relay4上的plane0实测已经完成4MiB、warmup 10次、正式100次的数据校验，
+两个rank均PASS，平均约119.9us。该结果证明synthetic Channel可以真实搬运数据；是否物理经过relay4仍以
+下面的HCCN端口差分为准。
 
 脚本自动生成：
 
@@ -146,6 +159,70 @@ sed -n '1,240p' "${RUN_DIR}/synthetic_relay_report.md"
 grep -RHnE 'SYNTHETIC_COMMLINK_TRACE|HcclChannelAcquire end|PASS|failure' "${RUN_DIR}"
 ```
 
+### 6.1 定位本轮HCCN差分表
+
+```bash
+find "${RUN_DIR}/hccn" \
+  -name hccn_counter_deltas.tsv \
+  -print
+
+TSV=$(find "${RUN_DIR}/hccn" \
+  -name hccn_counter_deltas.tsv \
+  | head -1)
+
+test -n "${TSV}" && test -f "${TSV}"
+echo "HCCN_TSV=${TSV}"
+```
+
+如果没有找到TSV，先查看本轮日志中的HCCN告警；业务数据PASS仍然有效，但不能据此命名物理relay。
+
+### 6.2 查看所有卡上流量最大的端口
+
+```bash
+{
+  head -1 "${TSV}"
+  awk -F $'\t' '
+    NR > 1 &&
+    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") {
+      print
+    }
+  ' "${TSV}" | sort -t $'\t' -k7,7nr | head -30
+} | column -s $'\t' -t
+```
+
+输出列依次为physical device、UDie、port、counter、before、after和delta。重点比较delta，不要直接比较
+不同端口的after绝对值。
+
+### 6.3 只查看指定relay4的端口流量
+
+```bash
+{
+  head -1 "${TSV}"
+  awk -F $'\t' '
+    NR > 1 && $1 == 4 &&
+    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") {
+      print
+    }
+  ' "${TSV}"
+} | column -s $'\t' -t
+```
+
+同时查看通信端点2、3和指定relay4；其他非指定relay由上一条“所有卡”排序结果检查，避免把系统背景流量
+误判为本次转发：
+
+```bash
+{
+  head -1 "${TSV}"
+  awk -F $'\t' '
+    NR > 1 &&
+    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") &&
+    ($1 == 2 || $1 == 3 || $1 == 4) {
+      print
+    }
+  ' "${TSV}"
+} | column -s $'\t' -t
+```
+
 ## 7. 判定规则
 
 仅 `HcclChannelAcquire status=0` 证明 EID pair 被控制面接受，尚不能证明经过指定 relay。
@@ -158,6 +235,10 @@ grep -RHnE 'SYNTHETIC_COMMLINK_TRACE|HcclChannelAcquire end|PASS|failure' "${RUN
 4. 非指定 relay 没有同量级增量；
 5. relay 卡没有用户进程，也没有中转 HBM buffer；
 6. 至少三次重复结果稳定。
+
+终端中的`PASS engine=CCU`证明端到端Channel、CCU kernel、WriteNb及数据校验成功；它本身不证明指定
+relay。只有relay4相关端口出现与业务量同量级的RX/TX增量，且其他relay没有同量级增量，才可以写出
+`2 -> relay4 -> 3`这一物理路径结论。
 
 如果 EID 查询成功但 Acquire 为status 9，说明“EID存在”仍不等于“该EID pair已 provision”。下一修改点是
 communicator 初始化期的 endpoint-pair/path provision，而不是 CCU `WriteNb`、TP handle 尾号或全局 UBUS route。
