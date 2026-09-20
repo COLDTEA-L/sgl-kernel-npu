@@ -223,6 +223,70 @@ echo "HCCN_TSV=${TSV}"
 } | column -s $'\t' -t
 ```
 
+### 6.4 一次完成base route与synthetic EID因果对照
+
+单次HCCN结果容易受到共享服务器背景业务干扰，也无法区分`HcclChannelAcquire`究竟采用了synthetic EID，
+还是仍然匹配base CommLink。使用下面的批量脚本，在固定同一组synthetic EID的前提下自动运行四组实验：
+
+| case | EID | base CommLink |
+|---|---|---:|
+| `native0` | 原生 | route0 |
+| `synthetic0` | relay4 synthetic pair | route0 |
+| `native2` | 原生 | route2 |
+| `synthetic2` | 与synthetic0完全相同 | route2 |
+
+```bash
+bash scripts/run_a5_ccu_synthetic_relay_causal_compare.sh \
+  --src-phy 2 --dst-phy 3 --relay-phy 4 \
+  --plane 0 \
+  --bytes 4194304 --warmup 10 --iters 100 \
+  --repeats 3 \
+  --hccn-devices 0,1,2,3,4,5,6,7 \
+  --timeout-seconds 300 \
+  --output-root /home/l00934901/profiling
+```
+
+脚本使用`--remote-only`，四组的网络字节数完全一致；奇数轮和偶数轮采用相反执行顺序，减小共享环境中
+随时间变化的背景流量偏差。每个case均单独保存before/after HCCN快照，失败不会中止其他case。
+
+查看自动分析：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_synthetic_causal_* \
+  | head -1)
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+sed -n '1,260p' "${RUN_DIR}/causal_comparison_report.md"
+column -s $'\t' -t "${RUN_DIR}/footprint_similarity.tsv"
+column -s $'\t' -t "${RUN_DIR}/device_traffic_summary.tsv"
+```
+
+完整输出包括：
+
+```text
+resolved_eid_pair.tsv
+case_status.tsv
+footprint_long.tsv
+median_port_footprints.tsv
+device_traffic_summary.tsv
+footprint_similarity.tsv
+causal_comparison_report.md
+cases/<case>_r<repeat>/run.log
+cases/<case>_r<repeat>/hccn/.../hccn_counter_deltas.tsv
+```
+
+报告结论含义：
+
+- `BASE_PATH_BOUND`：`synthetic0`更像`native0`且`synthetic2`更像`native2`，路径仍由base
+  CommLink/path object控制，覆盖EID不是有效selector；
+- `SYNTHETIC_EID_BOUND_CANDIDATE`：两个synthetic case相互更接近，并同时区别于两个原生基线；还必须检查
+  relay4的balanced RX/TX是否稳定高于对应原生基线，才能确认relay4；
+- `INCONCLUSIVE`：原生route0/route2本身无法区分、HCCN缺失或背景流量过大，需要换空闲窗口重测。
+
+自动分类只用于缩小方向，不能覆盖物理判定规则。最终仍需在`median_port_footprints.tsv`中确认指定relay的
+一进一出端口增量与业务量同阶，并排除其他relay上的同阶增量。
+
 ## 7. 判定规则
 
 仅 `HcclChannelAcquire status=0` 证明 EID pair 被控制面接受，尚不能证明经过指定 relay。
