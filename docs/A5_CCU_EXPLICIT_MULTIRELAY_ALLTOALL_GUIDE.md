@@ -144,7 +144,7 @@ manifest row，而不能用“剩余流量自动走direct”的隐式规则。
 
 ```bash
 RUN_DIR=$(ls -dt \
-  /home/l00934901/profiling/a5_ccu_explicit_multirelay_* \
+  /home/l00934901/profiling/a5_ccu_explicit_multirelay_2_3_20* \
   | head -1)
 
 column -s $'\t' -t "${RUN_DIR}/resolved_explicit_relays.tsv"
@@ -174,7 +174,7 @@ cat "${RUN_DIR}/explicit_multirelay_summary.json"
 cd /home/l00934901/sgl-kernel-npu
 
 RUN_DIR=$(ls -dt \
-  /home/l00934901/profiling/a5_ccu_explicit_multirelay_* \
+  /home/l00934901/profiling/a5_ccu_explicit_multirelay_2_3_20* \
   | head -1)
 
 R1_DIR=$(mktemp -d "${RUN_DIR}/r1_analysis.XXXXXX")
@@ -223,7 +223,94 @@ grep -H '^RESULT_JSON ' "${R1_DIR}"/cases/*.log
 `serial`/`concurrent`/`concurrent_reverse`时延，只表示该次运行没有生成物理端口计数证据；不能把它解释为
 relay没有流量。单轮数据只适合作为临时判断，环境恢复后仍应按第5节使用100次预热重新完成正式实验。
 
-## 8. 输出目录
+## 8. 使用 msprof 比较串行与并发 CCU Launch
+
+外层`msprof`用于查看设备时间线；不要同时给Python测试传`--profile`，否则会形成嵌套profiling。下面依次采集
+relay4、relay5、双relay串行和双relay并发四个独立进程，每个case重新建立自己的通信域：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+set +u
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+set -u
+
+command -v msprof
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multirelay_2_3_20* \
+  | head -1)
+MSPROF_ROOT=/home/l00934901/profiling/a5_ccu_explicit_multirelay_msprof_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${MSPROF_ROOT}"
+
+profile_case() {
+  local name=$1
+  local manifest=$2
+  local weights=$3
+  local schedule=$4
+  local output=${MSPROF_ROOT}/${name}
+  mkdir -p "${output}"
+
+  msprof \
+    --output="${output}" \
+    --ascendcl=on \
+    --runtime-api=on \
+    --task-time=l2 \
+    --hccl=on \
+    --type=text \
+    python3 -m torch.distributed.run \
+      --standalone --nproc-per-node=2 \
+      tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+      --implementation multiroute \
+      --synthetic-route-manifest "${manifest}" \
+      --path-weights "${weights}" \
+      --schedule "${schedule}" \
+      --bytes 4194304 \
+      --warmup 100 \
+      --iters 20
+
+  while IFS= read -r -d '' prof_dir; do
+    msprof --export=on --output="${prof_dir}"
+  done < <(find "${output}" -type d -name 'PROF_*' -print0)
+}
+
+profile_case relay4 \
+  "${RUN_DIR}/manifests/relay_4.tsv" 1 concurrent
+profile_case relay5 \
+  "${RUN_DIR}/manifests/relay_5.tsv" 1 concurrent
+profile_case serial \
+  "${RUN_DIR}/manifests/all.tsv" 1,1 serial
+profile_case concurrent \
+  "${RUN_DIR}/manifests/all.tsv" 1,1 concurrent
+
+echo "MSPROF_ROOT=${MSPROF_ROOT}"
+find "${MSPROF_ROOT}" -type d -name 'PROF_*' | sort
+find "${MSPROF_ROOT}" -type f -name '*.csv' | sort
+```
+
+外层`msprof`会记录进程初始化、100次warmup和20次正式迭代。打开MindStudio后不要把Channel建立和首次CCU
+注册计入稳态结果；对每个case取末尾稳定CCU Launch样本，记录平均值、P50、P95和最大值。每个case应检查
+rank0、rank1两个采集结果，不能只看较快的一张卡。
+
+判断并发收益时重点比较相同4 MiB peer数据量下的`serial`与`concurrent`：
+
+- `concurrent`稳定CCU Launch的P50显著小于`serial`，才说明“先提交两次`WriteNb`再统一等待”获得了收益；
+- `concurrent`与`serial`接近，说明两条Channel虽可用，但当前执行没有形成可见重叠或共享瓶颈占主导；
+- `concurrent`更慢，需要检查慢路径、notify/credit等待和两条Channel是否争用相同注入资源；
+- 单relay使用完整4 MiB，而双relay按`1:1`各承担2 MiB，因此单relay时长只能用于诊断，不能直接作为双relay
+  理想值；
+- 自定义CCU kernel可能只显示一个CCU Launch，且不一定生成标准HCCL Communication视图中的带宽和数据量。
+  一个Launch内部包含两条`WriteNb`并不等于串行；必须结合serial受控对照和HCCN物理链路计数判断。
+
+当前Python host计时在双rank正式起跑对齐修复前可能混入最多约10 ms的文件barrier偏差。该偏差不应拿来解释
+MindStudio中的稳定设备CCU Launch时长；性能结论暂时优先使用上述设备时间线，host数值待计时脚本修复后重测。
+
+## 9. 输出目录
 
 ```text
 resolved_explicit_relays.tsv        # 拓扑解析的原始显式relay列表
