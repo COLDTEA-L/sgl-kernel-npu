@@ -9,6 +9,7 @@ dst_phy=""
 relay_phy=""
 plane=""
 topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
+topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 bytes=4194304
 warmup=10
 iterations=100
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
         --relay-phy) relay_phy=$2; shift 2 ;;
         --plane) plane=$2; shift 2 ;;
         --topology) topology=$2; shift 2 ;;
+        --topology-json) topology_json=$2; shift 2 ;;
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
@@ -35,9 +37,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "${src_phy}" =~ ^[0-7]$ && "${dst_phy}" =~ ^[0-7]$ &&
-   "${relay_phy}" =~ ^[0-7]$ ]] || {
-    echo "--src-phy, --dst-phy and --relay-phy must be physical device IDs 0..7" >&2
+[[ "${src_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ &&
+   "${dst_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ &&
+   "${relay_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || {
+    echo "--src-phy, --dst-phy and --relay-phy must be physical device IDs 0..63" >&2
     exit 2
 }
 [[ "${src_phy}" != "${dst_phy}" && "${src_phy}" != "${relay_phy}" &&
@@ -51,17 +54,24 @@ done
 }
 [[ "${repeats}" =~ ^[1-9][0-9]*$ ]] || { echo "--repeats must be positive" >&2; exit 2; }
 [[ -f "${topology}" ]] || { echo "topology file not found: ${topology}" >&2; exit 2; }
+[[ -f "${topology_json}" ]] || {
+    echo "driver topology JSON not found: ${topology_json}" >&2
+    exit 2
+}
 
 run_dir="${output_root}/a5_ccu_synthetic_causal_${src_phy}_${relay_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases"
 manifest="${run_dir}/resolved_eid_pair.tsv"
 python3 "${script_dir}/resolve_a5_synthetic_relay_eids.py" \
-    --topology "${topology}" --src-phy "${src_phy}" --dst-phy "${dst_phy}" \
+    --topology "${topology}" --topology-json "${topology_json}" \
+    --src-phy "${src_phy}" --dst-phy "${dst_phy}" \
     --relay-phy "${relay_phy}" --plane "${plane}" >"${manifest}"
 
 pair=$(awk -F $'\t' 'NR == 2 {print; exit}' "${manifest}")
 [[ -n "${pair}" ]] || { echo "no EID pair resolved" >&2; exit 1; }
-IFS=$'\t' read -r selected_plane route_key die udmac src_index dst_index src_eid dst_eid <<<"${pair}"
+IFS=$'\t' read -r selected_plane src_die dst_die relay_die src_port relay_port_from_src \
+    relay_port_to_dst dst_port src_udmac dst_udmac src_index dst_index src_eid dst_eid \
+    src_edge dst_edge protocols <<<"${pair}"
 
 printf 'case\trepeat\tbase_route\tsynthetic\tstatus\tresult\tlog\thccn_tsv\n' >"${run_dir}/case_status.tsv"
 built=0
@@ -84,7 +94,8 @@ run_case() {
         command+=(--rebuild-public
             --synthetic-rank0-local-eid "${src_eid}"
             --synthetic-rank0-remote-eid "${dst_eid}"
-            --synthetic-die "${die}" --synthetic-hop 2)
+            --synthetic-rank0-local-die "${src_die}"
+            --synthetic-rank0-remote-die "${dst_die}" --synthetic-hop 2)
     fi
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
         "${command[@]}" >"${log}" 2>&1 || status=$?

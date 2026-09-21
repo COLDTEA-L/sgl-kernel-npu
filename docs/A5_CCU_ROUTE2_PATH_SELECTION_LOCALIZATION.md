@@ -801,17 +801,21 @@ footprint 验证 first-hop/relay 改变，才满足显式 relay 的最终判据�
 
 ## 11. 新方向：以 EID pair 合成 CommLink
 
-后续获得的硬件信息表明，目的EID本身可能已经编码转发出口：若rank7连接relay2的EID被用作destination，硬件
-可透明执行 `6 -> 2 -> 7`。因此当前优先级调整为：先验证一对拓扑中已存在、protocol/die/plane相容的src/dst
-EID是否能够直接被 `HcclChannelAcquire` 接受，而不是继续把私有TP字段作为第一主线。
+后续获得的硬件信息表明，EID可参与选择已provision的转发路径，但A5 EID第三字段是本地port key，不是物理
+relay ID。因此不能把`relay_phy=N`直接写成两端`route_key=N`。当前实现以驱动拓扑
+`/usr/local/Ascend/driver/topo/950/atlas_950_1.json`为权威邻接关系，先查询`src<->relay`与
+`relay<->dst`两条edge，再将端点侧`die/port`映射为EID。
 
-仓库新增 synthetic CommLink 穿刺，但不宣称未经 HCCN 验证的 route-key 就是物理relay：
+仓库新增 synthetic CommLink 穿刺，但不宣称仅完成建链就等于物理relay已确认：
 
-- `resolve_a5_synthetic_relay_eids.py` 从整机拓扑按src/dst/relay动态生成成对EID；
+- `resolve_a5_synthetic_relay_eids.py` 联接驱动JSON edge与HCCN EID inventory，按src/dst/relay动态生成成对EID；
 - `--rebuild-public` 验证现有 candidate 2 是否只依赖公开 EndpointDesc 字段；
 - `--synthetic-rank0-local-eid/--synthetic-rank0-remote-eid` 成对替换 ChannelDesc 地址；
-- `SYNTHETIC_COMMLINK_TRACE` 输出 endpoint查询状态、protocol、hop和die；
+- `SYNTHETIC_COMMLINK_TRACE` 输出endpoint查询状态、protocol、hop及rank本地die；
 - `run_a5_ccu_synthetic_relay_probe.sh` 依次验证两个网络平面并保存结果。
+
+旧版`0004... -> 0004...`测试只证明两端Port4 EID可建链，不能证明经过physical device4，相关结论已撤销。
+新版只有在两条JSON edge、relay侧同die条件与HCCN物理footprint三者一致时，才能命名`src->relay->dst`。
 
 candidate 1 仍是必要负对照：它说明 RankGraph 发布一个带EID和protocol的 CommLink，不必然代表对应path已经
 完成 provision。完整实验步骤和判据见 `A5_CCU_SYNTHETIC_COMMLINK_RELAY_GUIDE.md`。

@@ -31,6 +31,8 @@ worker_trace_prefix=""
 synthetic_rank0_local_eid=""
 synthetic_rank0_remote_eid=""
 synthetic_die=""
+synthetic_rank0_local_die=""
+synthetic_rank0_remote_die=""
 synthetic_hop=2
 rebuild_public=0
 
@@ -62,6 +64,8 @@ while [[ $# -gt 0 ]]; do
         --synthetic-rank0-local-eid) synthetic_rank0_local_eid=$2; shift 2 ;;
         --synthetic-rank0-remote-eid) synthetic_rank0_remote_eid=$2; shift 2 ;;
         --synthetic-die) synthetic_die=$2; shift 2 ;;
+        --synthetic-rank0-local-die) synthetic_rank0_local_die=$2; shift 2 ;;
+        --synthetic-rank0-remote-die) synthetic_rank0_remote_die=$2; shift 2 ;;
         --synthetic-hop) synthetic_hop=$2; shift 2 ;;
         --rebuild-public) rebuild_public=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -129,9 +133,14 @@ else
     unset A5_CCU_DESC_MUTATION A5_CCU_DESC_DONOR_ROUTE
 fi
 if [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]; then
+    if [[ -n "${synthetic_die}" ]]; then
+        [[ -n "${synthetic_rank0_local_die}" ]] || synthetic_rank0_local_die=${synthetic_die}
+        [[ -n "${synthetic_rank0_remote_die}" ]] || synthetic_rank0_remote_die=${synthetic_die}
+    fi
     [[ -n "${synthetic_rank0_local_eid}" && -n "${synthetic_rank0_remote_eid}" &&
-       "${synthetic_die}" =~ ^[01]$ ]] || {
-        echo "synthetic mode requires both rank0 EIDs and --synthetic-die 0|1" >&2
+       "${synthetic_rank0_local_die}" =~ ^[01]$ &&
+       "${synthetic_rank0_remote_die}" =~ ^[01]$ ]] || {
+        echo "synthetic mode requires both rank0 EIDs and rank0 local/remote die IDs (0|1)" >&2
         exit 2
     }
     [[ -z "${route_indices}" ]] || {
@@ -140,10 +149,13 @@ if [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]
     }
     export A5_CCU_SYNTHETIC_RANK0_LOCAL_EID="${synthetic_rank0_local_eid}"
     export A5_CCU_SYNTHETIC_RANK0_REMOTE_EID="${synthetic_rank0_remote_eid}"
-    export A5_CCU_SYNTHETIC_DIE_ID="${synthetic_die}"
+    export A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE="${synthetic_rank0_local_die}"
+    export A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE="${synthetic_rank0_remote_die}"
+    unset A5_CCU_SYNTHETIC_DIE_ID
     export A5_CCU_SYNTHETIC_HOP="${synthetic_hop}"
 else
     unset A5_CCU_SYNTHETIC_RANK0_LOCAL_EID A5_CCU_SYNTHETIC_RANK0_REMOTE_EID
+    unset A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE
     unset A5_CCU_SYNTHETIC_DIE_ID A5_CCU_SYNTHETIC_HOP
 fi
 if (( rebuild_public != 0 )); then

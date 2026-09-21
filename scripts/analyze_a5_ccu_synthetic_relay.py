@@ -9,7 +9,7 @@ from pathlib import Path
 
 TRACE_RE = re.compile(
     r"SYNTHETIC_COMMLINK_TRACE rank=(\d+) peer=(\d+).*?protocol=(\d+) hop=(\d+) "
-    r"die_id=(\d+) local_query_status=(\d+).*?remote_query_status=(\d+).*?"
+    r"die_id=(\d+).*?local_query_status=(\d+).*?remote_query_status=(\d+).*?"
     r"local_addr=(\S+) remote_addr=(\S+)"
 )
 ACQUIRE_RE = re.compile(r"HcclChannelAcquire end: status=(\d+)")
@@ -53,7 +53,8 @@ def main():
     ]
     if passed:
         report += [
-            "At least one EID pair constructed from the topology inventory was accepted by",
+            "At least one EID pair obtained by joining two driver-topology edges with the local EID",
+            "inventory was accepted by",
             "`HcclChannelAcquire` and completed the data check. This proves that a candidate does not",
             "have to be returned by `HcclRankGraphGetLinks` before it can be used. HCCN counters are still",
             "required before naming the physical relay.",

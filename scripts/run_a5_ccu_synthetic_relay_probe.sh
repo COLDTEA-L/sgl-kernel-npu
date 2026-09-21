@@ -10,6 +10,7 @@ relay_phy=""
 plane=all
 base_route=0
 topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
+topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 bytes=4096
 warmup=1
 iterations=3
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
         --plane) plane=$2; shift 2 ;;
         --base-route) base_route=$2; shift 2 ;;
         --topology) topology=$2; shift 2 ;;
+        --topology-json) topology_json=$2; shift 2 ;;
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
@@ -39,9 +41,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "${src_phy}" =~ ^[0-7]$ && "${dst_phy}" =~ ^[0-7]$ &&
-   "${relay_phy}" =~ ^[0-7]$ ]] || {
-    echo "--src-phy, --dst-phy and --relay-phy must be physical device IDs 0..7" >&2
+[[ "${src_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ &&
+   "${dst_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ &&
+   "${relay_phy}" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || {
+    echo "--src-phy, --dst-phy and --relay-phy must be physical device IDs 0..63" >&2
     exit 2
 }
 [[ "${src_phy}" != "${dst_phy}" && "${src_phy}" != "${relay_phy}" &&
@@ -50,27 +53,35 @@ done
     exit 2
 }
 [[ -f "${topology}" ]] || { echo "topology file not found: ${topology}" >&2; exit 2; }
+[[ -f "${topology_json}" ]] || {
+    echo "driver topology JSON not found: ${topology_json}" >&2
+    exit 2
+}
 command -v timeout >/dev/null || { echo "GNU timeout is required" >&2; exit 2; }
 
 run_dir="${output_root}/a5_ccu_synthetic_relay_${src_phy}_${relay_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}"
 manifest="${run_dir}/resolved_eid_pairs.tsv"
 python3 "${script_dir}/resolve_a5_synthetic_relay_eids.py" \
-    --topology "${topology}" --src-phy "${src_phy}" --dst-phy "${dst_phy}" \
+    --topology "${topology}" --topology-json "${topology_json}" \
+    --src-phy "${src_phy}" --dst-phy "${dst_phy}" \
     --relay-phy "${relay_phy}" --plane "${plane}" >"${manifest}"
 
-printf 'case\tplane\tdie\tudmac\tsrc_eid\tdst_eid\tstatus\tresult\n' >"${run_dir}/case_status.tsv"
+printf 'case\tplane\tsrc_die\tdst_die\trelay_die\tsrc_port\trelay_port_from_src\trelay_port_to_dst\tdst_port\tsrc_udmac\tdst_udmac\tsrc_eid\tdst_eid\tstatus\tresult\n' >"${run_dir}/case_status.tsv"
 built=0
-while IFS=$'\t' read -r selected_plane route_key die udmac src_index dst_index src_eid dst_eid; do
+while IFS=$'\t' read -r selected_plane src_die dst_die relay_die src_port relay_port_from_src \
+    relay_port_to_dst dst_port src_udmac dst_udmac src_index dst_index src_eid dst_eid \
+    src_edge dst_edge protocols; do
     [[ "${selected_plane}" != "plane" ]] || continue
-    case_name="plane${selected_plane}_${udmac}_src${src_index}_dst${dst_index}"
+    case_name="plane${selected_plane}_srcp${src_port}_relayp${relay_port_from_src}-${relay_port_to_dst}_dstp${dst_port}"
     log="${run_dir}/${case_name}.log"
     command=(bash "${script_dir}/run_a5_ccu_urma_route_probe.sh"
         --devices "${src_phy},${dst_phy}" --route-index "${base_route}"
         --rebuild-public
         --synthetic-rank0-local-eid "${src_eid}"
         --synthetic-rank0-remote-eid "${dst_eid}"
-        --synthetic-die "${die}" --synthetic-hop 2
+        --synthetic-rank0-local-die "${src_die}"
+        --synthetic-rank0-remote-die "${dst_die}" --synthetic-hop 2
         --bytes "${bytes}" --warmup "${warmup}" --iters "${iterations}")
     (( built == 0 )) || command+=(--skip-build)
     (( channel_only == 0 )) || command+=(--channel-only)
@@ -87,8 +98,10 @@ while IFS=$'\t' read -r selected_plane route_key die udmac src_index dst_index s
     else
         result=FAIL
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${case_name}" "${selected_plane}" "${die}" "${udmac}" "${src_eid}" "${dst_eid}" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${case_name}" "${selected_plane}" "${src_die}" "${dst_die}" "${relay_die}" "${src_port}" \
+        "${relay_port_from_src}" "${relay_port_to_dst}" "${dst_port}" \
+        "${src_udmac}" "${dst_udmac}" "${src_eid}" "${dst_eid}" \
         "${status}" "${result}" >>"${run_dir}/case_status.tsv"
     echo "${case_name}: ${result} (status=${status})"
 done <"${manifest}"

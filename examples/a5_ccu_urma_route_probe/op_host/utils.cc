@@ -434,13 +434,27 @@ HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
     std::copy(local, local + EID_BYTE_NUM, desc->localEndpoint.commAddr.eid);
     std::copy(remote, remote + EID_BYTE_NUM, desc->remoteEndpoint.commAddr.eid);
 
-    uint32_t configuredDie = 0;
-    status = ParseUint32Value("A5_CCU_SYNTHETIC_DIE_ID", &configuredDie);
-    if (status != HCCL_SUCCESS || configuredDie > 1U) {
-        std::fprintf(stderr, "[A5 CCU URMA] synthetic mode requires die id 0 or 1\n");
-        return status == HCCL_E_NOT_FOUND ? HCCL_E_PARA : status;
+    uint32_t rank0LocalDie = 0;
+    uint32_t rank0RemoteDie = 0;
+    HcclResult localDieStatus = ParseUint32Value(
+        "A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE", &rank0LocalDie);
+    HcclResult remoteDieStatus = ParseUint32Value(
+        "A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE", &rank0RemoteDie);
+    if (localDieStatus == HCCL_E_NOT_FOUND && remoteDieStatus == HCCL_E_NOT_FOUND) {
+        uint32_t legacyDie = 0;
+        status = ParseUint32Value("A5_CCU_SYNTHETIC_DIE_ID", &legacyDie);
+        if (status != HCCL_SUCCESS || legacyDie > 1U) {
+            std::fprintf(stderr, "[A5 CCU URMA] synthetic mode requires endpoint die ids 0 or 1\n");
+            return status == HCCL_E_NOT_FOUND ? HCCL_E_PARA : status;
+        }
+        rank0LocalDie = legacyDie;
+        rank0RemoteDie = legacyDie;
+    } else if (localDieStatus != HCCL_SUCCESS || remoteDieStatus != HCCL_SUCCESS ||
+               rank0LocalDie > 1U || rank0RemoteDie > 1U) {
+        std::fprintf(stderr, "[A5 CCU URMA] synthetic rank0 local/remote die must both be 0 or 1\n");
+        return HCCL_E_PARA;
     }
-    *dieId = configuredDie;
+    *dieId = rank == 0 ? rank0LocalDie : rank0RemoteDie;
     uint32_t hop = 2;
     const HcclResult hopStatus = ParseUint32Value("A5_CCU_SYNTHETIC_HOP", &hop);
     if (hopStatus != HCCL_SUCCESS && hopStatus != HCCL_E_NOT_FOUND) return hopStatus;
@@ -453,10 +467,11 @@ HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
     uid << "synthetic-" << std::hex << Fnv1a64(identity);
     if (pathUid != nullptr) *pathUid = uid.str();
     std::printf("SYNTHETIC_COMMLINK_TRACE rank=%u peer=%u path_uid=%s protocol=%d hop=%u "
-                "die_id=%u local_query_status=%d local_query_die=%s "
+                "die_id=%u rank0_local_die=%u rank0_remote_die=%u "
+                "local_query_status=%d local_query_die=%s "
                 "remote_query_status=%d remote_query_die=%s local_addr=%s remote_addr=%s\n",
                 rank, peer, uid.str().c_str(), static_cast<int>(desc->channelProtocol), hop,
-                *dieId, static_cast<int>(localInfo.dieStatus),
+                *dieId, rank0LocalDie, rank0RemoteDie, static_cast<int>(localInfo.dieStatus),
                 AttrToString(localInfo.dieId, localInfo.dieStatus).c_str(),
                 static_cast<int>(remoteInfo.dieStatus),
                 AttrToString(remoteInfo.dieId, remoteInfo.dieStatus).c_str(),
@@ -624,6 +639,8 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const char *syntheticLocal = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
     const char *syntheticRemote = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID");
     const char *syntheticDie = std::getenv("A5_CCU_SYNTHETIC_DIE_ID");
+    const char *syntheticLocalDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE");
+    const char *syntheticRemoteDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE");
     const char *syntheticHop = std::getenv("A5_CCU_SYNTHETIC_HOP");
     std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
@@ -637,6 +654,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     routeKey += ":synthetic_local=" + std::string(syntheticLocal == nullptr ? "none" : syntheticLocal);
     routeKey += ":synthetic_remote=" + std::string(syntheticRemote == nullptr ? "none" : syntheticRemote);
     routeKey += ":synthetic_die=" + std::string(syntheticDie == nullptr ? "none" : syntheticDie);
+    routeKey += ":synthetic_local_die=" +
+        std::string(syntheticLocalDie == nullptr ? "none" : syntheticLocalDie);
+    routeKey += ":synthetic_remote_die=" +
+        std::string(syntheticRemoteDie == nullptr ? "none" : syntheticRemoteDie);
     routeKey += ":synthetic_hop=" + std::string(syntheticHop == nullptr ? "default" : syntheticHop);
     routeKey += ":rebuild=" + std::to_string(EnvEnabled("A5_CCU_REBUILD_PUBLIC_FIELDS") ? 1 : 0);
     if (g_cache.comm == comm && g_cache.stream == stream && g_cache.routeKey == routeKey) {

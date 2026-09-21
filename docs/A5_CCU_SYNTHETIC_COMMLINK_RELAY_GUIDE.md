@@ -2,22 +2,30 @@
 
 ## 1. 目的与边界
 
-本实验验证：不修改 `ubus.ko` 和全局 route table，仅根据整机拓扑为通信两端选择一对具有相同 relay route-key
-的 EID，构造 `HcclChannelDesc`，能否让 `HcclChannelAcquire` 建立一条新的 forwarding Channel。
+本实验验证：不修改 `ubus.ko` 和全局 route table，利用驱动整机拓扑中两条真实物理边，为通信两端构造一对
+指向同一中转卡 IO Die 的 EID，再用该 EID pair 构造 `HcclChannelDesc` 并建立 forwarding Channel。
 
-当前实验使用物理卡2、3，并选择物理卡4作为待验证relay，即 `2 -> relay 4 -> 3`。拓扑记录中可解析出
-两组与现有route0/1/2 EID均不同的候选：
+当前目标为 `2 -> relay 4 -> 3`。解析器必须完成两次联接，不能把物理卡号4直接当成EID中的port字段：
 
 ```text
-plane0: 0004...4502 -> 0004...6503, die0
-plane1: 0044...5501 -> 0044...7501, die1
+/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+  edge(2,4) -> 2侧 die/port + 4侧 ingress die/port
+  edge(4,3) -> 4侧 egress die/port + 3侧 die/port
+
+docs/topology/a5_hccn_device_topology_raw.txt
+  (device2, 2侧 die/port) -> rank0 local EID
+  (device3, 3侧 die/port) -> rank0 remote EID
 ```
 
-EID 不在代码中硬编码；解析器按 `src/dst/relay/plane` 从拓扑文件动态选择两端同一 `udmac`、同一 die、同一
-route-key 的 EID。这里的 route-key 是实验性拓扑编码解释，最终 relay 必须由 HCCN 端口计数确认。
+只有relay4的ingress与egress位于同一IO Die，才生成IO-die-only候选。源2与目的3自身的die允许不同；运行时
+分别为两个rank选择对应per-die CCU thread/channel。
 
-`2/3/4` 仅是本轮实验参数，不是代码常量。通信卡变化时修改 `--src-phy/--dst-phy`，relay变化时修改
-`--relay-phy`；解析器会重新选择对应EID，并拒绝src、dst、relay三者重复。
+旧实现把`relay_phy=4`直接解释成两端EID第三字段`0004`，产生过
+`0004...4502 -> 0004...6503`。结合驱动JSON后已确认：第三字段是**本地port key**，不是物理relay ID；
+该旧EID pair只是“device2 Port4到device3 Port4”，不能证明经过物理卡4，现已废弃。
+
+`2/3/4`仅是本轮实验参数，不是代码常量。通信卡或relay变化时只修改
+`--src-phy/--dst-phy/--relay-phy`；解析器会从当前机器的JSON重新查询真实边和端口，并拒绝三者重复。
 
 ## 2. 拉取、编译和安装
 
@@ -66,6 +74,56 @@ provision”的负对照。
 `HcclChannelAcquire` 的endpoint-pair provision/匹配阶段。后续生成新的 synthetic CommLink 时必须同时检查
 “被枚举”和“可Acquire”，不能只统计RankGraph中的link数量。
 
+### 3.1 native candidate 2 已确认到什么程度
+
+物理卡2、3上，RankGraph公开的candidate 2为一条`layer=1/hop=2/die0/protocol=UBC_CTP` CommLink。rank0方向
+公开EID pair为：
+
+```text
+device2 local : 0000:0000:003f:0200:0010:0000:df12:4b01
+device3 remote: 0000:0000:003f:0200:0010:0000:df12:6b01
+```
+
+这只是candidate 2的**聚合CommLink端点**，不是六组独立relay EID pair。应用侧行为是：
+
+```text
+candidate 2
+  -> 一次 HcclChannelAcquire
+  -> 一个 ChannelHandle
+  -> CCU kernel中一次 WriteNb(channel, wholeChunk)
+  -> HCCP/MUE/UDMA内部聚合path/TP对象再做物理分流
+```
+
+在已完成的干净HCCN对照中，native0只有两个通信端点出现同量级流量；native2则在六个非端点设备
+`0,1,4,5,6,7`上出现近似均衡的计数增长。六个非端点RX合计约占目的端接收量的86%，与`6/7`吻合。因此当前
+最强证据是：**native2内部约等比分成7条物理路径，即1条direct加6条single-relay path并发**。
+
+需要区分两层并发：
+
+- native2单独运行：应用/CCU层只有一个Channel和一次`WriteNb`，七路并发发生在私有聚合path对象以下；
+- 显式选择多个CommLink运行：`all_to_all_multiroute_kernel.cc`先对每个Channel连续提交`WriteNb`，随后统一
+  `WaitEvent`，因此不同Channel在应用可见层是非阻塞并发。
+
+公开接口尚未给出native2内部六条relay path各自的EID pair或relay顺序。上述“1+6”来自端口footprint，不能把
+candidate 2的单个公开EID pair拆成六组未经观测的EID。
+
+在当前机器上重新确认公开EID pair：
+
+```bash
+timeout --signal=TERM --kill-after=5 180 \
+  bash scripts/run_a5_ccu_urma_route_probe.sh \
+    --devices 2,3 --route-index 2 \
+    --bytes 4096 --warmup 1 --iters 1 --channel-only \
+  2>&1 | tee /home/l00934901/profiling/native2_catalog.log
+
+grep -E 'route=2|acquiring route=2|HcclChannelAcquire end' \
+  /home/l00934901/profiling/native2_catalog.log
+```
+
+若要重新确认“1 direct + 6 relay”的footprint，去掉`--channel-only`，加入
+`--remote-only --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7`。公开日志仍只会显示一组CommLink EID；六个
+非端点设备的平衡计数才是内部relay数量证据。
+
 ## 4. 公共字段重建对照
 
 下面不复制完整 `EndpointDesc` 对象，而是清零后仅重新填写公开的 `protocol/commAddr/loc`：
@@ -87,11 +145,30 @@ timeout --signal=TERM --kill-after=5 180 \
 ```bash
 python3 scripts/resolve_a5_synthetic_relay_eids.py \
   --topology docs/topology/a5_hccn_device_topology_raw.txt \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
   --src-phy 2 --dst-phy 3 --relay-phy 4 --plane all
 ```
 
-输出中的 `udmac`、die、两端 EID 必须成对一致。换成物理卡2、3或4、5时，只修改三个 physical-device 参数，
-不要手工修改 EID。
+先检查输出，再运行数据实验：
+
+```bash
+python3 scripts/resolve_a5_synthetic_relay_eids.py \
+  --topology docs/topology/a5_hccn_device_topology_raw.txt \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --src-phy 2 --dst-phy 3 --relay-phy 4 --plane all \
+  | column -s $'\t' -t
+```
+
+每行必须同时满足：
+
+1. `src_edge`在JSON中确实连接physical device 2和4；
+2. `dst_edge`确实连接physical device 4和3；
+3. `relay_port_from_src`与`relay_port_to_dst`属于同一`relay_die`；
+4. `src_eid`由device2的`src_die/src_port`解析；
+5. `dst_eid`由device3的`dst_die/dst_port`解析。
+
+`plane`现在表示relay卡的IO Die，不再表示两个通信端点必须使用同一个die。如果两条物理边在relay4上落入不同
+die，解析器会拒绝该组合，而不是伪造跨die forwarding。换卡时只改三个physical-device参数，不要手工改EID。
 
 ## 6. 自动执行 synthetic CommLink 穿刺
 
@@ -100,19 +177,21 @@ python3 scripts/resolve_a5_synthetic_relay_eids.py \
 ```bash
 bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
   --src-phy 2 --dst-phy 3 --relay-phy 4 \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
   --plane all --base-route 0 \
   --bytes 4096 --warmup 1 --iters 1 \
   --channel-only --timeout-seconds 180 \
   --output-root /home/l00934901/profiling
 ```
 
-物理卡2、3当前已经确认只有 plane0 synthetic candidate 可以建链；plane1 会在
-`HcclChannelAcquire` 等待约120秒后返回status 9。因此正式数据和端口footprint实验只运行plane0：
+先从`resolved_eid_pairs.tsv`读取当前JSON实际返回的`plane`。不要沿用旧实验中“plane0可用”的结论；旧实验使用
+了错误的Port4/Port4 EID pair。若只有一行，就将下面`--plane`替换为该行的`relay_die`：
 
 ```bash
 bash scripts/run_a5_ccu_synthetic_relay_probe.sh \
   --src-phy 2 --dst-phy 3 --relay-phy 4 \
-  --plane 0 --base-route 0 \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --plane all --base-route 0 \
   --bytes 4194304 --warmup 10 --iters 100 \
   --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
   --timeout-seconds 300 \
@@ -123,13 +202,12 @@ echo "exit_status=$?"
 
 这里必须区分两个参数：
 
-- `--plane 0`：只生成die0/plane0的synthetic EID pair，不再尝试失败的plane1；
+- `--plane all|0|1`：筛选relay4的ingress/egress所在IO Die；
 - `--base-route 0`：只表示使用原生route0的protocol、rank location等公共字段作为
   `HcclChannelDesc`模板，不表示数据仍走原生direct route0。
 
-2026-09-20在物理卡2、3、relay4上的plane0实测已经完成4MiB、warmup 10次、正式100次的数据校验，
-两个rank均PASS，平均约119.9us。该结果证明synthetic Channel可以真实搬运数据；是否物理经过relay4仍以
-下面的HCCN端口差分为准。
+2026-09-20旧版Port4/Port4 pair虽能搬运数据，但它不是拓扑JSON证明的`2->4->3`，不能作为本轮结论复用。
+新版只有在manifest中的两条edge、relay-side端口和HCCN footprint同时吻合时才确认该物理路径。
 
 脚本自动生成：
 
@@ -236,9 +314,12 @@ echo "HCCN_TSV=${TSV}"
 | `synthetic2` | 与synthetic0完全相同 | route2 |
 
 ```bash
+RELAY_DIE=1  # 按本轮resolved_eid_pairs.tsv修改为0或1
+
 bash scripts/run_a5_ccu_synthetic_relay_causal_compare.sh \
   --src-phy 2 --dst-phy 3 --relay-phy 4 \
-  --plane 0 \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --plane "${RELAY_DIE}" \
   --bytes 4194304 --warmup 10 --iters 100 \
   --repeats 3 \
   --hccn-devices 0,1,2,3,4,5,6,7 \
@@ -293,12 +374,14 @@ cases/<case>_r<repeat>/hccn/.../hccn_counter_deltas.tsv
 
 显式 relay 的完整 PASS 条件：
 
-1. rank0/rank1 的 synthetic endpoint 查询和 ChannelAcquire 成功；
-2. 4MiB 数据校验通过；
-3. HCCN 同一实验窗口中，源2到指定relay4、relay4到目的3的对应端口计数明显增加；
-4. 非指定 relay 没有同量级增量；
-5. relay 卡没有用户进程，也没有中转 HBM buffer；
-6. 至少三次重复结果稳定。
+1. `resolved_eid_pairs.tsv`显示JSON中的`2<->4`、`4<->3`两条真实edge；
+2. 两条edge在relay4侧落到同一`relay_die`，且EID与端点侧`die/port`一致；
+3. rank0/rank1 的 synthetic endpoint 查询和 ChannelAcquire 成功；
+4. 4MiB 数据校验通过；
+5. HCCN同一窗口中，JSON给出的`2->4`及`4->3`物理端口计数明显增加；
+6. 非指定relay没有同量级增量；
+7. relay卡没有用户进程，也没有中转HBM buffer；
+8. 至少三次重复结果稳定。
 
 终端中的`PASS engine=CCU`证明端到端Channel、CCU kernel、WriteNb及数据校验成功；它本身不证明指定
 relay。只有relay4相关端口出现与业务量同量级的RX/TX增量，且其他relay没有同量级增量，才可以写出
@@ -310,12 +393,17 @@ communicator 初始化期的 endpoint-pair/path provision，而不是 CCU `Write
 ## 8. 调用链
 
 ```text
-topology raw inventory
-  -> resolve_a5_synthetic_relay_eids.py
-  -> rank0 local/remote EID pair + die
+driver atlas_950_1.json
+  -> edge(src, relay): src die/port + relay ingress die/port
+  -> edge(relay, dst): relay egress die/port + dst die/port
+  -> require relay ingress die == relay egress die
+  -> join a5_hccn_device_topology_raw.txt
+  -> rank0 local EID + local die
+  -> rank0 remote EID + remote die
   -> SelectRoute(base discovered CommLink)
   -> rebuild HcclChannelDesc
   -> replace both CommAddr.eid[16]
+  -> each rank selects its own local die CCU thread
   -> HcclChannelAcquire
   -> CCU kernel WriteNb
   -> destination EID driven hardware forwarding
