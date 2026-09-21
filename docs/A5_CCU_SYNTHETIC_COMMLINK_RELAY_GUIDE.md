@@ -288,14 +288,10 @@ Device2 die0/port6
 {
   head -1 "${TSV}"
   awk -F $'\t' '
-    NR > 1 &&
-    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") &&
-    (
-      ($1 == 2 && $2 == 0 && $3 == 6) ||
-      ($1 == 4 && $2 == 1 && ($3 == 0 || $3 == 3)) ||
-      ($1 == 3 && $2 == 0 && $3 == 3)
-    ) {
-      print
+    NR > 1 {
+      is_counter = ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num")
+      is_path_port = ($1 == 2 && $2 == 0 && $3 == 6) || ($1 == 4 && $2 == 1 && ($3 == 0 || $3 == 3)) || ($1 == 3 && $2 == 0 && $3 == 3)
+      if (is_counter && is_path_port) print
     }
   ' "${TSV}"
 } | column -s $'\t' -t
