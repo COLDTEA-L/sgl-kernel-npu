@@ -78,6 +78,9 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
 
 host侧manifest解析和Channel构造发生了变化，因此必须重新编译安装算子SO；不需要安装KO。
 
+运行脚本会在source DeepEP vendor `set_env.bash`时临时关闭`set -u`。这是因为该vendor脚本会直接读取可能尚未
+定义的`ASCEND_CUSTOM_OPP_PATH`；修复后的运行脚本会随即恢复`set -u`，用户无需提前手工export该变量。
+
 若Python wheel中的`deep_ep_cpp`尚未包含`ccu_urma_multiroute_alltoall_out`，按本分支原有DeepEP构建流程重新
 安装wheel。只更新自定义HCCL包而wheel已经是本分支版本时，无需重复安装wheel。
 
