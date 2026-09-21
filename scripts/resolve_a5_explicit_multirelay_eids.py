@@ -20,13 +20,16 @@ FIELDS = (
 )
 
 
-def csv_ints(text, name):
+def csv_ints(text, name, *, require_unique=False):
+    items = [item.strip() for item in text.split(",")]
+    if not items or any(not item for item in items):
+        raise SystemExit(f"{name} must be a non-empty comma-separated integer list")
     try:
-        values = [int(item.strip()) for item in text.split(",") if item.strip()]
+        values = [int(item) for item in items]
     except ValueError as exc:
         raise SystemExit(f"{name} must be a comma-separated integer list") from exc
-    if not values or len(values) != len(set(values)):
-        raise SystemExit(f"{name} must be non-empty and contain no duplicates")
+    if require_unique and len(values) != len(set(values)):
+        raise SystemExit(f"{name} must contain no duplicates")
     return values
 
 
@@ -109,7 +112,7 @@ def main():
     parser.add_argument("--net-layer", type=int, default=0)
     args = parser.parse_args()
 
-    relays = csv_ints(args.relay_phys, "--relay-phys")
+    relays = csv_ints(args.relay_phys, "--relay-phys", require_unique=True)
     if len(relays) < 2:
         raise SystemExit("multi-relay validation requires at least two explicit relay cards")
     if args.src_phy == args.dst_phy or args.src_phy in relays or args.dst_phy in relays:
@@ -119,6 +122,8 @@ def main():
         planes = ["all"] * len(relays)
     if len(planes) != len(relays) or any(item not in ("all", "0", "1") for item in planes):
         raise SystemExit("--relay-planes must contain one all|0|1 value per relay")
+    # Equal weights such as 1,1 are intentional: unlike physical relay IDs,
+    # split weights do not have to be unique.
     weights = csv_ints(args.weights, "--weights") if args.weights else [1] * len(relays)
     if len(weights) != len(relays) or any(value <= 0 for value in weights):
         raise SystemExit("--weights must contain one positive integer per relay")

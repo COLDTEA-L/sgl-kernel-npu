@@ -98,6 +98,9 @@ python3 scripts/resolve_a5_explicit_multirelay_eids.py \
   | column -s $'\t' -t
 ```
 
+`--relay-phys` 中的物理卡号必须互不重复；`--weights` 是各显式 relay 的切分权重，
+允许重复，因此 `--weights 1,1` 表示两条路径等分数据。
+
 输出必须恰好两行，`relay_phy`分别为4和5。每行中的：
 
 - `src_edge`必须连接`src_phy`与该行`relay_phy`；
