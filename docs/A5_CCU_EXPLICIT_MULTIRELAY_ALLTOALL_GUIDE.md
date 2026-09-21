@@ -119,11 +119,15 @@ bash scripts/run_a5_ccu_explicit_multirelay_alltoall.sh \
   --relay-phys 4,5 \
   --weights 1,1 \
   --bytes 4194304 \
-  --warmup 10 --iters 100 --repeats 3 \
+  --warmup 100 --iters 20 --repeats 3 \
   --hccn-devices 0,1,2,3,4,5,6,7 \
   --timeout-seconds 300 \
   --output-root /home/l00934901/profiling
 ```
+
+这里固定先做100次预热，再统计20次正式迭代。CCU Channel、TP和底层队列进入稳定状态所需的预热次数较多，
+不要为了缩短实验时间把预热重新降到10次；资源时间有限时，优先把`--repeats 3`改成`--repeats 1`，而不是
+减少`--warmup 100`。正式迭代20次也足以生成本实验需要的终端平均值和HCCN before/after流量差分。
 
 脚本依次执行：
 
