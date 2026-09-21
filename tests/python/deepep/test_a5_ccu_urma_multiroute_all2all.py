@@ -141,6 +141,8 @@ def parse_args():
                         help="comma-separated PATH_CATALOG path_uid values; preferred over route ordinals")
     parser.add_argument("--path-weights", default="",
                         help="comma-separated positive weights, one per selected path")
+    parser.add_argument("--synthetic-route-manifest", default="",
+                        help="TSV of explicitly resolved relay EID pairs")
     parser.add_argument("--schedule", choices=("concurrent", "serial"),
                         default="concurrent")
     parser.add_argument("--warmup", type=int, default=10)
@@ -160,6 +162,18 @@ def parse_args():
 
 
 def select_routes(args):
+    if args.synthetic_route_manifest:
+        manifest = Path(args.synthetic_route_manifest).resolve()
+        if not manifest.is_file():
+            raise RuntimeError(f"synthetic route manifest not found: {manifest}")
+        os.environ["A5_CCU_SYNTHETIC_ROUTE_MANIFEST"] = str(manifest)
+        os.environ["A5_CCU_REBUILD_PUBLIC_FIELDS"] = "1"
+        os.environ.pop("A5_CCU_SOURCE_ROUTE_MANIFEST", None)
+        os.environ.pop("A5_CCU_SOURCE_ROUTE_PROVIDER", None)
+        os.environ.pop("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID", None)
+        os.environ.pop("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID", None)
+    else:
+        os.environ.pop("A5_CCU_SYNTHETIC_ROUTE_MANIFEST", None)
     if args.path_uids:
         os.environ["A5_CCU_PATH_UIDS"] = args.path_uids
         os.environ.pop("A5_CCU_ROUTE_INDICES", None)
@@ -268,6 +282,7 @@ def main():
             "warmup": args.warmup,
             "iterations": args.iters,
             "host_batch_avg_us": result_us,
+            "synthetic_route_manifest": args.synthetic_route_manifest or "",
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "

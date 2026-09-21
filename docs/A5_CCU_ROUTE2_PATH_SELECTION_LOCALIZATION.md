@@ -820,14 +820,37 @@ relay ID。因此不能把`relay_phy=N`直接写成两端`route_key=N`。当前�
 candidate 1 仍是必要负对照：它说明 RankGraph 发布一个带EID和protocol的 CommLink，不必然代表对应path已经
 完成 provision。完整实验步骤和判据见 `A5_CCU_SYNTHETIC_COMMLINK_RELAY_GUIDE.md`。
 
-尚不能声称：
+后续对physical device 2、3和relay4的destination-only因果实验已经推进了这一结论：当每个发送方向只替换
+remote/destination EID时，该方向会在HCCN上稳定呈现`src -> relay4 ingress -> relay4 egress -> dst`的完整
+四段计数链，而反向保留native remote EID时仍走direct。因此在当前已provision的full-mesh环境中，应用可以
+通过driver topology解析出的relay-facing destination EID显式选择一条single-relay path，不需要知道
+`route_addr_idx`或修改全局UBUS route table。
 
-- 已经能够从应用任意指定一张 relay 卡；
-- 已经知道 `route_addr_idx`、TPN 或 endpoint raw 的私有编码；
-- 任意 `src -> relay -> dst` 的 forwarding path object 都已预创建；
-- 用户态只靠 EID 可以构造 source route。
+仍不能声称任意不存在于当前硬件/provision中的EID组合都能建链，也不能把EID第三字段直接解释成物理卡号。
+物理relay必须由两条driver JSON edge和HCCN counter链共同确认。
 
-## 11. 证据来源
+## 12. 从单relay扩展到显式多relay
+
+多relay实现不使用native candidate2内部的隐式聚合。调用者以`--relay-phys 4,5,...`列出每张中转卡，解析器为
+每张卡分别联接`src<->relay`和`relay<->dst`两条driver edge，并生成一组双向relay-facing EID。host层为每个
+manifest row构造一个`HcclChannelDesc`并一次acquire多个Channel；AllToAll按显式权重切片：
+
+```text
+explicit relay EID pair[0] -> Channel[0] -> chunk[0]
+explicit relay EID pair[1] -> Channel[1] -> chunk[1]
+
+concurrent CCU kernel:
+WriteNb(Channel[0], chunk[0])
+WriteNb(Channel[1], chunk[1])
+WaitEvent(event[0])
+WaitEvent(event[1])
+```
+
+不存在“第二条路径由系统自动选择”的步骤。任一指定relay无法唯一解析、不能Acquire，或与其他路径跨endpoint
+local die时，严格失败。单路、serial、concurrent、反序以及逐relay HCCN链验证见
+`A5_CCU_EXPLICIT_MULTIRELAY_ALLTOALL_GUIDE.md`。
+
+## 13. 证据来源
 
 本文综合以下材料：
 

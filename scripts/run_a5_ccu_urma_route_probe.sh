@@ -34,6 +34,8 @@ synthetic_die=""
 synthetic_rank0_local_die=""
 synthetic_rank0_remote_die=""
 synthetic_hop=2
+synthetic_route_manifest=""
+path_weights=""
 rebuild_public=0
 
 while [[ $# -gt 0 ]]; do
@@ -67,6 +69,8 @@ while [[ $# -gt 0 ]]; do
         --synthetic-rank0-local-die) synthetic_rank0_local_die=$2; shift 2 ;;
         --synthetic-rank0-remote-die) synthetic_rank0_remote_die=$2; shift 2 ;;
         --synthetic-hop) synthetic_hop=$2; shift 2 ;;
+        --synthetic-route-manifest) synthetic_route_manifest=$2; shift 2 ;;
+        --path-weights) path_weights=$2; shift 2 ;;
         --rebuild-public) rebuild_public=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -107,6 +111,11 @@ unset ASCEND_CUSTOM_OPP_PATH
 export ASCEND_RT_VISIBLE_DEVICES="${devices}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export A5_CCU_ROUTE_INDEX="${route_index}"
+if [[ -n "${path_weights}" ]]; then
+    export A5_CCU_PATH_WEIGHTS="${path_weights}"
+else
+    unset A5_CCU_PATH_WEIGHTS
+fi
 if [[ -n "${route_indices}" ]]; then
     export A5_CCU_ROUTE_INDICES="${route_indices}"
 else
@@ -132,7 +141,23 @@ if [[ -n "${descriptor_mutation}" ]]; then
 else
     unset A5_CCU_DESC_MUTATION A5_CCU_DESC_DONOR_ROUTE
 fi
-if [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]; then
+if [[ -n "${synthetic_route_manifest}" ]]; then
+    [[ -f "${synthetic_route_manifest}" ]] || {
+        echo "synthetic route manifest not found: ${synthetic_route_manifest}" >&2
+        exit 2
+    }
+    [[ -z "${synthetic_rank0_local_eid}" && -z "${synthetic_rank0_remote_eid}" ]] || {
+        echo "--synthetic-route-manifest cannot be combined with single synthetic EIDs" >&2
+        exit 2
+    }
+    export A5_CCU_SYNTHETIC_ROUTE_MANIFEST
+    A5_CCU_SYNTHETIC_ROUTE_MANIFEST=$(readlink -f "${synthetic_route_manifest}")
+    export A5_CCU_REBUILD_PUBLIC_FIELDS=1
+    unset A5_CCU_SYNTHETIC_RANK0_LOCAL_EID A5_CCU_SYNTHETIC_RANK0_REMOTE_EID
+    unset A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE
+    unset A5_CCU_SYNTHETIC_DIE_ID A5_CCU_SYNTHETIC_HOP
+elif [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]; then
+    unset A5_CCU_SYNTHETIC_ROUTE_MANIFEST
     if [[ -n "${synthetic_die}" ]]; then
         [[ -n "${synthetic_rank0_local_die}" ]] || synthetic_rank0_local_die=${synthetic_die}
         [[ -n "${synthetic_rank0_remote_die}" ]] || synthetic_rank0_remote_die=${synthetic_die}
@@ -154,11 +179,12 @@ if [[ -n "${synthetic_rank0_local_eid}" || -n "${synthetic_rank0_remote_eid}" ]]
     unset A5_CCU_SYNTHETIC_DIE_ID
     export A5_CCU_SYNTHETIC_HOP="${synthetic_hop}"
 else
+    unset A5_CCU_SYNTHETIC_ROUTE_MANIFEST
     unset A5_CCU_SYNTHETIC_RANK0_LOCAL_EID A5_CCU_SYNTHETIC_RANK0_REMOTE_EID
     unset A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE
     unset A5_CCU_SYNTHETIC_DIE_ID A5_CCU_SYNTHETIC_HOP
 fi
-if (( rebuild_public != 0 )); then
+if (( rebuild_public != 0 )) || [[ -n "${synthetic_route_manifest}" ]]; then
     export A5_CCU_REBUILD_PUBLIC_FIELDS=1
 else
     unset A5_CCU_REBUILD_PUBLIC_FIELDS

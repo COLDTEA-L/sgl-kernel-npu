@@ -1,5 +1,9 @@
 # A5 CCU synthetic CommLink 显式 relay 穿刺指南
 
+> 单relay因果验证完成后，显式指定两张或更多relay并运行CCU并发AllToAll的完整流程见
+> `A5_CCU_EXPLICIT_MULTIRELAY_ALLTOALL_GUIDE.md`。新流程要求`--relay-phys`列出的每张卡都能独立解析、建链和
+> 通过HCCN链路校验，不会自动选择第二张relay或退化到native route2。
+
 ## 1. 目的与边界
 
 本实验验证：不修改 `ubus.ko` 和全局 route table，利用驱动整机拓扑中两条真实物理边，为通信两端构造一对

@@ -35,6 +35,9 @@ HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf, uint64_t sen
 
 /**
  * Two-rank CCU AllToAll over one or more RankGraph routes.
+ * A5_CCU_SYNTHETIC_ROUTE_MANIFEST may instead provide multiple explicitly
+ * resolved physical-relay EID pairs. Each manifest row becomes one Channel;
+ * no relay card is selected implicitly in that mode.
  * sendBuf and recvBuf each contain two consecutive elementsPerPeer-element
  * slices. sendBuf[dstRank] is delivered to recvBuf[srcRank] on dstRank.
  */

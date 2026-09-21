@@ -14,7 +14,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -68,9 +70,103 @@ struct PathCandidate {
     std::string uid;
 };
 
+struct SyntheticRouteSpec {
+    uint32_t routeId = 0;
+    uint32_t relayPhy = 0;
+    uint32_t rank0LocalDie = 0;
+    uint32_t rank0RemoteDie = 0;
+    std::string rank0LocalEid;
+    std::string rank0RemoteEid;
+};
+
 HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
                                  HcclChannelDesc *desc, uint32_t *dieId,
                                  std::string *pathUid);
+
+std::vector<std::string> SplitTabs(const std::string &line)
+{
+    std::vector<std::string> fields;
+    std::stringstream input(line);
+    std::string item;
+    while (std::getline(input, item, '\t')) fields.push_back(item);
+    return fields;
+}
+
+HcclResult ParseUint32Text(const std::string &name, const std::string &text, uint32_t *value)
+{
+    if (value == nullptr) return HCCL_E_PTR;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str() || *end != '\0' || parsed > UINT32_MAX) {
+        std::fprintf(stderr, "[A5 CCU URMA] invalid %s=%s in synthetic manifest\n",
+                     name.c_str(), text.c_str());
+        return HCCL_E_PARA;
+    }
+    *value = static_cast<uint32_t>(parsed);
+    return HCCL_SUCCESS;
+}
+
+HcclResult LoadSyntheticRouteManifest(const char *path,
+                                      std::vector<SyntheticRouteSpec> *specs)
+{
+    if (path == nullptr || specs == nullptr) return HCCL_E_PTR;
+    std::ifstream input(path);
+    if (!input.good()) {
+        std::fprintf(stderr, "[A5 CCU URMA] cannot open synthetic route manifest: %s\n", path);
+        return HCCL_E_NOT_FOUND;
+    }
+    std::string line;
+    if (!std::getline(input, line)) return HCCL_E_PARA;
+    const std::vector<std::string> header = SplitTabs(line);
+    std::map<std::string, size_t> columns;
+    for (size_t i = 0; i < header.size(); ++i) columns[header[i]] = i;
+    const char *required[] = {
+        "route_id", "relay_phy", "src_die", "dst_die", "src_eid", "dst_eid"
+    };
+    for (const char *name : required) {
+        if (columns.find(name) == columns.end()) {
+            std::fprintf(stderr, "[A5 CCU URMA] synthetic manifest lacks column %s\n", name);
+            return HCCL_E_PARA;
+        }
+    }
+    specs->clear();
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> fields = SplitTabs(line);
+        if (fields.size() != header.size()) {
+            std::fprintf(stderr, "[A5 CCU URMA] malformed synthetic manifest row: %s\n",
+                         line.c_str());
+            return HCCL_E_PARA;
+        }
+        SyntheticRouteSpec spec;
+        HcclResult status = ParseUint32Text("route_id", fields[columns["route_id"]],
+                                            &spec.routeId);
+        if (status != HCCL_SUCCESS) return status;
+        status = ParseUint32Text("relay_phy", fields[columns["relay_phy"]],
+                                 &spec.relayPhy);
+        if (status != HCCL_SUCCESS) return status;
+        status = ParseUint32Text("src_die", fields[columns["src_die"]],
+                                 &spec.rank0LocalDie);
+        if (status != HCCL_SUCCESS) return status;
+        status = ParseUint32Text("dst_die", fields[columns["dst_die"]],
+                                 &spec.rank0RemoteDie);
+        if (status != HCCL_SUCCESS) return status;
+        if (spec.rank0LocalDie > 1U || spec.rank0RemoteDie > 1U) return HCCL_E_PARA;
+        spec.rank0LocalEid = fields[columns["src_eid"]];
+        spec.rank0RemoteEid = fields[columns["dst_eid"]];
+        if (std::find_if(specs->begin(), specs->end(), [&spec](const SyntheticRouteSpec &item) {
+                return item.routeId == spec.routeId || item.relayPhy == spec.relayPhy;
+            }) != specs->end()) {
+            std::fprintf(stderr,
+                "[A5 CCU URMA] duplicate route_id or relay_phy in synthetic manifest\n");
+            return HCCL_E_PARA;
+        }
+        specs->push_back(spec);
+    }
+    if (specs->empty() || specs->size() > 8U) return HCCL_E_PARA;
+    return HCCL_SUCCESS;
+}
 
 EndpointInfo QueryEndpointInfo(HcclComm comm, uint32_t ownerRank,
                                const EndpointDesc &endpoint)
@@ -378,10 +474,9 @@ HcclResult ParseUint32Value(const char *name, uint32_t *value)
     return HCCL_SUCCESS;
 }
 
-HcclResult ParseEidValue(const char *name, uint8_t *eid)
+HcclResult ParseEidText(const char *name, const char *raw, uint8_t *eid)
 {
     if (eid == nullptr) return HCCL_E_PTR;
-    const char *raw = std::getenv(name);
     if (raw == nullptr || raw[0] == '\0') return HCCL_E_NOT_FOUND;
     std::string compact;
     for (const char *cursor = raw; *cursor != '\0'; ++cursor) {
@@ -404,6 +499,11 @@ HcclResult ParseEidValue(const char *name, uint8_t *eid)
         eid[index] = static_cast<uint8_t>(value);
     }
     return HCCL_SUCCESS;
+}
+
+HcclResult ParseEidValue(const char *name, uint8_t *eid)
+{
+    return ParseEidText(name, std::getenv(name), eid);
 }
 
 HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
@@ -475,6 +575,46 @@ HcclResult ApplySyntheticEidPair(HcclComm comm, uint32_t rank, uint32_t peer,
                 AttrToString(localInfo.dieId, localInfo.dieStatus).c_str(),
                 static_cast<int>(remoteInfo.dieStatus),
                 AttrToString(remoteInfo.dieId, remoteInfo.dieStatus).c_str(),
+                CommAddrToString(desc->localEndpoint.commAddr).c_str(),
+                CommAddrToString(desc->remoteEndpoint.commAddr).c_str());
+    std::fflush(stdout);
+    return HCCL_SUCCESS;
+}
+
+HcclResult ApplySyntheticRouteSpec(HcclComm comm, uint32_t rank, uint32_t peer,
+                                   const SyntheticRouteSpec &spec,
+                                   HcclChannelDesc *desc, uint32_t *dieId,
+                                   std::string *pathUid)
+{
+    if (desc == nullptr || dieId == nullptr) return HCCL_E_PTR;
+    uint8_t rank0Local[EID_BYTE_NUM] = {};
+    uint8_t rank0Remote[EID_BYTE_NUM] = {};
+    HcclResult status = ParseEidText("src_eid", spec.rank0LocalEid.c_str(), rank0Local);
+    if (status != HCCL_SUCCESS) return status;
+    status = ParseEidText("dst_eid", spec.rank0RemoteEid.c_str(), rank0Remote);
+    if (status != HCCL_SUCCESS) return status;
+
+    const uint8_t *local = rank == 0 ? rank0Local : rank0Remote;
+    const uint8_t *remote = rank == 0 ? rank0Remote : rank0Local;
+    std::copy(local, local + EID_BYTE_NUM, desc->localEndpoint.commAddr.eid);
+    std::copy(remote, remote + EID_BYTE_NUM, desc->remoteEndpoint.commAddr.eid);
+    *dieId = rank == 0 ? spec.rank0LocalDie : spec.rank0RemoteDie;
+
+    const std::string identity = std::to_string(spec.relayPhy) + "|" +
+        CommAddrToString(desc->localEndpoint.commAddr) + "|" +
+        CommAddrToString(desc->remoteEndpoint.commAddr);
+    std::ostringstream uid;
+    uid << "explicit-relay" << spec.relayPhy << '-' << std::hex << Fnv1a64(identity);
+    if (pathUid != nullptr) *pathUid = uid.str();
+
+    const EndpointInfo localInfo = QueryEndpointInfo(comm, rank, desc->localEndpoint);
+    const EndpointInfo remoteInfo = QueryEndpointInfo(comm, peer, desc->remoteEndpoint);
+    std::printf("SYNTHETIC_MULTIRELAY_TRACE rank=%u peer=%u route_id=%u relay_phy=%u "
+                "path_uid=%s die_id=%u rank0_local_die=%u rank0_remote_die=%u "
+                "local_query_status=%d remote_query_status=%d local_addr=%s remote_addr=%s\n",
+                rank, peer, spec.routeId, spec.relayPhy, uid.str().c_str(), *dieId,
+                spec.rank0LocalDie, spec.rank0RemoteDie,
+                static_cast<int>(localInfo.dieStatus), static_cast<int>(remoteInfo.dieStatus),
                 CommAddrToString(desc->localEndpoint.commAddr).c_str(),
                 CommAddrToString(desc->remoteEndpoint.commAddr).c_str());
     std::fflush(stdout);
@@ -634,6 +774,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const char *pathKeyValue = std::getenv("A5_CCU_PATH_UIDS");
     const char *weightKeyValue = std::getenv("A5_CCU_PATH_WEIGHTS");
     const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
+    const char *syntheticManifestValue = std::getenv("A5_CCU_SYNTHETIC_ROUTE_MANIFEST");
     const char *mutationKeyValue = std::getenv("A5_CCU_DESC_MUTATION");
     const char *donorKeyValue = std::getenv("A5_CCU_DESC_DONOR_ROUTE");
     const char *syntheticLocal = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
@@ -642,11 +783,18 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const char *syntheticLocalDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE");
     const char *syntheticRemoteDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE");
     const char *syntheticHop = std::getenv("A5_CCU_SYNTHETIC_HOP");
-    std::string routeKey = manifestValue != nullptr && manifestValue[0] != '\0' ?
+    if (manifestValue != nullptr && manifestValue[0] != '\0' &&
+        syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0') {
+        std::fprintf(stderr, "[A5 CCU URMA] provider and synthetic manifests are mutually exclusive\n");
+        return HCCL_E_PARA;
+    }
+    std::string routeKey = syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0' ?
+        std::string("synthetic_manifest:") + syntheticManifestValue :
+        (manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
         (pathKeyValue != nullptr && pathKeyValue[0] != '\0' ?
             std::string("paths:") + pathKeyValue :
-            (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue)));
+            (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue))));
     routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
     routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
@@ -689,7 +837,50 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     created.rankSize = rankSize;
     std::vector<HcclChannelDesc> selectedDescs;
     std::vector<A5UvsSourceRoute> providerRoutes;
-    if (manifestValue != nullptr && manifestValue[0] != '\0') {
+    if (syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0') {
+        if (syntheticLocal != nullptr || syntheticRemote != nullptr) {
+            std::fprintf(stderr, "[A5 CCU URMA] single-pair and manifest synthetic modes are mutually exclusive\n");
+            return HCCL_E_PARA;
+        }
+        std::vector<SyntheticRouteSpec> specs;
+        status = LoadSyntheticRouteManifest(syntheticManifestValue, &specs);
+        if (status != HCCL_SUCCESS) return status;
+        const uint32_t baseRoute = routeIndices.front();
+        selectedDescs.resize(specs.size());
+        created.weights.reserve(specs.size());
+        for (size_t i = 0; i < specs.size(); ++i) {
+            uint32_t dieId = 0;
+            std::string ignoredUid;
+            status = SelectRoute(comm, rank, 1U - rank, baseRoute,
+                                 &selectedDescs[i], &dieId, &ignoredUid);
+            if (status != HCCL_SUCCESS) return status;
+            std::string pathUid;
+            status = ApplySyntheticRouteSpec(comm, rank, 1U - rank, specs[i],
+                                             &selectedDescs[i], &dieId, &pathUid);
+            if (status != HCCL_SUCCESS) return status;
+            if (i == 0) {
+                created.dieId = dieId;
+            } else if (dieId != created.dieId) {
+                std::fprintf(stderr,
+                    "[A5 CCU URMA] explicit relay paths use local die %u and %u on rank %u; "
+                    "the current CCU kernel supports one local die per launch\n",
+                    created.dieId, dieId, rank);
+                return HCCL_E_NOT_SUPPORT;
+            }
+            created.routeIndices.push_back(specs[i].routeId);
+            created.pathUids.push_back(pathUid);
+            std::printf("[A5 CCU URMA][rank=%u] explicit relay route_id=%u relay_phy=%u "
+                        "die=%u path_uid=%s\n", rank, specs[i].routeId, specs[i].relayPhy,
+                        dieId, pathUid.c_str());
+        }
+        routeIndices = created.routeIndices;
+        status = ParseWeights(specs.size(), &created.weights);
+        if (status != HCCL_SUCCESS) {
+            std::fprintf(stderr,
+                "[A5 CCU URMA] A5_CCU_PATH_WEIGHTS must contain one positive integer per explicit relay\n");
+            return status;
+        }
+    } else if (manifestValue != nullptr && manifestValue[0] != '\0') {
         status = LoadProviderRoutes(comm, rank, 1U - rank, &providerRoutes);
         if (status != HCCL_SUCCESS) {
             return status;
