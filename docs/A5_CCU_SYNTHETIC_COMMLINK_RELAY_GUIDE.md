@@ -393,6 +393,119 @@ cases/<case>_r<repeat>/hccn/.../hccn_counter_deltas.tsv
 自动分类只用于缩小方向，不能覆盖物理判定规则。最终仍需在`median_port_footprints.tsv`中确认指定relay的
 一进一出端口增量与业务量同阶，并排除其他relay上的同阶增量。
 
+### 6.5 只改变每个发送方向的destination EID
+
+第6.3节已经证明完整synthetic pair双向走`2 <-> 4 <-> 3`。本节进一步验证路径是否只由每个发送方向的
+remote/destination EID决定。使用两个非对称EID pair做交叉实验：
+
+```text
+Device2 native/direct EID : 0000:0000:0007:0300:0010:0000:df12:4802
+Device3 native/direct EID : 0000:0000:0000:0300:0010:0000:df12:6103
+Device2 relay4-facing EID : 0000:0000:0006:0300:0010:0000:df12:4702
+Device3 relay4-facing EID : 0000:0000:0003:0300:0010:0000:df12:6403
+```
+
+这些值只适用于当前physical device 2、3、4。换卡后必须分别从native route0日志和
+`resolved_eid_pairs.tsv`重新读取，不能照抄。
+
+#### 6.5.1 实验A：`2 -> 3`的destination选择relay，反向保持direct
+
+```bash
+mkdir -p /home/l00934901/profiling/dst_only_a
+
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 0 \
+  --rebuild-public \
+  --synthetic-rank0-local-eid \
+    0000:0000:0007:0300:0010:0000:df12:4802 \
+  --synthetic-rank0-remote-eid \
+    0000:0000:0003:0300:0010:0000:df12:6403 \
+  --synthetic-rank0-local-die 0 \
+  --synthetic-rank0-remote-die 0 \
+  --synthetic-hop 2 \
+  --bytes 4194304 --warmup 10 --iters 100 \
+  --remote-only \
+  --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
+  --hccn-stat-root /home/l00934901/profiling/dst_only_a
+```
+
+预期：
+
+```text
+2 -> 3: 2 d0/p6 TX -> 4 d1/p0 RX -> 4 d1/p3 TX -> 3 d0/p3 RX
+3 -> 2: 3 d0/p0 TX --------------------------------> 2 d0/p7 RX
+```
+
+#### 6.5.2 实验B：`2 -> 3`保持direct，反向destination选择relay
+
+```bash
+mkdir -p /home/l00934901/profiling/dst_only_b
+
+bash scripts/run_a5_ccu_urma_route_probe.sh \
+  --devices 2,3 \
+  --route-index 0 \
+  --rebuild-public \
+  --synthetic-rank0-local-eid \
+    0000:0000:0006:0300:0010:0000:df12:4702 \
+  --synthetic-rank0-remote-eid \
+    0000:0000:0000:0300:0010:0000:df12:6103 \
+  --synthetic-rank0-local-die 0 \
+  --synthetic-rank0-remote-die 0 \
+  --synthetic-hop 2 \
+  --bytes 4194304 --warmup 10 --iters 100 \
+  --remote-only \
+  --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
+  --hccn-stat-root /home/l00934901/profiling/dst_only_b
+```
+
+预期：
+
+```text
+2 -> 3: 2 d0/p7 TX --------------------------------> 3 d0/p0 RX
+3 -> 2: 3 d0/p3 TX -> 4 d1/p3 RX -> 4 d1/p0 TX -> 2 d0/p6 RX
+```
+
+#### 6.5.3 提取两组实验的关键端口
+
+```bash
+TSV_A=$(find /home/l00934901/profiling/dst_only_a \
+  -name hccn_counter_deltas.tsv -type f | head -1)
+TSV_B=$(find /home/l00934901/profiling/dst_only_b \
+  -name hccn_counter_deltas.tsv -type f | head -1)
+
+show_dst_selector_ports() {
+  local label=$1
+  local input_tsv=$2
+  echo "===== ${label}: ${input_tsv} ====="
+  {
+    head -1 "${input_tsv}"
+    awk -F $'\t' '
+      NR > 1 {
+        is_counter = ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num")
+        is_path_port = ($1 == 2 && $2 == 0 && ($3 == 6 || $3 == 7)) || ($1 == 3 && $2 == 0 && ($3 == 0 || $3 == 3)) || ($1 == 4 && $2 == 1 && ($3 == 0 || $3 == 3))
+        if (is_counter && is_path_port) print
+      }
+    ' "${input_tsv}"
+  } | column -s $'\t' -t
+}
+
+test -n "${TSV_A}" && test -f "${TSV_A}"
+test -n "${TSV_B}" && test -f "${TSV_B}"
+show_dst_selector_ports A "${TSV_A}"
+show_dst_selector_ports B "${TSV_B}"
+```
+
+严格PASS条件：
+
+| 实验 | `2 -> 3` | `3 -> 2` |
+|---|---|---|
+| A | relay4四段计数闭环 | direct两端计数闭环，relay方向无同量级增量 |
+| B | direct两端计数闭环，relay方向无同量级增量 | relay4四段计数闭环 |
+
+如果A、B均满足该交叉关系，就证明每个发送方向的物理路径跟随其remote/destination EID；local/source EID无需
+指向relay。若两方向仍一起切换，则EID pair作为整体匹配path，不能得出“只由dst EID控制”的结论。
+
 ## 7. 判定规则
 
 仅 `HcclChannelAcquire status=0` 证明 EID pair 被控制面接受，尚不能证明经过指定 relay。
