@@ -412,6 +412,8 @@ Device3 relay4-facing EID : 0000:0000:0003:0300:0010:0000:df12:6403
 
 ```bash
 mkdir -p /home/l00934901/profiling/dst_only_a
+LOG_A=/home/l00934901/profiling/dst_only_a/run.log
+status_a=0
 
 bash scripts/run_a5_ccu_urma_route_probe.sh \
   --devices 2,3 \
@@ -427,8 +429,14 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
   --bytes 4194304 --warmup 10 --iters 100 \
   --remote-only \
   --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
-  --hccn-stat-root /home/l00934901/profiling/dst_only_a
+  --hccn-stat-root /home/l00934901/profiling/dst_only_a \
+  >"${LOG_A}" 2>&1 || status_a=$?
+
+echo "experiment_A_exit_status=${status_a}"
+grep -E 'HcclChannelAcquire end|PASS engine|HCCL failure|Probe failed' "${LOG_A}" || true
 ```
+
+完整调试输出保存在`${LOG_A}`；XShell只显示ChannelAcquire、PASS或错误摘要。
 
 预期：
 
@@ -441,6 +449,8 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
 
 ```bash
 mkdir -p /home/l00934901/profiling/dst_only_b
+LOG_B=/home/l00934901/profiling/dst_only_b/run.log
+status_b=0
 
 bash scripts/run_a5_ccu_urma_route_probe.sh \
   --devices 2,3 \
@@ -456,8 +466,14 @@ bash scripts/run_a5_ccu_urma_route_probe.sh \
   --bytes 4194304 --warmup 10 --iters 100 \
   --remote-only \
   --hccn-stat --hccn-devices 0,1,2,3,4,5,6,7 \
-  --hccn-stat-root /home/l00934901/profiling/dst_only_b
+  --hccn-stat-root /home/l00934901/profiling/dst_only_b \
+  >"${LOG_B}" 2>&1 || status_b=$?
+
+echo "experiment_B_exit_status=${status_b}"
+grep -E 'HcclChannelAcquire end|PASS engine|HCCL failure|Probe failed' "${LOG_B}" || true
 ```
+
+完整调试输出保存在`${LOG_B}`；不要用`tee`，否则仍会把全部CCU launch日志输出到XShell。
 
 预期：
 
