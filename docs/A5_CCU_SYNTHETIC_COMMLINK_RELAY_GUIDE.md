@@ -264,29 +264,58 @@ echo "HCCN_TSV=${TSV}"
     ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") {
       print
     }
-  ' "${TSV}" | sort -t $'\t' -k7,7nr | head -30
+  ' "${TSV}" | sort -t $'\t' -k7,7nr | head -40
 } | column -s $'\t' -t
 ```
 
 输出列依次为physical device、UDie、port、counter、before、after和delta。重点比较delta，不要直接比较
 不同端口的after绝对值。
 
-### 6.3 只查看指定relay4的端口流量
+### 6.3 按JSON精确查看 `2 -> 4 -> 3` 的四个物理端口
+
+本轮`resolved_eid_pairs.tsv`给出的路径是：
+
+```text
+Device2 die0/port6
+  -> Device4 die1/port0
+  -> Device4 die1/port3
+  -> Device3 die0/port3
+```
+
+只提取这四个端口的TX/RX计数：
 
 ```bash
 {
   head -1 "${TSV}"
   awk -F $'\t' '
-    NR > 1 && $1 == 4 &&
-    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") {
+    NR > 1 &&
+    ($4 == "tx_busi_flit_num" || $4 == "rx_busi_flit_num") &&
+    (
+      ($1 == 2 && $2 == 0 && $3 == 6) ||
+      ($1 == 4 && $2 == 1 && ($3 == 0 || $3 == 3)) ||
+      ($1 == 3 && $2 == 0 && $3 == 3)
+    ) {
       print
     }
   ' "${TSV}"
 } | column -s $'\t' -t
 ```
 
-同时查看通信端点2、3和指定relay4；其他非指定relay由上一条“所有卡”排序结果检查，避免把系统背景流量
-误判为本次转发：
+上述端口号来自本轮driver JSON，换通信卡或relay后不能照抄。必须先读取新的`resolved_eid_pairs.tsv`，将
+`src_die/src_port`、`relay_die/relay_port_from_src`、`relay_die/relay_port_to_dst`和`dst_die/dst_port`
+代入过滤条件。
+
+由于当前测试是双向allgather，四个端口可能同时出现TX和RX。判断正向`2 -> 4 -> 3`时重点看：
+
+1. Device2 die0/port6的TX；
+2. Device4 die1/port0的RX；
+3. Device4 die1/port3的TX；
+4. Device3 die0/port3的RX。
+
+四项应在同一实验窗口内出现与业务量同阶的增量。然后结合第6.2节的全局Top40，确认其他非端点卡没有同量级
+流量；否则不能把背景业务或其他relay误判为本次指定路径。
+
+如需按设备粗筛通信端点2、3和relay4，可使用：
 
 ```bash
 {
