@@ -166,7 +166,64 @@ cat "${RUN_DIR}/explicit_multirelay_summary.json"
 确认它们出现在同一工作负载窗口，不能单独提供cycle级重叠证据；并发因果来自CCU kernel中“全部`WriteNb`
 先提交、随后统一`WaitEvent`”以及serial控制组。
 
-## 7. 输出目录
+## 7. 实验中断后只分析完整的第一轮
+
+如果`r1`已经完成，但`r2`或`r3`被中断，不要删除或改写原始结果。建立一个独立分析目录，只复制第一轮日志：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multirelay_* \
+  | head -1)
+
+R1_DIR=$(mktemp -d "${RUN_DIR}/r1_analysis.XXXXXX")
+mkdir -p "${R1_DIR}/cases" "${R1_DIR}/manifests"
+
+cp "${RUN_DIR}"/manifests/*.tsv "${R1_DIR}/manifests/"
+cp "${RUN_DIR}"/cases/*_r1.log "${R1_DIR}/cases/"
+
+echo "RUN_DIR=${RUN_DIR}"
+echo "R1_DIR=${R1_DIR}"
+```
+
+先确认两条单relay、串行、并发和反序并发五个第一轮case都有完整`RESULT_JSON`：
+
+```bash
+for name in \
+  single_relay4_r1 \
+  single_relay5_r1 \
+  serial_r1 \
+  concurrent_r1 \
+  concurrent_reverse_r1
+do
+  printf '%-32s ' "${name}"
+  if grep -q '^RESULT_JSON ' "${R1_DIR}/cases/${name}.log"; then
+    echo PASS
+  else
+    echo MISSING
+  fi
+done
+```
+
+只对`r1`生成报告：
+
+```bash
+python3 scripts/analyze_a5_ccu_explicit_multirelay.py \
+  --run-dir "${R1_DIR}"
+
+sed -n '1,260p' "${R1_DIR}/explicit_multirelay_report.md"
+cat "${R1_DIR}/explicit_multirelay_summary.json"
+
+grep -H '^RESULT_JSON ' "${R1_DIR}"/cases/*.log
+```
+
+如果脚本在最后的HCCN footprint之前被中断，独立的`r1`报告会显示
+`hccn_paths_confirmed=false`和`FUNCTIONAL_ONLY`。这不否定第一轮的数据正确性和
+`serial`/`concurrent`/`concurrent_reverse`时延，只表示该次运行没有生成物理端口计数证据；不能把它解释为
+relay没有流量。单轮数据只适合作为临时判断，环境恢复后仍应按第5节使用100次预热重新完成正式实验。
+
+## 8. 输出目录
 
 ```text
 resolved_explicit_relays.tsv        # 拓扑解析的原始显式relay列表
