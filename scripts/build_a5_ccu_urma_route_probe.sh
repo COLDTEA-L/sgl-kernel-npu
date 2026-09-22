@@ -39,8 +39,37 @@ echo "CANN home : ${ASCEND_HOME_PATH:-not-set}"
 echo "HCCL repo : ${hccl_repo}"
 echo "Probe src : ${project_dir}"
 
+temporary_cann_cmake_link=""
+cann_cmake_dir="${hccl_repo}/third_party/cann-cmake"
+if [[ ! -f "${cann_cmake_dir}/function/prepare.cmake" ]]; then
+    for cached_cann_cmake in \
+        "${hccl_repo}/build_device/_deps/cann-cmake-src" \
+        "${hccl_repo}/build/_deps/cann-cmake-src"
+    do
+        if [[ -f "${cached_cann_cmake}/function/prepare.cmake" ]]; then
+            if [[ -e "${cann_cmake_dir}" || -L "${cann_cmake_dir}" ]]; then
+                echo "Invalid incomplete cann-cmake cache: ${cann_cmake_dir}" >&2
+                echo "Move that path aside, or populate it with a complete cann-cmake checkout." >&2
+                exit 1
+            fi
+            mkdir -p "${hccl_repo}/third_party"
+            ln -s "${cached_cann_cmake}" "${cann_cmake_dir}"
+            temporary_cann_cmake_link="${cann_cmake_dir}"
+            echo "Offline cann-cmake: ${cached_cann_cmake}"
+            break
+        fi
+    done
+fi
+
 bridge_path=$(mktemp -d "${hccl_repo}/.a5_ccu_urma_route_probe.XXXXXX")
-trap 'rm -rf -- "${bridge_path}"' EXIT
+cleanup()
+{
+    rm -rf -- "${bridge_path}"
+    if [[ -n "${temporary_cann_cmake_link}" && -L "${temporary_cann_cmake_link}" ]]; then
+        rm -f -- "${temporary_cann_cmake_link}"
+    fi
+}
+trap cleanup EXIT
 cp -a "${project_dir}/." "${bridge_path}/"
 bridge_relative=${bridge_path#"${hccl_repo}/"}
 

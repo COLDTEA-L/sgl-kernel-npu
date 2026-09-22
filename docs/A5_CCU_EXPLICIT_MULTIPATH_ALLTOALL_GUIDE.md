@@ -123,8 +123,9 @@ git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+(
 set -euo pipefail
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install \
@@ -137,7 +138,12 @@ LATEST_WHEEL=$(find output -maxdepth 1 -type f -name 'deep_ep*.whl' \
   -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
 test -n "${LATEST_WHEEL}"
 python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${LATEST_WHEEL}"
+)
 ```
+
+这里用子shell包住`set -euo pipefail`：任何编译失败都会停止本组安装，但不会退出当前Docker交互shell。构建脚本
+还会优先复用HCCL `build_device/_deps/cann-cmake-src`中的完整缓存，避免host阶段再次联网下载
+`https://gitcode.com/cann/cmake.git`。如果本机既没有`third_party/cann-cmake`也没有该缓存，仍需先准备依赖。
 
 检查新接口。这里必须同时看到新C ABI、实际加载的扩展路径和两个Python绑定；不要只看pip提示安装成功：
 
