@@ -310,6 +310,77 @@ rank0、rank1两个采集结果，不能只看较快的一张卡。
 当前Python host计时在双rank正式起跑对齐修复前可能混入最多约10 ms的文件barrier偏差。该偏差不应拿来解释
 MindStudio中的稳定设备CCU Launch时长；性能结论暂时优先使用上述设备时间线，host数值待计时脚本修复后重测。
 
+### 8.1 三条显式relay只采集concurrent
+
+如果只需要观察`relay4 + relay5 + relay1`三条路径的并发CCU Launch，不必执行前面的单路和serial case。先生成
+三路manifest，再只运行一次外层`msprof`：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+set +u
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+set -u
+
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+RUN_DIR=/home/l00934901/profiling/a5_ccu_explicit_multirelay_2_3_3path_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${RUN_DIR}"
+
+python3 scripts/resolve_a5_explicit_multirelay_eids.py \
+  --topology docs/topology/a5_hccn_device_topology_raw.txt \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1 \
+  --weights 1,1,1 \
+  >"${RUN_DIR}/resolved_explicit_relays.tsv"
+
+column -s $'\t' -t "${RUN_DIR}/resolved_explicit_relays.tsv"
+
+python3 scripts/analyze_a5_ccu_explicit_multirelay.py \
+  --prepare \
+  --run-dir "${RUN_DIR}" \
+  --manifest "${RUN_DIR}/resolved_explicit_relays.tsv"
+
+MSPROF_ROOT=/home/l00934901/profiling/a5_ccu_explicit_3path_concurrent_msprof_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${MSPROF_ROOT}"
+
+msprof \
+  --output="${MSPROF_ROOT}" \
+  --ascendcl=on \
+  --runtime-api=on \
+  --task-time=l2 \
+  --hccl=on \
+  --type=text \
+  python3 -m torch.distributed.run \
+    --standalone --nproc-per-node=2 \
+    tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+    --implementation multiroute \
+    --synthetic-route-manifest "${RUN_DIR}/manifests/all.tsv" \
+    --path-weights 1,1,1 \
+    --schedule concurrent \
+    --bytes 4194304 \
+    --warmup 100 \
+    --iters 20
+
+while IFS= read -r -d '' prof_dir; do
+  msprof --export=on --output="${prof_dir}"
+done < <(find "${MSPROF_ROOT}" -type d -name 'PROF_*' -print0)
+
+echo "RUN_DIR=${RUN_DIR}"
+echo "MSPROF_ROOT=${MSPROF_ROOT}"
+find "${MSPROF_ROOT}" -type d -name 'PROF_*' | sort
+find "${MSPROF_ROOT}" -type f -name '*.csv' | sort
+```
+
+解析输出必须恰好包含relay4、relay5、relay1三行，并且三行的`src_die`一致、`dst_die`一致；否则不要继续
+profiling。`1,1,1`会把4 MiB对端数据近似三等分。该命令只证明三路concurrent的设备执行时间线；没有serial
+对照时，不能单凭这一份profiling计算“并发相对串行”的收益。
+
 ## 9. 输出目录
 
 ```text
