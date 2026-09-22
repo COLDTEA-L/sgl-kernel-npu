@@ -69,7 +69,7 @@ def prepare_runtime():
 
 def requested_implementation():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--implementation", choices=("native", "multiroute"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit"),
                         default="multiroute")
     return parser.parse_known_args()[0].implementation
 
@@ -77,13 +77,13 @@ def requested_implementation():
 IMPLEMENTATION = requested_implementation()
 EXTENSION = None
 ROUTE_LIB = None
-if IMPLEMENTATION == "multiroute":
+if IMPLEMENTATION != "native":
     EXTENSION, ROUTE_LIB = prepare_runtime()
 
 import torch
 import torch.distributed as dist
 import torch_npu
-if IMPLEMENTATION == "multiroute":
+if IMPLEMENTATION != "native":
     import deep_ep
 
 
@@ -131,7 +131,7 @@ def make_profiler(output_dir, rank):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--implementation", choices=("native", "multiroute"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit"),
                         default="multiroute")
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
@@ -143,6 +143,10 @@ def parse_args():
                         help="comma-separated positive weights, one per selected path")
     parser.add_argument("--synthetic-route-manifest", default="",
                         help="TSV of explicitly resolved relay EID pairs")
+    parser.add_argument("--direct-route", type=int, default=0,
+                        help="HCCL-discovered direct candidate prepended in explicit mode")
+    parser.add_argument("--relay-manifest", default="",
+                        help="ordered explicit relay TSV for the formal direct+relay operator")
     parser.add_argument("--schedule", choices=("concurrent", "serial"),
                         default="concurrent")
     parser.add_argument("--warmup", type=int, default=10)
@@ -158,6 +162,20 @@ def parse_args():
         parser.error("invalid warmup/iters/profile-iters")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
+    if args.implementation == "explicit":
+        if not args.relay_manifest:
+            parser.error("--implementation explicit requires --relay-manifest")
+        if args.schedule != "concurrent":
+            parser.error(
+                "the formal explicit-path operator is concurrent-only; "
+                "use --implementation multiroute for serialized control experiments"
+            )
+        if not args.path_weights:
+            parser.error("--implementation explicit requires direct+relay --path-weights")
+        weights = [item for item in args.path_weights.split(",") if item]
+        if len(weights) < 2 or len(weights) > 8 or any(
+                not item.isdigit() or int(item) <= 0 for item in weights):
+            parser.error("explicit --path-weights must contain 2..8 positive integers")
     return args
 
 
@@ -195,7 +213,14 @@ def select_routes(args):
 
 def main():
     args = parse_args()
-    select_routes(args)
+    if args.implementation == "multiroute":
+        select_routes(args)
+    elif args.implementation == "explicit":
+        os.environ.pop("A5_CCU_ROUTE_SCHEDULE", None)
+        for name in ("A5_CCU_SYNTHETIC_ROUTE_MANIFEST", "A5_CCU_PATH_UIDS",
+                     "A5_CCU_ROUTE_INDICES", "A5_CCU_ROUTE_INDEX",
+                     "A5_CCU_PATH_WEIGHTS"):
+            os.environ.pop(name, None)
     if args.debug:
         os.environ["A5_CCU_DEBUG"] = "1"
     else:
@@ -209,8 +234,13 @@ def main():
     torch.npu.set_device(local_rank)
     dist.init_process_group("hccl")
     buffer = None
-    if args.implementation == "multiroute":
+    if args.implementation != "native":
         buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
+
+    explicit_weights = [int(item) for item in args.path_weights.split(",") if item]
+    relay_manifest = str(Path(args.relay_manifest).resolve()) if args.relay_manifest else ""
+    if relay_manifest and not Path(relay_manifest).is_file():
+        raise RuntimeError(f"relay manifest not found: {relay_manifest}")
 
     elements = args.bytes // 4
     send = torch.stack([
@@ -228,6 +258,10 @@ def main():
     def run_op():
         if args.implementation == "native":
             dist.all_to_all_single(recv, send)
+        elif args.implementation == "explicit":
+            buffer.ccu_urma_explicit_multipath_alltoall_out(
+                send, recv, relay_manifest, args.direct_route, explicit_weights
+            )
         else:
             buffer.ccu_urma_multiroute_alltoall_out(send, recv)
 
@@ -236,7 +270,9 @@ def main():
         f"{os.environ.get('MASTER_PORT', '0')}")
     case_tag = sanitize(
         "native" if args.implementation == "native" else
-        f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}")
+        (f"explicit_direct{args.direct_route}_{len(explicit_weights) - 1}relay_{args.schedule}"
+         if args.implementation == "explicit" else
+         f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
     for _ in range(args.warmup):
@@ -274,15 +310,18 @@ def main():
     if rank == 0:
         result = {
             "implementation": args.implementation,
-            "paths": (args.path_uids or args.route_indices or str(args.route_index)
-                       if args.implementation == "multiroute" else "native"),
+            "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
+                      if args.implementation == "explicit" else
+                      (args.path_uids or args.route_indices or str(args.route_index)
+                       if args.implementation == "multiroute" else "native")),
             "weights": args.path_weights or "1",
-            "schedule": args.schedule if args.implementation == "multiroute" else "native",
+            "schedule": args.schedule if args.implementation != "native" else "native",
             "bytes_per_peer": args.bytes,
             "warmup": args.warmup,
             "iterations": args.iters,
             "host_batch_avg_us": result_us,
             "synthetic_route_manifest": args.synthetic_route_manifest or "",
+            "relay_manifest": relay_manifest,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "

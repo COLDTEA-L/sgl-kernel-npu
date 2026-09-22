@@ -32,12 +32,26 @@ struct RouteResources {
     uint32_t dieId = 0;
 };
 
+// Normalized two-rank control-plane request used by the production-facing
+// explicit multipath API.  The discovered route is always channel 0 and the
+// manifest contributes channels 1..N in file order.  Keeping the request
+// independent of environment variables lets a future host controller install
+// the same plan directly without changing the CCU data-plane kernel.
+struct RoutePlanRequest {
+    bool includeDiscoveredRoute = false;
+    uint32_t discoveredRoute = 0;
+    std::string relayManifest;
+    std::vector<uint32_t> weights;
+    std::string planName;
+};
+
 HcclResult GetCcuRouteIndex(uint32_t *routeIndex);
 
 HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices);
 
 HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
-                             RouteKernelKind kernelKind, RouteResources *resources);
+                             RouteKernelKind kernelKind, RouteResources *resources,
+                             const RoutePlanRequest *plan = nullptr);
 
 } // namespace a5_ccu_urma_probe
 

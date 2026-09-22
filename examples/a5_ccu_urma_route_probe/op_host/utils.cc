@@ -327,8 +327,9 @@ HcclResult EnumeratePaths(HcclComm comm, uint32_t rank, uint32_t peer,
 }
 
 HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
-                         uint32_t routeIndex, HcclChannelDesc *desc,
-                         uint32_t *dieId, std::string *pathUid)
+                       uint32_t routeIndex, HcclChannelDesc *desc,
+                       uint32_t *dieId, std::string *pathUid,
+                       bool rebuildPublicFields = false)
 {
     if (desc == nullptr || dieId == nullptr) {
         return HCCL_E_PTR;
@@ -370,7 +371,7 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
     desc->remoteRank = peer;
     desc->notifyNum = CHANNEL_NOTIFY_NUM;
     desc->channelProtocol = selectedLink.linkAttr.linkProtocol;
-    if (EnvEnabled("A5_CCU_REBUILD_PUBLIC_FIELDS")) {
+    if (rebuildPublicFields || EnvEnabled("A5_CCU_REBUILD_PUBLIC_FIELDS")) {
         EndpointDesc local{};
         local.protocol = selectedLink.srcEndpointDesc.protocol;
         local.commAddr = selectedLink.srcEndpointDesc.commAddr;
@@ -757,45 +758,66 @@ HcclResult GetCcuRouteIndices(std::vector<uint32_t> *routeIndices)
 }
 
 HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
-                             RouteKernelKind kernelKind, RouteResources *resources)
+                             RouteKernelKind kernelKind, RouteResources *resources,
+                             const RoutePlanRequest *plan)
 {
     if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
     }
     std::vector<uint32_t> routeIndices;
-    HcclResult status = GetCcuRouteIndices(&routeIndices);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
     std::vector<std::string> requestedPathUids;
-    const HcclResult uidStatus = ParseStringList("A5_CCU_PATH_UIDS", &requestedPathUids);
-    if (uidStatus != HCCL_SUCCESS && uidStatus != HCCL_E_NOT_FOUND) return uidStatus;
-    const char *routeKeyValue = std::getenv("A5_CCU_ROUTE_INDICES");
-    const char *pathKeyValue = std::getenv("A5_CCU_PATH_UIDS");
-    const char *weightKeyValue = std::getenv("A5_CCU_PATH_WEIGHTS");
-    const char *manifestValue = std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
-    const char *syntheticManifestValue = std::getenv("A5_CCU_SYNTHETIC_ROUTE_MANIFEST");
-    const char *mutationKeyValue = std::getenv("A5_CCU_DESC_MUTATION");
-    const char *donorKeyValue = std::getenv("A5_CCU_DESC_DONOR_ROUTE");
-    const char *syntheticLocal = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
-    const char *syntheticRemote = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID");
-    const char *syntheticDie = std::getenv("A5_CCU_SYNTHETIC_DIE_ID");
-    const char *syntheticLocalDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE");
-    const char *syntheticRemoteDie = std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE");
-    const char *syntheticHop = std::getenv("A5_CCU_SYNTHETIC_HOP");
+    HcclResult status = HCCL_SUCCESS;
+    const bool explicitPlan = plan != nullptr;
+    if (explicitPlan) {
+        if (!plan->includeDiscoveredRoute || plan->relayManifest.empty() ||
+            plan->weights.size() < 2U || plan->weights.size() > 8U ||
+            std::any_of(plan->weights.begin(), plan->weights.end(),
+                        [](uint32_t value) { return value == 0U; })) {
+            std::fprintf(stderr, "[A5 CCU URMA] invalid explicit multipath plan\n");
+            return HCCL_E_PARA;
+        }
+        routeIndices.push_back(plan->discoveredRoute);
+    } else {
+        status = GetCcuRouteIndices(&routeIndices);
+        if (status != HCCL_SUCCESS) return status;
+        const HcclResult uidStatus = ParseStringList("A5_CCU_PATH_UIDS", &requestedPathUids);
+        if (uidStatus != HCCL_SUCCESS && uidStatus != HCCL_E_NOT_FOUND) return uidStatus;
+    }
+    const char *routeKeyValue = explicitPlan ? nullptr : std::getenv("A5_CCU_ROUTE_INDICES");
+    const char *pathKeyValue = explicitPlan ? nullptr : std::getenv("A5_CCU_PATH_UIDS");
+    const char *weightKeyValue = explicitPlan ? nullptr : std::getenv("A5_CCU_PATH_WEIGHTS");
+    const char *manifestValue = explicitPlan ? nullptr : std::getenv("A5_CCU_SOURCE_ROUTE_MANIFEST");
+    const char *syntheticManifestValue = explicitPlan ? plan->relayManifest.c_str() :
+        std::getenv("A5_CCU_SYNTHETIC_ROUTE_MANIFEST");
+    const char *mutationKeyValue = explicitPlan ? nullptr : std::getenv("A5_CCU_DESC_MUTATION");
+    const char *donorKeyValue = explicitPlan ? nullptr : std::getenv("A5_CCU_DESC_DONOR_ROUTE");
+    const char *syntheticLocal = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_EID");
+    const char *syntheticRemote = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_EID");
+    const char *syntheticDie = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_DIE_ID");
+    const char *syntheticLocalDie = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_RANK0_LOCAL_DIE");
+    const char *syntheticRemoteDie = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_RANK0_REMOTE_DIE");
+    const char *syntheticHop = explicitPlan ? nullptr : std::getenv("A5_CCU_SYNTHETIC_HOP");
     if (manifestValue != nullptr && manifestValue[0] != '\0' &&
         syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0') {
         std::fprintf(stderr, "[A5 CCU URMA] provider and synthetic manifests are mutually exclusive\n");
         return HCCL_E_PARA;
     }
-    std::string routeKey = syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0' ?
+    std::string routeKey = explicitPlan ?
+        std::string("explicit_plan:") + plan->planName + ":direct=" +
+            std::to_string(plan->discoveredRoute) + ":manifest=" + plan->relayManifest :
+        (syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0' ?
         std::string("synthetic_manifest:") + syntheticManifestValue :
         (manifestValue != nullptr && manifestValue[0] != '\0' ?
         std::string("provider:") + manifestValue :
         (pathKeyValue != nullptr && pathKeyValue[0] != '\0' ?
             std::string("paths:") + pathKeyValue :
-            (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue))));
-    routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
+            (routeKeyValue == nullptr ? std::to_string(routeIndices.front()) : std::string(routeKeyValue)))));
+    if (explicitPlan) {
+        routeKey += ":weights=";
+        for (const uint32_t weight : plan->weights) routeKey += std::to_string(weight) + ',';
+    } else {
+        routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
+    }
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
     routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
     routeKey += ":donor=" + std::string(donorKeyValue == nullptr ? "none" : donorKeyValue);
@@ -846,19 +868,39 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         status = LoadSyntheticRouteManifest(syntheticManifestValue, &specs);
         if (status != HCCL_SUCCESS) return status;
         const uint32_t baseRoute = routeIndices.front();
-        selectedDescs.resize(specs.size());
-        created.weights.reserve(specs.size());
+        const size_t directCount = explicitPlan && plan->includeDiscoveredRoute ? 1U : 0U;
+        if (specs.size() + directCount > 8U) {
+            std::fprintf(stderr, "[A5 CCU URMA] at most eight direct+relay paths are supported\n");
+            return HCCL_E_PARA;
+        }
+        selectedDescs.resize(specs.size() + directCount);
+        created.weights.reserve(selectedDescs.size());
+        if (directCount != 0U) {
+            uint32_t directDie = 0;
+            std::string directUid;
+            status = SelectRoute(comm, rank, 1U - rank, baseRoute,
+                                 &selectedDescs[0], &directDie, &directUid);
+            if (status != HCCL_SUCCESS) return status;
+            created.dieId = directDie;
+            created.routeIndices.push_back(baseRoute);
+            created.pathUids.push_back(directUid);
+            std::printf("[A5 CCU URMA][rank=%u] explicit multipath direct route=%u "
+                        "die=%u path_uid=%s\n", rank, baseRoute, directDie,
+                        directUid.c_str());
+        }
         for (size_t i = 0; i < specs.size(); ++i) {
+            const size_t channelIndex = i + directCount;
             uint32_t dieId = 0;
             std::string ignoredUid;
             status = SelectRoute(comm, rank, 1U - rank, baseRoute,
-                                 &selectedDescs[i], &dieId, &ignoredUid);
+                                 &selectedDescs[channelIndex], &dieId, &ignoredUid,
+                                 explicitPlan);
             if (status != HCCL_SUCCESS) return status;
             std::string pathUid;
             status = ApplySyntheticRouteSpec(comm, rank, 1U - rank, specs[i],
-                                             &selectedDescs[i], &dieId, &pathUid);
+                                             &selectedDescs[channelIndex], &dieId, &pathUid);
             if (status != HCCL_SUCCESS) return status;
-            if (i == 0) {
+            if (channelIndex == 0U) {
                 created.dieId = dieId;
             } else if (dieId != created.dieId) {
                 std::fprintf(stderr,
@@ -874,10 +916,20 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
                         dieId, pathUid.c_str());
         }
         routeIndices = created.routeIndices;
-        status = ParseWeights(specs.size(), &created.weights);
+        if (explicitPlan) {
+            if (plan->weights.size() != selectedDescs.size()) {
+                std::fprintf(stderr,
+                    "[A5 CCU URMA] explicit plan has %zu paths but %zu weights\n",
+                    selectedDescs.size(), plan->weights.size());
+                return HCCL_E_PARA;
+            }
+            created.weights = plan->weights;
+        } else {
+            status = ParseWeights(specs.size(), &created.weights);
+        }
         if (status != HCCL_SUCCESS) {
             std::fprintf(stderr,
-                "[A5 CCU URMA] A5_CCU_PATH_WEIGHTS must contain one positive integer per explicit relay\n");
+                "[A5 CCU URMA] path weights must contain one positive integer per selected path\n");
             return status;
         }
     } else if (manifestValue != nullptr && manifestValue[0] != '\0') {

@@ -497,6 +497,37 @@ class Buffer:
         """Out variant used for stable profiling without per-launch allocation."""
         return self.runtime.ccu_urma_multiroute_alltoall_out(send_data, recv_data)
 
+    def ccu_urma_explicit_multipath_alltoall(
+        self,
+        send_data: torch.Tensor,
+        relay_manifest: str,
+        direct_route: int,
+        path_weights: list[int],
+    ) -> torch.Tensor:
+        """Run two-rank AllToAll over one direct path plus explicit relays.
+
+        ``path_weights[0]`` belongs to ``direct_route``. Remaining weights
+        correspond to relay-manifest rows in file order. The plan is an
+        explicit API argument so a future host controller can supply it
+        without changing the CCU kernel or process-global environment.
+        """
+        return self.runtime.ccu_urma_explicit_multipath_alltoall(
+            send_data, relay_manifest, direct_route, path_weights
+        )
+
+    def ccu_urma_explicit_multipath_alltoall_out(
+        self,
+        send_data: torch.Tensor,
+        recv_data: torch.Tensor,
+        relay_manifest: str,
+        direct_route: int,
+        path_weights: list[int],
+    ) -> torch.Tensor:
+        """Explicit multipath AllToAll writing into a caller-owned tensor."""
+        return self.runtime.ccu_urma_explicit_multipath_alltoall_out(
+            send_data, recv_data, relay_manifest, direct_route, path_weights
+        )
+
     def all2_all_detour_io_die(
         self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
     ) -> torch.Tensor:

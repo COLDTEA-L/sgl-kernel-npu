@@ -39,6 +39,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("ccu_urma_multiroute_write", &deep_ep::Buffer::ccu_urma_multiroute_write)
         .def("ccu_urma_multiroute_alltoall", &deep_ep::Buffer::ccu_urma_multiroute_alltoall)
         .def("ccu_urma_multiroute_alltoall_out", &deep_ep::Buffer::ccu_urma_multiroute_alltoall_out)
+        .def("ccu_urma_explicit_multipath_alltoall",
+             &deep_ep::Buffer::ccu_urma_explicit_multipath_alltoall,
+             py::arg("send_data"), py::arg("relay_manifest"),
+             py::arg("direct_route"), py::arg("path_weights"))
+        .def("ccu_urma_explicit_multipath_alltoall_out",
+             &deep_ep::Buffer::ccu_urma_explicit_multipath_alltoall_out,
+             py::arg("send_data"), py::arg("recv_data"),
+             py::arg("relay_manifest"), py::arg("direct_route"),
+             py::arg("path_weights"))
         .def("all2_all_detour_io_die", &deep_ep::Buffer::all2_all_detour_io_die)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)

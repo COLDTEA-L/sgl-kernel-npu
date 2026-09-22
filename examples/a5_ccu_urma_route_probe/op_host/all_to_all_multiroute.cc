@@ -14,6 +14,7 @@
 using a5_ccu_urma_probe::AllToAllMultiRouteTaskArg;
 using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteKernelKind;
+using a5_ccu_urma_probe::RoutePlanRequest;
 using a5_ccu_urma_probe::RouteResources;
 
 namespace {
@@ -42,10 +43,10 @@ HcclResult GetSerializedSchedule(bool *serialized)
     std::fprintf(stderr, "[A5 CCU URMA] A5_CCU_ROUTE_SCHEDULE must be concurrent or serial\n");
     return HCCL_E_PARA;
 }
-}
 
-extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
-    uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm, aclrtStream stream)
+HcclResult RunMultiRouteAllToAll(void *sendBuf, void *recvBuf,
+    uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
+    aclrtStream stream, const RoutePlanRequest *plan)
 {
     if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr || stream == nullptr) {
         return HCCL_E_PTR;
@@ -54,15 +55,21 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
         return HCCL_E_NOT_SUPPORT;
     }
 
+    // A formal explicit plan is always concurrent: submit every remote write
+    // before waiting for completion. The environment-selectable serial mode is
+    // retained only by the legacy probe API as an experimental control.
     bool serialized = false;
-    HcclResult status = GetSerializedSchedule(&serialized);
-    if (status != HCCL_SUCCESS) return status;
+    HcclResult status = HCCL_SUCCESS;
+    if (plan == nullptr) {
+        status = GetSerializedSchedule(&serialized);
+        if (status != HCCL_SUCCESS) return status;
+    }
     RouteResources resources;
     status = GetRouteResources(
         comm, stream,
         serialized ? RouteKernelKind::ALLTOALL_SERIAL
                    : RouteKernelKind::ALLTOALL_CONCURRENT,
-        &resources);
+        &resources, plan);
     if (status != HCCL_SUCCESS) {
         return status;
     }
@@ -126,4 +133,32 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf
     if (status != HCCL_SUCCESS) return status;
     return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
         resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
+}
+}
+
+extern "C" HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
+    uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm, aclrtStream stream)
+{
+    return RunMultiRouteAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
+                                 comm, stream, nullptr);
+}
+
+extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, HcclComm comm, aclrtStream stream,
+    const char *relayManifest, uint32_t directRoute,
+    const uint32_t *pathWeights, uint32_t pathCount)
+{
+    if (relayManifest == nullptr || relayManifest[0] == '\0' ||
+        pathWeights == nullptr || pathCount < 2U || pathCount > 8U) {
+        return HCCL_E_PARA;
+    }
+    RoutePlanRequest plan;
+    plan.includeDiscoveredRoute = true;
+    plan.discoveredRoute = directRoute;
+    plan.relayManifest = relayManifest;
+    plan.weights.assign(pathWeights, pathWeights + pathCount);
+    plan.planName = "direct+explicit-relays";
+    return RunMultiRouteAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
+                                 comm, stream, &plan);
 }

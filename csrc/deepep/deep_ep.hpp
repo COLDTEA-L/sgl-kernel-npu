@@ -77,6 +77,15 @@ public:
     torch::Tensor ccu_urma_multiroute_alltoall_out(const torch::Tensor &send_data,
                                                    const torch::Tensor &recv_data);
 
+    torch::Tensor ccu_urma_explicit_multipath_alltoall(
+        const torch::Tensor &send_data, const std::string &relay_manifest,
+        int64_t direct_route, const std::vector<int64_t> &path_weights);
+
+    torch::Tensor ccu_urma_explicit_multipath_alltoall_out(
+        const torch::Tensor &send_data, const torch::Tensor &recv_data,
+        const std::string &relay_manifest, int64_t direct_route,
+        const std::vector<int64_t> &path_weights);
+
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 
     std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,

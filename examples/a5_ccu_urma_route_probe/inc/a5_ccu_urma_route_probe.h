@@ -45,6 +45,23 @@ HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
                                         uint64_t elementsPerPeer, HcclDataType dataType,
                                         HcclComm comm, aclrtStream stream);
 
+/**
+ * Production-facing two-rank explicit multipath AllToAll.
+ *
+ * Channel 0 is the HCCL-discovered direct candidate selected by directRoute.
+ * relayManifest contains one explicitly resolved relay EID pair per remaining
+ * channel. pathWeights therefore contains relayCount + 1 entries in exactly
+ * that order.  The normalized plan is passed as an ordinary API argument so a
+ * future host controller can replace the command-line manifest producer
+ * without changing the CCU kernel or relying on process-global environment
+ * variables.  Current ABI supports at most eight total paths.
+ */
+HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, HcclComm comm, aclrtStream stream,
+    const char *relayManifest, uint32_t directRoute,
+    const uint32_t *pathWeights, uint32_t pathCount);
+
 #ifdef __cplusplus
 }
 #endif

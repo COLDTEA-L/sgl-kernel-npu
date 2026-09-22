@@ -1,4 +1,5 @@
 #include <memory>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -39,6 +40,9 @@ constexpr uint32_t MAX_TOTAL_TOKENS = 131072;
 
 using HcomGetCommHandleByGroupFn = HcclResult (*)(const char *, HcclComm *);
 using CcuUrmaMultiRouteWriteFn = HcclResult (*)(void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream);
+using CcuUrmaExplicitMultipathAllToAllFn = HcclResult (*)(
+    void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream,
+    const char *, uint32_t, const uint32_t *, uint32_t);
 
 HcclComm ResolveComm(const std::string &group_name, HcclComm owned_comm)
 {
@@ -90,6 +94,23 @@ CcuUrmaMultiRouteWriteFn GetCcuUrmaMultiRouteAllToAll()
         EP_HOST_ASSERT_S(symbol != nullptr, "HcclCcuUrmaMultiRouteAllToAll not found in ", library,
                          "; rebuild and install the latest package");
         return reinterpret_cast<CcuUrmaMultiRouteWriteFn>(symbol);
+    }();
+    return function;
+}
+
+CcuUrmaExplicitMultipathAllToAllFn GetCcuUrmaExplicitMultipathAllToAll()
+{
+    static CcuUrmaExplicitMultipathAllToAllFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaExplicitMultipathAllToAll");
+        EP_HOST_ASSERT_S(symbol != nullptr,
+            "HcclCcuUrmaExplicitMultipathAllToAll not found in ", library,
+            "; rebuild and install the explicit multipath package");
+        return reinterpret_cast<CcuUrmaExplicitMultipathAllToAllFn>(symbol);
     }();
     return function;
 }
@@ -228,6 +249,50 @@ torch::Tensor Buffer::ccu_urma_multiroute_alltoall(const torch::Tensor &send_dat
 {
     auto recv_data = torch::empty_like(send_data);
     return ccu_urma_multiroute_alltoall_out(send_data, recv_data);
+}
+
+torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    const std::string &relay_manifest, int64_t direct_route,
+    const std::vector<int64_t> &path_weights)
+{
+    RECORD_FUNCTION("deep_ep::ccu_urma_explicit_multipath_alltoall",
+                    std::vector<c10::IValue>({send_data, recv_data}));
+    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
+    EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
+    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(num_ranks == 2);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
+    EP_HOST_ASSERT(!relay_manifest.empty());
+    constexpr auto kMaxUint32 = static_cast<int64_t>(UINT32_MAX);
+    EP_HOST_ASSERT(direct_route >= 0 && direct_route <= kMaxUint32);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+
+    std::vector<uint32_t> weights;
+    weights.reserve(path_weights.size());
+    for (const int64_t weight : path_weights) {
+        EP_HOST_ASSERT(weight > 0 && weight <= kMaxUint32);
+        weights.push_back(static_cast<uint32_t>(weight));
+    }
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaExplicitMultipathAllToAll()(
+        send_data.data_ptr(), recv_data.data_ptr(),
+        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        comm, stream, relay_manifest.c_str(), static_cast<uint32_t>(direct_route),
+        weights.data(), static_cast<uint32_t>(weights.size())));
+    return recv_data;
+}
+
+torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall(
+    const torch::Tensor &send_data, const std::string &relay_manifest,
+    int64_t direct_route, const std::vector<int64_t> &path_weights)
+{
+    auto recv_data = torch::empty_like(send_data);
+    return ccu_urma_explicit_multipath_alltoall_out(
+        send_data, recv_data, relay_manifest, direct_route, path_weights);
 }
 
 torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)
