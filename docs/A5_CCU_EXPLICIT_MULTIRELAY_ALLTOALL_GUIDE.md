@@ -381,6 +381,79 @@ find "${MSPROF_ROOT}" -type f -name '*.csv' | sort
 profiling。`1,1,1`会把4 MiB对端数据近似三等分。该命令只证明三路concurrent的设备执行时间线；没有serial
 对照时，不能单凭这一份profiling计算“并发相对串行”的收益。
 
+### 8.2 四条显式relay只采集concurrent（增加relay0）
+
+三路`relay4 + relay5 + relay1`已经完成后，可以增加物理卡0，单独采集
+`relay4 + relay5 + relay1 + relay0`四路concurrent的MindStudio数据。该流程不会运行任何单relay或serial
+控制组，只会生成一次四路CCU Launch的profiling：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+set +u
+source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
+set -u
+
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
+unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+
+RUN_DIR=/home/l00934901/profiling/a5_ccu_explicit_multirelay_2_3_4path_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${RUN_DIR}"
+
+python3 scripts/resolve_a5_explicit_multirelay_eids.py \
+  --topology docs/topology/a5_hccn_device_topology_raw.txt \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1,0 \
+  --weights 1,1,1,1 \
+  >"${RUN_DIR}/resolved_explicit_relays.tsv"
+
+column -s $'\t' -t "${RUN_DIR}/resolved_explicit_relays.tsv"
+
+python3 scripts/analyze_a5_ccu_explicit_multirelay.py \
+  --prepare \
+  --run-dir "${RUN_DIR}" \
+  --manifest "${RUN_DIR}/resolved_explicit_relays.tsv"
+
+MSPROF_ROOT=/home/l00934901/profiling/a5_ccu_explicit_4path_concurrent_msprof_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${MSPROF_ROOT}"
+
+msprof \
+  --output="${MSPROF_ROOT}" \
+  --ascendcl=on \
+  --runtime-api=on \
+  --task-time=l2 \
+  --hccl=on \
+  --type=text \
+  python3 -m torch.distributed.run \
+    --standalone --nproc-per-node=2 \
+    tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+    --implementation multiroute \
+    --synthetic-route-manifest "${RUN_DIR}/manifests/all.tsv" \
+    --path-weights 1,1,1,1 \
+    --schedule concurrent \
+    --bytes 4194304 \
+    --warmup 100 \
+    --iters 20
+
+while IFS= read -r -d '' prof_dir; do
+  msprof --export=on --output="${prof_dir}"
+done < <(find "${MSPROF_ROOT}" -type d -name 'PROF_*' -print0)
+
+echo "RUN_DIR=${RUN_DIR}"
+echo "MSPROF_ROOT=${MSPROF_ROOT}"
+find "${MSPROF_ROOT}" -type d -name 'PROF_*' | sort
+find "${MSPROF_ROOT}" -type f -name '*.csv' | sort
+```
+
+执行`msprof`前，`resolved_explicit_relays.tsv`必须恰好包含物理relay `4、5、1、0`四行，且四行的
+`src_die`一致、`dst_die`一致。解析失败或跨endpoint IO Die时脚本会停止，不能删除检查后强行运行。
+`1,1,1,1`将每个rank发往对端的4 MiB数据近似四等分，即每条显式relay约承担1 MiB。终端输出的
+`host_batch_avg_us`可用于快速比较三路的74 us结果；正式比较仍以MindStudio中稳定CCU Launch的P50/P95为准。
+
 ## 9. 输出目录
 
 ```text
