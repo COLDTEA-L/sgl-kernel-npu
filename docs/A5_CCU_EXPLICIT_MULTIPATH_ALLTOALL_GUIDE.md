@@ -124,30 +124,65 @@ git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+set -euo pipefail
 
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install \
   --install-path /usr/local/Ascend/cann-9.1.T560
 
+# 防止本次编译失败后误装 output/ 中遗留的旧 wheel。
+rm -f output/deep_ep*.whl
 bash build.sh -a deepep Ascend950
 LATEST_WHEEL=$(find output -maxdepth 1 -type f -name 'deep_ep*.whl' \
   -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
 test -n "${LATEST_WHEEL}"
-python3 -m pip install --force-reinstall --no-deps "${LATEST_WHEEL}"
+python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${LATEST_WHEEL}"
 ```
 
-检查新接口：
+检查新接口。这里必须同时看到新C ABI、实际加载的扩展路径和两个Python绑定；不要只看pip提示安装成功：
 
 ```bash
 nm -D /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/\
 liba5_ccu_urma_route_probe.so | grep HcclCcuUrmaExplicitMultipathAllToAll
 
 python3 - <<'PY'
+from pathlib import Path
 import deep_ep.deep_ep_cpp as ext
-assert hasattr(ext.Buffer, "ccu_urma_explicit_multipath_alltoall_out")
-print(ext.__file__)
+
+required = (
+    "ccu_urma_explicit_multipath_alltoall",
+    "ccu_urma_explicit_multipath_alltoall_out",
+)
+missing = [name for name in required if not hasattr(ext.Buffer, name)]
+print("deep_ep_cpp =", Path(ext.__file__).resolve())
+print("explicit multipath bindings =", [name for name in required if name not in missing])
+if missing:
+    raise RuntimeError(
+        "loaded deep_ep_cpp is stale and misses: " + ", ".join(missing) +
+        "; verify the printed .so path, rebuild this branch, and reinstall the newly created wheel"
+    )
 PY
 ```
+
+若仍报告stale，先确认源码和加载文件，避免被`PYTHONPATH`中的另一份DeepEP覆盖：
+
+```bash
+git branch --show-current
+git rev-parse --short HEAD
+git grep -n ccu_urma_explicit_multipath_alltoall csrc/deepep/pybind_extension.cpp
+
+python3 - <<'PY'
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+print(Path(ext.__file__).resolve())
+print([name for name in dir(ext.Buffer) if "explicit_multipath" in name])
+PY
+
+python3 -m pip show -f deep-ep 2>/dev/null || python3 -m pip show -f deep_ep
+```
+
+预期分支为`feature/a5-ccu-explicit-multipath-alltoall`，提交至少包含`eec9ae9`。如果打印出的`.so`不在刚安装
+wheel对应的位置，先修正`PYTHONPATH`/旧包覆盖问题，再运行性能脚本。
 
 ## 7. 一次运行完整性能矩阵
 
