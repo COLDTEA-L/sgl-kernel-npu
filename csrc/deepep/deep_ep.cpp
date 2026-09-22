@@ -207,6 +207,58 @@ torch::Tensor Buffer::hccl_all2_all_ccu(const torch::Tensor &send_data)
     return recv_data;
 }
 
+torch::Tensor Buffer::explicit_multipath_all2all_ccu(
+    const torch::Tensor &send_data, const std::string &plan_id,
+    const std::vector<int64_t> &path_weights)
+{
+    RECORD_FUNCTION("deep_ep::explicit_multipath_all2all_ccu", std::vector<c10::IValue>({send_data}));
+    EP_HOST_ASSERT(send_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kHalf || send_data.scalar_type() == at::kBFloat16 ||
+                   send_data.scalar_type() == at::kFloat || send_data.scalar_type() == at::kInt);
+    EP_HOST_ASSERT(num_ranks == 2);
+    EP_HOST_ASSERT(send_data.numel() % num_ranks == 0);
+    EP_HOST_ASSERT(!plan_id.empty() && plan_id.size() < HCOMM_NAME_LEN);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+
+    std::string weights_text;
+    for (size_t i = 0; i < path_weights.size(); ++i) {
+        EP_HOST_ASSERT(path_weights[i] > 0 && path_weights[i] <= UINT32_MAX);
+        if (i != 0) weights_text.push_back(',');
+        weights_text += std::to_string(path_weights[i]);
+    }
+
+    // Never silently fall back to native HCCL routing. The marker is
+    // exported by the matching HCCL explicit-path executor package.
+    using ExtensionVersionFn = int (*)();
+    static auto extension_version = reinterpret_cast<ExtensionVersionFn>(
+        dlsym(RTLD_DEFAULT, "A5HcclExplicitMultipathExtensionVersion"));
+    EP_HOST_ASSERT_S(extension_version != nullptr && extension_version() >= 1,
+        "ExplicitMultipathAll2AllCcu requires the matching HCCL explicit-path extension; "
+        "refusing to run through the native AllToAll selector");
+
+    const char *active_plan = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID");
+    EP_HOST_ASSERT_S(active_plan != nullptr && plan_id == active_plan,
+        "plan_id must match A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID provisioned before communicator initialization");
+    const char *active_weights = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS");
+    EP_HOST_ASSERT_S(active_weights != nullptr && weights_text == active_weights,
+        "path_weights must match A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS provisioned before communicator initialization");
+    const char *active_manifest = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_MANIFEST");
+    EP_HOST_ASSERT_S(active_manifest != nullptr && active_manifest[0] != '\0',
+        "A5_CCU_EXPLICIT_MULTIPATH_MANIFEST must be set before communicator initialization");
+
+    char hcom_ep_name[HCOMM_NAME_LEN];
+    if (!moe_all_to_all_group_name.empty()) {
+        std::memcpy(hcom_ep_name, moe_all_to_all_group_name.data(), moe_all_to_all_group_name.size() + 1);
+    } else {
+        HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
+    }
+    auto recv_data = torch::empty_like(send_data);
+    EXEC_NPU_CMD(aclnnExplicitMultipathAll2AllCcu, send_data, hcom_ep_name,
+                 num_ranks, rank, plan_id, weights_text, recv_data);
+    return recv_data;
+}
+
 torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
 {
     RECORD_FUNCTION("deep_ep::ccu_urma_multiroute_write", std::vector<c10::IValue>({send_data}));

@@ -23,7 +23,7 @@ def prepend_env_path(name, path):
     os.environ[name] = ":".join([path, *(item for item in items if item != path)])
 
 
-def prepare_runtime():
+def prepare_runtime(require_route_library=True):
     root = Path(__file__).resolve().parents[3]
     packages = [root / "python" / "deep_ep" / "deep_ep"]
     packages.extend(Path(path) / "deep_ep" for path in site.getsitepackages())
@@ -36,15 +36,17 @@ def prepare_runtime():
     candidates.append(Path("/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/"
                            "liba5_ccu_urma_route_probe.so"))
     route_lib = next((path.resolve() for path in candidates if path.is_file()), None)
-    if route_lib is None:
+    if require_route_library and route_lib is None:
         raise RuntimeError("route library not found; rebuild and install the latest probe package")
 
     for package in packages:
         extensions = sorted(package.glob("deep_ep_cpp*.so"))
         if not extensions:
             continue
-        changed = os.environ.get("A5_CCU_ROUTE_PROBE_LIB") != str(route_lib)
-        os.environ["A5_CCU_ROUTE_PROBE_LIB"] = str(route_lib)
+        changed = False
+        if route_lib is not None:
+            changed = os.environ.get("A5_CCU_ROUTE_PROBE_LIB") != str(route_lib)
+            os.environ["A5_CCU_ROUTE_PROBE_LIB"] = str(route_lib)
         old_ld = os.environ.get("LD_LIBRARY_PATH", "")
         vendor_root = package / "vendors" / "hwcomputing"
         vendor_lib = vendor_root / "op_api" / "lib"
@@ -54,14 +56,16 @@ def prepare_runtime():
             changed |= old_opp != os.environ["ASCEND_CUSTOM_OPP_PATH"]
         if vendor_lib.is_dir():
             prepend_env_path("LD_LIBRARY_PATH", str(vendor_lib))
-        prepend_env_path("LD_LIBRARY_PATH", str(route_lib.parent))
+        if route_lib is not None:
+            prepend_env_path("LD_LIBRARY_PATH", str(route_lib.parent))
         changed |= old_ld != os.environ["LD_LIBRARY_PATH"]
         if changed and os.environ.get("_A5_CCU_A2A_REEXEC") != "1":
             env = os.environ.copy()
             env["_A5_CCU_A2A_REEXEC"] = "1"
             os.execvpe(sys.executable,
                        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env)
-        ctypes.CDLL(str(route_lib), mode=ctypes.RTLD_GLOBAL)
+        if route_lib is not None:
+            ctypes.CDLL(str(route_lib), mode=ctypes.RTLD_GLOBAL)
         sys.path.insert(0, str(package.parent))
         return extensions[0], route_lib
     raise RuntimeError("deep_ep_cpp not found; rebuild and install the latest DeepEP wheel")
@@ -69,7 +73,7 @@ def prepare_runtime():
 
 def requested_implementation():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard"),
                         default="multiroute")
     return parser.parse_known_args()[0].implementation
 
@@ -78,7 +82,7 @@ IMPLEMENTATION = requested_implementation()
 EXTENSION = None
 ROUTE_LIB = None
 if IMPLEMENTATION != "native":
-    EXTENSION, ROUTE_LIB = prepare_runtime()
+    EXTENSION, ROUTE_LIB = prepare_runtime(IMPLEMENTATION != "standard")
 
 import torch
 import torch.distributed as dist
@@ -131,7 +135,7 @@ def make_profiler(output_dir, rank):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard"),
                         default="multiroute")
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
@@ -147,6 +151,8 @@ def parse_args():
                         help="HCCL-discovered direct candidate prepended in explicit mode")
     parser.add_argument("--relay-manifest", default="",
                         help="ordered explicit relay TSV for the formal direct+relay operator")
+    parser.add_argument("--plan-id", default="a5-explicit-multipath",
+                        help="stable control-plane key used by the standard graph operator")
     parser.add_argument("--schedule", choices=("concurrent", "serial"),
                         default="concurrent")
     parser.add_argument("--warmup", type=int, default=10)
@@ -162,16 +168,16 @@ def parse_args():
         parser.error("invalid warmup/iters/profile-iters")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
-    if args.implementation == "explicit":
+    if args.implementation in ("explicit", "standard"):
         if not args.relay_manifest:
-            parser.error("--implementation explicit requires --relay-manifest")
+            parser.error(f"--implementation {args.implementation} requires --relay-manifest")
         if args.schedule != "concurrent":
             parser.error(
                 "the formal explicit-path operator is concurrent-only; "
                 "use --implementation multiroute for serialized control experiments"
             )
         if not args.path_weights:
-            parser.error("--implementation explicit requires direct+relay --path-weights")
+            parser.error(f"--implementation {args.implementation} requires direct+relay --path-weights")
         weights = [item for item in args.path_weights.split(",") if item]
         if len(weights) < 2 or len(weights) > 8 or any(
                 not item.isdigit() or int(item) <= 0 for item in weights):
@@ -215,12 +221,17 @@ def main():
     args = parse_args()
     if args.implementation == "multiroute":
         select_routes(args)
-    elif args.implementation == "explicit":
+    elif args.implementation in ("explicit", "standard"):
         os.environ.pop("A5_CCU_ROUTE_SCHEDULE", None)
         for name in ("A5_CCU_SYNTHETIC_ROUTE_MANIFEST", "A5_CCU_PATH_UIDS",
                      "A5_CCU_ROUTE_INDICES", "A5_CCU_ROUTE_INDEX",
                      "A5_CCU_PATH_WEIGHTS"):
             os.environ.pop(name, None)
+        if args.implementation == "standard":
+            manifest = str(Path(args.relay_manifest).resolve())
+            os.environ["A5_CCU_EXPLICIT_MULTIPATH_MANIFEST"] = manifest
+            os.environ["A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID"] = args.plan_id
+            os.environ["A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS"] = args.path_weights
     if args.debug:
         os.environ["A5_CCU_DEBUG"] = "1"
     else:
@@ -256,8 +267,13 @@ def main():
     ])
 
     def run_op():
+        nonlocal recv
         if args.implementation == "native":
             dist.all_to_all_single(recv, send)
+        elif args.implementation == "standard":
+            recv = buffer.explicit_multipath_all2all_ccu(
+                send, args.plan_id, explicit_weights
+            )
         elif args.implementation == "explicit":
             buffer.ccu_urma_explicit_multipath_alltoall_out(
                 send, recv, relay_manifest, args.direct_route, explicit_weights
@@ -270,8 +286,8 @@ def main():
         f"{os.environ.get('MASTER_PORT', '0')}")
     case_tag = sanitize(
         "native" if args.implementation == "native" else
-        (f"explicit_direct{args.direct_route}_{len(explicit_weights) - 1}relay_{args.schedule}"
-         if args.implementation == "explicit" else
+        (f"{args.implementation}_direct{args.direct_route}_{len(explicit_weights) - 1}relay_{args.schedule}"
+         if args.implementation in ("explicit", "standard") else
          f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
@@ -311,7 +327,7 @@ def main():
         result = {
             "implementation": args.implementation,
             "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
-                      if args.implementation == "explicit" else
+                      if args.implementation in ("explicit", "standard") else
                       (args.path_uids or args.route_indices or str(args.route_index)
                        if args.implementation == "multiroute" else "native")),
             "weights": args.path_weights or "1",

@@ -1,107 +1,20 @@
-# A5 CCU+URMA 两卡显式多路径 AllToAll
+# A5 CCU+URMA 两卡显式多路径 AllToAll 指导
 
-## 1. 范围和结论边界
+## 1. 实现范围
 
-本分支实现一个正式的两卡 AllToAll 数据面：一条 HCCL RankGraph 已发现的 direct CommLink，加上调用者显式
-指定的若干 single-relay CommLink。当前支持最多8条总路径，因此两卡模式可覆盖`1 direct + 6 relay`。
+本分支实现标准 Ascend 自定义算子 `ExplicitMultipathAll2AllCcu`。当前版本限定两个 rank，路径集合为一条
+HCCL direct CommLink 加调用者显式指定的 1～7 条 relay EID pair；总路径数不超过 8。
 
-当前版本明确限制`WORLD_SIZE=2`。四卡及更多卡的peer矩阵、每peer路径集合、并发顺序和完成协议不同，后续通过
-扩展plan维度实现，不在两卡代码中隐式假设。
+数据面由 CCU `WriteNb` 通过 URMA Channel 搬运 GM→GM。AIV 只负责图内启动 `Hccl<CCU>.Alltoall()`，
+不执行 payload 的 GM/UB DataCopy。relay 卡不运行用户进程，也不落其 HBM。
 
-“显式”表示relay物理卡、对应EID pair和权重全部来自调用者的路径计划；算子不会从剩余卡中自动挑路，也不会
-退化到native candidate2。当前命令行负责生成plan；正式API把plan作为函数参数传入，不再依赖
-`A5_CCU_SYNTHETIC_ROUTE_MANIFEST`等进程全局环境变量。未来host控制器可以生成同一标准plan并调用相同API。
+路径计划在 communicator/resource 初始化阶段转换成 `HcclChannelDesc[]` 并缓存。图执行和 replay 只启动缓存的
+CCU kernel，因此不会在图内读取文件、解析拓扑或重新建链。当前用环境变量把 host 控制计划交给 HCCL；未来 host
+控制器可替换这一配置入口，不需要修改 AIV/CCU 数据面。
 
-正式显式路径算子固定采用并发提交，不读取旧probe使用的`A5_CCU_ROUTE_SCHEDULE`。串行调度仅保留在旧
-`multiroute` probe中作为实验对照，避免生产算子被遗留环境变量意外切换为串行。
+## 2. 两个配套分支
 
-## 2. 数据切分
-
-输入和输出均为`[2, elements_per_peer]`的FP32 tensor：
-
-- 本rank对应的slice通过`LocalCopyNb`复制；
-- 发往peer的slice由direct和所有relay共同搬运；
-- 默认要求`direct总数据 : 全部relay总数据 = 2:1`。
-
-等权relay情况下使用：
-
-| relay数 | Channel总数 | path weights（direct在第0项） |
-|---:|---:|---|
-| 2 | 3 | `4,1,1` |
-| 4 | 5 | `8,1,1,1,1` |
-| 6 | 7 | `12,1,1,1,1,1,1` |
-
-例如六条relay时，direct权重12、relay总权重6，比例正好为2:1。每段按256 Byte对齐，最后一条路径接收除法和
-对齐产生的余数。
-
-## 3. 调用链
-
-```text
-run_a5_ccu_explicit_multipath_alltoall_perf.sh
-  |
-  +-- resolve_a5_explicit_multirelay_eids.py
-  |     `-- 显式物理relay -> 双向EID pair
-  |
-  +-- prepare_a5_ccu_explicit_multipath_plans.py
-  |     |-- direct_plus_2relay.tsv
-  |     |-- direct_plus_4relay.tsv
-  |     `-- direct_plus_6relay.tsv
-  |
-  `-- test_a5_ccu_urma_multiroute_all2all.py
-        `-- Buffer.ccu_urma_explicit_multipath_alltoall_out()
-              `-- deep_ep_cpp
-                    `-- HcclCcuUrmaExplicitMultipathAllToAll()
-                          `-- RoutePlanRequest
-                                |-- SelectRoute(direct candidate)
-                                |-- ApplySyntheticRouteSpec(relay EID pair[N])
-                                `-- HcclChannelAcquire(desc[N+1])
-                                      `-- Channel[direct, relay0..relayN]
-                          `-- AllToAllMultiRouteKernel
-                                |-- LocalCopyNb(self slice)
-                                |-- WriteNb(direct, direct chunk)
-                                |-- WriteNb(relay0, relay chunk0)
-                                |-- ...
-                                |-- WriteNb(relayN, relay chunkN)
-                                `-- 所有WriteNb提交后统一WaitEvent
-```
-
-关键控制面API：
-
-```c
-HcclCcuUrmaExplicitMultipathAllToAll(
-    send, recv, elementsPerPeer, dtype, comm, stream,
-    relayManifest, directRoute, pathWeights, pathCount);
-```
-
-`GetRouteResources()`按plan内容生成cache key。第一次调用负责解析plan、建Channel并注册CCU kernel；相同
-communicator、stream和plan的后续调用命中缓存，热路径不会重新解析拓扑或重新建链。
-
-## 4. 为后续host控制器和多卡扩展保留的边界
-
-当前`RoutePlanRequest`已经把路径控制从环境变量中分离，包含：
-
-- discovered direct candidate；
-- 有序relay manifest；
-- 每条路径权重；
-- plan name/cache identity。
-
-当前relay描述仍由文件承载，便于复用已经验证的拓扑解析器。host控制器接入时可以先原样生成manifest；随后可将
-`relayManifest`替换为内存中的`PathSpec[]`，而CCU kernel仍只消费已经建立的`Channel[] + weights[]`。
-
-四卡及更多卡应把plan扩展为：
-
-```text
-Plan
-  `-- peerPlans[srcRank][dstRank]
-        |-- direct path
-        |-- relay paths[]
-        |-- weights[]
-        `-- local IO die / thread group
-```
-
-不能简单把两卡的`peer=1-rank`推广到多卡，也不能让不同IO Die的Channel进入同一个现有CCU launch。
-
-## 5. 拉取分支
+DeepEP/自定义算子仓：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -110,93 +23,117 @@ git switch -c feature/a5-ccu-explicit-multipath-alltoall \
   --track origin/feature/a5-ccu-explicit-multipath-alltoall
 ```
 
-若本地分支已经存在：
+HCCL 仓也必须使用同名分支：
 
 ```bash
-git switch feature/a5-ccu-explicit-multipath-alltoall
-git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+cd /home/l00934901/hccl
+git fetch origin
+git switch -c feature/a5-ccu-explicit-multipath-alltoall \
+  --track origin/feature/a5-ccu-explicit-multipath-alltoall
 ```
 
-## 6. 编译和安装
+已有本地分支时改用 `git switch <branch>` 和 `git pull --ff-only`。不需要安装或替换 `ubus.ko`。
 
-本次同时修改自定义CCU SO和DeepEP C++扩展，两者都必须重新安装；不需要安装KO。
+## 3. 在 Docker 内编译 HCCL
+
+先用交互方式进入容器；不要 `source build.sh`：
 
 ```bash
-cd /home/l00934901/sgl-kernel-npu
-(
-set -euo pipefail
+docker exec -it sglang_yuanwen_old bash
+```
+
+容器内执行：
+
+```bash
+cd /home/l00934901/hccl
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+bash build.sh -j8
 
-bash scripts/build_a5_ccu_urma_route_probe.sh \
-  --install \
-  --install-path /usr/local/Ascend/cann-9.1.T560
+HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
+test -f "${HCCL_RUNTIME}/libhccl.so"
+test -f "${HCCL_RUNTIME}/libhccl_compat.so"
+nm -D "${HCCL_RUNTIME}/libhccl.so" | \
+  grep ' A5HcclExplicitMultipathExtensionVersion$'
 
-# 防止本次编译失败后误装 output/ 中遗留的旧 wheel。
-rm -f output/deep_ep*.whl
-bash build.sh -a deepep Ascend950
-LATEST_WHEEL=$(find output -maxdepth 1 -type f -name 'deep_ep*.whl' \
-  -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
-test -n "${LATEST_WHEEL}"
-python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${LATEST_WHEEL}"
-)
-```
-
-这里用子shell包住`set -euo pipefail`：任何编译失败都会停止本组安装，但不会退出当前Docker交互shell。构建脚本
-还会优先复用HCCL `build_device/_deps/cann-cmake-src`中的完整缓存，避免host阶段再次联网下载
-`https://gitcode.com/cann/cmake.git`。如果本机既没有`third_party/cann-cmake`也没有该缓存，仍需先准备依赖。
-
-检查新接口。这里必须同时看到新C ABI、实际加载的扩展路径和两个Python绑定；不要只看pip提示安装成功：
-
-```bash
-nm -D /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/\
-liba5_ccu_urma_route_probe.so | grep HcclCcuUrmaExplicitMultipathAllToAll
-
-python3 - <<'PY'
-from pathlib import Path
-import deep_ep.deep_ep_cpp as ext
-
-required = (
-    "ccu_urma_explicit_multipath_alltoall",
-    "ccu_urma_explicit_multipath_alltoall_out",
-)
-missing = [name for name in required if not hasattr(ext.Buffer, name)]
-print("deep_ep_cpp =", Path(ext.__file__).resolve())
-print("explicit multipath bindings =", [name for name in required if name not in missing])
-if missing:
-    raise RuntimeError(
-        "loaded deep_ep_cpp is stale and misses: " + ", ".join(missing) +
-        "; verify the printed .so path, rebuild this branch, and reinstall the newly created wheel"
-    )
+LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" python3 - <<'PY'
+import ctypes
+lib = ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
+version = lib.A5HcclExplicitMultipathExtensionVersion
+version.restype = ctypes.c_int
+assert version() >= 1
+print("HCCL explicit multipath extension:", version())
 PY
 ```
 
-若仍报告stale，先确认源码和加载文件，避免被`PYTHONPATH`中的另一份DeepEP覆盖：
+必须使用打包暂存目录中的完整 `lib64`，不能只把 `build/src/libhccl.so` 加入路径；后者缺少同一次构建产生的
+`libhccl_compat.so`，单独加载会出现未解析符号。这里不覆盖系统 CANN，公共机器上也不需要 root 安装。
+
+## 4. 编译并安装标准算子 wheel
+
+推荐单算子构建，避免重编所有 MoE kernel：
 
 ```bash
-git branch --show-current
-git rev-parse --short HEAD
-git grep -n ccu_urma_explicit_multipath_alltoall csrc/deepep/pybind_extension.cpp
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 
+(
+  set -euo pipefail
+  rm -f output/deep_ep*.whl
+  DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu \
+    bash build.sh -a deepep Ascend950
+  WHEEL=$(find output -maxdepth 1 -name 'deep_ep*.whl' -type f \
+    -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+  test -n "${WHEEL}"
+  python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
+)
+
+echo "still in container: $(hostname), shell_pid=$$"
+```
+
+子 shell 中的 `set -e` 只终止构建组，不会退出 `docker exec -it` 的交互 shell。验证安装：
+
+```bash
 python3 - <<'PY'
 from pathlib import Path
 import deep_ep.deep_ep_cpp as ext
 print(Path(ext.__file__).resolve())
-print([name for name in dir(ext.Buffer) if "explicit_multipath" in name])
+assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
+print("standard explicit multipath API: PASS")
 PY
 
-python3 -m pip show -f deep-ep 2>/dev/null || python3 -m pip show -f deep_ep
+python3 -m py_compile \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py
+bash -n scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh
 ```
 
-预期分支为`feature/a5-ccu-explicit-multipath-alltoall`，提交至少包含`eec9ae9`。如果打印出的`.so`不在刚安装
-wheel对应的位置，先修正`PYTHONPATH`/旧包覆盖问题，再运行性能脚本。
+## 5. 路径与数据切分
 
-## 7. 一次运行完整性能矩阵
+manifest 每行描述一条显式 relay 的双向 endpoint，至少包含：
 
-下面以通信卡2、3为例，显式relay顺序为`4,5,1,0,6,7`。2/4 relay case分别使用此前缀，6 relay case使用
-全部列表：
+```text
+route_id  relay_phy  src_die  dst_die  src_eid  dst_eid
+```
+
+Channel 0 是 HCCL direct，Channel 1..N 按 manifest 行序构造。等权 relay 且要求
+`direct 总量 : relay 总量 = 2:1` 时：
+
+| relay 数 | `path_weights` |
+|---:|---|
+| 2 | `4,1,1` |
+| 4 | `8,1,1,1,1` |
+| 6 | `12,1,1,1,1,1,1` |
+
+每段按 256 Byte 对齐，最后一条路径接收余数。CCU kernel 先提交全部远端 `WriteNb`，再统一等待事件；因此是
+因果上的并发提交，而不是 host 循环串行调用多个算子。
+
+## 6. 完整性能矩阵
+
+下面以通信卡 2、3 和六张显式 relay `4,5,1,0,6,7` 为例：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
+
+HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
 
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --src-phy 2 --dst-phy 3 \
@@ -205,55 +142,49 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --bytes 4194304 \
   --warmup 100 --iters 20 --repeats 3 \
   --timeout-seconds 300 \
+  --hccl-lib-dir "${HCCL_RUNTIME}" \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
 
-每轮依次输出五组：
+脚本输出五组：`native0`、`native2`、标准算子的 direct+2 relay、direct+4 relay、direct+6 relay。
+`native0/native2` 是旧 probe 的 RankGraph candidate 基线，不是 `route_addr_idx`。三个显式用例均调用新
+`Buffer.explicit_multipath_all2all_ccu()` 图算子；缺少定制 HCCL 标记时会立即失败，不会静默退化。
 
-1. `native0`：单独使用HCCL RankGraph candidate0；
-2. `native2`：单独使用HCCL RankGraph candidate2；
-3. `direct_plus_2relay`：direct + relay4、5；
-4. `direct_plus_4relay`：direct + relay4、5、1、0；
-5. `direct_plus_6relay`：direct + relay4、5、1、0、6、7。
-
-这里的`native0/native2`是RankGraph公开CommLink ordinal，不是UDMA `route_addr_idx`，也不是标准
-`torch.distributed.all_to_all_single`算法编号。五组都使用同一个两卡CCU AllToAll数据面，因此可隔离比较路径集合。
-
-结果：
+查看结果：
 
 ```bash
 RUN_DIR=$(ls -dt \
   /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
-
 column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
 sed -n '1,220p' "${RUN_DIR}/explicit_multipath_perf_report.md"
 cat "${RUN_DIR}/explicit_multipath_perf_summary.json"
 ```
 
-## 8. 同时采集MindStudio profiling
+## 7. MindStudio profiling
 
-在上一条命令末尾增加：
+在第 6 节命令末尾增加：
 
 ```bash
-  --profile \
-  --profile-iters 20
+  --profile --profile-iters 20
 ```
 
-每个case的两个rank分别写入：
+每个 case 的两个进程分别输出到：
 
 ```text
 RUN_DIR/profiling/a5_ccu_alltoall_<case>_<run-id>/rank0/
 RUN_DIR/profiling/a5_ccu_alltoall_<case>_<run-id>/rank1/
 ```
 
-profiling会增加固定开销；终端性能比较使用未开启`--profile`的结果，MindStudio主要查看稳定CCU Launch的P50/P95
-和不同路径数对应的设备时间线。
+性能结论以无 profiling 的三轮中位数为主；MindStudio 用来确认标准图节点、CCU Launch 时间线和异常长尾。
+严格证明指定物理 relay 仍应另用 HCCN before/after counter 做闭环。
 
-## 9. 正确性和性能判读
+## 8. 结果判定与限制
 
-- 每个case必须输出`PASS`，否则时延无效；
-- 2/4/6 relay plan必须分别包含3/5/7个Channel；
-- 所有路径在通信端点必须落入同一local IO Die，否则当前版本明确返回not support；
-- direct+relay的收益应同时参考终端median和MindStudio CCU Launch；
-- 时延下降证明额外路径带来收益，但严格证明每张显式relay承担流量仍需另跑HCCN counter闭环；
-- 若慢relay造成拖尾，可由host控制器修改`path_weights`，无需改CCU kernel。
+- 五个 case 均须 correctness PASS；
+- explicit case 必须加载定制 `libhccl.so`；
+- plan ID、weights 和 manifest 必须在 communicator/resource 初始化前一致；
+- 当前一个 launch 内的所有 Channel 必须落在兼容的本地 IO Die/CCU thread 资源上；
+- 当前仅支持两个 rank；多卡扩展应使用 `peerPlans[src][dst]`，不能复用 `peer=1-rank`；
+- host 控制器以后可改变 relay 集合和权重，但计划变化需要新的 communicator/resource identity，不能在已捕获图的
+  replay 中原地改路径。

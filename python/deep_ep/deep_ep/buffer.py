@@ -477,6 +477,26 @@ class Buffer:
         """
         return self.runtime.hccl_all2_all_ccu(send_data)
 
+    def explicit_multipath_all2all_ccu(
+        self,
+        send_data: torch.Tensor,
+        plan_id: str,
+        path_weights: list[int],
+    ) -> torch.Tensor:
+        """Graphable two-rank CCU+URMA AllToAll over explicit paths.
+
+        Before communicator initialization, the process must export the same
+        ``A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID`` and
+        ``A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS`` plus an
+        ``A5_CCU_EXPLICIT_MULTIPATH_MANIFEST``.  HCCL provisions one direct
+        channel and the manifest relay channels once; graph replay only
+        launches the cached CCU kernel.  A mismatched or missing HCCL
+        extension fails instead of silently falling back to native routing.
+        """
+        return self.runtime.explicit_multipath_all2all_ccu(
+            send_data, plan_id, path_weights
+        )
+
     def ccu_urma_multiroute_write(self, send_data: torch.Tensor) -> torch.Tensor:
         """Write one FP32 payload over selected A5 CCU+URMA RankGraph routes.
 

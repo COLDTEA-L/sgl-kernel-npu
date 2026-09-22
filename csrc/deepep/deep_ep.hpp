@@ -70,6 +70,10 @@ public:
 
     torch::Tensor hccl_all2_all_ccu(const torch::Tensor &send_data);
 
+    torch::Tensor explicit_multipath_all2all_ccu(
+        const torch::Tensor &send_data, const std::string &plan_id,
+        const std::vector<int64_t> &path_weights);
+
     torch::Tensor ccu_urma_multiroute_write(const torch::Tensor &send_data);
 
     torch::Tensor ccu_urma_multiroute_alltoall(const torch::Tensor &send_data);

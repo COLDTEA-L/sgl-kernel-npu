@@ -19,6 +19,8 @@ topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 profile=0
 profile_iters=20
+hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
+cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do
         --topology-json) topology_json=$2; shift 2 ;;
         --profile) profile=1; shift ;;
         --profile-iters) profile_iters=$2; shift 2 ;;
+        --hccl-lib-dir) hccl_lib_dir=$2; shift 2 ;;
+        --cann-root) cann_root=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -55,7 +59,7 @@ IFS=',' read -ra relay_array <<<"${relay_phys}"
 }
 
 cd "${repo_root}"
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source "${cann_root}/set_env.sh"
 set +u
 source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 set -u
@@ -63,6 +67,17 @@ export ASCEND_RT_VISIBLE_DEVICES="${src_phy},${dst_phy}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
 unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
+if [[ -z "${hccl_lib_dir}" || ! -f "${hccl_lib_dir}/libhccl.so" ]]; then
+    echo "--hccl-lib-dir must name the build/src directory of the patched HCCL" >&2
+    exit 2
+fi
+export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH:-}"
+marker=$(nm -D "${hccl_lib_dir}/libhccl.so" 2>/dev/null |
+    grep -c ' A5HcclExplicitMultipathExtensionVersion$' || true)
+(( marker == 1 )) || {
+    echo "patched libhccl.so is missing A5HcclExplicitMultipathExtensionVersion" >&2
+    exit 2
+}
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases" "${run_dir}/plans" "${run_dir}/profiling"
@@ -106,15 +121,18 @@ for ((round=1; round<=repeats; ++round)); do
         --route-index 0 --path-weights 1 --schedule concurrent
     run_case native2 "${round}" --implementation multiroute \
         --route-index 2 --path-weights 1 --schedule concurrent
-    run_case direct_plus_2relay "${round}" --implementation explicit \
+    run_case direct_plus_2relay "${round}" --implementation standard \
+        --plan-id "explicit-2relay" \
         --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
         --path-weights 4,1,1 --schedule concurrent
-    run_case direct_plus_4relay "${round}" --implementation explicit \
+    run_case direct_plus_4relay "${round}" --implementation standard \
+        --plan-id "explicit-4relay" \
         --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
         --path-weights 8,1,1,1,1 --schedule concurrent
-    run_case direct_plus_6relay "${round}" --implementation explicit \
+    run_case direct_plus_6relay "${round}" --implementation standard \
+        --plan-id "explicit-6relay" \
         --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \
         --path-weights 12,1,1,1,1,1,1 --schedule concurrent
