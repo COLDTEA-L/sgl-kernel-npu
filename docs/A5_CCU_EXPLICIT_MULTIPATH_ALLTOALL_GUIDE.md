@@ -125,18 +125,62 @@ ctypes.CDLL("libhccl.so")
 
 ### 3.1 仅在校验失败时执行
 
-正常构建无需执行额外的 `torch_npu`、`/proc/self/maps` 或系统 HCCL 校验。失败时只按以下三层定位，前一层失败便停止：
+正常构建无需执行额外的 `torch_npu`、`/proc/self/maps` 或系统 HCCL 校验。为避免终端一次粘贴过长发生错行，
+下面三小节应分段执行；前一小节失败便停止。
+
+#### 3.1.1 确认分支和源码
 
 ```bash
 cd /home/l00934901/hccl
 
-# 1. 分支和源码
 git branch --show-current
 git log -3 --oneline
 grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
   src/ops/all_to_all_v/template/ccu
+```
 
-# 2. 本次打包产物；不能假设固定的 CPack 目录层级
+源码不存在 marker 时不要构建，先切换并拉取配套 HCCL 分支。
+
+#### 3.1.2 无打包产物时重新构建并保存日志
+
+当 `HCCL_RUNTIME` 为空，或整个仓库找不到配套的 `libhccl.so`、`libhccl_compat.so` 时，单独执行：
+
+```bash
+cd /home/l00934901/hccl
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+
+bash build.sh -j8 > /tmp/hccl_build_j8.log 2>&1
+BUILD_RC=$?
+
+echo "BUILD_RC=${BUILD_RC}"
+tail -n 100 /tmp/hccl_build_j8.log
+```
+
+只有 `BUILD_RC=0` 才继续。非零时不要执行 `nm` 或 Python，先提取真正的编译/打包错误：
+
+```bash
+grep -nEi \
+  'error:|fatal:|undefined reference|failed|no such file' \
+  /tmp/hccl_build_j8.log | \
+tail -n 100
+```
+
+`BUILD_RC=0` 后查看实际生成位置：
+
+```bash
+find /home/l00934901/hccl \
+  \( -name libhccl.so -o -name libhccl_compat.so \) \
+  -type f -print
+```
+
+#### 3.1.3 定位配套运行目录并加载验证
+
+不要假设固定的 CPack 目录层级；自动选择最近生成、且同时包含两个库的目录：
+
+```bash
+cd /home/l00934901/hccl
+
 HCCL_RUNTIME=$(
   find /home/l00934901/hccl \
     -name libhccl.so -printf '%T@ %h\n' 2>/dev/null | \
@@ -157,7 +201,7 @@ else
   nm -D "${HCCL_SO}" | \
     grep ' A5HcclExplicitMultipathExtensionVersion$'
 
-# 3. 配套依赖和绝对路径加载
+  # 使用配套依赖和绝对路径加载。
   LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
   python3 -S - "${HCCL_SO}" <<'PY'
 import ctypes
@@ -179,7 +223,8 @@ fi
 | 失败位置 | 含义 | 处理 |
 |---|---|---|
 | 源码搜不到 marker | HCCL 分支/提交不对 | 切换并拉取配套 HCCL 分支 |
-| `HCCL_RUNTIME` 为空 | 硬编码目录不存在，或 build/package 未完整结束 | 查看自动列出的实际 `.so`；若一个也没有则重新构建 |
+| `BUILD_RC` 非零 | 编译或打包真实失败 | 查看 `/tmp/hccl_build_j8.log`，不要继续动态库校验 |
+| `BUILD_RC=0` 但 `HCCL_RUNTIME` 为空 | 未生成一对配套运行库 | 检查 build 日志结尾及上面的 `find` 输出 |
 | `nm` 搜不到 marker | 构建或 package 是旧产物 | 重新执行 HCCL build/package |
 | 报错路径为 `/usr/local/Ascend/.../libhccl.so` | 加载了系统 HCCL | 改用打包产物的绝对路径，不能使用 `CDLL("libhccl.so")` |
 | 绝对路径加载仍缺符号 | 定制 HCCL 与依赖混用 | 将同一 package 的完整 `lib64` 放在 `LD_LIBRARY_PATH` 最前面 |
