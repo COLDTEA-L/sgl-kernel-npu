@@ -1,5 +1,11 @@
 # A5 CCU+URMA 两卡显式多路径 AllToAll 指导
 
+CommLink、synthetic relay `HcclChannelDesc`、`HcclChannelAcquire`、CCU kernel 注册及数据面调用链的逐步说明见：
+
+```text
+docs/A5_CCU_EXPLICIT_MULTIPATH_ALLTOALL_IMPLEMENTATION.md
+```
+
 ## 1. 实现范围
 
 本分支实现标准 Ascend 自定义算子 `ExplicitMultipathAll2AllCcu`。当前版本限定两个 rank，路径集合为一条
