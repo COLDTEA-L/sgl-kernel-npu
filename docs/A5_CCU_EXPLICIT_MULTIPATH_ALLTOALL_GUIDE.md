@@ -225,7 +225,122 @@ find /home/l00934901/hccl \
   -type f -print
 ```
 
-#### 3.1.3 定位配套运行目录并加载验证
+#### 3.1.3 构建长时间停在某个 `100% Built target` 时定位
+
+类似下面的输出只表示一个并行子目标完成，不表示整个 `build.sh` 已经完成：
+
+```text
+[100%] Built target hccl_aiv_reduce_scatter_op_910_95
+```
+
+真正完成时还应看到主目标链接、CPack 打包成功，并返回 shell 提示符或 `BUILD_RC=0`。如果该行之后长时间无输出，
+先不要中断；在第二个终端进入同一个容器，查明 `build.sh` 正在等待哪个子进程：
+
+```bash
+BUILD_PID=$(pgrep -o -f '[b]ash build.sh')
+echo "BUILD_PID=${BUILD_PID}"
+
+if [[ -n "${BUILD_PID}" ]]; then
+  pstree -ap "${BUILD_PID}"
+fi
+
+ps -eo pid,ppid,etime,stat,%cpu,%mem,wchan:32,cmd | \
+  grep -E 'build\.sh|cmake --build|gmake|make|ccec|c\+\+|collect2|(^|/)ld |cpack|makeself|gen_esb' | \
+  grep -v grep
+```
+
+判读原则：
+
+- `ccec`、`c++`、`ld`、`cpack` 或 `makeself` 仍有持续 CPU/I/O：任务仍在工作；
+- `STAT=D`：进程阻塞在文件系统或内核 I/O；
+- 只有 `cmake/gmake` 停在 `futex_wait`，却没有编译、链接或打包子进程：可能是并行 jobserver 等待；
+- 某个 `ccec` 已运行很久且 CPU、I/O 均不再变化：可能卡在该 device kernel 编译。
+
+用下面的命令保存完整现场。该命令只读取 `/proc` 和构建目录，不改变构建状态：
+
+```bash
+DIAG=/tmp/hccl_hang_diag_$(date +%Y%m%d_%H%M%S).txt
+
+{
+  date
+  echo "===== process tree ====="
+  BUILD_PID=$(pgrep -o -f '[b]ash build.sh')
+  echo "BUILD_PID=${BUILD_PID}"
+  [[ -n "${BUILD_PID}" ]] && pstree -ap "${BUILD_PID}"
+
+  echo "===== relevant processes ====="
+  ps -eo pid,ppid,etime,stat,%cpu,%mem,wchan:40,cmd | \
+    grep -E 'build\.sh|cmake|gmake|make|ccec|c\+\+|collect2|ld|cpack|makeself|gen_esb' | \
+    grep -v grep
+
+  echo "===== process details ====="
+  for pid in $(pgrep -f 'build\.sh|cmake|gmake|make|ccec|collect2|cpack|makeself|gen_esb'); do
+    [[ -r "/proc/${pid}/status" ]] || continue
+    echo "--- PID ${pid} ---"
+    grep -E '^(Name|State|Pid|PPid|Threads|VmRSS):' "/proc/${pid}/status"
+    printf 'wchan='
+    cat "/proc/${pid}/wchan" 2>/dev/null || true
+    printf '\ncmd='
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true
+    printf '\ncwd='
+    readlink "/proc/${pid}/cwd" 2>/dev/null || true
+    printf '\n'
+  done
+
+  echo "===== recently modified files ====="
+  find /home/l00934901/hccl/build \
+    -type f -mmin -10 -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' 2>/dev/null | \
+    sort | tail -80
+} | tee "${DIAG}"
+
+echo "DIAG=${DIAG}"
+```
+
+确认相关编译、链接、打包子进程均无进展后，先保存上述现场，再在原构建终端按一次 `Ctrl+C`。此时不要重新运行
+`build.sh`，因为它会清理构建目录；直接复用现有 `build/`，用单线程 verbose 模式继续，最后一条完整命令就是实际卡点：
+
+```bash
+cd /home/l00934901/hccl
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+
+cmake --build build --parallel 1 --verbose \
+  2>&1 | tee /tmp/hccl_build_j1_verbose.log
+
+BUILD_RC=${PIPESTATUS[0]}
+echo "BUILD_RC=${BUILD_RC}"
+```
+
+如果编译阶段成功，再单独串行定位打包阶段：
+
+```bash
+cmake --build build --target package --parallel 1 --verbose \
+  2>&1 | tee /tmp/hccl_package_j1_verbose.log
+
+PACKAGE_RC=${PIPESTATUS[0]}
+echo "PACKAGE_RC=${PACKAGE_RC}"
+```
+
+若串行模式仍卡住，先从进程列表找到最后一个活动的叶子进程；系统存在 `strace` 时，可进行 15 秒只读观察：
+
+```bash
+ps -eo pid,ppid,etime,stat,%cpu,wchan:32,cmd | \
+  grep -E 'ccec|c\+\+|collect2|(^|/)ld |cpack|makeself|gen_esb' | \
+  grep -v grep
+
+LEAF_PID=<上面找到的PID>
+timeout 15 strace -ff -tt -T -s 256 \
+  -p "${LEAF_PID}" \
+  -o /tmp/hccl_hang_strace
+
+tail -n 100 /tmp/hccl_hang_strace*
+```
+
+重复 `futex(...FUTEX_WAIT...)` 通常表示锁/并行等待；`wait4()` 表示还要继续检查它等待的子 PID；持续
+`connect()` 表示网络等待；进程处于 `D` 状态则优先检查磁盘、NFS 或容器挂载。反馈问题时至少保留
+`DIAG`、`/tmp/hccl_build_j1_verbose.log` 最后 100 行以及 `BUILD_RC`。
+
+#### 3.1.4 定位配套运行目录并加载验证
 
 不要假设固定的 CPack 目录层级；自动选择最近生成、且同时包含两个库的目录：
 
