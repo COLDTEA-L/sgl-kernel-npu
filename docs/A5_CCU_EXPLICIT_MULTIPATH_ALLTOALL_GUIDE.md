@@ -57,17 +57,37 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 # 这里只负责构建。-j8 已在 cam_lyw_dev_91 中完整验证通过。
 bash build.sh -j8
 
-HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
-HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
-HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
-test -f "${HCCL_SO}" -a -f "${HCCL_COMPAT_SO}"
-nm -D "${HCCL_SO}" | \
-  grep ' A5HcclExplicitMultipathExtensionVersion$'
+# 不硬编码 CPack 子目录；不同 CANN/HCCL 版本的 staging 层级可能不同。
+# 选择最近生成且同时包含 libhccl.so/libhccl_compat.so 的目录。
+HCCL_RUNTIME=$(
+  find /home/l00934901/hccl \
+    -name libhccl.so -printf '%T@ %h\n' 2>/dev/null | \
+  sort -nr | \
+  while read -r _ candidate; do
+    if [[ -f "${candidate}/libhccl_compat.so" ]]; then
+      echo "${candidate}"
+      break
+    fi
+  done
+)
+
+if [[ -z "${HCCL_RUNTIME}" ]]; then
+  echo "ERROR: no packaged directory contains matching libhccl.so and libhccl_compat.so" >&2
+  find /home/l00934901/hccl \
+    -type f \( -name libhccl.so -o -name libhccl_compat.so \) -print 2>/dev/null
+  echo "Check the end of build.sh output; do not continue to Python verification." >&2
+else
+  echo "HCCL_RUNTIME=${HCCL_RUNTIME}"
+  HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
+  HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
+  test -f "${HCCL_SO}" -a -f "${HCCL_COMPAT_SO}"
+  nm -D "${HCCL_SO}" | \
+    grep ' A5HcclExplicitMultipathExtensionVersion$'
 
 # 使用 -S 禁止 sitecustomize/torch_npu 提前加载系统 CANN 的 libhccl，
 # 并按绝对路径打开本次构建产物，不能写成 CDLL("libhccl.so")。
-LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
-python3 -S - "${HCCL_SO}" <<'PY'
+  LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+  python3 -S - "${HCCL_SO}" <<'PY'
 import ctypes, pathlib, sys
 path = pathlib.Path(sys.argv[1]).resolve()
 lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
@@ -78,12 +98,14 @@ assert pathlib.Path(lib._name).resolve() == path
 print("loaded HCCL:", path)
 print("HCCL explicit multipath extension:", version())
 PY
+fi
 ```
 
 预期最后两行类似：
 
 ```text
-loaded HCCL: /home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64/libhccl.so
+HCCL_RUNTIME=<本次构建实际产生的配套 lib64 目录>
+loaded HCCL: <HCCL_RUNTIME>/libhccl.so
 HCCL explicit multipath extension: 1
 ```
 
@@ -114,17 +136,30 @@ git log -3 --oneline
 grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
   src/ops/all_to_all_v/template/ccu
 
-# 2. 本次打包产物
-HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
-HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
-HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
-ls -lh "${HCCL_SO}" "${HCCL_COMPAT_SO}"
-nm -D "${HCCL_SO}" | \
-  grep ' A5HcclExplicitMultipathExtensionVersion$'
+# 2. 本次打包产物；不能假设固定的 CPack 目录层级
+HCCL_RUNTIME=$(
+  find /home/l00934901/hccl \
+    -name libhccl.so -printf '%T@ %h\n' 2>/dev/null | \
+  sort -nr | \
+  while read -r _ candidate; do
+    [[ -f "${candidate}/libhccl_compat.so" ]] && { echo "${candidate}"; break; }
+  done
+)
+if [[ -z "${HCCL_RUNTIME}" ]]; then
+  echo "ERROR: build/package did not produce a matching HCCL runtime directory" >&2
+  find /home/l00934901/hccl \
+    -type f \( -name libhccl.so -o -name libhccl_compat.so \) -print 2>/dev/null
+else
+  echo "HCCL_RUNTIME=${HCCL_RUNTIME}"
+  HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
+  HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
+  ls -lh "${HCCL_SO}" "${HCCL_COMPAT_SO}"
+  nm -D "${HCCL_SO}" | \
+    grep ' A5HcclExplicitMultipathExtensionVersion$'
 
 # 3. 配套依赖和绝对路径加载
-LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
-python3 -S - "${HCCL_SO}" <<'PY'
+  LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+  python3 -S - "${HCCL_SO}" <<'PY'
 import ctypes
 import pathlib
 import sys
@@ -138,11 +173,13 @@ print("extension:", version())
 assert pathlib.Path(lib._name).resolve() == expected
 assert version() >= 1
 PY
+fi
 ```
 
 | 失败位置 | 含义 | 处理 |
 |---|---|---|
 | 源码搜不到 marker | HCCL 分支/提交不对 | 切换并拉取配套 HCCL 分支 |
+| `HCCL_RUNTIME` 为空 | 硬编码目录不存在，或 build/package 未完整结束 | 查看自动列出的实际 `.so`；若一个也没有则重新构建 |
 | `nm` 搜不到 marker | 构建或 package 是旧产物 | 重新执行 HCCL build/package |
 | 报错路径为 `/usr/local/Ascend/.../libhccl.so` | 加载了系统 HCCL | 改用打包产物的绝对路径，不能使用 `CDLL("libhccl.so")` |
 | 绝对路径加载仍缺符号 | 定制 HCCL 与依赖混用 | 将同一 package 的完整 `lib64` 放在 `LD_LIBRARY_PATH` 最前面 |
@@ -215,7 +252,16 @@ Channel 0 是 HCCL direct，Channel 1..N 按 manifest 行序构造。等权 rela
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 
-HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
+HCCL_RUNTIME=$(
+  find /home/l00934901/hccl \
+    -name libhccl.so -printf '%T@ %h\n' 2>/dev/null | \
+  sort -nr | \
+  while read -r _ candidate; do
+    [[ -f "${candidate}/libhccl_compat.so" ]] && { echo "${candidate}"; break; }
+  done
+)
+test -n "${HCCL_RUNTIME}" || { echo "matching HCCL runtime not found" >&2; false; }
+echo "HCCL_RUNTIME=${HCCL_RUNTIME}"
 
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --src-phy 2 --dst-phy 3 \
