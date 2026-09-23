@@ -94,8 +94,13 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
                     OP_LOGE(nodeName, "rank_id is invalid"), return ge::GRAPH_FAILED);
 
     std::vector<uint32_t> weights;
-    OP_TILING_CHECK(!ParseWeights(weightText, weights),
-                    OP_LOGE(nodeName, "path_weights must contain 2..8 positive integers"),
+    const bool weightsOk = ParseWeights(weightText, weights);
+    const size_t weightTextLength = weightText == nullptr ? 0UL : strnlen(weightText, MAX_ATTR_LENGTH);
+    OP_TILING_CHECK(!weightsOk,
+                    OP_LOGE(nodeName,
+                            "path_weights must contain 2..8 positive integers; received length=%lu value='%.*s'",
+                            static_cast<unsigned long>(weightTextLength),
+                            static_cast<int>(weightTextLength), weightText == nullptr ? "" : weightText),
                     return ge::GRAPH_FAILED);
 
     const uint64_t sendCount = NumElements(sendShape);

@@ -426,11 +426,17 @@ echo "still in container: $(hostname), shell_pid=$$"
 
 ```bash
 python3 - <<'PY'
+import ctypes
 from pathlib import Path
 import deep_ep.deep_ep_cpp as ext
-print(Path(ext.__file__).resolve())
+path = Path(ext.__file__).resolve()
+print(path)
 assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
-print("standard explicit multipath API: PASS")
+lib = ctypes.CDLL(str(path))
+version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
+version.restype = ctypes.c_int
+assert version() >= 2
+print("standard explicit multipath API: PASS; attr ABI =", version())
 PY
 
 python3 -m py_compile \
@@ -643,6 +649,10 @@ Failed to execute tiling function
 `EXEC_NPU_CMD` 按 C++ 实参类型推导动态加载函数 ABI，而旧代码把 `std::string` 直接传给实际要求 `char *` 的 ACLNN C
 接口。tiling 因此读到损坏的 `path_weights`。修复后使用有稳定生命周期的可写字符缓冲区指针。
 
+仅出现 `Verified matrix APIs` 不能证明已加载修复后的 wheel：修复前的扩展也已经导出了同名 Python 方法。当前版本额外
+导出 `A5DeepEpExplicitMultipathAttrAbiVersion()`，性能脚本会对**实际 import 的** `deep_ep_cpp.so` 要求版本至少为 2；
+marker 缺失时会在启动阶段明确报告 stale wheel，不再等到 tiling 才失败。
+
 拉取后先确认两个修复都在源码中：
 
 ```bash
@@ -659,6 +669,33 @@ grep -nE 'plan_id_ptr|weights_ptr' csrc/deepep/deep_ep.cpp
 随后必须重新执行第 3 节构建 HCCL，并重新确定 `HCCL_RUNTIME`；旧打包目录仍包含不转发 endpoint-info 的
 `libhccl.so`。再执行第 4 节重新构建、安装自定义算子和 wheel；只重新运行 Python、不重装 wheel，仍会使用错误的
 `std::string` ABI。
+
+重装后单独确认源码、安装路径和已加载二进制属于同一版本：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+grep -nE 'plan_id_ptr|weights_ptr|A5DeepEpExplicitMultipathAttrAbiVersion' \
+  csrc/deepep/deep_ep.cpp
+
+python3 - <<'PY'
+import ctypes
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+
+path = Path(ext.__file__).resolve()
+lib = ctypes.CDLL(str(path))
+version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
+version.restype = ctypes.c_int
+print("loaded deep_ep_cpp:", path)
+print("explicit multipath attr ABI:", version())
+assert version() >= 2
+PY
+```
+
+预期最后打印 `explicit multipath attr ABI: 2`（或更大）。如果报 `undefined symbol`，说明当前 Python 环境仍加载旧
+wheel；回到第 4 节删除旧 `output/deep_ep*.whl` 后重新构建，并使用 `--force-reinstall --no-cache-dir --no-deps`
+安装。此时不要继续跑矩阵，否则仍会复现 `path_weights must contain 2..8 positive integers`。
 
 用配套的两个 HCCL 库确认 endpoint-info 转发表已初始化：
 

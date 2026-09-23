@@ -14,6 +14,14 @@
 #include "profiling/adapters/fused_deep_moe_a5/fused_deep_moe_a5_profile_adapter.hpp"
 #include "pytorch_npu_helper.hpp"
 
+// Increment this marker whenever the Python-visible explicit multipath API
+// changes its ACLNN argument ABI.  The performance launcher checks the marker
+// in the actually imported extension, so a stale wheel fails before tiling.
+extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathAttrAbiVersion()
+{
+    return 2;
+}
+
 namespace deep_ep {
 constexpr int PADDING_SIZE = 1;
 constexpr size_t HCOMM_NAME_LEN = 128;

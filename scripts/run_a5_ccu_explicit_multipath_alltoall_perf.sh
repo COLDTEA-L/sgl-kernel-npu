@@ -150,13 +150,30 @@ fi
 
 env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
 python3 - <<'PY'
+import ctypes
 from pathlib import Path
 import deep_ep.deep_ep_cpp as ext
 
-print(f"Verified DeepEP extension: {Path(ext.__file__).resolve()}")
+extension_path = Path(ext.__file__).resolve()
+print(f"Verified DeepEP extension: {extension_path}")
 assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
 assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
-print("Verified matrix APIs: explicit + legacy multiroute")
+try:
+    extension = ctypes.CDLL(str(extension_path))
+    abi_version = extension.A5DeepEpExplicitMultipathAttrAbiVersion
+except AttributeError as error:
+    raise RuntimeError(
+        "loaded deep_ep_cpp is stale: explicit-multipath ACLNN ABI marker is missing; "
+        "rebuild and force-reinstall the wheel from the current branch"
+    ) from error
+abi_version.restype = ctypes.c_int
+version = abi_version()
+if version < 2:
+    raise RuntimeError(
+        f"loaded deep_ep_cpp has explicit-multipath ACLNN ABI {version}, expected >= 2; "
+        "rebuild and force-reinstall the wheel from the current branch"
+    )
+print(f"Verified matrix APIs: explicit + legacy multiroute; attr ABI={version}")
 PY
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
