@@ -145,6 +145,17 @@ grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
 
 当 `HCCL_RUNTIME` 为空，或整个仓库找不到配套的 `libhccl.so`、`libhccl_compat.so` 时，单独执行：
 
+如果此前日志包含 `fatal error: ccu_types.h: No such file or directory`，说明 T560 报告了 9.1 版本号、但安装包
+未交付新版公开 CCU 开发头。配套 HCCL 分支已在 `1c566f8` 中改为按头文件实际存在性选择兼容定义；先更新 HCCL：
+
+```bash
+cd /home/l00934901/hccl
+git pull --ff-only
+git log -2 --oneline
+```
+
+确认日志中包含 `1c566f8` 后再构建：
+
 ```bash
 cd /home/l00934901/hccl
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
@@ -223,6 +234,7 @@ fi
 | 失败位置 | 含义 | 处理 |
 |---|---|---|
 | 源码搜不到 marker | HCCL 分支/提交不对 | 切换并拉取配套 HCCL 分支 |
+| 缺少 `ccu_types.h` | T560 未交付公开 CCU 头，但旧兼容判断只看版本号 | 拉取包含 `1c566f8` 的 HCCL 分支后重建 |
 | `BUILD_RC` 非零 | 编译或打包真实失败 | 查看 `/tmp/hccl_build_j8.log`，不要继续动态库校验 |
 | `BUILD_RC=0` 但 `HCCL_RUNTIME` 为空 | 未生成一对配套运行库 | 检查 build 日志结尾及上面的 `find` 输出 |
 | `nm` 搜不到 marker | 构建或 package 是旧产物 | 重新执行 HCCL build/package |
