@@ -42,7 +42,7 @@ git switch -c feature/a5-ccu-explicit-multipath-alltoall \
 
 ## 3. 在 Docker 内编译 HCCL
 
-先用交互方式进入容器；不要 `source build.sh`：
+先用交互方式进入容器；不要 `source build.sh`，也不要在宿主机直接编译：
 
 ```bash
 docker exec -it sglang_yuanwen_old bash
@@ -53,13 +53,14 @@ docker exec -it sglang_yuanwen_old bash
 ```bash
 cd /home/l00934901/hccl
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+
+# 这里只负责构建。-j8 已在 cam_lyw_dev_91 中完整验证通过。
 bash build.sh -j8
 
 HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
 HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
 HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
-test -f "${HCCL_SO}"
-test -f "${HCCL_COMPAT_SO}"
+test -f "${HCCL_SO}" -a -f "${HCCL_COMPAT_SO}"
 nm -D "${HCCL_SO}" | \
   grep ' A5HcclExplicitMultipathExtensionVersion$'
 
@@ -79,58 +80,49 @@ print("HCCL explicit multipath extension:", version())
 PY
 ```
 
-必须使用打包暂存目录中的完整 `lib64`，不能只把 `build/src/libhccl.so` 加入路径；后者缺少同一次构建产生的
-`libhccl_compat.so`，单独加载会出现未解析符号。这里不覆盖系统 CANN，公共机器上也不需要 root 安装。
+预期最后两行类似：
+
+```text
+loaded HCCL: /home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64/libhccl.so
+HCCL explicit multipath extension: 1
+```
+
+必须使用打包暂存目录中的完整 `lib64`。不能只加载 `build/src/libhccl.so`，因为它还依赖同一次构建产生的
+`libhccl_compat.so`；混用系统依赖会出现 `IsHcommDefaultTimeoutSupported` 等未解析符号。以上步骤不覆盖系统 CANN，
+公共机器上也不需要 root 安装。
 
 如果异常里的库路径仍是 `/usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so`，说明验证程序加载了系统 HCCL，
-不是编译失败。先以 `nm -D "${HCCL_SO}"` 的结果判断定制二进制是否正确，再使用上面的绝对路径命令验证。
-如果 `nm` 本身找不到 marker，则检查 HCCL 分支并重新构建：
+不是 `-j8` 编译失败。禁止使用下面这种按 SONAME 搜索的校验：
 
-```bash
-cd /home/l00934901/hccl
-git branch --show-current
-grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
-  src/ops/all_to_all_v/template/ccu
-bash build.sh -j8
+```python
+# 错误：set_env.sh 通常会让它命中系统 CANN 的 libhccl.so。
+ctypes.CDLL("libhccl.so")
 ```
 
-### 3.1 按四层定位“undefined symbol”
+只以 `nm -D "${HCCL_SO}"` 和上面的绝对路径加载结果判断本次构建产物。
 
-不要只看最后一个 Python 异常。按下面顺序检查，哪一层失败就停在哪一层处理。
+### 3.1 仅在校验失败时执行
 
-第一层检查分支和源码：
+正常构建无需执行额外的 `torch_npu`、`/proc/self/maps` 或系统 HCCL 校验。失败时只按以下三层定位，前一层失败便停止：
 
 ```bash
 cd /home/l00934901/hccl
 
+# 1. 分支和源码
 git branch --show-current
 git log -3 --oneline
-
 grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
   src/ops/all_to_all_v/template/ccu
-```
 
-预期分支是 `feature/a5-ccu-explicit-multipath-alltoall`，且源码能搜到 marker。搜不到表示拉取的 HCCL 分支不对，
-此时不要继续检查动态库。
-
-第二层检查构建产物：
-
-```bash
+# 2. 本次打包产物
 HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
 HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
 HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
-
 ls -lh "${HCCL_SO}" "${HCCL_COMPAT_SO}"
 nm -D "${HCCL_SO}" | \
   grep ' A5HcclExplicitMultipathExtensionVersion$'
-```
 
-源码存在但 `nm` 没有输出，表示 build/package 仍是旧产物，需要重新执行 `bash build.sh -j8`；这和系统
-`/usr/local/Ascend/.../libhccl.so` 无关。
-
-第三层按绝对路径加载定制 HCCL：
-
-```bash
+# 3. 配套依赖和绝对路径加载
 LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
 python3 -S - "${HCCL_SO}" <<'PY'
 import ctypes
@@ -148,53 +140,15 @@ assert version() >= 1
 PY
 ```
 
-第四层检查带 `torch_npu` 的真实进程最终映射到哪个 HCCL：
-
-```bash
-HCCL_PRELOAD="${HCCL_COMPAT_SO}:${HCCL_SO}"
-
-env \
-  A5_EXPECTED_HCCL="${HCCL_SO}" \
-  LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
-  LD_PRELOAD="${HCCL_PRELOAD}${LD_PRELOAD:+:${LD_PRELOAD}}" \
-  python3 - <<'PY'
-import ctypes
-import os
-from pathlib import Path
-
-import torch_npu
-
-# 让本进程显式解析 HCCL SONAME，然后检查实际内存映射。
-ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
-expected = Path(os.environ["A5_EXPECTED_HCCL"]).resolve()
-loaded = set()
-for line in Path("/proc/self/maps").read_text().splitlines():
-    path = line.split()[-1]
-    if path.endswith("/libhccl.so"):
-        loaded.add(Path(path).resolve())
-print("expected:", expected)
-print("mapped HCCL:", sorted(str(path) for path in loaded))
-assert expected in loaded, "patched HCCL is not mapped into the torch_npu process"
-
-process = ctypes.CDLL(None)
-version = process.A5HcclExplicitMultipathExtensionVersion
-version.restype = ctypes.c_int
-assert version() >= 1
-print("torch_npu process extension:", version())
-PY
-```
-
-四层结果的含义：
-
 | 失败位置 | 含义 | 处理 |
 |---|---|---|
 | 源码搜不到 marker | HCCL 分支/提交不对 | 切换并拉取配套 HCCL 分支 |
 | `nm` 搜不到 marker | 构建或 package 是旧产物 | 重新执行 HCCL build/package |
-| 绝对路径加载失败 | 定制 `libhccl.so` 与配套依赖不一致 | 使用同一 package 的完整 `lib64` |
-| `/proc/self/maps` 只有系统 HCCL | 进程启动时动态库选择错误 | 使用更新后的脚本限定 `LD_PRELOAD`/`LD_LIBRARY_PATH` |
+| 报错路径为 `/usr/local/Ascend/.../libhccl.so` | 加载了系统 HCCL | 改用打包产物的绝对路径，不能使用 `CDLL("libhccl.so")` |
+| 绝对路径加载仍缺符号 | 定制 HCCL 与依赖混用 | 将同一 package 的完整 `lib64` 放在 `LD_LIBRARY_PATH` 最前面 |
 
-不要在交互 shell 中长期 `export LD_PRELOAD`。性能脚本只对子 `torchrun` 进程注入定制 HCCL，避免影响编译器、
-`git` 和其他系统命令。
+性能脚本会对子 `torchrun` 进程同时限定 `LD_LIBRARY_PATH` 和匹配的 `libhccl_compat.so:libhccl.so`，不需要手工在
+交互 shell 中长期 `export LD_PRELOAD`；长期设置反而可能影响编译器、`git` 和其他系统命令。
 
 ## 4. 编译并安装标准算子 wheel
 
