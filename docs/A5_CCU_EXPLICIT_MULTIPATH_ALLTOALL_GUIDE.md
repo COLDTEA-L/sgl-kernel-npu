@@ -56,23 +56,43 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 bash build.sh -j8
 
 HCCL_RUNTIME=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
-test -f "${HCCL_RUNTIME}/libhccl.so"
-test -f "${HCCL_RUNTIME}/libhccl_compat.so"
-nm -D "${HCCL_RUNTIME}/libhccl.so" | \
+HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
+HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
+test -f "${HCCL_SO}"
+test -f "${HCCL_COMPAT_SO}"
+nm -D "${HCCL_SO}" | \
   grep ' A5HcclExplicitMultipathExtensionVersion$'
 
-LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" python3 - <<'PY'
-import ctypes
-lib = ctypes.CDLL("libhccl.so", mode=ctypes.RTLD_GLOBAL)
+# 使用 -S 禁止 sitecustomize/torch_npu 提前加载系统 CANN 的 libhccl，
+# 并按绝对路径打开本次构建产物，不能写成 CDLL("libhccl.so")。
+LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+python3 -S - "${HCCL_SO}" <<'PY'
+import ctypes, pathlib, sys
+path = pathlib.Path(sys.argv[1]).resolve()
+lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 assert version() >= 1
+assert pathlib.Path(lib._name).resolve() == path
+print("loaded HCCL:", path)
 print("HCCL explicit multipath extension:", version())
 PY
 ```
 
 必须使用打包暂存目录中的完整 `lib64`，不能只把 `build/src/libhccl.so` 加入路径；后者缺少同一次构建产生的
 `libhccl_compat.so`，单独加载会出现未解析符号。这里不覆盖系统 CANN，公共机器上也不需要 root 安装。
+
+如果异常里的库路径仍是 `/usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so`，说明验证程序加载了系统 HCCL，
+不是编译失败。先以 `nm -D "${HCCL_SO}"` 的结果判断定制二进制是否正确，再使用上面的绝对路径命令验证。
+如果 `nm` 本身找不到 marker，则检查 HCCL 分支并重新构建：
+
+```bash
+cd /home/l00934901/hccl
+git branch --show-current
+grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
+  src/ops/all_to_all_v/template/ccu
+bash build.sh -j8
+```
 
 ## 4. 编译并安装标准算子 wheel
 

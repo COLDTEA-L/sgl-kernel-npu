@@ -67,17 +67,37 @@ export ASCEND_RT_VISIBLE_DEVICES="${src_phy},${dst_phy}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
 unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
-if [[ -z "${hccl_lib_dir}" || ! -f "${hccl_lib_dir}/libhccl.so" ]]; then
-    echo "--hccl-lib-dir must name the build/src directory of the patched HCCL" >&2
+if [[ -z "${hccl_lib_dir}" || ! -f "${hccl_lib_dir}/libhccl.so" ||
+      ! -f "${hccl_lib_dir}/libhccl_compat.so" ]]; then
+    echo "--hccl-lib-dir must name the packaged lib64 directory containing matching patched libhccl.so and libhccl_compat.so" >&2
     exit 2
 fi
+hccl_so=$(readlink -f "${hccl_lib_dir}/libhccl.so")
+hccl_compat_so=$(readlink -f "${hccl_lib_dir}/libhccl_compat.so")
 export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH:-}"
-marker=$(nm -D "${hccl_lib_dir}/libhccl.so" 2>/dev/null |
+marker=$(nm -D "${hccl_so}" 2>/dev/null |
     grep -c ' A5HcclExplicitMultipathExtensionVersion$' || true)
 (( marker == 1 )) || {
     echo "patched libhccl.so is missing A5HcclExplicitMultipathExtensionVersion" >&2
     exit 2
 }
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" python3 -S - "${hccl_so}" <<'PY'
+import ctypes
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve()
+lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+version = lib.A5HcclExplicitMultipathExtensionVersion
+version.restype = ctypes.c_int
+if version() < 1:
+    raise SystemExit("invalid explicit multipath HCCL extension version")
+print(f"Verified patched HCCL: {path} (extension={version()})")
+PY
+hccl_preload="${hccl_compat_so}:${hccl_so}"
+if [[ -n "${LD_PRELOAD:-}" ]]; then
+    hccl_preload="${hccl_preload}:${LD_PRELOAD}"
+fi
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases" "${run_dir}/plans" "${run_dir}/profiling"
@@ -106,6 +126,7 @@ run_case() {
     shift 2
     local log="${run_dir}/cases/${name}_r${round}.log" status=0 result=FAIL
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
+      env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
         "${test_script}" --bytes "${bytes}" --warmup "${warmup}" \
         --iters "${iterations}" "${profile_args[@]}" "$@" \
