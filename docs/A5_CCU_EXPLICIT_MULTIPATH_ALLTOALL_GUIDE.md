@@ -27,6 +27,7 @@ cd /home/l00934901/sgl-kernel-npu
 git fetch origin
 git switch -c feature/a5-ccu-explicit-multipath-alltoall \
   --track origin/feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 ```
 
 HCCL 仓也必须使用同名分支：
@@ -36,9 +37,32 @@ cd /home/l00934901/hccl
 git fetch origin
 git switch -c feature/a5-ccu-explicit-multipath-alltoall \
   --track origin/feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 ```
 
-已有本地分支时改用 `git switch <branch>` 和 `git pull --ff-only`。不需要安装或替换 `ubus.ko`。
+上面的 `switch -c` 仅用于本地尚无该分支的第一次拉取。已有本地分支时，必须分别在两个仓库显式更新，不能只更新
+`sgl-kernel-npu`：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+git log -2 --oneline
+
+cd /home/l00934901/hccl
+git fetch origin
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+git log -2 --oneline
+
+# 必须包含 T560 缺少公开 ccu_types.h 时的兼容修复。
+git merge-base --is-ancestor 1c566f8 HEAD && \
+  echo "HCCL compatibility fix: PASS"
+```
+
+若最后没有输出 `PASS`，不要开始编译；先比较 `git remote -v`，确认 HCCL 的 `origin` 是
+`https://gitcode.com/yuanwenliu/hccl.git`。不需要安装或替换 `ubus.ko`。
 
 ## 3. 在 Docker 内编译 HCCL
 
