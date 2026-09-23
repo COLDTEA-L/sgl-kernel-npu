@@ -56,8 +56,9 @@ git switch feature/a5-ccu-explicit-multipath-alltoall
 git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 git log -2 --oneline
 
-# 必须包含 T560 缺少公开 ccu_types.h 时的兼容修复。
-git merge-base --is-ancestor 1c566f8 HEAD && \
+# 必须包含 T560 缺少公开 CCU C/C++ 头文件时的完整兼容修复。
+# 9644f7c 已包含其父提交 1c566f8。
+git merge-base --is-ancestor 9644f7c HEAD && \
   echo "HCCL compatibility fix: PASS"
 ```
 
@@ -169,16 +170,31 @@ grep -Rsn 'A5HcclExplicitMultipathExtensionVersion' \
 
 当 `HCCL_RUNTIME` 为空，或整个仓库找不到配套的 `libhccl.so`、`libhccl_compat.so` 时，单独执行：
 
-如果此前日志包含 `fatal error: ccu_types.h: No such file or directory`，说明 T560 报告了 9.1 版本号、但安装包
-未交付新版公开 CCU 开发头。配套 HCCL 分支已在 `1c566f8` 中改为按头文件实际存在性选择兼容定义；先更新 HCCL：
+如果此前日志包含下面任一错误：
+
+```text
+fatal error: ccu_types.h: No such file or directory
+fatal error: ccu_primitives.hpp: No such file or directory
+fatal error: ccu_variable.hpp: No such file or directory
+fatal error: ccu_control_flow_macro.h: No such file or directory
+```
+
+说明 T560 报告了 9.1 版本号、但安装包没有完整交付新版公开 CCU C/C++ 开发头。`1c566f8` 只处理了
+`ccu_types.h` 及部分 C 接口；`9644f7c` 进一步覆盖 `ccu_primitives.hpp` 和同组 CCU C++ 包装头。
+配套 HCCL 分支现在按头文件实际存在性整体选择公共实现或仓内兼容实现。先显式更新 HCCL：
 
 ```bash
 cd /home/l00934901/hccl
-git pull --ff-only
+git fetch origin
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 git log -2 --oneline
+
+git merge-base --is-ancestor 9644f7c HEAD && \
+  echo "HCCL CCU header compatibility: PASS"
 ```
 
-确认日志中包含 `1c566f8` 后再构建：
+确认最后输出 `PASS` 后再构建。若没有输出，当前 HCCL 仍是旧提交；不要通过复制某一个缺失头文件绕过错误：
 
 ```bash
 cd /home/l00934901/hccl
@@ -258,7 +274,8 @@ fi
 | 失败位置 | 含义 | 处理 |
 |---|---|---|
 | 源码搜不到 marker | HCCL 分支/提交不对 | 切换并拉取配套 HCCL 分支 |
-| 缺少 `ccu_types.h` | T560 未交付公开 CCU 头，但旧兼容判断只看版本号 | 拉取包含 `1c566f8` 的 HCCL 分支后重建 |
+| 缺少 `ccu_types.h` | T560 未交付公开 CCU C 头，但旧兼容判断只看版本号 | 拉取包含 `9644f7c`（含 `1c566f8`）的 HCCL 分支后重建 |
+| 缺少 `ccu_primitives.hpp` 或其他 `ccu_*.hpp` | T560 未完整交付公开 CCU C++ 包装头 | 拉取包含 `9644f7c` 的 HCCL 分支后重建；不要手工复制单个头文件 |
 | `BUILD_RC` 非零 | 编译或打包真实失败 | 查看 `/tmp/hccl_build_j8.log`，不要继续动态库校验 |
 | `BUILD_RC=0` 但 `HCCL_RUNTIME` 为空 | 未生成一对配套运行库 | 检查 build 日志结尾及上面的 `find` 输出 |
 | `nm` 搜不到 marker | 构建或 package 是旧产物 | 重新执行 HCCL build/package |
