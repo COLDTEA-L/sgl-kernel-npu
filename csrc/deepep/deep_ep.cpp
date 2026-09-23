@@ -254,8 +254,15 @@ torch::Tensor Buffer::explicit_multipath_all2all_ccu(
         HCCL_CHECK(HcclGetCommName(ep_comm, hcom_ep_name));
     }
     auto recv_data = torch::empty_like(send_data);
+    // EXEC_NPU_CMD infers the loaded aclnn function ABI from the converted
+    // C++ argument types.  Passing std::string here therefore makes it call a
+    // C function that expects char* with the wrong ABI.  Keep mutable storage
+    // alive for the synchronous workspace query and pass the actual pointers.
+    std::string plan_id_text = plan_id;
+    char *plan_id_ptr = plan_id_text.data();
+    char *weights_ptr = weights_text.data();
     EXEC_NPU_CMD(aclnnExplicitMultipathAll2AllCcu, send_data, hcom_ep_name,
-                 num_ranks, rank, plan_id, weights_text, recv_data);
+                 num_ranks, rank, plan_id_ptr, weights_ptr, recv_data);
     return recv_data;
 }
 

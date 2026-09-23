@@ -621,6 +621,109 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 诊断通过后，再恢复 `--warmup 100 --iters 20 --repeats 3` 采正式性能数据。
 
+### 6.2 `status=1` 的两个已定位原因及修复验证
+
+如果日志同时出现下面两类错误，它们是两个独立的软件问题，不是物理 relay 不通：
+
+```text
+native0/native2:
+get selected endpoint die id failed: status=-1
+
+direct_plus_2relay:
+path_weights must contain 2..8 positive integers
+Failed to execute tiling function
+```
+
+`native0/native2` 已经成功输出三个 `PATH_CATALOG`，说明 RankGraph/CommLink 枚举成功。`-1` 来自定制
+`libhccl.so` 中 `HcclRankGraphGetEndpointInfo` 的兼容弱符号：旧实现只记录 HCOMM 是否支持该接口，却没有把调用转发给
+实际 `libhcomm`，因此 probe 在查询 endpoint 的 IO Die 时必然得到 `-1`。修复后的 HCCL wrapper 保存
+`dlsym(libhcomm, "HcclRankGraphGetEndpointInfo")` 的函数指针并转发调用。
+
+`direct_plus_2relay` 的 Python/C++ 入口已经得到 `[4,1,1]`，失败发生在 ACLNN host tiling。根因是
+`EXEC_NPU_CMD` 按 C++ 实参类型推导动态加载函数 ABI，而旧代码把 `std::string` 直接传给实际要求 `char *` 的 ACLNN C
+接口。tiling 因此读到损坏的 `path_weights`。修复后使用有稳定生命周期的可写字符缓冲区指针。
+
+拉取后先确认两个修复都在源码中：
+
+```bash
+cd /home/l00934901/hccl
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+grep -n 'g_hcclRankGraphGetEndpointInfo' \
+  src/common/hcomm_dlsym/hccl_rank_graph_dl.cc
+
+cd /home/l00934901/sgl-kernel-npu
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+grep -nE 'plan_id_ptr|weights_ptr' csrc/deepep/deep_ep.cpp
+```
+
+随后必须重新执行第 3 节构建 HCCL，并重新确定 `HCCL_RUNTIME`；旧打包目录仍包含不转发 endpoint-info 的
+`libhccl.so`。再执行第 4 节重新构建、安装自定义算子和 wheel；只重新运行 Python、不重装 wheel，仍会使用错误的
+`std::string` ABI。
+
+用配套的两个 HCCL 库确认 endpoint-info 转发表已初始化：
+
+```bash
+HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
+HCCL_COMPAT_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl_compat.so")
+
+LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+python3 -S - "${HCCL_COMPAT_SO}" "${HCCL_SO}" <<'PY'
+import ctypes
+import sys
+
+compat = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
+ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
+supported = compat.HcommIsSupportHcclRankGraphGetEndpointInfo
+supported.restype = ctypes.c_bool
+print("HcclRankGraphGetEndpointInfo forwarding:", supported())
+assert supported()
+PY
+```
+
+预期打印 `HcclRankGraphGetEndpointInfo forwarding: True`。它验证定制 compat 库已找到当前 HCOMM 的真实
+endpoint-info 实现；不能只看 `nm` 中存在弱符号。
+
+完成后先跑最小回归：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1,0,6,7 \
+  --direct-route 0 \
+  --cases native0,native2,direct_plus_2relay \
+  --bytes 4194304 \
+  --warmup 1 --iters 1 --repeats 1 \
+  --timeout-seconds 300 \
+  --hccl-lib-dir "${HCCL_RUNTIME}" \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+检查 native 与标准算子：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+
+grep -RHnE \
+  'PATH_CATALOG|get selected endpoint die id failed|HcclChannelAcquire end|PASS:|CASE_FAILURE' \
+  "${RUN_DIR}/cases"/native[02]_r1.log
+
+grep -RHnE \
+  'path_weights|tiling function|PASS:|CASE_FAILURE' \
+  "${RUN_DIR}/cases/direct_plus_2relay_r1.log"
+```
+
+预期结果：native 的 `PATH_CATALOG` 恢复 `src_die=<0或1>(status=0)`，不再出现 endpoint die `status=-1`；
+标准算子不再报 `path_weights`/tiling 解析错误。日志里的 `LD_PRELOAD detected` 本身不是故障，因为矩阵脚本需要
+预加载本次配套的 `libhccl_compat.so:libhccl.so`；脚本已忽略交互 shell 中继承的其他 preload。
+
 ## 7. MindStudio profiling
 
 在第 6 节命令末尾增加：
