@@ -3,6 +3,8 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "${script_dir}/.." && pwd)
+inherited_ld_preload=${LD_PRELOAD:-}
+unset LD_PRELOAD
 
 src_phy=""
 dst_phy=""
@@ -19,6 +21,7 @@ topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 profile=0
 profile_iters=20
+cases=native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay
 hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 
@@ -39,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --topology-json) topology_json=$2; shift 2 ;;
         --profile) profile=1; shift ;;
         --profile-iters) profile_iters=$2; shift 2 ;;
+        --cases) cases=$2; shift 2 ;;
         --hccl-lib-dir) hccl_lib_dir=$2; shift 2 ;;
         --cann-root) cann_root=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -56,6 +60,21 @@ IFS=',' read -ra relay_array <<<"${relay_phys}"
 (( bytes > 0 && bytes % 256 == 0 && warmup >= 0 && iterations > 0 &&
    repeats > 0 && profile_iters > 0 )) || {
     echo "invalid bytes/warmup/iters/repeats/profile-iters" >&2; exit 2;
+}
+IFS=',' read -ra case_array <<<"${cases}"
+(( ${#case_array[@]} > 0 )) || { echo "--cases must not be empty" >&2; exit 2; }
+for selected_case in "${case_array[@]}"; do
+    case "${selected_case}" in
+        native0|native2|direct_plus_2relay|direct_plus_4relay|direct_plus_6relay) ;;
+        *) echo "unsupported --cases entry: ${selected_case}" >&2; exit 2 ;;
+    esac
+done
+case_selected() {
+    local wanted=$1 item
+    for item in "${case_array[@]}"; do
+        [[ "${item}" == "${wanted}" ]] && return 0
+    done
+    return 1
 }
 
 cd "${repo_root}"
@@ -95,9 +114,50 @@ if version() < 1:
 print(f"Verified patched HCCL: {path} (extension={version()})")
 PY
 hccl_preload="${hccl_compat_so}:${hccl_so}"
-if [[ -n "${LD_PRELOAD:-}" ]]; then
-    hccl_preload="${hccl_preload}:${LD_PRELOAD}"
+if [[ -n "${inherited_ld_preload}" ]]; then
+    echo "Ignoring inherited LD_PRELOAD while running the matrix: ${inherited_ld_preload}" >&2
 fi
+if [[ -n "${A5_EXPLICIT_EXTRA_LD_PRELOAD:-}" ]]; then
+    hccl_preload="${hccl_preload}:${A5_EXPLICIT_EXTRA_LD_PRELOAD}"
+fi
+
+if case_selected native0 || case_selected native2; then
+    route_probe_lib=${A5_CCU_ROUTE_PROBE_LIB:-}
+    if [[ -z "${route_probe_lib}" ]]; then
+        for candidate in \
+            "${cann_root}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so" \
+            /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
+        do
+            if [[ -f "${candidate}" ]]; then
+                route_probe_lib=${candidate}
+                break
+            fi
+        done
+    fi
+    [[ -f "${route_probe_lib}" ]] || {
+        echo "native0/native2 require liba5_ccu_urma_route_probe.so; install the latest route probe or omit them with --cases" >&2
+        exit 2
+    }
+    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaMultiRouteAllToAll$' || {
+        echo "route probe is stale: HcclCcuUrmaMultiRouteAllToAll is missing from ${route_probe_lib}" >&2
+        exit 2
+    }
+    route_probe_lib=$(readlink -f "${route_probe_lib}")
+    export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"
+    export LD_LIBRARY_PATH="$(dirname "${route_probe_lib}"):${LD_LIBRARY_PATH}"
+    echo "Verified route probe: ${route_probe_lib}"
+fi
+
+env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
+python3 - <<'PY'
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+
+print(f"Verified DeepEP extension: {Path(ext.__file__).resolve()}")
+assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
+assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
+print("Verified matrix APIs: explicit + legacy multiroute")
+PY
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases" "${run_dir}/plans" "${run_dir}/profiling"
@@ -135,26 +195,34 @@ run_case() {
     printf '%s\t%s\t%s\t%s\n' "${name}" "${round}" "${status}" "${result}" \
         >>"${run_dir}/case_status.tsv"
     echo "${name}_r${round}: ${result} (status=${status})"
+    if [[ "${result}" != PASS || "${status}" != 0 ]]; then
+        echo "===== ${name}_r${round} first errors =====" >&2
+        grep -nEi \
+          'CASE_FAILURE|traceback|runtimeerror|importerror|attributeerror|undefined symbol|dlopen|not found|failed|error' \
+          "${log}" | head -80 >&2 || true
+        echo "===== ${name}_r${round} log tail =====" >&2
+        tail -n 80 "${log}" >&2 || true
+    fi
 }
 
 for ((round=1; round<=repeats; ++round)); do
-    run_case native0 "${round}" --implementation multiroute \
+    case_selected native0 && run_case native0 "${round}" --implementation multiroute \
         --route-index 0 --path-weights 1 --schedule concurrent
-    run_case native2 "${round}" --implementation multiroute \
+    case_selected native2 && run_case native2 "${round}" --implementation multiroute \
         --route-index 2 --path-weights 1 --schedule concurrent
-    run_case direct_plus_2relay "${round}" --implementation standard \
-        --plan-id "explicit-2relay" \
-        --direct-route "${direct_route}" \
+    case_selected direct_plus_2relay && \
+      run_case direct_plus_2relay "${round}" --implementation standard \
+        --plan-id "explicit-2relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
         --path-weights 4,1,1 --schedule concurrent
-    run_case direct_plus_4relay "${round}" --implementation standard \
-        --plan-id "explicit-4relay" \
-        --direct-route "${direct_route}" \
+    case_selected direct_plus_4relay && \
+      run_case direct_plus_4relay "${round}" --implementation standard \
+        --plan-id "explicit-4relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
         --path-weights 8,1,1,1,1 --schedule concurrent
-    run_case direct_plus_6relay "${round}" --implementation standard \
-        --plan-id "explicit-6relay" \
-        --direct-route "${direct_route}" \
+    case_selected direct_plus_6relay && \
+      run_case direct_plus_6relay "${round}" --implementation standard \
+        --plan-id "explicit-6relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \
         --path-weights 12,1,1,1,1,1,1 --schedule concurrent
 done

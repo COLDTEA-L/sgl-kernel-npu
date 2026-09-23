@@ -12,6 +12,13 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
+CURRENT_PHASE = "module_import"
+
+
+def mark_phase(name):
+    global CURRENT_PHASE
+    CURRENT_PHASE = name
+    print(f"CASE_PHASE rank={os.environ.get('RANK', 'NA')} phase={name}", flush=True)
 
 
 def sanitize(value):
@@ -218,6 +225,7 @@ def select_routes(args):
 
 
 def main():
+    mark_phase("parse_args")
     args = parse_args()
     if args.implementation == "multiroute":
         select_routes(args)
@@ -242,11 +250,16 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size != 2:
         raise RuntimeError("this test requires WORLD_SIZE=2")
+    mark_phase("set_device")
     torch.npu.set_device(local_rank)
+    mark_phase("init_process_group")
     dist.init_process_group("hccl")
+    mark_phase("init_process_group_done")
     buffer = None
     if args.implementation != "native":
+        mark_phase("deep_ep_buffer_init")
         buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
+        mark_phase("deep_ep_buffer_init_done")
 
     explicit_weights = [int(item) for item in args.path_weights.split(",") if item]
     relay_manifest = str(Path(args.relay_manifest).resolve()) if args.relay_manifest else ""
@@ -291,12 +304,15 @@ def main():
          f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
+    mark_phase("warmup")
     for _ in range(args.warmup):
         run_op()
     torch.npu.synchronize()
+    mark_phase("warmup_correctness")
     torch.testing.assert_close(recv, expected)
     file_barrier(sync_dir, "warmup_done", rank, world_size)
 
+    mark_phase("timing")
     torch.npu.synchronize()
     begin = time.perf_counter()
     for _ in range(args.iters):
@@ -312,6 +328,7 @@ def main():
     result_us = max(averages)
 
     if args.profile:
+        mark_phase("profiling")
         profile_dir = (Path(args.profile_root) /
                        f"a5_ccu_alltoall_{case_tag}_{run_id}" / f"rank{rank}")
         profiler = make_profiler(profile_dir, rank)
@@ -346,9 +363,20 @@ def main():
         if args.implementation == "multiroute":
             print(f"deep_ep_cpp={EXTENSION}", flush=True)
             print(f"route_library={ROUTE_LIB}", flush=True)
+    mark_phase("reported_barrier")
     file_barrier(sync_dir, "reported", rank, world_size)
+    mark_phase("destroy_process_group")
     dist.destroy_process_group()
+    mark_phase("complete")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as error:
+        print(
+            f"CASE_FAILURE rank={os.environ.get('RANK', 'NA')} "
+            f"phase={CURRENT_PHASE} type={type(error).__name__} error={error}",
+            flush=True,
+        )
+        raise

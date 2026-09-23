@@ -502,6 +502,125 @@ sed -n '1,220p' "${RUN_DIR}/explicit_multipath_perf_report.md"
 cat "${RUN_DIR}/explicit_multipath_perf_summary.json"
 ```
 
+### 6.1 `native0/native2` 和标准算子失败检查
+
+矩阵脚本里的 `native0/native2` 是旧 `multiroute` probe 的 HCCL-discovered CommLink 基线，不是
+`torch.distributed.all_to_all_single`。它们除了 DeepEP wheel 和定制 HCCL，还依赖最新的：
+
+```text
+liba5_ccu_urma_route_probe.so
+  └── HcclCcuUrmaMultiRouteAllToAll
+```
+
+标准 `direct_plus_*relay` 不调用这个 probe 符号。如果 native 和标准算子同时失败，优先检查它们的共同阶段：
+定制 HCCL 动态加载、`set_device`、`init_process_group` 和 DeepEP `Buffer` 初始化，而不是先判断某条 relay 不通。
+
+查看失败日志及最后成功阶段：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
+
+echo "RUN_DIR=${RUN_DIR}"
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+
+for name in native0_r1 native2_r1 direct_plus_2relay_r1; do
+  LOG="${RUN_DIR}/cases/${name}.log"
+  [[ -f "${LOG}" ]] || continue
+  echo "===== ${name} phase/error ====="
+  grep -nE \
+    'CASE_PHASE|CASE_FAILURE|Traceback|RuntimeError|ImportError|AttributeError|undefined symbol|dlopen|not found|failed|error' \
+    "${LOG}" | tail -120 || true
+  echo "===== ${name} tail ====="
+  tail -n 100 "${LOG}"
+done
+```
+
+`CASE_FAILURE phase=` 的判读：
+
+| phase | 失败范围 |
+|---|---|
+| `module_import` | wheel、`torch_npu`、动态库或符号加载 |
+| `set_device` | 可见卡映射或 ACL runtime |
+| `init_process_group` | 定制 HCCL、rank 通信域或 HCOMM 依赖 |
+| `deep_ep_buffer_init` | DeepEP communicator/Buffer 初始化 |
+| `warmup` | Channel 建链、路径计划或 CCU kernel launch |
+| `warmup_correctness` | 搬运完成但数据结果错误 |
+| `timing` | warmup 正常，计时循环或异步错误失败 |
+
+单独检查 native probe：
+
+```bash
+CANN_ROOT=/usr/local/Ascend/cann-9.1.T560
+ROUTE_LIB="${CANN_ROOT}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+
+ls -lh "${ROUTE_LIB}"
+nm -D "${ROUTE_LIB}" | grep -E \
+  'HcclCcuUrmaMultiRoute(AllToAll|Write)$'
+
+LD_LIBRARY_PATH="${CANN_ROOT}/lib64:${CANN_ROOT}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}" \
+ldd -r "${ROUTE_LIB}" 2>&1 | \
+  grep -E 'not found|undefined symbol' || true
+```
+
+缺少库或 `HcclCcuUrmaMultiRouteAllToAll` 时，安装当前分支的 probe：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+
+HCCL_REPO=/home/l00934901/hccl \
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
+```
+
+该脚本会使用 HCCL 构建目录。完成后重新执行第 3 节生成并校验配套 `HCCL_RUNTIME`，不能继续引用已经被清理的旧
+staging 目录。
+
+单独检查标准算子 wheel API：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+
+print("deep_ep_cpp:", Path(ext.__file__).resolve())
+print("standard:", hasattr(ext.Buffer, "explicit_multipath_all2all_ccu"))
+print("legacy baseline:", hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out"))
+assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
+assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
+PY
+```
+
+更新后的矩阵脚本不继承交互 shell 中残留的 `LD_PRELOAD`，并会在失败时自动打印关键错误和日志尾部。需要额外
+preload 时只能显式设置 `A5_EXPLICIT_EXTRA_LD_PRELOAD`。为了避免重新运行全部矩阵，可以只重跑失败的三项：
+
+```bash
+unset LD_PRELOAD
+
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1,0,6,7 \
+  --direct-route 0 \
+  --cases native0,native2,direct_plus_2relay \
+  --bytes 4194304 \
+  --warmup 1 --iters 1 --repeats 1 \
+  --timeout-seconds 300 \
+  --hccl-lib-dir "${HCCL_RUNTIME}" \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+如果 route probe 尚未修复，可先隔离标准算子，不运行 native：
+
+```bash
+# 其余参数同上，仅替换 --cases。
+--cases direct_plus_2relay
+```
+
+诊断通过后，再恢复 `--warmup 100 --iters 20 --repeats 3` 采正式性能数据。
+
 ## 7. MindStudio profiling
 
 在第 6 节命令末尾增加：
