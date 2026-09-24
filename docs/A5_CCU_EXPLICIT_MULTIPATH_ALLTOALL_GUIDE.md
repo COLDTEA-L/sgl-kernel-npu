@@ -894,6 +894,57 @@ PY
 `libhccl.so` 路径以及新 HCCL 是否包含 `HCCL_CMD_HALF_ALLTOALLV` 下的
 `CcuExplicitMultipathAllToAll2Rank` 注册；不要把问题重新归因于 rendezvous。
 
+#### 6.4.1 extension/ABI 已更新但 `ret=5` 仍存在
+
+`extension=2` 和 `attr ABI=3` 只能证明定制 `libhccl.so` 与新 wheel 已经被进程加载，不能单独证明
+`HcclAllocComResourceByTiling` 随后确实进入了定制 HCCL 的 selector。若两个版本检查均通过但仍返回 `5`，先执行
+下面两组只读检查，不要继续盲目切换 `ALLTOALL`/`HALFALLTOALLV`。
+
+第一组按本次失败日志中的 worker PID 查 HCCL plog。例如日志 PID 为 `14954`、`14955`：
+
+```bash
+for pid in 14954 14955; do
+  echo "===== PID ${pid} ====="
+  grep -RHniE \
+    'ExplicitMultipath|HALF_ALLTOALLV|CCU selector|optype\[20\]|Fail to find executor|HcclAllocAlgResourceCcu|HcclGetAlgRes' \
+    /root/ascend/log/run/plog/*"${pid}"* \
+    /root/ascend/log/debug/plog/*"${pid}"* \
+    2>/dev/null
+done
+```
+
+运行新 case 后，要把上面 PID 替换成该 case 日志中 `CASE_PHASE pid=... rank=0/1` 的两个 PID。结果按以下顺序判读：
+
+| 日志特征 | 结论 |
+|---|---|
+| `select CcuExplicitMultipathAllToAll2Rank` | 定制 selector 已进入；继续定位 executor、`CalcRes` 或资源申请 |
+| `CCU selector can not match for optype[20]` | MC2 请求已到 selector，但没有命中显式 plan 条件 |
+| `Fail to find executor for algName[CcuExplicitMultipathAllToAll2Rank]` | selector 已选中，但实际运行库没有对应 HalfAllToAllV executor 注册 |
+| 完全没有这些定制日志 | 当前资源分配调用没有经过定制 HCCL 算法层，marker 校验不能作为反证 |
+
+第二组定位 `HcclAllocComResourceByTiling` 的实际符号提供者：
+
+```bash
+CUSTOM=/home/l00934901/hccl/build/_CPack_Packages/makeself_staging/aarch64-linux/lib64
+
+for so in \
+  "${CUSTOM}/libhccl.so" \
+  "${CUSTOM}/libhccl_compat.so" \
+  /usr/local/Ascend/cann-9.1.T560/lib64/*.so \
+  /usr/local/Ascend/cann-9.1.T560/lib64/plugin/opskernel/*.so
+do
+  [[ -f "${so}" ]] || continue
+  if nm -D "${so}" 2>/dev/null | grep -q 'HcclAllocComResourceByTiling'; then
+    echo "SYMBOL_OWNER=${so}"
+    nm -D "${so}" | grep 'HcclAllocComResourceByTiling'
+  fi
+done
+```
+
+若符号只存在于系统 HCOMM/CANN 运行库，而定制 `libhccl.so` 不导出它，同时第一组也没有定制 selector 日志，则
+ACLNN 的 MC2 资源入口并未使用本分支修改的 selector。下一步应在实际符号提供者到 HCCL 算法库之间的装载/转发边界
+接入显式 path plan；此时继续修改 host tiling 的 opType 不会解决问题。
+
 源码树 `python/deep_ep/deep_ep/deep_ep_cpp*.so` 只作为未安装 wheel 时的开发回退，不能在正式矩阵中静默覆盖已经
 校验过的安装产物。
 
