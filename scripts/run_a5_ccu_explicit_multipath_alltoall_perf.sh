@@ -21,6 +21,7 @@ topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 profile=0
 profile_iters=20
+graph_backend=none
 cases=native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay
 hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
@@ -42,12 +43,17 @@ while [[ $# -gt 0 ]]; do
         --topology-json) topology_json=$2; shift 2 ;;
         --profile) profile=1; shift ;;
         --profile-iters) profile_iters=$2; shift 2 ;;
+        --graph-backend) graph_backend=$2; shift 2 ;;
         --cases) cases=$2; shift 2 ;;
         --hccl-lib-dir) hccl_lib_dir=$2; shift 2 ;;
         --cann-root) cann_root=$2; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+case "${graph_backend}" in
+    none|eager|aot_eager|npu|npugraphs|npugraph_ex|inductor) ;;
+    *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
+esac
 
 [[ "${src_phy}" =~ ^[0-9]+$ && "${dst_phy}" =~ ^[0-9]+$ ]] || {
     echo "--src-phy and --dst-phy are required" >&2; exit 2;
@@ -227,16 +233,19 @@ for ((round=1; round<=repeats; ++round)); do
         --route-index 2 --path-weights 1 --schedule concurrent
     case_selected direct_plus_2relay && \
       run_case direct_plus_2relay "${round}" --implementation prepared \
+        --compile-backend "${graph_backend}" \
         --plan-id "explicit-2relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
         --path-weights 4,1,1 --schedule concurrent
     case_selected direct_plus_4relay && \
       run_case direct_plus_4relay "${round}" --implementation prepared \
+        --compile-backend "${graph_backend}" \
         --plan-id "explicit-4relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
         --path-weights 8,1,1,1,1 --schedule concurrent
     case_selected direct_plus_6relay && \
       run_case direct_plus_6relay "${round}" --implementation prepared \
+        --compile-backend "${graph_backend}" \
         --plan-id "explicit-6relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \
         --path-weights 12,1,1,1,1,1,1 --schedule concurrent

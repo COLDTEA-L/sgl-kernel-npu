@@ -216,3 +216,62 @@ CCU kernel release 语义仍与 communicator 生命周期绑定；进程退出�
 3. 数据正确性；
 4. direct+2/4/6 relay 的性能与 HCCN 物理路径；
 5. 有卡 PrivateUse1 执行下的 graph capture/replay（无卡 Meta capture 已通过）。
+
+## 9. 控制面延迟触发数据面的扩展设计
+
+该能力可以在方案 2 上实现，不需要回到 MC2 tiling。推荐使用：
+
+```text
+host/controller
+  1. 在独立 control stream 写 HBM CommandBlock
+  2. 做可见性/顺序保证
+  3. 发送 CCU local-notify doorbell
+                         |
+already-launched CCU kernel
+  4. NotifyWait(doorbell)
+  5. Load(command_addr, command variables)
+  6. 校验 epoch/opcode
+  7. 按 path_mask/path_bytes 发出 WriteNb
+  8. Store completion/status 到 HBM
+```
+
+建议的 `CommandBlock` 至少包含：
+
+```c
+struct CommandBlock {
+    uint64_t submit_epoch;
+    uint64_t opcode;       // EXECUTE / CANCEL
+    uint64_t path_mask;
+    uint64_t bytes[8];
+    uint64_t completion_epoch;
+    uint64_t status;
+};
+```
+
+公开 CCU primitive 已暴露 `Load(Variable addrVar, Variable)`/
+`CcuLoadVarFromVarAddr`，因此 CCU 可以在被唤醒后读取 HBM command；`CCU_IF` 可用于按 mask 条件提交路径。
+
+不推荐只让 CCU 无限轮询 HBM flag：它会长期占用 CCU，超时/取消语义困难，也更依赖缓存一致性。HBM 保存
+命令内容，notify 只作为 doorbell，二者职责分开。
+
+必须避免以下死锁：
+
+```text
+same stream:
+  launch(wait flag) -> memcpy(flag=READY)
+```
+
+后一个 memcpy 永远无法越过正在等待的 kernel。控制器应使用独立 control stream，或使用独立 host API/
+CCU thread 发 doorbell；写 command 必须先于 doorbell 对设备可见。
+
+两 rank 还需要相同 `submit_epoch`。一个 rank 提前启动可以在既有 peer `NotifyWait` 处等待，但控制器必须保证
+另一 rank 最终收到同一命令，并为等待、取消、超时和 completion 提供明确状态机。
+
+建议分三步实现：
+
+1. gate-only：固定路径和 bytes，只验证下发后在 doorbell 前不产生 HCCN 流量；
+2. dynamic mask：由 `path_mask` 选择已经 prepare 的 Channel，验证 direct/relay 组合；
+3. dynamic weights：由 `bytes[8]` 控制分片，加入 epoch、cancel、completion 和错误恢复。
+
+这项扩展不会动态创建新路径：控制器只能在 prepare 阶段已经建好的 Channel 集合中选择。新增 relay 仍应创建
+新的 plan，不能在图 replay 期间修改 plan 的 Channel 资源。

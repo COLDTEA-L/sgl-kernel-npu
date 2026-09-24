@@ -164,6 +164,52 @@ PASS: ... implementation=prepared
 `PREPARED_MULTIPATH_PLAN` 每个 rank 只应在 warmup 前出现一次。若反复出现，说明控制面准备错误地进入了
 热循环。
 
+### 5.1 验证是否真正入图
+
+先用 `eager` backend 验证 Dynamo 能以 `fullgraph=True` 捕获完整节点：
+
+```bash
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1,0,6,7 \
+  --direct-route 0 \
+  --cases direct_plus_2relay \
+  --graph-backend eager \
+  --bytes 4194304 \
+  --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+再用 `npugraphs` 验证 ACLGraph 首次 capture 和重复 replay：
+
+```bash
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 4,5,1,0,6,7 \
+  --direct-route 0 \
+  --cases direct_plus_2relay \
+  --graph-backend npugraphs \
+  --bytes 4194304 \
+  --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+PASS 必须同时满足：
+
+```text
+CASE_GRAPH_CAPTURE ... fullgraph=1
+CASE_GRAPH_FIRST_EXECUTE ... PASS
+CASE_GRAPH_REPLAY ... PASS
+PASS: implementation=prepared ...
+```
+
+并且每个 rank 只有一条 `PREPARED_MULTIPATH_PLAN`。`eager` 只证明 FX/Dynamo 完整捕获；只有
+`npugraphs` 的 first execute 与 replay 都正确，才能说明这条路径能进入当前环境的 NPU graph。
+
 ## 6. 完整性能矩阵
 
 推荐稳定参数为 warmup 100、计时 20 次、重复 3 轮：
@@ -230,6 +276,8 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 | DeepEP ABI `< 4` | 加载了旧 wheel；重新构建并 `--force-reinstall` |
 | prepared-plan ABI 缺失 | route package 是旧版本；重建并安装第 3 节 |
 | 找不到 `torch.ops.deep_ep...` | wheel 未包含新的 `TORCH_LIBRARY` 注册 |
+| `npugraphs` backend 不存在 | 当前 torch_npu 版本未提供 ACLGraph backend；先用 `python3 -c 'import torch,torch_npu; print(torch._dynamo.list_backends())'` 检查 |
+| fullgraph graph break | 保存完整 `CASE_FAILURE`；不能把 eager PASS 当作设备图 PASS |
 | `path_weights must contain...` | wheel/测试脚本版本不一致；先做 4.1 |
 | `HcclAllocComResourceByTiling ret=5` | 仍在执行旧 `standard`/MC2 路径；正式 case 必须显示 `implementation=prepared` |
 | `plan handle not found` | plan 在另一进程创建，或进程已重启；每个 rank 必须各自 prepare |

@@ -227,6 +227,12 @@ def parse_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument("--profile-root", default="/home/l00934901/profiling")
+    parser.add_argument(
+        "--compile-backend",
+        choices=("none", "eager", "aot_eager", "npu", "npugraphs", "npugraph_ex", "inductor"),
+        default="none",
+        help="compile the prepared graph op; eager checks Dynamo fullgraph and npugraphs checks ACLGraph replay",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     if args.bytes <= 0 or args.bytes % 4:
@@ -235,6 +241,8 @@ def parse_args():
         parser.error("invalid warmup/iters/profile-iters")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
+    if args.compile_backend != "none" and args.implementation != "prepared":
+        parser.error("--compile-backend currently requires --implementation prepared")
     if args.implementation in ("explicit", "standard", "prepared"):
         if not args.relay_manifest:
             parser.error(f"--implementation {args.implementation} requires --relay-manifest")
@@ -367,6 +375,27 @@ def main():
         for src in range(world_size)
     ])
 
+    compiled_prepared_op = None
+    if args.compile_backend != "none":
+        mark_phase(f"compile_graph_{args.compile_backend}")
+
+        def prepared_graph_op(send_tensor, recv_tensor):
+            return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+                send_tensor, recv_tensor, plan_handle
+            )
+
+        compiled_prepared_op = torch.compile(
+            prepared_graph_op,
+            backend=args.compile_backend,
+            fullgraph=True,
+            dynamic=False,
+        )
+        print(
+            f"CASE_GRAPH_CAPTURE rank={rank} backend={args.compile_backend} "
+            f"fullgraph=1 dynamic=0 plan_handle={plan_handle}",
+            flush=True,
+        )
+
     def run_op():
         nonlocal recv
         if args.implementation == "native":
@@ -376,9 +405,12 @@ def main():
                 send, args.plan_id, explicit_weights
             )
         elif args.implementation == "prepared":
-            buffer.ccu_urma_prepared_multipath_alltoall_out(
-                send, recv, plan_handle
-            )
+            if compiled_prepared_op is None:
+                buffer.ccu_urma_prepared_multipath_alltoall_out(
+                    send, recv, plan_handle
+                )
+            else:
+                compiled_prepared_op(send, recv)
         elif args.implementation == "explicit":
             buffer.ccu_urma_explicit_multipath_alltoall_out(
                 send, recv, relay_manifest, args.direct_route, explicit_weights
@@ -395,6 +427,23 @@ def main():
          if args.implementation in ("explicit", "standard", "prepared") else
          f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
+
+    if compiled_prepared_op is not None:
+        # torch.compile is lazy. Separate the first compile/execute from a
+        # second replay so logs and profiler results can distinguish them.
+        mark_phase(f"graph_first_execute_{args.compile_backend}")
+        run_op()
+        torch.npu.synchronize()
+        torch.testing.assert_close(recv, expected)
+        file_barrier(sync_dir, "graph_first_execute", rank, world_size)
+        print(f"CASE_GRAPH_FIRST_EXECUTE rank={rank} backend={args.compile_backend} PASS", flush=True)
+
+        mark_phase(f"graph_replay_{args.compile_backend}")
+        run_op()
+        torch.npu.synchronize()
+        torch.testing.assert_close(recv, expected)
+        file_barrier(sync_dir, "graph_replay", rank, world_size)
+        print(f"CASE_GRAPH_REPLAY rank={rank} backend={args.compile_backend} PASS", flush=True)
 
     mark_phase("warmup")
     for _ in range(args.warmup):
@@ -447,6 +496,7 @@ def main():
             "host_batch_avg_us": result_us,
             "synthetic_route_manifest": args.synthetic_route_manifest or "",
             "relay_manifest": relay_manifest,
+            "compile_backend": args.compile_backend,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "
