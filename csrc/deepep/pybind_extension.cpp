@@ -3,6 +3,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
 #include <c10/util/ArrayRef.h>
+#include <torch/library.h>
 
 #include "deep_ep.hpp"
 #include "config.hpp"
@@ -13,6 +14,24 @@
 #endif
 
 namespace py = pybind11;
+
+TORCH_LIBRARY_FRAGMENT(deep_ep, m)
+{
+    m.def(
+        "ccu_urma_prepared_multipath_alltoall(Tensor send_data, Tensor(a!) recv_data, int plan_handle) -> Tensor(a!)");
+}
+
+TORCH_LIBRARY_IMPL(deep_ep, PrivateUse1, m)
+{
+    m.impl("ccu_urma_prepared_multipath_alltoall",
+           TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_op));
+}
+
+TORCH_LIBRARY_IMPL(deep_ep, Meta, m)
+{
+    m.impl("ccu_urma_prepared_multipath_alltoall",
+           TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_meta));
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -51,6 +70,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              py::arg("send_data"), py::arg("recv_data"),
              py::arg("relay_manifest"), py::arg("direct_route"),
              py::arg("path_weights"))
+        .def("prepare_ccu_urma_explicit_multipath_plan",
+             &deep_ep::Buffer::prepare_ccu_urma_explicit_multipath_plan,
+             py::arg("plan_id"), py::arg("relay_manifest"),
+             py::arg("direct_route"), py::arg("path_weights"),
+             "Prepare explicit CommLinks, Channels and a CCU kernel outside graph execution")
+        .def("ccu_urma_prepared_multipath_alltoall",
+             &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall,
+             py::arg("send_data"), py::arg("plan_handle"),
+             "Launch a previously prepared explicit multipath CCU plan")
+        .def("ccu_urma_prepared_multipath_alltoall_out",
+             &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall_out,
+             py::arg("send_data"), py::arg("recv_data"), py::arg("plan_handle"),
+             "Out variant of the prepared explicit multipath CCU plan")
         .def("all2_all_detour_io_die", &deep_ep::Buffer::all2_all_detour_io_die)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)

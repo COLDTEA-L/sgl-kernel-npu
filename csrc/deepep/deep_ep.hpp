@@ -15,6 +15,14 @@
 
 namespace deep_ep {
 
+torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    int64_t plan_handle);
+
+torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    int64_t plan_handle);
+
 struct Buffer {
     int64_t rank, rdma_rank, nvl_rank;
     int64_t num_ranks, num_rdma_ranks, num_nvl_ranks;
@@ -89,6 +97,17 @@ public:
         const torch::Tensor &send_data, const torch::Tensor &recv_data,
         const std::string &relay_manifest, int64_t direct_route,
         const std::vector<int64_t> &path_weights);
+
+    int64_t prepare_ccu_urma_explicit_multipath_plan(
+        const std::string &plan_id, const std::string &relay_manifest,
+        int64_t direct_route, const std::vector<int64_t> &path_weights);
+
+    torch::Tensor ccu_urma_prepared_multipath_alltoall(
+        const torch::Tensor &send_data, int64_t plan_handle);
+
+    torch::Tensor ccu_urma_prepared_multipath_alltoall_out(
+        const torch::Tensor &send_data, const torch::Tensor &recv_data,
+        int64_t plan_handle);
 
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 

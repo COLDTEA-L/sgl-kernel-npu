@@ -86,45 +86,16 @@ export ASCEND_RT_VISIBLE_DEVICES="${src_phy},${dst_phy}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
 unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
-if [[ -z "${hccl_lib_dir}" || ! -f "${hccl_lib_dir}/libhccl.so" ||
-      ! -f "${hccl_lib_dir}/libhccl_compat.so" ]]; then
-    echo "--hccl-lib-dir must name the packaged lib64 directory containing matching patched libhccl.so and libhccl_compat.so" >&2
-    exit 2
-fi
-hccl_so=$(readlink -f "${hccl_lib_dir}/libhccl.so")
-hccl_compat_so=$(readlink -f "${hccl_lib_dir}/libhccl_compat.so")
-export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH:-}"
-marker=$(nm -D "${hccl_so}" 2>/dev/null |
-    grep -c ' A5HcclExplicitMultipathExtensionVersion$' || true)
-(( marker == 1 )) || {
-    echo "patched libhccl.so is missing A5HcclExplicitMultipathExtensionVersion" >&2
-    exit 2
-}
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" python3 -S - "${hccl_so}" <<'PY'
-import ctypes
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1]).resolve()
-lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
-version = lib.A5HcclExplicitMultipathExtensionVersion
-version.restype = ctypes.c_int
-if version() < 2:
-    raise SystemExit(
-        f"stale explicit multipath HCCL extension {version()}, expected >= 2; "
-        "rebuild HCCL from the matching branch"
-    )
-print(f"Verified patched HCCL: {path} (extension={version()})")
-PY
-hccl_preload="${hccl_compat_so}:${hccl_so}"
 if [[ -n "${inherited_ld_preload}" ]]; then
-    echo "Ignoring inherited LD_PRELOAD while running the matrix: ${inherited_ld_preload}" >&2
+    echo "Ignoring inherited LD_PRELOAD: ${inherited_ld_preload}" >&2
 fi
-if [[ -n "${A5_EXPLICIT_EXTRA_LD_PRELOAD:-}" ]]; then
-    hccl_preload="${hccl_preload}:${A5_EXPLICIT_EXTRA_LD_PRELOAD}"
+if [[ -n "${hccl_lib_dir}" ]]; then
+    echo "NOTE: --hccl-lib-dir is no longer used; prepared-plan mode works with the installed stock HCCL." >&2
 fi
 
-if case_selected native0 || case_selected native2; then
+if case_selected native0 || case_selected native2 ||
+   case_selected direct_plus_2relay || case_selected direct_plus_4relay ||
+   case_selected direct_plus_6relay; then
     route_probe_lib=${A5_CCU_ROUTE_PROBE_LIB:-}
     if [[ -z "${route_probe_lib}" ]]; then
         for candidate in \
@@ -138,11 +109,19 @@ if case_selected native0 || case_selected native2; then
         done
     fi
     [[ -f "${route_probe_lib}" ]] || {
-        echo "native0/native2 require liba5_ccu_urma_route_probe.so; install the latest route probe or omit them with --cases" >&2
+        echo "the selected cases require liba5_ccu_urma_route_probe.so; install the latest route probe" >&2
         exit 2
     }
     nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaMultiRouteAllToAll$' || {
         echo "route probe is stale: HcclCcuUrmaMultiRouteAllToAll is missing from ${route_probe_lib}" >&2
+        exit 2
+    }
+    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaExplicitMultipathPlanCreate$' || {
+        echo "route probe is stale: prepared-plan create API is missing from ${route_probe_lib}" >&2
+        exit 2
+    }
+    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaExplicitMultipathPlanExecute$' || {
+        echo "route probe is stale: prepared-plan execute API is missing from ${route_probe_lib}" >&2
         exit 2
     }
     route_probe_lib=$(readlink -f "${route_probe_lib}")
@@ -151,16 +130,20 @@ if case_selected native0 || case_selected native2; then
     echo "Verified route probe: ${route_probe_lib}"
 fi
 
-env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
+env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
 python3 - <<'PY'
 import ctypes
 from pathlib import Path
+import torch
 import deep_ep.deep_ep_cpp as ext
 
 extension_path = Path(ext.__file__).resolve()
 print(f"Verified DeepEP extension: {extension_path}")
 assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
 assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
+assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
+assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
+assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
 try:
     extension = ctypes.CDLL(str(extension_path))
     abi_version = extension.A5DeepEpExplicitMultipathAttrAbiVersion
@@ -171,12 +154,16 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 3:
+if version < 4:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ACLNN ABI {version}, expected >= 3; "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 4; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
-print(f"Verified matrix APIs: explicit + legacy multiroute; attr ABI={version}")
+route = ctypes.CDLL(str(Path(__import__('os').environ['A5_CCU_ROUTE_PROBE_LIB'])))
+route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
+route_abi.restype = ctypes.c_int
+assert route_abi() >= 1
+print(f"Verified matrix APIs: prepared-plan + graph op + legacy multiroute; DeepEP ABI={version}; route ABI={route_abi()}")
 PY
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
@@ -208,7 +195,7 @@ run_case() {
     local pg_init_file="${run_dir}/cases/${name}_r${round}.pgstore"
     rm -f "${pg_init_file}"
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
-      env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
+      env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
         PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
         A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
@@ -239,17 +226,17 @@ for ((round=1; round<=repeats; ++round)); do
     case_selected native2 && run_case native2 "${round}" --implementation multiroute \
         --route-index 2 --path-weights 1 --schedule concurrent
     case_selected direct_plus_2relay && \
-      run_case direct_plus_2relay "${round}" --implementation standard \
+      run_case direct_plus_2relay "${round}" --implementation prepared \
         --plan-id "explicit-2relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
         --path-weights 4,1,1 --schedule concurrent
     case_selected direct_plus_4relay && \
-      run_case direct_plus_4relay "${round}" --implementation standard \
+      run_case direct_plus_4relay "${round}" --implementation prepared \
         --plan-id "explicit-4relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
         --path-weights 8,1,1,1,1 --schedule concurrent
     case_selected direct_plus_6relay && \
-      run_case direct_plus_6relay "${round}" --implementation standard \
+      run_case direct_plus_6relay "${round}" --implementation prepared \
         --plan-id "explicit-6relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \
         --path-weights 12,1,1,1,1,1,1 --schedule concurrent

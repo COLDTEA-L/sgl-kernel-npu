@@ -62,6 +62,36 @@ HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
     const char *relayManifest, uint32_t directRoute,
     const uint32_t *pathWeights, uint32_t pathCount);
 
+/** ABI marker for the prepared-plan API below. */
+int A5CcuUrmaPreparedPlanAbiVersion(void);
+
+/**
+ * Build and register all control-plane resources for one explicit multipath
+ * plan. This call performs CommLink construction, HcclChannelAcquire and CCU
+ * kernel registration. It must run once, outside the captured execution
+ * graph, on the same ACL stream later used by PlanExecute.
+ *
+ * planId is an immutable, process-local controller key. Repeating PlanCreate
+ * with the same communicator, stream, planId and configuration is idempotent.
+ * Reusing the key with a different configuration is rejected.
+ */
+HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
+    HcclComm comm, aclrtStream stream, const char *planId,
+    const char *relayManifest, uint32_t directRoute,
+    const uint32_t *pathWeights, uint32_t pathCount,
+    uint64_t *planHandle);
+
+/**
+ * Execute a previously prepared plan. This data-plane-only entry does not
+ * parse a manifest, enumerate RankGraph links, acquire a Channel or register a
+ * CCU kernel. It only updates buffer tokens/offsets and launches the cached
+ * CCU kernel on the stream to which the plan was bound.
+ */
+HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, HcclComm comm, aclrtStream stream,
+    uint64_t planHandle);
+
 #ifdef __cplusplus
 }
 #endif

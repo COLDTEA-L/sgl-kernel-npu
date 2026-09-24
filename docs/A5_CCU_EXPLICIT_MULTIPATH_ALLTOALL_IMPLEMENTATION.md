@@ -1,341 +1,218 @@
-# A5 标准显式多路径 AllToAll：CommLink、Channel 与 CCU 数据面
+# A5 CCU+URMA 显式多路径 AllToAll：方案 2 实现说明
 
-## 1. 先澄清：当前没有向 RankGraph 新增 `CommLink`
+## 1. 为什么改为两阶段模型
 
-当前实现中，只有 direct 路径来自 RankGraph 的原生 `CommLink`。显式 relay 路径并没有调用
-`HcclRankGraphAddLink`，也没有修改 communicator 的 RankGraph catalog；代码实际做的是：
-
-```text
-RankGraph 原生 direct CommLink
-  -> 转成 direct HcclChannelDesc
-  -> 克隆 direct HcclChannelDesc
-  -> 只替换 local/remote CommAddr 中的 128-bit EID
-  -> 得到 synthetic relay HcclChannelDesc
-  -> HcclChannelAcquire() 按 endpoint pair 匹配已 provision 的底层 path/TP
-```
-
-因此，工程里常说的“合成 CommLink”是便于交流的简称。准确名称应是：
-
-> **由拓扑解析得到 EID pair，并据此合成的 relay `HcclChannelDesc`。**
-
-这也解释了为什么不需要让 relay 卡运行进程：relay 卡只承担 UB/IO Die transit forwarding；通信端仍然是
-源 rank 和目的 rank。
-
-## 2. 完整调用链
+旧标准 Ascend C 方案把路径属性放进 host tiling，再调用 MC2 申请通信资源：
 
 ```text
-用户指定 src/dst/relay cards
-  |
-  | resolve_a5_explicit_multirelay_eids.py
-  |  - 读取 driver topology JSON
-  |  - 读取 device/UDMAC/EID inventory
-  |  - 对每张 relay 拼接 src<->relay 与 relay<->dst 两条物理边
-  |  - 输出源端 EID、目的端 EID、die/port/edge 元数据
-  v
-relay manifest.tsv
-  |
-  | prepare_a5_ccu_explicit_multipath_plans.py
-  |  - 生成 direct+2/direct+4/direct+6 relay plan
-  |  - 生成 direct:relay aggregate = 2:1 的 weights
-  v
-A5_CCU_EXPLICIT_MULTIPATH_{MANIFEST,PLAN_ID,WEIGHTS}
-  |
-  v
-Python Buffer.explicit_multipath_all2all_ccu()
-  -> DeepEP C++ Buffer::explicit_multipath_all2all_ccu()
-  -> aclnnExplicitMultipathAll2AllCcu()
-  -> 标准 Ascend OpDef + tiling
-  -> AIV 控制 kernel: Hccl<CCU>.Alltoall()
-  -> AlltoAllAutoSelector::SelectCcuScheduleAlgo()
-  -> CcuExplicitMultipathAllToAll2Rank
-  -> CcuTempExplicitMultipathAllToAll::CalcRes()
-  -> BuildExplicitChannels()
-       |- direct: CalcChannelRequestMesh1DWithPriorityTopo()
-       |    -> ProcessLinksForChannel()
-       |    -> HcclRankGraphGetLayers()
-       |    -> HcclRankGraphGetLinks()
-       |    -> CommLink.src/dstEndpointDesc -> HcclChannelDesc
-       |
-       `- relay: LoadPlan()
-            -> clone direct HcclChannelDesc
-            -> replace localEndpoint.commAddr.eid
-            -> replace remoteEndpoint.commAddr.eid
-  -> CcuKernelInfo.channels = [direct, relay0, relay1, ...]
-  -> AlgResourceRequest.ccuKernelInfos
-  -> HcclGetChannelForCcu()
-       -> AddExchangeInfo()
-       -> HcclChannelAcquire(desc[], channelNum, handles[])
-       -> handles[] 写入 CcuKernelArg.channels[]
-  -> HcclGetCcuKernel()
-       -> HcommCcuKernelRegisterStart()
-       -> HcommCcuKernelRegister(CcuExplicitMultipathAllToAllKernel)
-       -> HcommCcuKernelRegisterEnd()
-  -> HcommCcuKernelLaunch()
-  -> CCU LocalCopy(self) + 多 Channel Write + EventWait
-  -> UB/IO Die forwarding
-  -> peer GM
+aclnn custom op
+  -> host tiling / Mc2CcTilingConfig
+  -> HcclAllocComResourceByTiling
+  -> libmc2_client.so
+  -> system-private mc2_ops_hccl
 ```
 
-## 3. relay EID pair 如何生成
+实际运行表明系统 `libmc2_client.so` 并不消费本分支修改的开源 HCCL selector，因此在进入显式
+CommLink/Channel 构造前就返回 `HCCL_E_NOT_SUPPORT`。继续修改 `libhccl.so` 无法越过这个边界。
 
-入口脚本为：
+方案 2 保留“标准图节点”这个目标，但把不可图捕获的资源初始化前移：
 
 ```text
-scripts/resolve_a5_explicit_multirelay_eids.py
+control plane (once)                   graph/data plane (every iteration)
+----------------------------------     -----------------------------------
+resolve explicit EID pairs             torch.ops.deep_ep...
+HcclChannelAcquire                     validate opaque plan_handle
+HcclThreadAcquireWithStream            HcclCcuKernelLaunch
+HcclCcuKernelRegister/Finish           CCU WriteNb on prepared Channels
+store resources under plan_handle      return recv tensor
 ```
 
-对每个显式指定的 `relay_phy`，`resolve_relay()` 执行：
+这与 CUDA/NPU 图常见的“图外创建 communicator/handle，图内只执行算子”一致。
 
-1. `directed_links(edges, src_phy, relay_phy, net_layer)` 找源卡到 relay 卡的物理边；
-2. `directed_links(edges, dst_phy, relay_phy, net_layer)` 找目的卡到同一 relay 卡的物理边；
-3. 要求两条边在 relay 侧落到同一个 `relay_die`；
-4. `endpoint_eids(entries, src_phy, src_die, src_port)` 找源卡该端口的本地 EID；
-5. `endpoint_eids(entries, dst_phy, dst_die, dst_port)` 找目的卡该端口的本地 EID；
-6. 输出一行 manifest。
+## 2. 总体调用链
 
-关键点：manifest 中写入的是通信两端的 EID，不是 relay 卡自己的 EID：
+### 2.1 控制面准备
 
 ```text
-src_eid = 源卡上与指定 relay 物理边对应的 endpoint EID
-dst_eid = 目的卡上与指定 relay 物理边对应的 endpoint EID
+Python host/controller
+  Buffer.prepare_ccu_urma_explicit_multipath_plan(...)
+    -> deep_ep_cpp pybind
+      -> dlsym(HcclCcuUrmaExplicitMultipathPlanCreate)
+        -> ParseExplicitPlan
+          -> HcclRankGraphGetLayers/GetLinks（取得 direct candidate）
+          -> 读取 controller 提供的 relay manifest
+          -> 构造有序 HcclChannelDesc 列表
+        -> GetRouteResources
+          -> HcclThreadAcquireWithStream
+          -> HcclChannelAcquire(each path)
+          -> HcclCcuKernelRegister
+          -> HcclCcuKernelRegisterFinish
+        -> PreparedPlanRegistry[(comm, stream, plan_id)]
+        -> uint64 plan_handle
 ```
 
-`relay_phy`、`src_edge`、`dst_edge`、port/die 等字段用于证明和审计“这对 EID 是如何由指定 relay 推导出来的”；
-真正交给 `HcclChannelAcquire` 参与匹配的是两端 `EndpointDesc/CommAddr` 中的 EID。
+relay manifest 中只保存已经由拓扑解析器算出的两端 EID/CommAddr，不写死 `P67/P62` 等端口编号。
 
-当前实现要求每张 relay 解析结果唯一，而且一个 launch 中所有路径在两个端点分别使用一致的 local die。否则脚本或
-HCCL template 会拒绝执行，避免把不兼容的 CCU/IO Die 资源塞进同一个 kernel。
-
-## 4. direct `CommLink` 如何变成 `HcclChannelDesc`
-
-`BuildExplicitChannels()` 首先调用：
-
-```cpp
-CalcChannelRequestMesh1DWithPriorityTopo(
-    comm, param, topoInfo, subCommRanks, base,
-    CommTopo::COMM_TOPO_1DMESH);
-```
-
-其内部 `ProcessLinksForChannel()` 的关键步骤是：
-
-```cpp
-HcclRankGraphGetLayers(comm, &netLayers, &netLayerNum);
-HcclRankGraphGetLinks(comm, netLayer, myRank, peerRank,
-                      &linkList, &listSize);
-```
-
-选择优先拓扑的一个 `CommLink` 后，原生代码执行等价于：
-
-```cpp
-HcclChannelDescInit(&channelDesc, 1);
-channelDesc.remoteRank = peerRank;
-channelDesc.localEndpoint.protocol = link.srcEndpointDesc.protocol;
-channelDesc.localEndpoint.commAddr = link.srcEndpointDesc.commAddr;
-channelDesc.localEndpoint.loc = link.srcEndpointDesc.loc;
-channelDesc.remoteEndpoint.protocol = link.dstEndpointDesc.protocol;
-channelDesc.remoteEndpoint.commAddr = link.dstEndpointDesc.commAddr;
-channelDesc.remoteEndpoint.loc = link.dstEndpointDesc.loc;
-channelDesc.channelProtocol = link.srcEndpointDesc.protocol;
-channelDesc.notifyNum = NORMAL_NOTIFY_NUM;
-```
-
-两卡场景预期只产生一个 direct descriptor，放入：
+### 2.2 图内执行
 
 ```text
-channels[0] = base[0]
+torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall
+  -> PrivateUse1 implementation
+    -> Buffer.ccu_urma_prepared_multipath_alltoall_out
+      -> HcclCcuUrmaExplicitMultipathPlanExecute(plan_handle, ...)
+        -> PreparedPlanRegistry lookup
+        -> LaunchPreparedAllToAll
+          -> 计算每条 path 的 byte range
+          -> HcclCcuKernelLaunch
+            -> CCU kernel
+              -> NotifyWait(start)
+              -> WriteNb(channel_0, direct chunk)
+              -> WriteNb(channel_1, relay chunk)
+              -> ...
+              -> WaitEvent(all writes)
+              -> completion notify
 ```
 
-## 5. relay `HcclChannelDesc` 如何合成
+并发 schedule 的关键是先向所有 Channel 发出 `WriteNb`，最后统一等待；它不是 host 侧依次调用多个完整
+通信算子。
 
-`LoadPlan()` 读取以下环境变量：
+## 3. API
+
+### 3.1 route runtime C ABI
+
+头文件：`examples/a5_ccu_urma_route_probe/inc/a5_ccu_urma_route_probe.h`
+
+```c
+int A5CcuUrmaPreparedPlanAbiVersion(void);
+
+HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
+    HcclComm comm, aclrtStream stream, const char *planId,
+    uint32_t directRoute, const char *relayManifest,
+    const uint32_t *pathWeights, uint32_t pathCount,
+    uint64_t *planHandle);
+
+HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
+    HcclComm comm, aclrtStream stream, uint64_t planHandle,
+    void *send, void *recv, uint64_t bytesPerPeer);
+```
+
+`PlanCreate` 是 host-only 控制面 API；`PlanExecute` 是固定语义的数据面入口。
+
+### 3.2 Python Buffer API
+
+```python
+plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
+    plan_id, direct_route, relay_manifest, path_weights,
+)
+
+buffer.ccu_urma_prepared_multipath_alltoall_out(
+    send, recv, plan_handle,
+)
+```
+
+### 3.3 图算子 API
+
+```python
+recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+    send, recv, plan_handle,
+)
+```
+
+注册 schema：
 
 ```text
-A5_CCU_EXPLICIT_MULTIPATH_MANIFEST
-A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID
-A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS
+ccu_urma_prepared_multipath_alltoall(
+    Tensor send, Tensor(a!) recv, int plan_handle
+) -> Tensor(a!)
 ```
 
-manifest 的最小必需列为：
+实现包含 `PrivateUse1` 与 `Meta` dispatch；编译器能看到一个有固定输入/输出 alias 关系的算子节点。
+`plan_handle` 是不透明整数，图内不解析字符串或文件。
+
+## 4. 路径计划和流量分片
+
+路径顺序固定为：
 
 ```text
-route_id  relay_phy  src_die  dst_die  src_eid  dst_eid
+path 0: HCCL-discovered direct candidate
+path 1..N: controller 显式给出的 relay EID pair
 ```
 
-每条 relay 的构造逻辑是：
+分片采用最大余数法按 `path_weights` 对齐到 256 bytes。为了满足 direct 总量与 relay 总量 `2:1`：
 
-```cpp
-HcclChannelDesc desc = base[0];
+| plan | path weights |
+|---|---|
+| direct + 2 relay | `4,1,1` |
+| direct + 4 relay | `8,1,1,1,1` |
+| direct + 6 relay | `12,1,1,1,1,1,1` |
 
-const uint8_t *local  = rank0 ? srcEid : dstEid;
-const uint8_t *remote = rank0 ? dstEid : srcEid;
+relay 是显式 EID path，不是 UBUS 全局 route override；中转卡不运行 rank 进程，数据在 IO Die/UB 转发，
+不落中转卡 HBM。
 
-copy(local,  local  + 16, desc.localEndpoint.commAddr.eid);
-copy(remote, remote + 16, desc.remoteEndpoint.commAddr.eid);
-channels.push_back(desc);
-```
+## 5. 资源身份和生命周期
 
-所以两个 rank 看到的是互为镜像的 endpoint pair：
+注册表 key 为：
 
 ```text
-rank0: local=src_eid, remote=dst_eid
-rank1: local=dst_eid, remote=src_eid
+(communicator identity, aclrtStream, plan_id)
 ```
 
-当前版本只覆盖 EID。下面这些字段沿用 direct descriptor：
+同一 key、同一 fingerprint 重复 prepare 会返回原 handle；同一 key 但 plan 内容不同会报错，防止控制器
+悄悄改变已捕获图的语义。
 
-- `remoteRank`；
-- endpoint `protocol`；
-- endpoint `loc`；
-- `channelProtocol`；
-- `notifyNum`。
+plan fingerprint 包含 direct candidate、relay manifest 和 weights。当前没有公开销毁接口，因为底层 Channel/
+CCU kernel release 语义仍与 communicator 生命周期绑定；进程退出时统一释放。
 
-`route_id` 和 `relay_phy` 当前是计划标识与日志元数据，不会直接写入硬件 route index。`src_die/dst_die` 当前用于
-同 die 一致性检查，也不会作为 path ID 传下去。真正造成 relay path 区分的是替换后的 EID pair 被
-`HcclChannelAcquire` 消费。
+限制：
 
-## 6. `ChannelAcquire` 与 CCU kernel 注册
+- handle 不能跨进程；每个 torchrun rank 都要各自 prepare；
+- handle 不能跨 stream；换 stream 必须重新 prepare；
+- communicator 被销毁后不能继续 execute；
+- 当前实现只处理两 rank AllToAll；未来多 rank 应把 peer/path matrix 放进 controller plan，而不是扩展图内参数。
 
-template 不直接逐条调用 `HcclChannelAcquire`。它把所有 descriptor 放进：
+## 6. 为什么不需要 patched HCCL 或 MC2 源码
 
-```cpp
-CcuKernelInfo info;
-info.channels = channels;
-resourceRequest.ccuKernelInfos.push_back(info);
-```
+方案 2 直接动态调用已安装 route runtime 中的 prepared APIs。该 runtime 使用系统已经暴露的：
 
-HCCL 通用资源层 `HcclGetChannelForCcu()` 再一次性执行：
+- `HcclRankGraphGetLayers/GetLinks`；
+- `HcclChannelAcquire`；
+- `HcclThreadAcquireWithStream`；
+- `HcclCcuKernelRegister/Finish/Launch`。
 
-```cpp
-AddExchangeInfo(comm, param);
-HcclChannelAcquire(comm, param.engine,
-                   kernelChannelRequest.data(), channelNum,
-                   kernelChannels.data());
-```
+它不要求修改系统 `libmc2_client.so`，也不把新增 selector 接入系统 `mc2_ops_hccl`。HCCL 源码仓仅作为
+编译 route runtime 时的头文件/兼容源码来源，不需要把其 `libhccl.so` 注入运行进程。
 
-成功返回后：
+## 7. 与旧实现的区别
 
-```cpp
-kernelArgBase->channels[i] = kernelChannels[i];
-kernelArgBase->channelCount = channelNum;
-```
-
-随后 `HcclGetCcuKernel()` 通过：
-
-```text
-HcclCommQueryCcuIns
-HcommCcuKernelRegisterStart
-HcommCcuKernelRegister
-HcommCcuKernelRegisterEnd
-```
-
-把 `CcuExplicitMultipathAllToAllKernel` 与上述 Channel handles 绑定到 communicator resource。CCU thread、kernel、
-Channel 的实际句柄由 HCCL 资源上下文缓存；标准算子 replay 不会重复读取 manifest 或重新 Acquire Channel。
-
-## 7. 数据如何分片并并发发送
-
-`KernelRun()` 根据 `weights` 将每个 rank 发给 peer 的数据按 256 Byte 对齐切片。参数排列为：
-
-```text
-[input, output, token,
- selfSrcOffset, selfDstOffset, selfBytes,
- path0SrcOffset, path0DstOffset, path0Bytes,
- path1SrcOffset, path1DstOffset, path1Bytes,
- ...]
-```
-
-`CcuExplicitMultipathAllToAllKernel` 的顺序是：
-
-1. `WriteVariableWithNotify`/`NotifyWait` 交换每条 Channel 的 output address 和 token；
-2. `LocalCopy` 搬运本 rank 的 self slice；
-3. 对 direct 与全部 relay Channel 逐一提交非阻塞 `ccu::Write`；
-4. 所有 `Write` 都提交后，才开始 `EventWait`；
-5. 所有 path completion event 完成后，在 Channel 0 做最终完成握手。
-
-因此并发的因果保证是：
-
-```text
-Write(channel0)
-Write(channel1)
-...
-Write(channelN)
-EventWait(channel0..N)
-```
-
-而不是：
-
-```text
-Write(channel0) -> Wait -> Write(channel1) -> Wait
-```
-
-## 8. selector、图节点与 replay
-
-`AlltoAllAutoSelector::SelectCcuScheduleAlgo()` 检测到 manifest 与 plan ID 后选择：
-
-```text
-CcuExplicitMultipathAllToAll2Rank
-```
-
-executor 注册关系为：
-
-```text
-HCCL_CMD_ALLTOALL
-  -> InsV2AlltoAllVSoleExecutor
-  -> CcuTempExplicitMultipathAllToAll
-```
-
-首次 launch 把 task args、arg count、input/output base offset 存入 `CcuKernelSubmitInfo::cachedArgs`。
-`FastLaunch()` 只替换新 tensor 地址并再次 `HcommCcuKernelLaunch()`，不会重新建 Channel。
-
-## 9. 主要 API 与职责
-
-| API/结构 | 位置 | 职责 |
+| 项目 | 旧 standard/MC2 路径 | 方案 2 prepared 路径 |
 |---|---|---|
-| `HcclRankGraphGetLayers` | HCCL RankGraph | 枚举原生网络层 |
-| `HcclRankGraphGetLinks` | HCCL RankGraph | 取得 direct `CommLink` catalog |
-| `CalcChannelRequestMesh1DWithPriorityTopo` | HCCL channel helper | 选择原生 direct link |
-| `HcclChannelDesc` | HCCL/HCOMM | 描述一对 local/remote endpoint 与协议 |
-| `BuildExplicitChannels` | 本分支 HCCL template | 保留 direct，并用 EID pair 合成 relay descriptors |
-| `HcclChannelAcquire` | HCOMM/HCCL resource | 将 descriptors 匹配/建立成 Channel handles |
-| `CcuKernelInfo.channels` | HCCL resource request | 把 Channel 描述绑定到 CCU kernel 请求 |
-| `HcommCcuKernelRegister` | HCOMM CCU runtime | 注册自定义 CCU kernel 与静态参数 |
-| `HcommCcuKernelLaunch` | HCOMM CCU runtime | 启动首次执行和 replay |
-| `ccu::Write` | CCU 数据面 | 通过指定 Channel 发起 GM 到远端 GM 的搬运 |
+| path plan 入口 | Ascend C attrs/tiling | host controller prepare |
+| Channel 建链 | 期望 MC2 转发到 patched HCCL | route runtime 直接建链 |
+| 热路径建链 | 理论上缓存，但实际未进入 selector | 明确禁止，资源已准备 |
+| 图内文件读取 | 不应有 | 没有 |
+| 图节点 | ACLNN custom op | `torch.ops.deep_ep` PrivateUse1 op |
+| patched HCCL | 需要且仍未解决 MC2 边界 | 不需要 |
+| `libmc2_client` 源码 | 成为 blocker | 不需要 |
 
-## 10. 能证明什么，不能证明什么
+原 Ascend C `ExplicitMultipathAll2AllCcu` 源码保留为实验记录，但性能矩阵的正式显式 case 使用
+`implementation=prepared`，不再使用 `implementation=standard`。
 
-当前实现和既有实验已经证明：
+## 8. 当前验证状态
 
-- 不需要把 synthetic relay 写回 RankGraph，也能把 EID pair 交给 `HcclChannelAcquire` 建成可用 Channel；
-- 只替换目的端 EID 的实验可以使 HCCN footprint 切换到指定 relay 链；
-- 多条显式 relay Channel 可以在同一个 CCU kernel 中提交并取得带宽收益。
+已完成无卡编译/装载级验证：
 
-但仅从 manifest 或 Channel 成功不能证明物理 relay；严格闭环仍需检查对应端口的 HCCN before/after counter。
-另外，当前做法复用 direct descriptor 的 protocol/loc，只覆盖 EID，因此只支持已经由系统 provision、并与该 direct
-descriptor 兼容的 endpoint/path；它不是任意创建新的底层 TP 或修改 UBUS 路由表。
+- route package 编译、安装通过；
+- DeepEP wheel 编译、强制安装通过；
+- DeepEP attr ABI `4`；
+- prepared-plan ABI `1`；
+- plan create/execute 动态符号存在；
+- PyTorch graph op 注册与 Meta dispatch 通过。
+- `torch.compile(..., fullgraph=True)` 的 Meta capture 通过。
 
-## 11. 主要文件
+仍需在有卡环境验证：
 
-DeepEP/算子仓：
-
-- `scripts/resolve_a5_explicit_multirelay_eids.py`
-- `scripts/prepare_a5_ccu_explicit_multipath_plans.py`
-- `csrc/deepep/ops/op_host/explicit_multipath_all2all_ccu_def.cpp`
-- `csrc/deepep/ops/op_host/explicit_multipath_all2all_ccu_tiling.cpp`
-- `csrc/deepep/ops/op_kernel/explicit_multipath_all2_all_ccu.cpp`
-- `csrc/deepep/deep_ep.cpp`
-- `tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py`
-
-HCCL 仓：
-
-- `src/ops/all_to_all_v/selector/alltoall_auto_selector.cc`
-- `src/ops/all_to_all_v/executor/ins_v2_all_to_all_v_sole_executor.cc`
-- `src/ops/all_to_all_v/template/ccu/ccu_temp_explicit_multipath_alltoall.cc`
-- `src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_explicit_multipath_alltoall.cc`
-- `src/ops/op_common/executor/channel/channel.cc`
-- `src/ops/op_common/op_common.cc`
-
-## 12. 多卡与动态控制扩展点
-
-多卡 plan 应升级为 `peerPlans[srcRank][dstRank]`，每项持有 direct、relay `PathSpec`、weights 和 die/thread group。
-host 控制器可在 communicator 创建前生成内存 plan，并让 plan ID 参与 resource cache key。切换路径集合应创建新
-resource/graph，不能修改正在 replay 的 Channel。
+1. 每个 rank prepare 一次并获得 handle；
+2. warmup/iters 中只调用 execute；
+3. 数据正确性；
+4. direct+2/4/6 relay 的性能与 HCCN 物理路径；
+5. 有卡 PrivateUse1 执行下的 graph capture/replay（无卡 Meta capture 已通过）。

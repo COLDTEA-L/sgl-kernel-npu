@@ -548,6 +548,44 @@ class Buffer:
             send_data, recv_data, relay_manifest, direct_route, path_weights
         )
 
+    def prepare_ccu_urma_explicit_multipath_plan(
+        self,
+        plan_id: str,
+        relay_manifest: str,
+        direct_route: int,
+        path_weights: list[int],
+    ) -> int:
+        """Prepare explicit CCU+URMA path resources outside graph execution.
+
+        The plan is bound to the current HCCL communicator and current NPU
+        stream.  It acquires all direct/relay Channels and registers the CCU
+        kernel exactly once. Reusing ``plan_id`` with the same configuration is
+        idempotent; changing its path set requires a new id.
+        """
+        return self.runtime.prepare_ccu_urma_explicit_multipath_plan(
+            plan_id, relay_manifest, direct_route, path_weights
+        )
+
+    def ccu_urma_prepared_multipath_alltoall(
+        self, send_data: torch.Tensor, plan_handle: int
+    ) -> torch.Tensor:
+        """Launch a prepared plan without rebuilding communication resources."""
+        recv_data = torch.empty_like(send_data)
+        return self.ccu_urma_prepared_multipath_alltoall_out(
+            send_data, recv_data, plan_handle
+        )
+
+    def ccu_urma_prepared_multipath_alltoall_out(
+        self,
+        send_data: torch.Tensor,
+        recv_data: torch.Tensor,
+        plan_handle: int,
+    ) -> torch.Tensor:
+        """Graph-visible out variant backed by a prebuilt CCU resource plan."""
+        return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+            send_data, recv_data, int(plan_handle)
+        )
+
     def all2_all_detour_io_die(
         self, send_data: torch.Tensor, comm_rank_ids: torch.Tensor
     ) -> torch.Tensor:

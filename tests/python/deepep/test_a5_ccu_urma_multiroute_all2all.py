@@ -101,7 +101,7 @@ def prepare_runtime(require_route_library=True):
 
 def requested_implementation():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard", "prepared"),
                         default="multiroute")
     return parser.parse_known_args()[0].implementation
 
@@ -126,7 +126,7 @@ if IMPLEMENTATION != "native":
     mark_phase("import_deep_ep")
     import deep_ep
     mark_phase("import_deep_ep_done")
-    if IMPLEMENTATION == "standard":
+    if IMPLEMENTATION in ("standard", "prepared"):
         extension = ctypes.CDLL(str(EXTENSION))
         try:
             attr_abi = extension.A5DeepEpExplicitMultipathAttrAbiVersion
@@ -136,12 +136,26 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        if version < 3:
+        required_version = 4 if IMPLEMENTATION == "prepared" else 3
+        if version < required_version:
             raise RuntimeError(
-                f"worker loaded DeepEP attr ABI {version}, expected >= 3: {EXTENSION}"
+                f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
             )
         print(f"CASE_DEEP_EP_ABI rank={os.environ.get('RANK', 'NA')} "
               f"version={version} extension={EXTENSION}", flush=True)
+        if IMPLEMENTATION == "prepared":
+            route_extension = ctypes.CDLL(str(ROUTE_LIB))
+            try:
+                plan_abi = route_extension.A5CcuUrmaPreparedPlanAbiVersion
+            except AttributeError as error:
+                raise RuntimeError(
+                    f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
+                ) from error
+            plan_abi.restype = ctypes.c_int
+            if plan_abi() < 1:
+                raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
+            print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
+                  f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
 
 
 def file_barrier(directory, tag, rank, world_size, timeout=180):
@@ -188,7 +202,7 @@ def make_profiler(output_dir, rank):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard"),
+    parser.add_argument("--implementation", choices=("native", "multiroute", "explicit", "standard", "prepared"),
                         default="multiroute")
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
@@ -221,7 +235,7 @@ def parse_args():
         parser.error("invalid warmup/iters/profile-iters")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
-    if args.implementation in ("explicit", "standard"):
+    if args.implementation in ("explicit", "standard", "prepared"):
         if not args.relay_manifest:
             parser.error(f"--implementation {args.implementation} requires --relay-manifest")
         if args.schedule != "concurrent":
@@ -275,7 +289,7 @@ def main():
     args = parse_args()
     if args.implementation == "multiroute":
         select_routes(args)
-    elif args.implementation in ("explicit", "standard"):
+    elif args.implementation in ("explicit", "standard", "prepared"):
         os.environ.pop("A5_CCU_ROUTE_SCHEDULE", None)
         for name in ("A5_CCU_SYNTHETIC_ROUTE_MANIFEST", "A5_CCU_PATH_UIDS",
                      "A5_CCU_ROUTE_INDICES", "A5_CCU_ROUTE_INDEX",
@@ -328,6 +342,18 @@ def main():
     if relay_manifest and not Path(relay_manifest).is_file():
         raise RuntimeError(f"relay manifest not found: {relay_manifest}")
 
+    plan_handle = 0
+    if args.implementation == "prepared":
+        mark_phase("prepare_explicit_multipath_plan")
+        plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
+            args.plan_id, relay_manifest, args.direct_route, explicit_weights
+        )
+        if plan_handle <= 0:
+            raise RuntimeError(f"invalid prepared plan handle: {plan_handle}")
+        print(f"CASE_PREPARED_PLAN rank={rank} plan_id={args.plan_id} "
+              f"plan_handle={plan_handle} paths={len(explicit_weights)}", flush=True)
+        mark_phase("prepare_explicit_multipath_plan_done")
+
     elements = args.bytes // 4
     send = torch.stack([
         torch.full((elements,), float(rank * 100 + dst + 1),
@@ -349,6 +375,10 @@ def main():
             recv = buffer.explicit_multipath_all2all_ccu(
                 send, args.plan_id, explicit_weights
             )
+        elif args.implementation == "prepared":
+            buffer.ccu_urma_prepared_multipath_alltoall_out(
+                send, recv, plan_handle
+            )
         elif args.implementation == "explicit":
             buffer.ccu_urma_explicit_multipath_alltoall_out(
                 send, recv, relay_manifest, args.direct_route, explicit_weights
@@ -362,7 +392,7 @@ def main():
     case_tag = sanitize(
         "native" if args.implementation == "native" else
         (f"{args.implementation}_direct{args.direct_route}_{len(explicit_weights) - 1}relay_{args.schedule}"
-         if args.implementation in ("explicit", "standard") else
+         if args.implementation in ("explicit", "standard", "prepared") else
          f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
@@ -406,7 +436,7 @@ def main():
         result = {
             "implementation": args.implementation,
             "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
-                      if args.implementation in ("explicit", "standard") else
+                      if args.implementation in ("explicit", "standard", "prepared") else
                       (args.path_uids or args.route_indices or str(args.route_index)
                        if args.implementation == "multiroute" else "native")),
             "weights": args.path_weights or "1",
