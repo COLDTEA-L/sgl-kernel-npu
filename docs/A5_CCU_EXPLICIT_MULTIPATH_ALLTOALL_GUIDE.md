@@ -122,6 +122,19 @@ git restore --source=HEAD --worktree -- \
   examples/a5_ccu_urma_route_probe
 ```
 
+不要逐个文件恢复后立即重试构建。例如顶层 `CMakeLists.txt` 修好后又在
+`op_kernel_ccu/CMakeLists.txt:1` 报乱码，就已经证明目录中存在多个损坏文件，应执行上面的整目录恢复。
+当前构建脚本会在调用 CMake 前扫描该目录的全部源文件，并一次列出所有非文本文件。
+
+另外，root shell 可能配置了 `alias cp='cp -i'`；此时 `cp -f` 仍可能进入交互询问，并没有真正覆盖目标。
+首选 `git restore`。必须从已验证的 Git blob 手工恢复时，应明确调用 `/bin/cp`：
+
+```bash
+git show "HEAD:${REL}" > /tmp/CMakeLists.txt.good
+file /tmp/CMakeLists.txt.good
+/bin/cp -f /tmp/CMakeLists.txt.good "${REL}"
+```
+
 恢复后重新执行本节开头的构建命令。如果 `git restore` 后 `file CMakeLists.txt` 仍显示 `data`，停止
 构建并保留上述 blob、`git status` 和 `git check-attr -a -- "${REL}"` 输出；这表明文件系统或检出过滤
 策略仍在改写工作文件，不能再通过普通复制或 hard-link 绕过。

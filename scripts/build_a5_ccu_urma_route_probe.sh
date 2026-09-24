@@ -84,6 +84,34 @@ project_cmake="${project_dir}/CMakeLists.txt"
     echo "Missing custom-op CMakeLists.txt: ${project_cmake}" >&2
     exit 1
 }
+
+if ! python3 - "${project_dir}" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+text_names = {"CMakeLists.txt", "Makefile"}
+text_suffixes = {".cmake", ".cc", ".cpp", ".h", ".hpp", ".md"}
+bad = []
+for path in sorted(root.rglob("*")):
+    if not path.is_file():
+        continue
+    if path.name not in text_names and path.suffix not in text_suffixes:
+        continue
+    try:
+        path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        bad.append((path, exc))
+
+for path, exc in bad:
+    print(f"Custom-op source is not readable UTF-8 text: {path}: {exc}", file=sys.stderr)
+raise SystemExit(1 if bad else 0)
+PY
+then
+    echo "Restore the complete examples/a5_ccu_urma_route_probe directory from Git before building." >&2
+    exit 1
+fi
+
 first_byte=$(LC_ALL=C head -c 1 "${project_cmake}" || true)
 if [[ "${first_byte}" != "#" && "${first_byte}" != "c" ]]; then
     echo "Custom-op CMakeLists.txt is not readable text: ${project_cmake}" >&2
