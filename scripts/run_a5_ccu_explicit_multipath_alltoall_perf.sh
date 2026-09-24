@@ -204,6 +204,7 @@ run_case() {
     local log="${run_dir}/cases/${name}_r${round}.log" status=0 result=FAIL
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
       env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
+        PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
         "${test_script}" --bytes "${bytes}" --warmup "${warmup}" \
         --iters "${iterations}" "${profile_args[@]}" "$@" \
@@ -217,6 +218,9 @@ run_case() {
         grep -nEi \
           'CASE_FAILURE|traceback|runtimeerror|importerror|attributeerror|undefined symbol|dlopen|not found|failed|error' \
           "${log}" | head -80 >&2 || true
+        echo "===== ${name}_r${round} phase trace =====" >&2
+        grep -nE 'CASE_PHASE|Timeout \(|Current thread|Thread 0x|File "' \
+          "${log}" | tail -120 >&2 || true
         echo "===== ${name}_r${round} log tail =====" >&2
         tail -n 80 "${log}" >&2 || true
     fi

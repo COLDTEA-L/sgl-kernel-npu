@@ -761,6 +761,48 @@ grep -RHnE \
 标准算子不再报 `path_weights`/tiling 解析错误。日志里的 `LD_PRELOAD detected` 本身不是故障，因为矩阵脚本需要
 预加载本次配套的 `libhccl_compat.so:libhccl.so`；脚本已忽略交互 shell 中继承的其他 preload。
 
+### 6.3 `status=137` 且没有进入算子时的定位
+
+如果脚本最后显示：
+
+```text
+Killed timeout ...
+direct_plus_2relay_r1: FAIL (status=137)
+```
+
+先按时间戳判断。若 `torchrun` 在启动约 `--timeout-seconds` 后收到 signal 15，随后五秒被杀，137 表示外层
+`timeout` 的 TERM/KILL 流程，不等同于 OOM。若日志中还没有 `CASE_PHASE ... phase=parse_args`，说明尚未执行
+测试主函数；此时不要分析 tiling、Channel 或 CCU kernel。
+
+当前测试程序会在 runtime re-exec，以及 `torch`、`torch.distributed`、`torch_npu`、`deep_ep` 的每个导入边界输出
+`CASE_PHASE`。性能脚本还会设置 60 秒 watchdog；某一步长时间没有返回时，日志会自动写出所有 Python 线程栈。
+查看最近一次失败停在哪一步：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
+LOG="${RUN_DIR}/cases/direct_plus_2relay_r1.log"
+
+grep -nE 'CASE_PHASE|Timeout \(|Current thread|Thread 0x|File "' "${LOG}" | tail -160
+tail -n 160 "${LOG}"
+```
+
+判读方法：
+
+| 最后一条 phase | 阻塞范围 |
+|---|---|
+| `prepare_runtime` | 本地扩展搜索、vendor 环境设置或 re-exec |
+| `import_torch` | PyTorch 动态库装载 |
+| `import_torch_npu` | `torch_npu`/CANN 运行库装载或设备探测 |
+| `import_deep_ep` | 已安装 DeepEP 扩展及自定义算子动态库装载 |
+| `init_process_group` | HCCL communicator 初始化 |
+| `deep_ep_buffer_init` | DeepEP Buffer/HCOMM 初始化 |
+| `warmup` | 才进入标准算子、tiling、Channel 和 CCU 数据面 |
+
+`can not use command: npu-smi info` 单独出现不能作为算子错误；必须与最后一条 phase 和 watchdog 栈一起判断。
+首次冷启动若能够持续推进 phase、只是总耗时超过 300 秒，可临时使用 `--timeout-seconds 900`；如果同一 phase
+连续输出相同 watchdog 栈，则是阻塞，不应只延长超时。
+
 ## 7. MindStudio profiling
 
 在第 6 节命令末尾增加：

@@ -3,6 +3,7 @@
 
 import argparse
 import ctypes
+import faulthandler
 import json
 import os
 import re
@@ -18,7 +19,24 @@ CURRENT_PHASE = "module_import"
 def mark_phase(name):
     global CURRENT_PHASE
     CURRENT_PHASE = name
-    print(f"CASE_PHASE rank={os.environ.get('RANK', 'NA')} phase={name}", flush=True)
+    print(
+        f"CASE_PHASE pid={os.getpid()} rank={os.environ.get('RANK', 'NA')} phase={name}",
+        flush=True,
+    )
+
+
+def start_phase_watchdog():
+    text = os.environ.get("A5_CCU_PHASE_WATCHDOG_SECONDS", "0")
+    try:
+        seconds = int(text)
+    except ValueError as error:
+        raise RuntimeError(f"invalid A5_CCU_PHASE_WATCHDOG_SECONDS={text!r}") from error
+    faulthandler.enable(all_threads=True)
+    if seconds > 0:
+        faulthandler.dump_traceback_later(seconds, repeat=True)
+
+
+start_phase_watchdog()
 
 
 def sanitize(value):
@@ -85,17 +103,26 @@ def requested_implementation():
     return parser.parse_known_args()[0].implementation
 
 
+mark_phase("requested_implementation")
 IMPLEMENTATION = requested_implementation()
 EXTENSION = None
 ROUTE_LIB = None
 if IMPLEMENTATION != "native":
+    mark_phase("prepare_runtime")
     EXTENSION, ROUTE_LIB = prepare_runtime(IMPLEMENTATION != "standard")
+    mark_phase(f"prepare_runtime_done_extension_{sanitize(EXTENSION)}")
 
+mark_phase("import_torch")
 import torch
+mark_phase("import_torch_distributed")
 import torch.distributed as dist
+mark_phase("import_torch_npu")
 import torch_npu
+mark_phase("import_torch_npu_done")
 if IMPLEMENTATION != "native":
+    mark_phase("import_deep_ep")
     import deep_ep
+    mark_phase("import_deep_ep_done")
 
 
 def file_barrier(directory, tag, rank, world_size, timeout=180):
@@ -367,6 +394,7 @@ def main():
     file_barrier(sync_dir, "reported", rank, world_size)
     mark_phase("destroy_process_group")
     dist.destroy_process_group()
+    faulthandler.cancel_dump_traceback_later()
     mark_phase("complete")
 
 
