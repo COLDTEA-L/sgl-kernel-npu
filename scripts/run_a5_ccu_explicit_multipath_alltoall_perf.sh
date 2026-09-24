@@ -202,13 +202,17 @@ run_case() {
     local name=$1 round=$2
     shift 2
     local log="${run_dir}/cases/${name}_r${round}.log" status=0 result=FAIL
+    local pg_init_file="${run_dir}/cases/${name}_r${round}.pgstore"
+    rm -f "${pg_init_file}"
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
       env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
         PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
+        A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
         "${test_script}" --bytes "${bytes}" --warmup "${warmup}" \
         --iters "${iterations}" "${profile_args[@]}" "$@" \
         >"${log}" 2>&1 || status=$?
+    rm -f "${pg_init_file}"
     grep -q '^PASS:' "${log}" && result=PASS
     printf '%s\t%s\t%s\t%s\n' "${name}" "${round}" "${status}" "${result}" \
         >>"${run_dir}/case_status.tsv"

@@ -50,8 +50,11 @@ def prepend_env_path(name, path):
 
 def prepare_runtime(require_route_library=True):
     root = Path(__file__).resolve().parents[3]
-    packages = [root / "python" / "deep_ep" / "deep_ep"]
-    packages.extend(Path(path) / "deep_ep" for path in site.getsitepackages())
+    # Prefer the force-installed wheel that the launcher validated.  Keep the
+    # source-tree extension only as a development fallback; choosing it first
+    # can silently mix a stale local .so with a new installed operator package.
+    packages = [Path(path) / "deep_ep" for path in site.getsitepackages()]
+    packages.append(root / "python" / "deep_ep" / "deep_ep")
     candidates = []
     if os.environ.get("A5_CCU_ROUTE_PROBE_LIB"):
         candidates.append(Path(os.environ["A5_CCU_ROUTE_PROBE_LIB"]))
@@ -123,6 +126,22 @@ if IMPLEMENTATION != "native":
     mark_phase("import_deep_ep")
     import deep_ep
     mark_phase("import_deep_ep_done")
+    if IMPLEMENTATION == "standard":
+        extension = ctypes.CDLL(str(EXTENSION))
+        try:
+            attr_abi = extension.A5DeepEpExplicitMultipathAttrAbiVersion
+        except AttributeError as error:
+            raise RuntimeError(
+                f"worker loaded stale DeepEP extension without attr ABI marker: {EXTENSION}"
+            ) from error
+        attr_abi.restype = ctypes.c_int
+        version = attr_abi()
+        if version < 2:
+            raise RuntimeError(
+                f"worker loaded DeepEP attr ABI {version}, expected >= 2: {EXTENSION}"
+            )
+        print(f"CASE_DEEP_EP_ABI rank={os.environ.get('RANK', 'NA')} "
+              f"version={version} extension={EXTENSION}", flush=True)
 
 
 def file_barrier(directory, tag, rank, world_size, timeout=180):
@@ -280,7 +299,23 @@ def main():
     mark_phase("set_device")
     torch.npu.set_device(local_rank)
     mark_phase("init_process_group")
-    dist.init_process_group("hccl")
+    pg_init_file = os.environ.get("A5_CCU_PG_INIT_FILE", "")
+    if pg_init_file:
+        pg_init_path = Path(pg_init_file).resolve()
+        pg_init_path.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"CASE_PG_INIT rank={rank} method=file path={pg_init_path}",
+            flush=True,
+        )
+        dist.init_process_group(
+            "hccl",
+            init_method=f"file://{pg_init_path}",
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        print(f"CASE_PG_INIT rank={rank} method=env", flush=True)
+        dist.init_process_group("hccl")
     mark_phase("init_process_group_done")
     buffer = None
     if args.implementation != "native":

@@ -803,6 +803,35 @@ tail -n 160 "${LOG}"
 首次冷启动若能够持续推进 phase、只是总耗时超过 300 秒，可临时使用 `--timeout-seconds 900`；如果同一 phase
 连续输出相同 watchdog 栈，则是阻塞，不应只延长超时。
 
+若两个 rank 的 watchdog 栈都停在：
+
+```text
+torch.distributed.rendezvous._create_c10d_store
+  -> torch.distributed.init_process_group
+```
+
+说明 `torchrun` 已经成功创建 worker，但 worker 使用 env rendezvous 建默认进程组时卡在 TCPStore，尚未进入 HCCL
+communicator。性能脚本现在为每个 case 创建独立的 `A5_CCU_PG_INIT_FILE`，测试程序据此使用 PyTorch FileStore：
+
+```text
+CASE_PG_INIT rank=0 method=file path=.../direct_plus_2relay_r1.pgstore
+CASE_PG_INIT rank=1 method=file path=.../direct_plus_2relay_r1.pgstore
+```
+
+它只替换 PyTorch 默认进程组的 rendezvous store，不改变 HCCL backend、通信域内 rank、显式 CommLink 计划或 CCU
+数据面。case 结束后临时 store 文件由外层脚本删除。
+
+本次 phase trace 还应核对 worker 的扩展路径。launcher 预检和 worker 必须都指向已安装的 `site-packages` wheel；
+测试程序现在优先选择该路径，并再次输出：
+
+```text
+CASE_DEEP_EP_ABI rank=0 version=2 extension=.../site-packages/deep_ep/deep_ep_cpp....so
+CASE_DEEP_EP_ABI rank=1 version=2 extension=.../site-packages/deep_ep/deep_ep_cpp....so
+```
+
+源码树 `python/deep_ep/deep_ep/deep_ep_cpp*.so` 只作为未安装 wheel 时的开发回退，不能在正式矩阵中静默覆盖已经
+校验过的安装产物。
+
 ## 7. MindStudio profiling
 
 在第 6 节命令末尾增加：
