@@ -48,6 +48,26 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
+脚本必须同时满足两个约束：HCCL 的 `add_subdirectory` 要求 custom-op 目录位于 HCCL 仓内；部分有卡
+环境又会在跨工作区复制文件时令目标侧读到密文。为此脚本会在 HCCL 仓内建立临时**硬链接目录**，
+不会复制源码字节。正常日志应包含：
+
+```text
+Custom ops source : /home/l00934901/sgl-kernel-npu/examples/a5_ccu_urma_route_probe
+Hard-link staging : /home/l00934901/hccl/.a5_ccu_urma_route_probe.*
+```
+
+若环境不允许硬链接或两个仓不在同一文件系统，脚本会在进入 CMake 前明确失败；不要退回 `cp -a`。
+若仍看到 `CMakeLists.txt:1 Parse error` 和乱码，先确认拉到了包含硬链接修复的最新提交，再检查：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git status --short
+grep -n 'cp -al' scripts/build_a5_ccu_urma_route_probe.sh
+head -n 3 examples/a5_ccu_urma_route_probe/CMakeLists.txt
+stat -c '%d %i %n' examples/a5_ccu_urma_route_probe/CMakeLists.txt
+```
+
 确认 prepared-plan ABI：
 
 ```bash

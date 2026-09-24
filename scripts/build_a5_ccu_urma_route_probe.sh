@@ -40,6 +40,7 @@ echo "HCCL repo : ${hccl_repo}"
 echo "Probe src : ${project_dir}"
 
 temporary_cann_cmake_link=""
+bridge_path=""
 cann_cmake_dir="${hccl_repo}/third_party/cann-cmake"
 if [[ ! -f "${cann_cmake_dir}/function/prepare.cmake" ]]; then
     for cached_cann_cmake in \
@@ -61,17 +62,61 @@ if [[ ! -f "${cann_cmake_dir}/function/prepare.cmake" ]]; then
     done
 fi
 
-bridge_path=$(mktemp -d "${hccl_repo}/.a5_ccu_urma_route_probe.XXXXXX")
 cleanup()
 {
-    rm -rf -- "${bridge_path}"
+    if [[ -n "${bridge_path}" && -d "${bridge_path}" ]]; then
+        rm -rf -- "${bridge_path}"
+    fi
     if [[ -n "${temporary_cann_cmake_link}" && -L "${temporary_cann_cmake_link}" ]]; then
         rm -f -- "${temporary_cann_cmake_link}"
     fi
 }
 trap cleanup EXIT
-cp -a "${project_dir}/." "${bridge_path}/"
+
+# Some secured server images apply different transparent-encryption policies to
+# the HCCL and sgl-kernel-npu workspaces.  Copying text sources into a temporary
+# directory below HCCL can therefore expose ciphertext to cmake.  HCCL invokes
+# add_subdirectory(CUSTOM_OPS_PATH) without a binary directory, so the custom-op
+# tree must still appear below HCCL.  Make an in-tree hard-link farm: no source
+# bytes are copied, while CMake still sees an ordinary in-tree directory.
+project_cmake="${project_dir}/CMakeLists.txt"
+[[ -s "${project_cmake}" ]] || {
+    echo "Missing custom-op CMakeLists.txt: ${project_cmake}" >&2
+    exit 1
+}
+first_byte=$(LC_ALL=C head -c 1 "${project_cmake}" || true)
+if [[ "${first_byte}" != "#" && "${first_byte}" != "c" ]]; then
+    echo "Custom-op CMakeLists.txt is not readable text: ${project_cmake}" >&2
+    file "${project_cmake}" >&2 || true
+    od -An -tx1 -N32 "${project_cmake}" >&2 || true
+    exit 1
+fi
+bridge_path=$(mktemp -d "${hccl_repo}/.a5_ccu_urma_route_probe.XXXXXX")
+if ! cp -al "${project_dir}/." "${bridge_path}/"; then
+    echo "Failed to hard-link the custom-op tree into ${hccl_repo}." >&2
+    echo "The HCCL and sgl-kernel-npu repositories must be on the same filesystem." >&2
+    exit 1
+fi
+
+bridge_cmake="${bridge_path}/CMakeLists.txt"
+if ! cmp -s "${project_cmake}" "${bridge_cmake}"; then
+    echo "Custom-op staging changed CMakeLists.txt contents: ${bridge_cmake}" >&2
+    file "${project_cmake}" "${bridge_cmake}" >&2 || true
+    od -An -tx1 -N32 "${project_cmake}" >&2 || true
+    od -An -tx1 -N32 "${bridge_cmake}" >&2 || true
+    exit 1
+fi
+
+source_inode=$(stat -c '%d:%i' "${project_cmake}")
+bridge_inode=$(stat -c '%d:%i' "${bridge_cmake}")
+if [[ "${source_inode}" != "${bridge_inode}" ]]; then
+    echo "Custom-op staging is not a hard link: source=${source_inode} staged=${bridge_inode}" >&2
+    exit 1
+fi
+
 bridge_relative=${bridge_path#"${hccl_repo}/"}
+echo "Custom ops source : ${project_dir}"
+echo "Hard-link staging : ${bridge_path}"
 
 cd "${hccl_repo}"
 bash build.sh \
