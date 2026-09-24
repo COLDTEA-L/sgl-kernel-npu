@@ -68,6 +68,64 @@ head -n 3 examples/a5_ccu_urma_route_probe/CMakeLists.txt
 stat -c '%d %i %n' examples/a5_ccu_urma_route_probe/CMakeLists.txt
 ```
 
+### 3.1 源 CMakeLists.txt 已显示为 data
+
+若脚本在创建 hard-link staging 之前报告：
+
+```text
+Custom-op CMakeLists.txt is not readable text: .../CMakeLists.txt
+.../CMakeLists.txt: data
+```
+
+说明损坏的是 `sgl-kernel-npu` 工作区中的源文件，不是本次 staging，也不是 CCU 编译错误。先比较当前
+工作树内容和当前提交中的 Git blob：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+
+REL=examples/a5_ccu_urma_route_probe/CMakeLists.txt
+
+echo "expected blob: $(git rev-parse HEAD:${REL})"
+echo "working blob : $(git hash-object "${REL}")"
+git status --short -- "${REL}"
+
+# 该输出应该是以 # 开头的 CMake 文本。
+git show "HEAD:${REL}" | head -n 5
+```
+
+只有确认 Git blob 是正常文本、工作文件确实损坏后，才恢复这个文件：
+
+```bash
+git restore --source=HEAD --worktree -- "${REL}"
+
+file "${REL}"
+head -n 5 "${REL}"
+test "$(LC_ALL=C head -c 1 "${REL}")" = "#"
+```
+
+继续校验整个 route-probe 目录。命令无输出表示所有已跟踪文件均与当前提交一致：
+
+```bash
+while IFS= read -r f; do
+  expected=$(git rev-parse "HEAD:${f}")
+  actual=$(git hash-object "${f}")
+  if [[ "${expected}" != "${actual}" ]]; then
+    echo "MISMATCH ${f}"
+  fi
+done < <(git ls-files examples/a5_ccu_urma_route_probe)
+```
+
+如果有多个 `MISMATCH`，并且确认该目录没有需要保留的本地修改，可以只恢复这个 probe 目录：
+
+```bash
+git restore --source=HEAD --worktree -- \
+  examples/a5_ccu_urma_route_probe
+```
+
+恢复后重新执行本节开头的构建命令。如果 `git restore` 后 `file CMakeLists.txt` 仍显示 `data`，停止
+构建并保留上述 blob、`git status` 和 `git check-attr -a -- "${REL}"` 输出；这表明文件系统或检出过滤
+策略仍在改写工作文件，不能再通过普通复制或 hard-link 绕过。
+
 确认 prepared-plan ABI：
 
 ```bash
