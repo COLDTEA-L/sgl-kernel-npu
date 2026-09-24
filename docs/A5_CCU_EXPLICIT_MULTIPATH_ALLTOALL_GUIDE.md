@@ -829,7 +829,7 @@ CASE_DEEP_EP_ABI rank=0 version=3 extension=.../site-packages/deep_ep/deep_ep_cp
 CASE_DEEP_EP_ABI rank=1 version=3 extension=.../site-packages/deep_ep/deep_ep_cpp....so
 ```
 
-### 6.4 `HcclAllocComResourceByTiling ret=5`：A5 MC2 资源类型不受支持
+### 6.4 `HcclAllocComResourceByTiling ret=5`：定位 A5 MC2 资源入口
 
 如果两个 rank 都已经输出：
 
@@ -848,8 +848,8 @@ Nnopbase fails to invoke HcclAllocComResourceByTiling ... ret = 5
 则 FileStore、communicator 和 DeepEP 初始化均已通过。`ret=5` 对应 `HCCL_E_NOT_SUPPORT`，失败点是 ACLNN/MC2
 根据 host tiling 中的通信命令分配 HCCL 资源，尚未进入显式 Channel 建链或 CCU 搬运。
 
-原生 A5 CCU MoE host tiling 明确只用 `HCCL_CMD_HALFALLTOALLV`；在该 MC2 入口提交
-`HCCL_CMD_ALLTOALL` 会被资源分配层拒绝。本分支的配套修复为：
+原生 A5 CCU MoE host tiling 明确只用 `HCCL_CMD_HALFALLTOALLV`。因此本分支先完成以下对齐，但它们只是进入
+标准 A5 MC2 资源入口的必要条件，不能单独证明私有资源分配层已使用定制 selector：
 
 1. 标准算子的 `Mc2CcTilingConfig` 使用 `HCCL_CMD_HALFALLTOALLV` 申请 A5 支持的 CCU 资源；
 2. HCCL 在 MC2 + 显式 plan 环境下，将该资源命令选择到
@@ -944,6 +944,81 @@ done
 若符号只存在于系统 HCOMM/CANN 运行库，而定制 `libhccl.so` 不导出它，同时第一组也没有定制 selector 日志，则
 ACLNN 的 MC2 资源入口并未使用本分支修改的 selector。下一步应在实际符号提供者到 HCCL 算法库之间的装载/转发边界
 接入显式 path plan；此时继续修改 host tiling 的 opType 不会解决问题。
+
+#### 6.4.2 已确认的系统 MC2 调用边界与下一步黑箱
+
+在 T560 有卡环境中已经观察到：
+
+- 定制 HCCL extension 为 `2`，安装的 DeepEP attr ABI 为 `3`；新二进制确实已加载；
+- worker plog 只有 NNOP 调用 `HcclAllocComResourceByTiling` 返回 `5`，没有
+  `CcuExplicitMultipathAllToAll2Rank`、定制 selector 或 executor 日志；
+- `HcclAllocComResourceByTiling`/V2/A5Mc2 的动态符号由系统 CANN 库提供，而非定制 `libhccl.so`：
+
+```text
+libmc2_client.so   : HcclAllocComResourceByTiling
+                     HcclAllocComResourceByTilingA5Mc2
+libhcomm.so        : HcclAllocComResourceByTiling
+libhccl_fwk.so     : HcclAllocComResourceByTiling
+libhccl_v2.so      : HcclAllocComResourceByTilingV2
+libnnopbase.so     : DoHcclAllocComResourceByTiling
+```
+
+因此当前已知的实际入口链应按下面的边界继续定位：
+
+```text
+ACLNN / Nnopbase
+  -> libmc2_client.so
+  -> HcclAllocComResourceByTilingA5Mc2
+  -> libhcomm.so / libhccl_fwk.so / libhccl_v2.so
+  -> MC2 resource allocator
+  -> （尚未观察到进入）定制 libhccl.so selector/template
+```
+
+这不表示显式 CommLink 构造错误；失败发生在其之前。下一步只追 `libmc2_client` 到 HCOMM/HCCL 算法库的分发、装载与
+注册边界。先保存依赖、符号和 A5 allocator 反汇编：
+
+```bash
+MC2=/usr/local/Ascend/cann-9.1.T560/lib64/libmc2_client.so
+HCOMM=/usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so
+HCCL_V2=/usr/local/Ascend/cann-9.1.T560/lib64/libhccl_v2.so
+
+echo "===== dependencies ====="
+ldd "${MC2}"
+readelf -d "${MC2}" | grep NEEDED
+
+echo "===== MC2 exported/imported symbols ====="
+objdump -T "${MC2}" | \
+  grep -E 'HcclAllocComResourceByTiling|Hccl.*Resource|dlopen|dlsym'
+
+echo "===== A5 MC2 allocator disassembly ====="
+objdump -d -C \
+  --disassemble=HcclAllocComResourceByTilingA5Mc2 \
+  "${MC2}" \
+  > /home/l00934901/profiling/HcclAllocComResourceByTilingA5Mc2.asm
+
+sed -n '1,260p' \
+  /home/l00934901/profiling/HcclAllocComResourceByTilingA5Mc2.asm
+
+echo "===== runtime plugin names ====="
+strings "${MC2}" "${HCOMM}" "${HCCL_V2}" | \
+  grep -Ei 'libhccl|libhcomm|selector|executor|half.*all.*to.*all|ccu' | \
+  sort -u | head -300
+```
+
+同时扩大日志搜索范围，避免定制算法日志写入 HCCL/HCOMM 专用目录而不在 worker plog：
+
+```bash
+grep -RHniE \
+  'ExplicitMultipath|CcuExplicitMultipath|CCU selector|optype\[20\]|Fail to find executor|HcclAllocAlgResourceCcu|HcclGetAlgRes' \
+  /root/ascend/log/run \
+  /root/ascend/log/debug \
+  2>/dev/null | tail -300
+```
+
+如果扩大搜索后仍无定制 selector 日志，反汇编的首要目标是确认
+`HcclAllocComResourceByTilingA5Mc2` 如何选择 `HcclAllocComResourceByTilingV2`，以及它按何种库名、版本或注册接口加载
+算法实现。只有找到该接入点后，才把显式 path plan 接入标准算子的 communicator/resource 初始化；不要再回到
+`GET_TP_LIST`，也不要继续靠修改 opType 试错。
 
 源码树 `python/deep_ep/deep_ep/deep_ep_cpp*.so` 只作为未安装 wheel 时的开发回退，不能在正式矩阵中静默覆盖已经
 校验过的安装产物。
