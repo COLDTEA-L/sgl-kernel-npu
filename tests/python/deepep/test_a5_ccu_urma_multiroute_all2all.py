@@ -136,9 +136,9 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        if version < 2:
+        if version < 3:
             raise RuntimeError(
-                f"worker loaded DeepEP attr ABI {version}, expected >= 2: {EXTENSION}"
+                f"worker loaded DeepEP attr ABI {version}, expected >= 3: {EXTENSION}"
             )
         print(f"CASE_DEEP_EP_ABI rank={os.environ.get('RANK', 'NA')} "
               f"version={version} extension={EXTENSION}", flush=True)

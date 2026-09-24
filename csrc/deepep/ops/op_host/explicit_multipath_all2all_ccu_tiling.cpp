@@ -122,9 +122,11 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
         tiling->info.pathWeights[i] = i < weights.size() ? weights[i] : 0U;
     }
 
-    // The HCCL extension resolves plan_id while it provisions the communicator
-    // resource.  The AIV side only submits the already prepared ALLTOALL task.
-    const uint32_t opType = static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLTOALL);
+    // A5 MC2 only accepts HALFALLTOALLV when allocating CCU communication
+    // resources.  The paired HCCL extension selects the private fixed-size
+    // explicit-multipath template for this resource entry; the AIV side still
+    // submits one prepared two-rank AllToAll task.
+    const uint32_t opType = static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_HALFALLTOALLV);
     AscendC::Mc2CcTilingConfig config(
         std::string(group), opType, "AlltoAll=level0:fullmesh;level1:pairwise");
     config.SetCommEngine(mc2tiling::A5_CCU_ENGINE);

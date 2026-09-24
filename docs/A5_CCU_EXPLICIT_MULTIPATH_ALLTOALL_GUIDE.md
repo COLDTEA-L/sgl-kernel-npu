@@ -118,7 +118,7 @@ path = pathlib.Path(sys.argv[1]).resolve()
 lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
-assert version() >= 1
+assert version() >= 2
 assert pathlib.Path(lib._name).resolve() == path
 print("loaded HCCL:", path)
 print("HCCL explicit multipath extension:", version())
@@ -131,7 +131,7 @@ fi
 ```text
 HCCL_RUNTIME=<本次构建实际产生的配套 lib64 目录>
 loaded HCCL: <HCCL_RUNTIME>/libhccl.so
-HCCL explicit multipath extension: 1
+HCCL explicit multipath extension: 2
 ```
 
 必须使用打包暂存目录中的完整 `lib64`。不能只加载 `build/src/libhccl.so`，因为它还依赖同一次构建产生的
@@ -381,7 +381,7 @@ version.restype = ctypes.c_int
 print("loaded:", pathlib.Path(lib._name).resolve())
 print("extension:", version())
 assert pathlib.Path(lib._name).resolve() == expected
-assert version() >= 1
+assert version() >= 2
 PY
 fi
 ```
@@ -435,7 +435,7 @@ assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
 lib = ctypes.CDLL(str(path))
 version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
 version.restype = ctypes.c_int
-assert version() >= 2
+assert version() >= 3
 print("standard explicit multipath API: PASS; attr ABI =", version())
 PY
 
@@ -650,7 +650,7 @@ Failed to execute tiling function
 接口。tiling 因此读到损坏的 `path_weights`。修复后使用有稳定生命周期的可写字符缓冲区指针。
 
 仅出现 `Verified matrix APIs` 不能证明已加载修复后的 wheel：修复前的扩展也已经导出了同名 Python 方法。当前版本额外
-导出 `A5DeepEpExplicitMultipathAttrAbiVersion()`，性能脚本会对**实际 import 的** `deep_ep_cpp.so` 要求版本至少为 2；
+导出 `A5DeepEpExplicitMultipathAttrAbiVersion()`，性能脚本会对**实际 import 的** `deep_ep_cpp.so` 要求版本至少为 3；
 marker 缺失时会在启动阶段明确报告 stale wheel，不再等到 tiling 才失败。
 
 拉取后先确认两个修复都在源码中：
@@ -689,11 +689,11 @@ version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
 version.restype = ctypes.c_int
 print("loaded deep_ep_cpp:", path)
 print("explicit multipath attr ABI:", version())
-assert version() >= 2
+assert version() >= 3
 PY
 ```
 
-预期最后打印 `explicit multipath attr ABI: 2`（或更大）。如果报 `undefined symbol`，说明当前 Python 环境仍加载旧
+预期最后打印 `explicit multipath attr ABI: 3`（或更大）。如果报 `undefined symbol`，说明当前 Python 环境仍加载旧
 wheel；回到第 4 节删除旧 `output/deep_ep*.whl` 后重新构建，并使用 `--force-reinstall --no-cache-dir --no-deps`
 安装。此时不要继续跑矩阵，否则仍会复现 `path_weights must contain 2..8 positive integers`。
 
@@ -825,9 +825,74 @@ CASE_PG_INIT rank=1 method=file path=.../direct_plus_2relay_r1.pgstore
 测试程序现在优先选择该路径，并再次输出：
 
 ```text
-CASE_DEEP_EP_ABI rank=0 version=2 extension=.../site-packages/deep_ep/deep_ep_cpp....so
-CASE_DEEP_EP_ABI rank=1 version=2 extension=.../site-packages/deep_ep/deep_ep_cpp....so
+CASE_DEEP_EP_ABI rank=0 version=3 extension=.../site-packages/deep_ep/deep_ep_cpp....so
+CASE_DEEP_EP_ABI rank=1 version=3 extension=.../site-packages/deep_ep/deep_ep_cpp....so
 ```
+
+### 6.4 `HcclAllocComResourceByTiling ret=5`：A5 MC2 资源类型不受支持
+
+如果两个 rank 都已经输出：
+
+```text
+phase=init_process_group_done
+phase=deep_ep_buffer_init_done
+phase=warmup
+```
+
+随后在 `torch.npu.synchronize()` 报：
+
+```text
+Nnopbase fails to invoke HcclAllocComResourceByTiling ... ret = 5
+```
+
+则 FileStore、communicator 和 DeepEP 初始化均已通过。`ret=5` 对应 `HCCL_E_NOT_SUPPORT`，失败点是 ACLNN/MC2
+根据 host tiling 中的通信命令分配 HCCL 资源，尚未进入显式 Channel 建链或 CCU 搬运。
+
+原生 A5 CCU MoE host tiling 明确只用 `HCCL_CMD_HALFALLTOALLV`；在该 MC2 入口提交
+`HCCL_CMD_ALLTOALL` 会被资源分配层拒绝。本分支的配套修复为：
+
+1. 标准算子的 `Mc2CcTilingConfig` 使用 `HCCL_CMD_HALFALLTOALLV` 申请 A5 支持的 CCU 资源；
+2. HCCL 在 MC2 + 显式 plan 环境下，将该资源命令选择到
+   `CcuExplicitMultipathAllToAll2Rank`，而不是原生 HalfAllToAllV 模板；
+3. 自定义模板仍按定长两卡 AllToAll 构造 direct + relay Channels，并由 AIV 发起一次 CCU task；
+4. HCCL extension 版本提升到 `2`，DeepEP attr ABI 提升到 `3`，防止旧 HCCL 或旧 wheel 被混用。
+
+拉取后必须同时重建第 3 节 HCCL 和第 4 节 wheel。运行前检查实际二进制版本：
+
+```bash
+HCCL_SO=$(readlink -f "${HCCL_RUNTIME}/libhccl.so")
+
+LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+python3 -S - "${HCCL_SO}" <<'PY'
+import ctypes
+import sys
+
+lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
+version = lib.A5HcclExplicitMultipathExtensionVersion
+version.restype = ctypes.c_int
+print("HCCL explicit multipath extension:", version())
+assert version() >= 2
+PY
+
+python3 - <<'PY'
+import ctypes
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+
+path = Path(ext.__file__).resolve()
+lib = ctypes.CDLL(str(path))
+version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
+version.restype = ctypes.c_int
+print("loaded deep_ep_cpp:", path)
+print("explicit multipath attr ABI:", version())
+assert version() >= 3
+PY
+```
+
+若 launcher 仍显示 `extension=1` 或 `attr ABI=2`，不要继续跑矩阵：它说明实际加载的是修复前产物。
+两个版本均通过后，先用第 6.2 节的 `warmup=1, iters=1` 最小回归。若仍报 `ret=5`，检查日志中的实际
+`libhccl.so` 路径以及新 HCCL 是否包含 `HCCL_CMD_HALF_ALLTOALLV` 下的
+`CcuExplicitMultipathAllToAll2Rank` 注册；不要把问题重新归因于 rendezvous。
 
 源码树 `python/deep_ep/deep_ep/deep_ep_cpp*.so` 只作为未安装 wheel 时的开发回退，不能在正式矩阵中静默覆盖已经
 校验过的安装产物。

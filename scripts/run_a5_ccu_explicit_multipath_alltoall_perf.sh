@@ -109,8 +109,11 @@ path = pathlib.Path(sys.argv[1]).resolve()
 lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
-if version() < 1:
-    raise SystemExit("invalid explicit multipath HCCL extension version")
+if version() < 2:
+    raise SystemExit(
+        f"stale explicit multipath HCCL extension {version()}, expected >= 2; "
+        "rebuild HCCL from the matching branch"
+    )
 print(f"Verified patched HCCL: {path} (extension={version()})")
 PY
 hccl_preload="${hccl_compat_so}:${hccl_so}"
@@ -168,9 +171,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 2:
+if version < 3:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ACLNN ABI {version}, expected >= 2; "
+        f"loaded deep_ep_cpp has explicit-multipath ACLNN ABI {version}, expected >= 3; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 print(f"Verified matrix APIs: explicit + legacy multiroute; attr ABI={version}")
