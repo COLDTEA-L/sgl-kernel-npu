@@ -56,15 +56,15 @@ def main():
         "manifest": str(all_path.resolve()),
         "relays": relays,
         "direct_route": args.direct_route,
-        "weights": [direct_ratio * len(rows), *([relay_ratio] * len(rows))],
+        "weights": [direct_ratio, *([relay_ratio] * len(rows))],
     }
     for count in (value for value in COUNTS if value <= len(rows)):
         selected = rows[:count]
         path = args.output_dir / f"direct_plus_{count}relay.tsv"
         write_tsv(path, fields, selected)
-        # Each relay has relay_ratio units. The direct path gets enough units
-        # for direct_total:relay_total == direct_ratio:relay_ratio.
-        weights = [direct_ratio * count, *([relay_ratio] * count)]
+        # The ratio applies independently to every relay path:
+        # direct:relay_i == direct_ratio:relay_ratio.
+        weights = [direct_ratio, *([relay_ratio] * count)]
         plans[str(count)] = {
             "manifest": str(path.resolve()),
             "relays": relays[:count],
@@ -74,7 +74,7 @@ def main():
     metadata = {
         "version": 1,
         "world_size": 2,
-        "direct_relay_aggregate_ratio": [direct_ratio, relay_ratio],
+        "direct_each_relay_ratio": [direct_ratio, relay_ratio],
         "plans": plans,
     }
     (args.output_dir / "multipath_plans.json").write_text(

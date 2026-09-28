@@ -250,7 +250,7 @@ if (( need_prepared )); then
         --resolved-manifest "${resolved}" --output-dir "${run_dir}/plans" \
         --direct-route "${direct_route}" --direct-relay-ratio 2:1
 
-    generic_path_weights=$((2 * required_relay_count))
+    generic_path_weights=2
     for ((i=0; i<required_relay_count; ++i)); do
         generic_path_weights+=,1
     done
@@ -312,19 +312,19 @@ for ((round=1; round<=repeats; ++round)); do
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-2relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
-        --path-weights 4,1,1 --schedule concurrent
+        --path-weights 2,1,1 --schedule concurrent
     case_selected direct_plus_4relay && \
       run_case direct_plus_4relay "${round}" --implementation prepared \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-4relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
-        --path-weights 8,1,1,1,1 --schedule concurrent
+        --path-weights 2,1,1,1,1 --schedule concurrent
     case_selected direct_plus_6relay && \
       run_case direct_plus_6relay "${round}" --implementation prepared \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-6relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \
-        --path-weights 12,1,1,1,1,1,1 --schedule concurrent
+        --path-weights 2,1,1,1,1,1,1 --schedule concurrent
 done
 
 python3 "${script_dir}/analyze_a5_ccu_explicit_multipath_perf.py" --run-dir "${run_dir}"

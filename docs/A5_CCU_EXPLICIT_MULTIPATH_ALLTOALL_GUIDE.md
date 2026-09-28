@@ -341,14 +341,18 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 显式 case 的总流量分配保持：
 
 ```text
-direct 总字节 : 所有 relay 总字节 = 2 : 1
+direct 路径数据量 : 每一条 relay 路径数据量 = 2 : 1
 ```
 
 因此脚本使用：
 
-- direct + 2 relay：`4,1,1`；
-- direct + 4 relay：`8,1,1,1,1`；
-- direct + 6 relay：`12,1,1,1,1,1,1`。
+- direct + 1 relay：`2,1`；
+- direct + 2 relay：`2,1,1`；
+- direct + 4 relay：`2,1,1,1,1`；
+- direct + 6 relay：`2,1,1,1,1,1,1`。
+
+该比例逐 relay 生效，而不是 direct 与所有 relay 合计的比例。因此 relay 数量增加时，relay 合计流量
+也会增加；对于 `N` 条等权 relay，direct 占总通信数据的 `2/(N+2)`，每条 relay 占 `1/(N+2)`。
 
 查看结果：
 
