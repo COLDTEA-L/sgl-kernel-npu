@@ -10,6 +10,7 @@ constexpr uint32_t OUTPUT_MASK = 1;
 constexpr uint32_t TOKEN_MASK = 2;
 constexpr uint32_t PRE_SYNC_MASK = OUTPUT_MASK | TOKEN_MASK;
 constexpr uint32_t POST_SYNC_MASK = 1;
+constexpr size_t MAX_EXPLICIT_PATHS = 64U;
 
 #define CCU_KERNEL_CHECK(expression) do { \
     HcclResult status = (expression); \
@@ -45,7 +46,7 @@ AllToAllMultiRouteKernel::AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &ar
 
 HcclResult AllToAllMultiRouteKernel::Algorithm()
 {
-    if (channels_.empty() || channels_.size() > 8) {
+    if (channels_.empty() || channels_.size() > MAX_EXPLICIT_PATHS) {
         return HCCL_E_PARA;
     }
 

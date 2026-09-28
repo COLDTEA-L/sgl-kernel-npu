@@ -67,7 +67,7 @@ IFS=',' read -ra case_array <<<"${cases}"
 (( ${#case_array[@]} > 0 )) || { echo "--cases must not be empty" >&2; exit 2; }
 for selected_case in "${case_array[@]}"; do
     case "${selected_case}" in
-        native0|native2|direct_plus_2relay|direct_plus_4relay|direct_plus_6relay) ;;
+        native0|native2|direct_plus_relays|direct_plus_2relay|direct_plus_4relay|direct_plus_6relay) ;;
         *) echo "unsupported --cases entry: ${selected_case}" >&2; exit 2 ;;
     esac
 done
@@ -79,32 +79,48 @@ case_selected() {
     return 1
 }
 
+fixed_relay_count=0
 required_relay_count=0
 need_legacy=0
 need_prepared=0
+generic_relay_case=0
 if case_selected native0 || case_selected native2; then
     need_legacy=1
 fi
 if case_selected direct_plus_2relay; then
-    required_relay_count=2
+    fixed_relay_count=2
     need_prepared=1
 fi
 if case_selected direct_plus_4relay; then
-    required_relay_count=4
+    fixed_relay_count=4
     need_prepared=1
 fi
 if case_selected direct_plus_6relay; then
-    required_relay_count=6
+    fixed_relay_count=6
+    need_prepared=1
+fi
+if case_selected direct_plus_relays; then
+    generic_relay_case=1
     need_prepared=1
 fi
 
 relay_array=()
-if (( required_relay_count > 0 )); then
+if (( need_prepared )); then
     IFS=',' read -ra relay_array <<<"${relay_phys}"
-    (( ${#relay_array[@]} == required_relay_count )) || {
-        echo "selected cases require exactly ${required_relay_count} ordered relay cards in --relay-phys" >&2
+    (( ${#relay_array[@]} >= 1 && ${#relay_array[@]} <= 63 )) || {
+        echo "prepared cases require 1..63 ordered relay cards in --relay-phys" >&2
         exit 2
     }
+    required_relay_count=${#relay_array[@]}
+    if (( generic_relay_case == 0 && required_relay_count != fixed_relay_count )); then
+        echo "selected benchmark cases require exactly ${fixed_relay_count} ordered relay cards; " \
+             "use --cases direct_plus_relays to consume an arbitrary relay list" >&2
+        exit 2
+    fi
+    if (( generic_relay_case != 0 && required_relay_count < fixed_relay_count )); then
+        echo "the relay list is too short for the selected fixed benchmark cases" >&2
+        exit 2
+    fi
 elif [[ -n "${relay_phys}" ]]; then
     IFS=',' read -ra relay_array <<<"${relay_phys}"
 fi
@@ -198,9 +214,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 4:
+if version < 5:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 4; "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 5; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 route = ctypes.CDLL(str(Path(os.environ['A5_CCU_ROUTE_PROBE_LIB'])))
@@ -209,7 +225,7 @@ if need_prepared:
     route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
     route_abi.restype = ctypes.c_int
     route_abi_value = route_abi()
-    assert route_abi_value >= 1
+    assert route_abi_value >= 2
 print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "
       f"DeepEP ABI={version}; route ABI={route_abi_value}")
 PY
@@ -233,6 +249,11 @@ if (( need_prepared )); then
     python3 "${script_dir}/prepare_a5_ccu_explicit_multipath_plans.py" \
         --resolved-manifest "${resolved}" --output-dir "${run_dir}/plans" \
         --direct-route "${direct_route}" --direct-relay-ratio 2:1
+
+    generic_path_weights=$((2 * required_relay_count))
+    for ((i=0; i<required_relay_count; ++i)); do
+        generic_path_weights+=,1
+    done
 fi
 
 printf 'case\trepeat\tstatus\tresult\n' >"${run_dir}/case_status.tsv"
@@ -280,6 +301,12 @@ for ((round=1; round<=repeats; ++round)); do
         --route-index 0 --path-weights 1 --schedule concurrent
     case_selected native2 && run_case native2 "${round}" --implementation multiroute \
         --route-index 2 --path-weights 1 --schedule concurrent
+    case_selected direct_plus_relays && \
+      run_case direct_plus_relays "${round}" --implementation prepared \
+        --compile-backend "${graph_backend}" \
+        --plan-id "explicit-${required_relay_count}relay" --direct-route "${direct_route}" \
+        --relay-manifest "${run_dir}/plans/direct_plus_relays.tsv" \
+        --path-weights "${generic_path_weights}" --schedule concurrent
     case_selected direct_plus_2relay && \
       run_case direct_plus_2relay "${round}" --implementation prepared \
         --compile-backend "${graph_backend}" \

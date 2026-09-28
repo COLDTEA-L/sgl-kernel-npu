@@ -113,8 +113,10 @@ def main():
     args = parser.parse_args()
 
     relays = csv_ints(args.relay_phys, "--relay-phys", require_unique=True)
-    if len(relays) < 2:
-        raise SystemExit("multi-relay validation requires at least two explicit relay cards")
+    if len(relays) < 1:
+        raise SystemExit("explicit relay validation requires at least one relay card")
+    if len(relays) > 63:
+        raise SystemExit("one prepared CCU plan supports at most 63 relay cards plus one direct path")
     if args.src_phy == args.dst_phy or args.src_phy in relays or args.dst_phy in relays:
         raise SystemExit("src, dst and every relay card must be distinct")
     planes = [item.strip() for item in args.relay_planes.split(",") if item.strip()]

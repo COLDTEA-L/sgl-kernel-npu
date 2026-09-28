@@ -22,6 +22,7 @@ using a5_ccu_urma_probe::RoutePlanRequest;
 using a5_ccu_urma_probe::RouteResources;
 
 namespace {
+constexpr uint32_t MAX_EXPLICIT_PATHS = 64U;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
 constexpr uint64_t PATH_ALIGNMENT = 256;
@@ -88,7 +89,7 @@ HcclResult ValidatePlanArguments(HcclComm comm, aclrtStream stream,
         return HCCL_E_PTR;
     }
     if (planId[0] == '\0' || relayManifest[0] == '\0' ||
-        pathCount < 2U || pathCount > 8U) {
+        pathCount < 2U || pathCount > MAX_EXPLICIT_PATHS) {
         return HCCL_E_PARA;
     }
     for (uint32_t i = 0; i < pathCount; ++i) {
@@ -216,7 +217,7 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
     const uint32_t *pathWeights, uint32_t pathCount)
 {
     if (relayManifest == nullptr || relayManifest[0] == '\0' ||
-        pathWeights == nullptr || pathCount < 2U || pathCount > 8U) {
+        pathWeights == nullptr || pathCount < 2U || pathCount > MAX_EXPLICIT_PATHS) {
         return HCCL_E_PARA;
     }
     RoutePlanRequest plan;
@@ -231,7 +232,7 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    return 1;
+    return 2;
 }
 
 extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(

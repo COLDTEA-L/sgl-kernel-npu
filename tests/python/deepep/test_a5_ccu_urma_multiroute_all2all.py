@@ -254,9 +254,9 @@ def parse_args():
         if not args.path_weights:
             parser.error(f"--implementation {args.implementation} requires direct+relay --path-weights")
         weights = [item for item in args.path_weights.split(",") if item]
-        if len(weights) < 2 or len(weights) > 8 or any(
+        if len(weights) < 2 or len(weights) > 64 or any(
                 not item.isdigit() or int(item) <= 0 for item in weights):
-            parser.error("explicit --path-weights must contain 2..8 positive integers")
+            parser.error("explicit --path-weights must contain 2..64 positive integers")
     return args
 
 

@@ -54,7 +54,8 @@ HcclResult HcclCcuUrmaMultiRouteAllToAll(void *sendBuf, void *recvBuf,
  * that order.  The normalized plan is passed as an ordinary API argument so a
  * future host controller can replace the command-line manifest producer
  * without changing the CCU kernel or relying on process-global environment
- * variables.  Current ABI supports at most eight total paths.
+ * variables.  Prepared-plan ABI supports up to 64 total paths per launch;
+ * the first path is direct and the remaining paths are explicit relays.
  */
 HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
     void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,

@@ -8,6 +8,7 @@ constexpr uint32_t OUTPUT_NOTIFY_INDEX = 0;
 constexpr uint32_t TOKEN_NOTIFY_INDEX = 1;
 constexpr uint32_t COMPLETION_NOTIFY_INDEX = 2;
 constexpr uint32_t NOTIFY_MASK = 1;
+constexpr size_t MAX_ROUTE_PATHS = 64U;
 
 #define CCU_KERNEL_CHECK(expression)          \
     do {                                      \
@@ -37,7 +38,7 @@ hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 
 HcclResult RouteKernel::Algorithm()
 {
-    if (channels_.empty() || channels_.size() > 8) {
+    if (channels_.empty() || channels_.size() > MAX_ROUTE_PATHS) {
         return HCCL_E_PARA;
     }
 

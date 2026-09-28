@@ -19,9 +19,8 @@
 // in the actually imported extension, so a stale wheel fails before tiling.
 extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathAttrAbiVersion()
 {
-    // Version 4 adds the prepared-plan runtime and no longer requires the
-    // private libmc2_client algorithm registry or a patched libhccl.so.
-    return 4;
+    // Version 5 raises prepared-plan capacity to 64 total direct+relay paths.
+    return 5;
 }
 
 namespace deep_ep {
@@ -376,7 +375,7 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     EP_HOST_ASSERT(!relay_manifest.empty());
     constexpr auto kMaxUint32 = static_cast<int64_t>(UINT32_MAX);
     EP_HOST_ASSERT(direct_route >= 0 && direct_route <= kMaxUint32);
-    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 64);
 
     std::vector<uint32_t> weights;
     weights.reserve(path_weights.size());
@@ -411,7 +410,7 @@ int64_t Buffer::prepare_ccu_urma_explicit_multipath_plan(
     EP_HOST_ASSERT(!plan_id.empty() && !relay_manifest.empty());
     constexpr auto kMaxUint32 = static_cast<int64_t>(UINT32_MAX);
     EP_HOST_ASSERT(direct_route >= 0 && direct_route <= kMaxUint32);
-    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 64);
     std::vector<uint32_t> weights;
     weights.reserve(path_weights.size());
     for (const int64_t weight : path_weights) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create ordered 2/4/6-relay plan manifests from one resolved inventory."""
+"""Create one arbitrary-size relay plan plus optional 2/4/6 benchmark prefixes."""
 
 import argparse
 import csv
@@ -33,8 +33,8 @@ def main():
     args = parser.parse_args()
 
     fields, rows = read_tsv(args.resolved_manifest)
-    if len(rows) not in COUNTS:
-        raise SystemExit(f"expected 2, 4 or 6 explicit relay rows, got {len(rows)}")
+    if not 1 <= len(rows) <= 63:
+        raise SystemExit(f"expected 1..63 explicit relay rows, got {len(rows)}")
     relays = [int(row["relay_phy"]) for row in rows]
     if len(set(relays)) != len(rows):
         raise SystemExit("the relay rows must name distinct physical devices")
@@ -50,6 +50,14 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plans = {}
+    all_path = args.output_dir / "direct_plus_relays.tsv"
+    write_tsv(all_path, fields, rows)
+    plans["all"] = {
+        "manifest": str(all_path.resolve()),
+        "relays": relays,
+        "direct_route": args.direct_route,
+        "weights": [direct_ratio * len(rows), *([relay_ratio] * len(rows))],
+    }
     for count in (value for value in COUNTS if value <= len(rows)):
         selected = rows[:count]
         path = args.output_dir / f"direct_plus_{count}relay.tsv"

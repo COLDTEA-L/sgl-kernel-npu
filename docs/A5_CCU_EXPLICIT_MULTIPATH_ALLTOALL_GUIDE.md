@@ -158,7 +158,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("route library:", path)
 print("prepared-plan ABI:", version())
-assert version() >= 1
+assert version() >= 2
 PY
 ```
 
@@ -199,7 +199,7 @@ print("loaded deep_ep_cpp:", path)
 print("explicit multipath attr ABI:", version())
 print("prepared graph op:", torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall)
 
-assert version() >= 4
+assert version() >= 5
 assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
 assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
 assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
@@ -219,12 +219,13 @@ print("torch.compile fullgraph Meta capture: PASS")
 PY
 ```
 
-预期 ABI 至少为 `4`，并输出 `Meta dispatch: PASS` 和 `torch.compile fullgraph Meta capture: PASS`。
+预期 DeepEP ABI 至少为 `5`、prepared-plan ABI 至少为 `2`，并输出 `Meta dispatch: PASS` 和
+`torch.compile fullgraph Meta capture: PASS`。
 
 ## 5. 快速单 case 验证
 
-单 case 只要求提供该 case 实际使用的 relay，不再要求固定传入六张卡。例如端点改为物理卡 `0,1`，
-显式指定物理卡 `2,3` 为两条 relay：
+单 case 只要求提供实际使用的 relay，不要求 relay 数量为偶数。例如当前用物理卡 `2,3` 作为通信
+端点，显式指定物理卡 `0,1` 为两条 relay：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -232,10 +233,10 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD
 
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 0 --dst-phy 1 \
-  --relay-phys 2,3 \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
   --direct-route 0 \
-  --cases direct_plus_2relay \
+  --cases direct_plus_relays \
   --bytes 4194304 \
   --warmup 1 --iters 1 --repeats 1 \
   --timeout-seconds 300 \
@@ -243,11 +244,21 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --output-root /home/l00934901/profiling
 ```
 
+`direct_plus_relays` 会使用 `--relay-phys` 中的全部卡。可传 1、2、3、5、6 或更多 relay，例如：
+
+```text
+--relay-phys 0                 # direct + 1 relay
+--relay-phys 0,1,4             # direct + 3 relay
+--relay-phys 0,1,4,5,6         # direct + 5 relay
+```
+
 规则如下：
 
-- `direct_plus_2relay`：`--relay-phys` 恰好列 2 张卡；
-- `direct_plus_4relay`：恰好列 4 张卡；
-- `direct_plus_6relay` 或完整矩阵：恰好列 6 张卡；
+- `direct_plus_relays` 是通用单 case，使用任意 `1..63` 张 relay；
+- `direct_plus_2relay`、`direct_plus_4relay`、`direct_plus_6relay` 只是便于横向比较的性能预置，不是
+  算子语义约束；
+- 一个 prepared plan 当前最多 64 条总路径，即 1 条 direct 加最多 63 条 relay，覆盖 64-device
+  集群；更大规模需要把一个 plan 分批为多个 CCU launch，不能静默截断；
 - relay 顺序就是 manifest/path 顺序，不能包含 `src-phy` 或 `dst-phy`，卡号不会在脚本中写死；
 - relay 卡不启动 rank，但其 IO Die/端口会承载转发流量，不能把他人正在使用的卡视为完全无影响。
 
@@ -270,10 +281,10 @@ PASS: ... implementation=prepared
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 0 --dst-phy 1 \
-  --relay-phys 2,3 \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
   --direct-route 0 \
-  --cases direct_plus_2relay \
+  --cases direct_plus_relays \
   --graph-backend eager \
   --bytes 4194304 \
   --warmup 1 --iters 3 --repeats 1 \
@@ -286,10 +297,10 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 0 --dst-phy 1 \
-  --relay-phys 2,3 \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
   --direct-route 0 \
-  --cases direct_plus_2relay \
+  --cases direct_plus_relays \
   --graph-backend npugraphs \
   --bytes 4194304 \
   --warmup 1 --iters 3 --repeats 1 \
@@ -373,12 +384,12 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 | 现象 | 原因/处理 |
 |---|---|
-| DeepEP ABI `< 4` | 加载了旧 wheel；重新构建并 `--force-reinstall` |
+| DeepEP ABI `< 5` | 加载了仍限制为 8 条总路径的旧 wheel；重新构建并 `--force-reinstall` |
 | prepared-plan ABI 缺失 | route package 是旧版本；重建并安装第 3 节 |
 | 只跑 prepared case，却提示缺少 `HcclCcuUrmaMultiRouteAllToAll` | 旧性能脚本误查了 legacy API；更新到最新分支。prepared case 只校验 PlanCreate/PlanExecute/ABI marker |
 | `nm -D` 手工能看到符号，脚本却报告 missing | 旧脚本在 `set -o pipefail` 下使用 `grep -q`，`grep` 提前退出令 `nm` 收到 SIGPIPE，形成假阴性；更新脚本 |
 | 安装后 SO 仍是旧符号表 | 第 3 节的新构建脚本会比较 packaged/installed SO；安装器未覆盖时会用已验证产物刷新并再次校验 |
-| `--relay-phys must ... six` | 旧脚本把完整矩阵约束错误施加给单 case；更新脚本后按 case 传 2、4 或 6 张 relay |
+| `--relay-phys must ... six` | 旧脚本把性能矩阵约束错误施加给算子；更新后用 `direct_plus_relays` 传任意 1..63 张 relay |
 | 找不到 `torch.ops.deep_ep...` | wheel 未包含新的 `TORCH_LIBRARY` 注册 |
 | `npugraphs` backend 不存在 | 当前 torch_npu 版本未提供 ACLGraph backend；先用 `python3 -c 'import torch,torch_npu; print(torch._dynamo.list_backends())'` 检查 |
 | fullgraph graph break | 保存完整 `CASE_FAILURE`；不能把 eager PASS 当作设备图 PASS |

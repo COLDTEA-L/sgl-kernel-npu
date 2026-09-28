@@ -28,6 +28,7 @@ namespace {
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 3;
 constexpr uint32_t THREAD_NOTIFY_NUM = 1;
 constexpr uint32_t EID_BYTE_NUM = 16;
+constexpr size_t MAX_EXPLICIT_PATHS = 64U;
 
 struct ThreadLocalCache {
     HcclComm comm = nullptr;
@@ -164,7 +165,7 @@ HcclResult LoadSyntheticRouteManifest(const char *path,
         }
         specs->push_back(spec);
     }
-    if (specs->empty() || specs->size() > 8U) return HCCL_E_PARA;
+    if (specs->empty() || specs->size() >= MAX_EXPLICIT_PATHS) return HCCL_E_PARA;
     return HCCL_SUCCESS;
 }
 
@@ -770,7 +771,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     const bool explicitPlan = plan != nullptr;
     if (explicitPlan) {
         if (!plan->includeDiscoveredRoute || plan->relayManifest.empty() ||
-            plan->weights.size() < 2U || plan->weights.size() > 8U ||
+            plan->weights.size() < 2U || plan->weights.size() > MAX_EXPLICIT_PATHS ||
             std::any_of(plan->weights.begin(), plan->weights.end(),
                         [](uint32_t value) { return value == 0U; })) {
             std::fprintf(stderr, "[A5 CCU URMA] invalid explicit multipath plan\n");
@@ -869,8 +870,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         if (status != HCCL_SUCCESS) return status;
         const uint32_t baseRoute = routeIndices.front();
         const size_t directCount = explicitPlan && plan->includeDiscoveredRoute ? 1U : 0U;
-        if (specs.size() + directCount > 8U) {
-            std::fprintf(stderr, "[A5 CCU URMA] at most eight direct+relay paths are supported\n");
+        if (specs.size() + directCount > MAX_EXPLICIT_PATHS) {
+            std::fprintf(stderr,
+                "[A5 CCU URMA] at most %zu direct+relay paths are supported by one CCU plan\n",
+                MAX_EXPLICIT_PATHS);
             return HCCL_E_PARA;
         }
         selectedDescs.resize(specs.size() + directCount);

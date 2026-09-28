@@ -27,8 +27,16 @@ def main():
         case = re.sub(r"_r\d+$", "", log.stem)
         samples.setdefault(case, []).append(float(result["host_batch_avg_us"]))
 
-    expected = ["native0", "native2", "direct_plus_2relay",
-                "direct_plus_4relay", "direct_plus_6relay"]
+    expected = []
+    status_path = args.run_dir / "case_status.tsv"
+    if status_path.is_file():
+        for line in status_path.read_text(errors="replace").splitlines()[1:]:
+            fields = line.split("\t")
+            if fields and fields[0] and fields[0] not in expected:
+                expected.append(fields[0])
+    for case in samples:
+        if case not in expected:
+            expected.append(case)
     rows = []
     for case in expected:
         values = samples.get(case, [])
