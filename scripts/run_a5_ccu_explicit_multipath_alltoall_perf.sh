@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${graph_backend}" in
-    none|eager|aot_eager|npu|npugraphs|npugraph_ex|inductor) ;;
+    none|eager|aot_eager|npu|npugraphs|npugraph_ex|inductor|aclgraph) ;;
     *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
 esac
 
@@ -225,7 +225,7 @@ if need_prepared:
     route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
     route_abi.restype = ctypes.c_int
     route_abi_value = route_abi()
-    assert route_abi_value >= 3
+    assert route_abi_value >= 4
 print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "
       f"DeepEP ABI={version}; route ABI={route_abi_value}")
 PY

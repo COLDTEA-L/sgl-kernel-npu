@@ -158,7 +158,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("route library:", path)
 print("prepared-plan ABI:", version())
-assert version() >= 3
+assert version() >= 4
 PY
 ```
 
@@ -219,7 +219,7 @@ print("torch.compile fullgraph Meta capture: PASS")
 PY
 ```
 
-预期 DeepEP ABI 至少为 `6`、prepared-plan ABI 至少为 `3`，并输出 `Meta dispatch: PASS` 和
+预期 DeepEP ABI 至少为 `6`、prepared-plan ABI 至少为 `4`，并输出 `Meta dispatch: PASS` 和
 `torch.compile fullgraph Meta capture: PASS`。
 
 ## 5. 快速单 case 验证
@@ -267,13 +267,23 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 日志应依次出现：
 
 ```text
-CASE_PREPARED_PLAN_ABI ... version=1
+CASE_PREPARED_PLAN_ABI ... version=4
 PREPARED_MULTIPATH_PLAN ...
 PASS: ... implementation=prepared
 ```
 
 `PREPARED_MULTIPATH_PLAN` 每个 rank 只应在 warmup 前出现一次。若反复出现，说明控制面准备错误地进入了
 热循环。
+
+当 `npugraphs` 使用不同于 PlanCreate 的私有 graph stream 时，首次预执行还会出现一组：
+
+```text
+PREPARED_MULTIPATH_STREAM phase=begin ...
+PREPARED_MULTIPATH_STREAM phase=ready ...
+```
+
+这是 route ABI 4 的预期行为：在真正 capture 前为该 stream 创建一次 CCU thread/channel/kernel 资源实例。
+同一 stream 后续执行不能再次出现 `phase=begin`；否则说明资源创建进入了 capture/replay 热路径。
 
 ### 5.1 验证是否真正入图
 
@@ -293,7 +303,34 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --output-root /home/l00934901/profiling
 ```
 
-再用 `npugraphs` 验证 ACLGraph 首次 capture 和重复 replay：
+先用显式 `torch.npu.NPUGraph` 验证 ACLGraph capture 和 replay。该模式会先创建 capture stream，并在同一
+stream 上准备 Plan，因此是判断方案 2 数据面是否可捕获的确定性实验：
+
+```bash
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
+  --direct-route 0 \
+  --cases direct_plus_relays \
+  --graph-backend aclgraph \
+  --bytes 4194304 \
+  --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+预期两个 rank 均输出：
+
+```text
+CASE_ACLGRAPH_CAPTURE ... PASS
+CASE_ACLGRAPH_REPLAY ... PASS
+```
+
+测试会在 replay 前修改 captured send Tensor；因此 replay correctness PASS 排除了重复返回首次输出的假阳性。
+
+再用 `npugraphs` 验证 `torch.compile` 后端集成。它内部自行管理 graph stream，route ABI 4 会在第一次
+pre-execution 时为该 stream 建立一次资源实例：
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
@@ -318,8 +355,34 @@ CASE_GRAPH_REPLAY ... PASS
 PASS: implementation=prepared ...
 ```
 
-并且每个 rank 只有一条 `PREPARED_MULTIPATH_PLAN`。`eager` 只证明 FX/Dynamo 完整捕获；只有
-`npugraphs` 的 first execute 与 replay 都正确，才能说明这条路径能进入当前环境的 NPU graph。
+显式 `aclgraph` 的 PASS 条件是：
+
+```text
+CASE_ACLGRAPH_CAPTURE ... PASS
+CASE_ACLGRAPH_REPLAY ... PASS
+PASS: implementation=prepared ...
+```
+
+并且每个 rank 只有一条 `PREPARED_MULTIPATH_PLAN`，每个 graph stream 最多一组
+`PREPARED_MULTIPATH_STREAM begin/ready`。replay 前测试程序会原地改变 send 数据，因而
+`CASE_GRAPH_REPLAY ... PASS` 同时证明 replay 读取的是当前输入，而不是第一次执行遗留的输出。
+`eager` 只证明 FX/Dynamo 完整捕获；只有 `npugraphs` 的 first execute 与 replay 都正确，才能说明这条路径
+能进入当前环境的 NPU graph。
+
+检查 stream 资源是否只创建一次：
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_* | head -1)
+LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+grep -nE \
+'CASE_GRAPH_|PREPARED_MULTIPATH_PLAN|PREPARED_MULTIPATH_STREAM|HcclChannelAcquire|CASE_FAILURE|PASS:' \
+"${LOG}"
+```
+
+旧 route ABI 3 会在 `graph_first_execute_npugraphs` 以 `HCCL_E_PARA` 失败，因为 Plan 绑定默认 stream，
+而 `npugraphs` 在私有 graph stream 上预执行。出现该现象时必须重新编译并安装第 3 节 route package；
+只重装 DeepEP wheel 不够。
 
 ## 6. 完整性能矩阵
 
@@ -427,7 +490,7 @@ grep -nE \
 | `plan handle not found` | plan 在另一进程创建，或进程已重启；每个 rank 必须各自 prepare |
 | `plan stream mismatch` | prepare 与 execute 不在同一 NPU stream；按 stream 分别准备 plan |
 | ChannelAcquire status=9 | 所选 EID pair 未被当前底层 provision；检查 relay manifest/拓扑 |
-| 正确性固定缺失一个 rank 的整块数据 | 确认 route ABI 至少为 3；旧 AllToAll kernel 将 output/token 合并在同一个 notify index，必须重建第 3 节 route package，使用独立 output/token/completion 通知 |
+| 正确性固定缺失一个 rank 的整块数据 | 当前要求 route ABI 至少为 4；ABI 2 及更早版本将 output/token 合并在同一个 notify index，必须重建第 3 节 route package |
 
 方案 2 不需要 `libmc2_client.so` 源码，也不需要 patched `libhccl.so`。它仍依赖系统 HCOMM/HCCL 的公开
 Channel/CCU primitive 来准备资源。

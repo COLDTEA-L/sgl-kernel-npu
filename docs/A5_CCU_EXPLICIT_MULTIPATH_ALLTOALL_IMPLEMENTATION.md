@@ -47,7 +47,8 @@ Python host/controller
           -> HcclChannelAcquire(each path)
           -> HcclCcuKernelRegister
           -> HcclCcuKernelRegisterFinish
-        -> PreparedPlanRegistry[(comm, stream, plan_id)]
+        -> PreparedPlanRegistry[(comm, initial_stream, plan_id)]
+             -> resources_by_stream[initial_stream]
         -> uint64 plan_handle
 ```
 
@@ -61,6 +62,9 @@ torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall
     -> Buffer.ccu_urma_prepared_multipath_alltoall_out
       -> HcclCcuUrmaExplicitMultipathPlanExecute(plan_handle, ...)
         -> PreparedPlanRegistry lookup
+        -> resources_by_stream[current_stream] lookup
+          -> graph stream 首次预执行：创建并缓存一次 stream-bound CCU resources
+          -> capture/replay：直接复用缓存，不重新 Acquire/Register
         -> LaunchPreparedAllToAll
           -> 计算每条 path 的 byte range
           -> HcclCcuKernelLaunch
@@ -97,6 +101,15 @@ HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
 ```
 
 `PlanCreate` 是 host-only 控制面 API；`PlanExecute` 是固定语义的数据面入口。
+
+route ABI 4 允许一个逻辑 plan handle 拥有多个 stream-bound resource instance。原因是
+`HcclThreadAcquireWithStream` 令 CCU thread/kernel 与 stream 绑定，而 `torch.compile(...,
+backend="npugraphs")` 的 graph stream 通常不同于控制面创建 plan 时的默认 stream。实现不能忽略 stream
+差异：首次 graph-stream 预执行会为该 stream 创建一次资源，后续 capture/replay 必须命中同一缓存。
+
+验证分两层：`--graph-backend aclgraph` 显式创建 capture stream，并在该 stream 上 PlanCreate、capture、
+修改输入和 replay，用于证明底层数据面可捕获；`--graph-backend npugraphs` 再验证 torch.compile 自动管理
+graph stream 时的框架集成。前者失败是数据面/capture blocker，只有后者失败通常是 backend 生命周期适配问题。
 
 ### 3.2 Python Buffer API
 
@@ -205,7 +218,7 @@ CCU kernel release 语义仍与 communicator 生命周期绑定；进程退出�
 - route package 编译、安装通过；
 - DeepEP wheel 编译、强制安装通过；
 - DeepEP attr ABI `4`；
-- prepared-plan ABI `1`；
+- prepared-plan ABI `4`；
 - plan create/execute 动态符号存在；
 - PyTorch graph op 注册与 Meta dispatch 通过。
 - `torch.compile(..., fullgraph=True)` 的 Meta capture 通过。

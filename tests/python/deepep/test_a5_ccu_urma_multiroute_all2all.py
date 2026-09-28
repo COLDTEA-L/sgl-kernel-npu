@@ -152,7 +152,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 1:
+            if plan_abi() < 4:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -229,9 +229,10 @@ def parse_args():
     parser.add_argument("--profile-root", default="/home/l00934901/profiling")
     parser.add_argument(
         "--compile-backend",
-        choices=("none", "eager", "aot_eager", "npu", "npugraphs", "npugraph_ex", "inductor"),
+        choices=("none", "eager", "aot_eager", "npu", "npugraphs", "npugraph_ex", "inductor", "aclgraph"),
         default="none",
-        help="compile the prepared graph op; eager checks Dynamo fullgraph and npugraphs checks ACLGraph replay",
+        help=("compile the prepared graph op; eager checks Dynamo fullgraph, npugraphs checks framework "
+              "integration, and aclgraph performs explicit torch.npu.NPUGraph capture/replay"),
     )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -350,12 +351,22 @@ def main():
     if relay_manifest and not Path(relay_manifest).is_file():
         raise RuntimeError(f"relay manifest not found: {relay_manifest}")
 
+    capture_stream = torch_npu.npu.Stream() if args.compile_backend == "aclgraph" else None
     plan_handle = 0
     if args.implementation == "prepared":
         mark_phase("prepare_explicit_multipath_plan")
-        plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
-            args.plan_id, relay_manifest, args.direct_route, explicit_weights
-        )
+        if capture_stream is None:
+            plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
+                args.plan_id, relay_manifest, args.direct_route, explicit_weights
+            )
+        else:
+            # HcclThreadAcquireWithStream binds the prepared CCU resources to
+            # the stream. Explicit ACLGraph validation therefore prepares the
+            # plan while its capture stream is current.
+            with torch_npu.npu.stream(capture_stream):
+                plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
+                    args.plan_id, relay_manifest, args.direct_route, explicit_weights
+                )
         if plan_handle <= 0:
             raise RuntimeError(f"invalid prepared plan handle: {plan_handle}")
         print(f"CASE_PREPARED_PLAN rank={rank} plan_id={args.plan_id} "
@@ -376,7 +387,8 @@ def main():
     ])
 
     compiled_prepared_op = None
-    if args.compile_backend != "none":
+    acl_graph = None
+    if args.compile_backend not in ("none", "aclgraph"):
         mark_phase(f"compile_graph_{args.compile_backend}")
 
         def prepared_graph_op(send_tensor):
@@ -397,7 +409,10 @@ def main():
         )
 
     def run_op():
-        nonlocal recv
+        nonlocal recv, acl_graph
+        if acl_graph is not None:
+            acl_graph.replay()
+            return
         if args.implementation == "native":
             dist.all_to_all_single(recv, send)
         elif args.implementation == "standard":
@@ -428,7 +443,43 @@ def main():
          f"multiroute_{args.path_uids or args.route_indices or args.route_index}_{args.schedule}"))
     sync_dir = Path("/tmp") / f"a5_ccu_urma_a2a_{case_tag}_{run_id}"
 
-    if compiled_prepared_op is not None:
+    if args.compile_backend == "aclgraph":
+        # Prime all lazy host/runtime state on the exact capture stream. Plan
+        # creation already installed stream-bound HCOMM resources, so neither
+        # capture nor replay may acquire a Channel or register a CCU kernel.
+        mark_phase("aclgraph_stream_warmup")
+        with torch_npu.npu.stream(capture_stream):
+            recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+                send, plan_handle
+            )
+        torch.npu.synchronize()
+        torch.testing.assert_close(recv, expected)
+        file_barrier(sync_dir, "aclgraph_stream_warmup", rank, world_size)
+
+        mark_phase("aclgraph_capture")
+        file_barrier(sync_dir, "aclgraph_capture_begin", rank, world_size)
+        acl_graph = torch.npu.NPUGraph()
+        with torch_npu.npu.graph(
+            acl_graph, stream=capture_stream, auto_dispatch_capture=True
+        ):
+            recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+                send, plan_handle
+            )
+        torch.npu.synchronize()
+        file_barrier(sync_dir, "aclgraph_capture_done", rank, world_size)
+        print(f"CASE_ACLGRAPH_CAPTURE rank={rank} PASS", flush=True)
+
+        # Mutating the stable captured input makes stale-output replay fail.
+        send.add_(1000.0)
+        expected.add_(1000.0)
+        torch.npu.synchronize()
+        mark_phase("aclgraph_replay")
+        acl_graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(recv, expected)
+        file_barrier(sync_dir, "aclgraph_replay", rank, world_size)
+        print(f"CASE_ACLGRAPH_REPLAY rank={rank} PASS", flush=True)
+    elif compiled_prepared_op is not None:
         # torch.compile is lazy. Separate the first compile/execute from a
         # second replay so logs and profiler results can distinguish them.
         mark_phase(f"graph_first_execute_{args.compile_backend}")
@@ -438,6 +489,12 @@ def main():
         file_barrier(sync_dir, "graph_first_execute", rank, world_size)
         print(f"CASE_GRAPH_FIRST_EXECUTE rank={rank} backend={args.compile_backend} PASS", flush=True)
 
+        # Change the captured input storage before the second execution. A
+        # successful equality check now proves that replay consumed current
+        # data instead of returning the first execution's stale output.
+        send.add_(1000.0)
+        expected.add_(1000.0)
+        torch.npu.synchronize()
         mark_phase(f"graph_replay_{args.compile_backend}")
         run_op()
         torch.npu.synchronize()
