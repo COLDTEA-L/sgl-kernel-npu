@@ -404,9 +404,9 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
 extern "C" __attribute__((visibility("default"))) int
 A5CcuHbmCommandPunctureAbiVersion()
 {
-    // Version 3 adds registration-only capability probes for HBM Load/Store,
-    // CCU_WHILE and their combination.
-    return 3;
+    // Version 4 consumes the commandBlockAddr task argument with Load(),
+    // matching GeneArgs and the task-argument contract used by native kernels.
+    return 4;
 }
 
 extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(

@@ -80,7 +80,7 @@ lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 abi = lib.A5CcuHbmCommandPunctureAbiVersion
 abi.restype = ctypes.c_int
 print("Route puncture:", path, "ABI=", abi())
-assert abi() >= 3, "route package predates the registration capability probes"
+assert abi() >= 4, "route package predates the task-argument registration fix"
 PY
 
 python3 - <<'PY'

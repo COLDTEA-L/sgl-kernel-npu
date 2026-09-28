@@ -102,7 +102,7 @@ fn = lib.A5CcuHbmCommandPunctureAbiVersion
 fn.restype = ctypes.c_int
 print("route library:", p)
 print("command puncture ABI:", fn())
-assert fn() >= 3
+assert fn() >= 4
 PY
 ```
 
@@ -171,6 +171,12 @@ HBM cache、EID 或 relay。先用注册矩阵把失败拆成四类：
 这些模式都使用真实的 direct/relay Channel，但设置
 `A5_CCU_WORKER_REGISTER_ONLY=1`，只执行 register/finalize，不 launch CCU kernel，
 因此不会产生数据流量，也不会进入 AIV handshake。
+
+> ABI 3 的四项测试曾全部在 `algorithm_begin` 后返回 4，但该结果不能用于判定
+> HBM/WHILE 均不受支持：当时 `GeneArgs()` 返回了 `commandBlockAddr`，Algorithm
+> 却没有用 `Load()` 消费该 task argument。ABI 4 已按原生 CCU kernel 的约定补齐
+> 这一项；只有 ABI 4 的矩阵结果才具有能力判定意义。日志中应在各模式看到
+> `phase=task_arg_ready`。
 
 端点为物理卡 2、3，relay 为 0、1 时执行：
 

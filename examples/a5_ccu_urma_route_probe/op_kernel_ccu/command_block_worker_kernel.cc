@@ -91,6 +91,17 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
     using hcomm::CcuRep::RemoteAddr;
     using hcomm::CcuRep::Variable;
 
+    // GeneArgs() supplies exactly one task argument.  Every working HCOMM CCU
+    // kernel in this repository consumes each task argument with Load() while
+    // building the instruction template.  Omitting this Load made all probe
+    // modes share an invalid task-argument layout and obscured the actual
+    // HBM/control-flow capability result.
+    Variable runtimeCommandBlock;
+    Load(runtimeCommandBlock);
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=task_arg_ready mode=%s\n",
+                RegisterModeName(registerMode_));
+    std::fflush(stdout);
+
     // Registration-only capability probes.  The host never launches these
     // kernels when A5_CCU_WORKER_REGISTER_ONLY=1; their sole purpose is to
     // make the registration boundary attributable to one instruction group.
