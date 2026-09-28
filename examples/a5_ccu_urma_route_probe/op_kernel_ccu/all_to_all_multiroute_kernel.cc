@@ -4,12 +4,10 @@ namespace a5_ccu_urma_probe {
 namespace {
 constexpr uint32_t OUTPUT_VAR_INDEX = 0;
 constexpr uint32_t TOKEN_VAR_INDEX = 1;
-constexpr uint32_t PRE_SYNC_NOTIFY_INDEX = 0;
-constexpr uint32_t POST_SYNC_NOTIFY_INDEX = 1;
-constexpr uint32_t OUTPUT_MASK = 1;
-constexpr uint32_t TOKEN_MASK = 2;
-constexpr uint32_t PRE_SYNC_MASK = OUTPUT_MASK | TOKEN_MASK;
-constexpr uint32_t POST_SYNC_MASK = 1;
+constexpr uint32_t OUTPUT_NOTIFY_INDEX = 0;
+constexpr uint32_t TOKEN_NOTIFY_INDEX = 1;
+constexpr uint32_t COMPLETION_NOTIFY_INDEX = 2;
+constexpr uint32_t NOTIFY_MASK = 1;
 constexpr size_t MAX_EXPLICIT_PATHS = 64U;
 
 #define CCU_KERNEL_CHECK(expression) do { \
@@ -29,7 +27,7 @@ AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
 hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append("A5CcuUrmaMultiRouteAllToAllV1");
+    signature.Append("A5CcuUrmaMultiRouteAllToAllV2");
     signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
     for (const uint32_t routeIndex : routeIndices_) {
         signature.Append(routeIndex);
@@ -65,6 +63,11 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
     std::vector<hcomm::CcuRep::Variable> pathBytes;
     std::vector<hcomm::CcuRep::Variable> remoteOutputs;
     std::vector<hcomm::CcuRep::Variable> remoteTokens;
+    sourceOffsets.reserve(channels_.size());
+    remoteOffsets.reserve(channels_.size());
+    pathBytes.reserve(channels_.size());
+    remoteOutputs.reserve(channels_.size());
+    remoteTokens.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
         sourceOffsets.push_back(CreateVariable());
         remoteOffsets.push_back(CreateVariable());
@@ -73,13 +76,14 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         remoteOutputs.emplace_back(); remoteTokens.emplace_back();
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], OUTPUT_VAR_INDEX, &remoteOutputs.back()));
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], TOKEN_VAR_INDEX, &remoteTokens.back()));
-        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], PRE_SYNC_NOTIFY_INDEX, OUTPUT_VAR_INDEX,
-                                      output, OUTPUT_MASK));
-        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], PRE_SYNC_NOTIFY_INDEX, TOKEN_VAR_INDEX,
-                                      outputToken, TOKEN_MASK));
+        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], OUTPUT_NOTIFY_INDEX, OUTPUT_VAR_INDEX,
+                                      output, NOTIFY_MASK));
+        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], TOKEN_NOTIFY_INDEX, TOKEN_VAR_INDEX,
+                                      outputToken, NOTIFY_MASK));
     }
     for (const ChannelHandle channel : channels_) {
-        CCU_KERNEL_CHECK(NotifyWait(channel, PRE_SYNC_NOTIFY_INDEX, PRE_SYNC_MASK));
+        CCU_KERNEL_CHECK(NotifyWait(channel, OUTPUT_NOTIFY_INDEX, NOTIFY_MASK));
+        CCU_KERNEL_CHECK(NotifyWait(channel, TOKEN_NOTIFY_INDEX, NOTIFY_MASK));
     }
 
     hcomm::CcuRep::LocalAddr localSource = CreateLocalAddr();
@@ -115,8 +119,8 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
 
     // All data routes target the same peer. One peer-level completion handshake
     // is sufficient after every local completion event has fired.
-    CCU_KERNEL_CHECK(NotifyRecord(channels_.front(), POST_SYNC_NOTIFY_INDEX, POST_SYNC_MASK));
-    CCU_KERNEL_CHECK(NotifyWait(channels_.front(), POST_SYNC_NOTIFY_INDEX, POST_SYNC_MASK));
+    CCU_KERNEL_CHECK(NotifyRecord(channels_.front(), COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
+    CCU_KERNEL_CHECK(NotifyWait(channels_.front(), COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
     return HCCL_SUCCESS;
 }
 

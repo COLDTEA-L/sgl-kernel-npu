@@ -158,7 +158,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("route library:", path)
 print("prepared-plan ABI:", version())
-assert version() >= 2
+assert version() >= 3
 PY
 ```
 
@@ -219,7 +219,7 @@ print("torch.compile fullgraph Meta capture: PASS")
 PY
 ```
 
-预期 DeepEP ABI 至少为 `5`、prepared-plan ABI 至少为 `2`，并输出 `Meta dispatch: PASS` 和
+预期 DeepEP ABI 至少为 `5`、prepared-plan ABI 至少为 `3`，并输出 `Meta dispatch: PASS` 和
 `torch.compile fullgraph Meta capture: PASS`。
 
 ## 5. 快速单 case 验证
@@ -423,6 +423,7 @@ grep -nE \
 | `plan handle not found` | plan 在另一进程创建，或进程已重启；每个 rank 必须各自 prepare |
 | `plan stream mismatch` | prepare 与 execute 不在同一 NPU stream；按 stream 分别准备 plan |
 | ChannelAcquire status=9 | 所选 EID pair 未被当前底层 provision；检查 relay manifest/拓扑 |
+| 正确性固定缺失一个 rank 的整块数据 | 确认 route ABI 至少为 3；旧 AllToAll kernel 将 output/token 合并在同一个 notify index，必须重建第 3 节 route package，使用独立 output/token/completion 通知 |
 
 方案 2 不需要 `libmc2_client.so` 源码，也不需要 patched `libhccl.so`。它仍依赖系统 HCOMM/HCCL 的公开
 Channel/CCU primitive 来准备资源。

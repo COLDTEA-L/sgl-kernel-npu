@@ -232,7 +232,8 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    return 2;
+    // Version 3 uses independent output/token/completion notify indices.
+    return 3;
 }
 
 extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
