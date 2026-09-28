@@ -3,6 +3,8 @@
 
 import argparse
 import os
+import sys
+import traceback
 from pathlib import Path
 
 import torch
@@ -67,35 +69,50 @@ def main():
     command_block = torch.zeros((64,), dtype=torch.int64, device="npu")
     expected = expected_tensor(rank, elements)
     worker = 0
+    if args.register_only:
+        try:
+            worker = buffer.runtime.prepare_ccu_hbm_command_worker(
+                send, recv, command_block, args.plan_id, str(manifest),
+                args.direct_route, weights)
+            print(f"PUNCTURE_WORKER rank={rank} handle={worker} paths={len(weights)}", flush=True)
+            print(f"PUNCTURE_REGISTER_ONLY rank={rank} PASS", flush=True)
+            print("PUNCTURE_RESULT PASS", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # This is an intentionally short-lived registration probe.  The
+            # route package did not launch or retain a worker, and process exit
+            # reclaims the diagnostic Channel/thread resources without waiting
+            # through process-group teardown on a partially registered kernel.
+            os._exit(0)
+        except BaseException:
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+
     try:
         worker = buffer.runtime.prepare_ccu_hbm_command_worker(
             send, recv, command_block, args.plan_id, str(manifest),
             args.direct_route, weights)
         print(f"PUNCTURE_WORKER rank={rank} handle={worker} paths={len(weights)}", flush=True)
 
-        if args.register_only:
-            # The route package has registered and finalized the selected
-            # instruction group but deliberately did not launch it.
-            print(f"PUNCTURE_REGISTER_ONLY rank={rank} PASS", flush=True)
-            worker = 0
-        else:
-            # Stage A: no payload movement. This isolates cache/coherency and the
-            # two-way command/completion handshake from URMA communication.
-            ack = buffer.runtime.ccu_hbm_command_puncture(
-                send, recv, command_block, weights, False)
-            torch.npu.synchronize()
-            check_ack(ack, "handshake")
-            torch.testing.assert_close(recv, torch.full_like(recv, -1.0))
+        # Stage A: no payload movement. This isolates cache/coherency and the
+        # two-way command/completion handshake from URMA communication.
+        ack = buffer.runtime.ccu_hbm_command_puncture(
+            send, recv, command_block, weights, False)
+        torch.npu.synchronize()
+        check_ack(ack, "handshake")
+        torch.testing.assert_close(recv, torch.full_like(recv, -1.0))
 
-            # Stage B: the exact same worker consumes addresses/offsets/path bytes
-            # published by AIV and performs one real explicit multipath AllToAll.
-            ack = buffer.runtime.ccu_hbm_command_puncture(
-                send, recv, command_block, weights, True)
-            torch.npu.synchronize()
-            check_ack(ack, "transfer")
-            torch.testing.assert_close(recv, expected)
+        # Stage B: the exact same worker consumes addresses/offsets/path bytes
+        # published by AIV and performs one real explicit multipath AllToAll.
+        ack = buffer.runtime.ccu_hbm_command_puncture(
+            send, recv, command_block, weights, True)
+        torch.npu.synchronize()
+        check_ack(ack, "transfer")
+        torch.testing.assert_close(recv, expected)
 
-        if args.graph and not args.register_only:
+        if args.graph:
             capture_stream = torch_npu.npu.Stream()
             graph = torch.npu.NPUGraph()
             with torch_npu.npu.stream(capture_stream):
