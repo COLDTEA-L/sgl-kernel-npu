@@ -404,9 +404,9 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
 extern "C" __attribute__((visibility("default"))) int
 A5CcuHbmCommandPunctureAbiVersion()
 {
-    // Version 2 uses a single CCU polling loop.  The nested WHILE form in V1
-    // was rejected by the A5 instruction builder during kernel registration.
-    return 2;
+    // Version 3 adds registration-only capability probes for HBM Load/Store,
+    // CCU_WHILE and their combination.
+    return 3;
 }
 
 extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
@@ -447,6 +447,22 @@ extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
         comm, workerStream, RouteKernelKind::COMMAND_BLOCK_WORKER,
         &resources, &request);
     if (status != HCCL_SUCCESS) return status;
+
+    const char *registerOnly = std::getenv("A5_CCU_WORKER_REGISTER_ONLY");
+    if (registerOnly != nullptr && std::string(registerOnly) == "1") {
+        // Registration probing intentionally stops before initializing HBM or
+        // launching the generated kernel.  The process is short lived, so its
+        // HCCL resources are reclaimed at process exit; no synthetic worker is
+        // inserted into g_commandWorkers.
+        *workerHandle = UINT64_MAX >> 1U;
+        const char *mode = std::getenv("A5_CCU_WORKER_REGISTER_MODE");
+        std::printf("COMMAND_BLOCK_REGISTER_PROBE_RESULT mode=%s status=PASS "
+                    "rank=%u paths=%zu\n",
+                    mode == nullptr ? "full" : mode,
+                    resources.rank, resources.channels.size());
+        std::fflush(stdout);
+        return HCCL_SUCCESS;
+    }
 
     std::vector<uint64_t> initial(COMMAND_WORDS, 0U);
     const uint64_t totalBytes = elementsPerPeer * resources.rankSize * sizeof(float);

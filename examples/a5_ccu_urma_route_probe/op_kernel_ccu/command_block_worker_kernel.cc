@@ -26,15 +26,27 @@ uint64_t AddressAt(uint64_t base, uint64_t word)
 {
     return base + word * sizeof(uint64_t);
 }
+
+const char *RegisterModeName(CommandWorkerRegisterMode mode)
+{
+    switch (mode) {
+        case CommandWorkerRegisterMode::FULL: return "full";
+        case CommandWorkerRegisterMode::HBM_ONCE: return "hbm_once";
+        case CommandWorkerRegisterMode::LOOP_ONLY: return "loop_only";
+        case CommandWorkerRegisterMode::LOOP_HBM: return "loop_hbm";
+    }
+    return "invalid";
+}
 } // namespace
 
 CommandBlockWorkerKernelArg::CommandBlockWorkerKernelArg(
     const std::vector<ChannelHandle> &inputChannels,
     const std::vector<uint32_t> &routeIndices,
     const std::vector<uint32_t> &weights,
-    uint64_t commandBlockAddress)
+    uint64_t commandBlockAddress,
+    CommandWorkerRegisterMode registerMode)
     : routeIndices_(routeIndices), weights_(weights),
-      commandBlockAddress_(commandBlockAddress)
+      commandBlockAddress_(commandBlockAddress), registerMode_(registerMode)
 {
     channels = inputChannels;
 }
@@ -48,6 +60,7 @@ hcomm::CcuKernelSignature CommandBlockWorkerKernelArg::GetKernelSignature() cons
         signature.Append(weights_[i]);
     }
     signature.Append(commandBlockAddress_);
+    signature.Append(static_cast<uint32_t>(registerMode_));
     return signature;
 }
 
@@ -55,7 +68,10 @@ CommandBlockWorkerKernel::CommandBlockWorkerKernel(const hcomm::CcuKernelArg &ar
     : hcomm::CcuKernel(arg)
 {
     const auto *workerArg = dynamic_cast<const CommandBlockWorkerKernelArg *>(&arg);
-    if (workerArg != nullptr) commandBlockAddress_ = workerArg->GetCommandBlockAddress();
+    if (workerArg != nullptr) {
+        commandBlockAddress_ = workerArg->GetCommandBlockAddress();
+        registerMode_ = workerArg->GetRegisterMode();
+    }
 }
 
 HcclResult CommandBlockWorkerKernel::Algorithm()
@@ -65,7 +81,8 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
     }
 
     if (commandBlockAddress_ == 0U) return HCCL_E_PARA;
-    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_begin paths=%zu command_block=0x%lx\n",
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_begin mode=%s paths=%zu "
+                "command_block=0x%lx\n", RegisterModeName(registerMode_),
                 channels_.size(), static_cast<unsigned long>(commandBlockAddress_));
     std::fflush(stdout);
     using namespace hcomm;
@@ -74,13 +91,46 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
     using hcomm::CcuRep::RemoteAddr;
     using hcomm::CcuRep::Variable;
 
+    // Registration-only capability probes.  The host never launches these
+    // kernels when A5_CCU_WORKER_REGISTER_ONLY=1; their sole purpose is to
+    // make the registration boundary attributable to one instruction group.
+    if (registerMode_ == CommandWorkerRegisterMode::HBM_ONCE) {
+        Variable value;
+        value = 0;
+        LoadVariable(AddressAt(commandBlockAddress_, COMMAND_OPCODE), value);
+        StoreVariable(value, AddressAt(commandBlockAddress_, COMMAND_STATUS));
+        std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready mode=hbm_once\n");
+        std::fflush(stdout);
+        return HCCL_SUCCESS;
+    }
+    if (registerMode_ == CommandWorkerRegisterMode::LOOP_ONLY) {
+        Variable once;
+        once = 0;
+        CCU_WHILE(once == 0) {
+            once = 1;
+        }
+        std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready mode=loop_only\n");
+        std::fflush(stdout);
+        return HCCL_SUCCESS;
+    }
+    if (registerMode_ == CommandWorkerRegisterMode::LOOP_HBM) {
+        Variable command;
+        command = 0;
+        CCU_WHILE(command == 0) {
+            LoadVariable(AddressAt(commandBlockAddress_, COMMAND_OPCODE), command);
+        }
+        std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready mode=loop_hbm\n");
+        std::fflush(stdout);
+        return HCCL_SUCCESS;
+    }
+
     std::vector<Variable> remoteOutputs(channels_.size());
     std::vector<Variable> remoteTokens(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], OUTPUT_VAR_INDEX, &remoteOutputs[i]));
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], TOKEN_VAR_INDEX, &remoteTokens[i]));
     }
-    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=remote_variables_ready paths=%zu\n",
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=remote_variables_ready mode=full paths=%zu\n",
                 channels_.size());
     std::fflush(stdout);
 
@@ -203,7 +253,7 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
             StoreVariable(completed, AddressAt(commandBlockAddress_, COMMAND_COMPLETION));
         }
     }
-    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready paths=%zu\n",
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready mode=full paths=%zu\n",
                 channels_.size());
     std::fflush(stdout);
     return HCCL_SUCCESS;

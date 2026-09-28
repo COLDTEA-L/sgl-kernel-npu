@@ -46,6 +46,31 @@ bool EnvEnabled(const char *name)
     return value != nullptr && std::string(value) == "1";
 }
 
+HcclResult GetCommandWorkerRegisterMode(CommandWorkerRegisterMode *mode,
+                                        std::string *name)
+{
+    if (mode == nullptr || name == nullptr) return HCCL_E_PTR;
+    const char *value = std::getenv("A5_CCU_WORKER_REGISTER_MODE");
+    const std::string requested = value == nullptr || value[0] == '\0' ?
+        "full" : std::string(value);
+    if (requested == "full") {
+        *mode = CommandWorkerRegisterMode::FULL;
+    } else if (requested == "hbm_once") {
+        *mode = CommandWorkerRegisterMode::HBM_ONCE;
+    } else if (requested == "loop_only") {
+        *mode = CommandWorkerRegisterMode::LOOP_ONLY;
+    } else if (requested == "loop_hbm") {
+        *mode = CommandWorkerRegisterMode::LOOP_HBM;
+    } else {
+        std::fprintf(stderr,
+            "[A5 CCU URMA] invalid A5_CCU_WORKER_REGISTER_MODE=%s\n",
+            requested.c_str());
+        return HCCL_E_PARA;
+    }
+    *name = requested;
+    return HCCL_SUCCESS;
+}
+
 void SetUrmaTraceLabel(const std::string &label)
 {
     using SetLabelFn = void (*)(const char *);
@@ -768,7 +793,14 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     }
     std::vector<uint32_t> routeIndices;
     std::vector<std::string> requestedPathUids;
+    CommandWorkerRegisterMode commandRegisterMode = CommandWorkerRegisterMode::FULL;
+    std::string commandRegisterModeName = "full";
     HcclResult status = HCCL_SUCCESS;
+    if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
+        status = GetCommandWorkerRegisterMode(&commandRegisterMode,
+                                              &commandRegisterModeName);
+        if (status != HCCL_SUCCESS) return status;
+    }
     const bool explicitPlan = plan != nullptr;
     if (explicitPlan) {
         if (!plan->includeDiscoveredRoute || plan->relayManifest.empty() ||
@@ -824,6 +856,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
         if (!explicitPlan || plan->commandBlockAddress == 0U) return HCCL_E_PARA;
         routeKey += ":command_block=" + std::to_string(plan->commandBlockAddress);
+        routeKey += ":register_mode=" + commandRegisterModeName;
     }
     routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
     routeKey += ":donor=" + std::string(donorKeyValue == nullptr ? "none" : donorKeyValue);
@@ -1136,7 +1169,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         kernelName = "command_block_worker";
         CommandBlockWorkerKernelArg kernelArg(
             created.channels, routeIndices, created.weights,
-            plan->commandBlockAddress);
+            plan->commandBlockAddress, commandRegisterMode);
         hcomm::KernelCreator creator = CreateCommandBlockWorkerKernel;
         registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
     } else {

@@ -39,19 +39,32 @@ constexpr uint64_t COMMAND_OPCODE_EXECUTE = 1;
 constexpr uint64_t COMMAND_OPCODE_STOP = 2;
 constexpr uint64_t COMMAND_STATUS_SUCCESS = 0;
 
+// Registration-only probe modes.  These deliberately split the persistent
+// worker into orthogonal instruction groups so an A5 machine can identify
+// which group is rejected by HcclCcuKernelRegister without launching it.
+enum class CommandWorkerRegisterMode : uint32_t {
+    FULL = 0,
+    HBM_ONCE = 1,
+    LOOP_ONLY = 2,
+    LOOP_HBM = 3,
+};
+
 class CommandBlockWorkerKernelArg : public hcomm::CcuKernelArg {
 public:
     CommandBlockWorkerKernelArg(const std::vector<ChannelHandle> &channels,
                                 const std::vector<uint32_t> &routeIndices,
                                 const std::vector<uint32_t> &weights,
-                                uint64_t commandBlockAddress);
+                                uint64_t commandBlockAddress,
+                                CommandWorkerRegisterMode registerMode);
     hcomm::CcuKernelSignature GetKernelSignature() const override;
     uint64_t GetCommandBlockAddress() const { return commandBlockAddress_; }
+    CommandWorkerRegisterMode GetRegisterMode() const { return registerMode_; }
 
 private:
     std::vector<uint32_t> routeIndices_;
     std::vector<uint32_t> weights_;
     uint64_t commandBlockAddress_ = 0;
+    CommandWorkerRegisterMode registerMode_ = CommandWorkerRegisterMode::FULL;
 };
 
 class CommandBlockWorkerTaskArg : public hcomm::CcuTaskArg {
@@ -71,6 +84,7 @@ protected:
 
 private:
     uint64_t commandBlockAddress_ = 0;
+    CommandWorkerRegisterMode registerMode_ = CommandWorkerRegisterMode::FULL;
 };
 
 std::unique_ptr<hcomm::CcuKernel> CreateCommandBlockWorkerKernel(

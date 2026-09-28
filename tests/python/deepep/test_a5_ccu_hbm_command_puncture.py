@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument("--path-weights", default="2,1,1")
     parser.add_argument("--plan-id", default="aiv-hbm-ccu-puncture")
     parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--register-only", action="store_true")
     return parser.parse_args()
 
 
@@ -72,23 +73,29 @@ def main():
             args.direct_route, weights)
         print(f"PUNCTURE_WORKER rank={rank} handle={worker} paths={len(weights)}", flush=True)
 
-        # Stage A: no payload movement. This isolates cache/coherency and the
-        # two-way command/completion handshake from URMA communication.
-        ack = buffer.runtime.ccu_hbm_command_puncture(
-            send, recv, command_block, weights, False)
-        torch.npu.synchronize()
-        check_ack(ack, "handshake")
-        torch.testing.assert_close(recv, torch.full_like(recv, -1.0))
+        if args.register_only:
+            # The route package has registered and finalized the selected
+            # instruction group but deliberately did not launch it.
+            print(f"PUNCTURE_REGISTER_ONLY rank={rank} PASS", flush=True)
+            worker = 0
+        else:
+            # Stage A: no payload movement. This isolates cache/coherency and the
+            # two-way command/completion handshake from URMA communication.
+            ack = buffer.runtime.ccu_hbm_command_puncture(
+                send, recv, command_block, weights, False)
+            torch.npu.synchronize()
+            check_ack(ack, "handshake")
+            torch.testing.assert_close(recv, torch.full_like(recv, -1.0))
 
-        # Stage B: the exact same worker consumes addresses/offsets/path bytes
-        # published by AIV and performs one real explicit multipath AllToAll.
-        ack = buffer.runtime.ccu_hbm_command_puncture(
-            send, recv, command_block, weights, True)
-        torch.npu.synchronize()
-        check_ack(ack, "transfer")
-        torch.testing.assert_close(recv, expected)
+            # Stage B: the exact same worker consumes addresses/offsets/path bytes
+            # published by AIV and performs one real explicit multipath AllToAll.
+            ack = buffer.runtime.ccu_hbm_command_puncture(
+                send, recv, command_block, weights, True)
+            torch.npu.synchronize()
+            check_ack(ack, "transfer")
+            torch.testing.assert_close(recv, expected)
 
-        if args.graph:
+        if args.graph and not args.register_only:
             capture_stream = torch_npu.npu.Stream()
             graph = torch.npu.NPUGraph()
             with torch_npu.npu.stream(capture_stream):

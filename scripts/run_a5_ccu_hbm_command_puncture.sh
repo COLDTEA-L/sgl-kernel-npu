@@ -15,6 +15,8 @@ topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 graph=1
+worker_register_mode=full
+register_only=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,9 +32,16 @@ while [[ $# -gt 0 ]]; do
         --topology-json) topology_json=$2; shift 2 ;;
         --cann-root) cann_root=$2; shift 2 ;;
         --no-graph) graph=0; shift ;;
+        --worker-register-mode) worker_register_mode=$2; shift 2 ;;
+        --register-only) register_only=1; graph=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+case "${worker_register_mode}" in
+    full|hbm_once|loop_only|loop_hbm) ;;
+    *) echo "--worker-register-mode must be full, hbm_once, loop_only, or loop_hbm" >&2; exit 2 ;;
+esac
 
 [[ "${src_phy}" =~ ^[0-9]+$ && "${dst_phy}" =~ ^[0-9]+$ ]] || {
     echo "--src-phy and --dst-phy are required" >&2; exit 2;
@@ -71,7 +80,7 @@ lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 abi = lib.A5CcuHbmCommandPunctureAbiVersion
 abi.restype = ctypes.c_int
 print("Route puncture:", path, "ABI=", abi())
-assert abi() >= 2, "route package predates the single-loop CCU worker fix"
+assert abi() >= 3, "route package predates the registration capability probes"
 PY
 
 python3 - <<'PY'
@@ -89,7 +98,7 @@ for name in ("prepare_ccu_hbm_command_worker", "ccu_hbm_command_puncture",
     assert hasattr(ext.Buffer, name), name
 PY
 
-run_dir="${output_root}/a5_ccu_hbm_command_puncture_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
+run_dir="${output_root}/a5_ccu_hbm_command_puncture_${worker_register_mode}_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/plans"
 relay_weights=""
 for ((i=0; i<${#relay_array[@]}; ++i)); do
@@ -111,6 +120,10 @@ for ((i=0; i<${#relay_array[@]}; ++i)); do weights+=,1; done
 args=(--bytes "${bytes}" --relay-manifest "${run_dir}/plans/direct_plus_relays.tsv"
       --direct-route "${direct_route}" --path-weights "${weights}")
 (( graph )) && args+=(--graph)
+(( register_only )) && args+=(--register-only)
+
+export A5_CCU_WORKER_REGISTER_MODE="${worker_register_mode}"
+export A5_CCU_WORKER_REGISTER_ONLY="${register_only}"
 
 status=0
 timeout --signal=TERM --kill-after=10 "${timeout_seconds}" \
@@ -118,7 +131,7 @@ timeout --signal=TERM --kill-after=10 "${timeout_seconds}" \
     tests/python/deepep/test_a5_ccu_hbm_command_puncture.py "${args[@]}" \
     >"${run_dir}/puncture.log" 2>&1 || status=$?
 printf 'status\t%s\n' "${status}" >"${run_dir}/status.tsv"
-grep -E 'PUNCTURE_|COMMAND_BLOCK_WORKER' "${run_dir}/puncture.log" || true
+grep -E 'PUNCTURE_|COMMAND_BLOCK_(WORKER|REGISTER)' "${run_dir}/puncture.log" || true
 if (( status != 0 )) || ! grep -q '^PUNCTURE_RESULT PASS' "${run_dir}/puncture.log"; then
     echo "Puncture failed; inspect ${run_dir}/puncture.log" >&2
     tail -120 "${run_dir}/puncture.log" >&2

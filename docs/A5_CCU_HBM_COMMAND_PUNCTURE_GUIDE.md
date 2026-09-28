@@ -102,7 +102,7 @@ fn = lib.A5CcuHbmCommandPunctureAbiVersion
 fn.restype = ctypes.c_int
 print("route library:", p)
 print("command puncture ABI:", fn())
-assert fn() >= 2
+assert fn() >= 3
 PY
 ```
 
@@ -156,7 +156,59 @@ print("command puncture Python APIs: PASS")
 PY
 ```
 
-## 7. 运行穿刺
+## 7. 先运行 CCU 注册能力矩阵
+
+如果完整 worker 在 `HcclCcuKernelRegister` 返回 `status=4`，不要继续猜测
+HBM cache、EID 或 relay。先用注册矩阵把失败拆成四类：
+
+| mode | 只注册的指令组 | 能回答的问题 |
+|---|---|---|
+| `hbm_once` | 一次原始 HBM `LoadVariable + StoreVariable` | 注册器是否接受 CCU 直接读写这块 HBM |
+| `loop_only` | 不访问 HBM 的 `CCU_WHILE` | 注册器是否接受 repeat/while 控制流 |
+| `loop_hbm` | `CCU_WHILE` 内只做 HBM load | 循环与 HBM 访问的组合是否可注册 |
+| `full` | 完整 mailbox + direct/relay `WriteNb` worker | 完整 worker 是否可注册 |
+
+这些模式都使用真实的 direct/relay Channel，但设置
+`A5_CCU_WORKER_REGISTER_ONLY=1`，只执行 register/finalize，不 launch CCU kernel，
+因此不会产生数据流量，也不会进入 AIV handshake。
+
+端点为物理卡 2、3，relay 为 0、1 时执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_hbm_command_register_matrix.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
+  --direct-route 0 \
+  --bytes 4194304 \
+  --timeout-seconds 300 \
+  --output-root /home/l00934901/profiling
+```
+
+结果位于：
+
+```bash
+MATRIX_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_hbm_command_register_matrix_* | head -1)
+
+column -s $'\t' -t "${MATRIX_DIR}/register_matrix.tsv"
+grep -RHnE \
+'COMMAND_BLOCK_REGISTER_TRACE|COMMAND_BLOCK_REGISTER_PROBE_RESULT|register command_block_worker end' \
+"${MATRIX_DIR}"
+```
+
+判读规则：
+
+- `hbm_once=FAIL`：当前 CCU 注册边界不接受原始地址形式的 HBM Load/Store；先换成公开 remote-variable/GM 机制，不能进入 mailbox 调试。
+- `hbm_once=PASS, loop_only=FAIL`：问题是 `CCU_WHILE`/repeat 控制流，需改为 host/AIV 每次 launch 一次短 CCU kernel，或寻找官方常驻 worker 原语。
+- 前两项 PASS、`loop_hbm=FAIL`：单项均支持，但循环内 HBM 访问组合不支持；同样不能采用当前 busy-poll worker。
+- 三个最小项 PASS、`full=FAIL`：基础控制链成立，失败来自完整分支、Notify/WriteNb 指令规模或资源上限；再对 full body 二分。
+- 四项均 PASS：注册问题已解决，才继续下一节的真实 handshake/transfer。
+
+## 8. 运行完整穿刺
 
 例如端点使用物理卡 2、3，relay 显式指定为 0、1：
 
@@ -188,7 +240,7 @@ bash scripts/run_a5_ccu_hbm_command_puncture.sh \
 
 先只验证非图路径时增加 `--no-graph`。
 
-## 8. 查看结果
+## 9. 查看结果
 
 ```bash
 RUN_DIR=$(ls -dt \
@@ -213,7 +265,7 @@ PUNCTURE_RESULT PASS
 
 `COMMAND_BLOCK_WORKER phase=ready` 应只在 prepare 阶段出现，不应在 capture/replay 间重新创建 Channel。
 
-## 9. 失败定位
+## 10. 失败定位
 
 1. 缺少 worker symbol：安装的 route SO 过旧，重做第 5 节。
 2. DeepEP ABI `< 7`：导入了旧 wheel，重做第 6 节并核对 `ext.__file__`。
@@ -222,7 +274,7 @@ PUNCTURE_RESULT PASS
 5. 普通 transfer 通过但 capture/replay 失败：检查是否在 capture 内重新 prepare/stop，以及 command/completion 是否正确清零。
 6. 外层 timeout 中止进程时，`finally` 可能来不及发 STOP；进程退出后资源由 runtime 回收，但不要在同一进程中遗留 worker 后继续其他测试。
 7. 当前公开 HCOMM 边界没有与 `HcclThreadAcquireWithStream`/`HcclChannelAcquire` 配对的 release API。穿刺程序会发 STOP 并等待 worker 退出，但不在存活进程内销毁仍被 HCCL thread/channel 引用的专用 stream。因此该版本用于一次性穿刺，不应在长寿命进程中反复 prepare/stop。
-8. `register command_block_worker end: status=4` 表示失败在 CCU kernel 注册，尚未进入 HBM handshake。ABI 2 已将 V1 的嵌套 `CCU_WHILE` 改为单层轮询，并输出 `COMMAND_BLOCK_REGISTER_TRACE`。如果 ABI 2 仍失败，使用下列命令区分 primitive 生成失败和 register finalize 失败：
+8. `register command_block_worker end: status=4` 表示失败在 CCU kernel 注册，尚未进入 HBM handshake。ABI 3 提供第 7 节的四级注册能力矩阵；先跑矩阵，再使用下列命令区分 primitive 生成失败和 register finalize 失败：
 
 ```bash
 grep -nE \
@@ -232,7 +284,7 @@ grep -nE \
 
 `primitive_failed` 会给出失败源码行；如果已出现 `algorithm_ready` 但 Register 仍返回 4，则问题在 HCOMM 对整个 instruction group 的 finalize/verify，不在 relay Channel 或 CommandBlock 可见性。
 
-## 10. 通过后的下一步
+## 11. 通过后的下一步
 
 三层全部通过后，才将该协议收敛成最终标准算子：
 
