@@ -201,10 +201,15 @@ MATRIX_DIR=$(ls -dt \
   /home/l00934901/profiling/a5_ccu_hbm_command_register_matrix_* | head -1)
 
 column -s $'\t' -t "${MATRIX_DIR}/register_matrix.tsv"
+grep -m1 '^Route puncture:' "${MATRIX_DIR}/hbm_once.log"
 grep -RHnE \
 'COMMAND_BLOCK_REGISTER_TRACE|COMMAND_BLOCK_REGISTER_PROBE_RESULT|register command_block_worker end' \
 "${MATRIX_DIR}"
 ```
+
+矩阵脚本会从第一个子测试日志回显一次 `Route puncture: ... ABI= 4`。旧版脚本
+因为将子测试 stdout 重定向到 `hbm_once.log`，终端只显示 PASS/FAIL；这不表示 ABI
+没有检查。上面的 `grep` 可以直接读取实际加载结果。
 
 判读规则：
 

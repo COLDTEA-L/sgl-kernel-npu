@@ -20,6 +20,7 @@ matrix_dir="${output_root}/a5_ccu_hbm_command_register_matrix_$(date +%Y%m%d_%H%
 mkdir -p "${matrix_dir}"
 summary="${matrix_dir}/register_matrix.tsv"
 printf 'mode\tstatus\tresult\tlog\n' >"${summary}"
+printed_abi=0
 
 for mode in hbm_once loop_only loop_hbm full; do
     log="${matrix_dir}/${mode}.log"
@@ -29,6 +30,15 @@ for mode in hbm_once loop_only loop_hbm full; do
         >"${log}" 2>&1
     status=$?
     set -e
+    if (( printed_abi == 0 )); then
+        abi_line=$(grep -m1 '^Route puncture:' "${log}" || true)
+        if [[ -n "${abi_line}" ]]; then
+            echo "${abi_line}"
+            printed_abi=1
+        else
+            echo "WARNING: route puncture ABI line is missing; inspect ${log}" >&2
+        fi
+    fi
     run_dir=$(ls -dt "${output_root}/a5_ccu_hbm_command_puncture_${mode}_"* 2>/dev/null | head -1 || true)
     result=FAIL
     if (( status == 0 )) && [[ -n "${run_dir}" ]] &&
@@ -38,6 +48,10 @@ for mode in hbm_once loop_only loop_hbm full; do
     printf '%s\t%s\t%s\t%s\n' "${mode}" "${status}" "${result}" \
         "${run_dir:-${log}}" >>"${summary}"
     echo "${mode}: ${result} (status=${status})"
+    if [[ -n "${run_dir}" && -f "${run_dir}/puncture.log" ]]; then
+        grep -m1 'COMMAND_BLOCK_REGISTER_TRACE phase=task_arg_ready' \
+            "${run_dir}/puncture.log" || true
+    fi
 done
 
 echo
