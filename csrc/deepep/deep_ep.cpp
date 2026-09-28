@@ -21,8 +21,9 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
 {
     // Version 6 makes the graph-visible prepared operator functional: it
     // allocates and returns a fresh output instead of aliasing an out tensor.
-    // Version 7 adds the graph-visible AIV/HBM/CCU command-block puncture.
-    return 7;
+    // Version 8 replaces the standard operator's static path-weight string
+    // with a graph-visible int64 runtime PathPolicy tensor.
+    return 8;
 }
 
 namespace deep_ep {
@@ -296,10 +297,11 @@ torch::Tensor Buffer::hccl_all2_all_ccu(const torch::Tensor &send_data)
 }
 
 torch::Tensor Buffer::explicit_multipath_all2all_ccu(
-    const torch::Tensor &send_data, const std::string &plan_id,
-    const std::vector<int64_t> &path_weights)
+    const torch::Tensor &send_data, const torch::Tensor &path_policy,
+    const std::string &plan_id)
 {
-    RECORD_FUNCTION("deep_ep::explicit_multipath_all2all_ccu", std::vector<c10::IValue>({send_data}));
+    RECORD_FUNCTION("deep_ep::explicit_multipath_all2all_ccu",
+                    std::vector<c10::IValue>({send_data, path_policy}));
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.numel() > 0);
     EP_HOST_ASSERT(send_data.scalar_type() == at::kHalf || send_data.scalar_type() == at::kBFloat16 ||
@@ -307,30 +309,23 @@ torch::Tensor Buffer::explicit_multipath_all2all_ccu(
     EP_HOST_ASSERT(num_ranks == 2);
     EP_HOST_ASSERT(send_data.numel() % num_ranks == 0);
     EP_HOST_ASSERT(!plan_id.empty() && plan_id.size() < HCOMM_NAME_LEN);
-    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
-
-    std::string weights_text;
-    for (size_t i = 0; i < path_weights.size(); ++i) {
-        EP_HOST_ASSERT(path_weights[i] > 0 && path_weights[i] <= UINT32_MAX);
-        if (i != 0) weights_text.push_back(',');
-        weights_text += std::to_string(path_weights[i]);
-    }
+    EP_HOST_ASSERT(path_policy.is_contiguous());
+    EP_HOST_ASSERT(path_policy.numel() == 1);
+    EP_HOST_ASSERT(path_policy.scalar_type() == at::kLong);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(path_policy));
 
     // Never silently fall back to native HCCL routing. The marker is
     // exported by the matching HCCL explicit-path executor package.
     using ExtensionVersionFn = int (*)();
     static auto extension_version = reinterpret_cast<ExtensionVersionFn>(
         dlsym(RTLD_DEFAULT, "A5HcclExplicitMultipathExtensionVersion"));
-    EP_HOST_ASSERT_S(extension_version != nullptr && extension_version() >= 2,
-        "ExplicitMultipathAll2AllCcu requires HCCL explicit-path extension >= 2; "
+    EP_HOST_ASSERT_S(extension_version != nullptr && extension_version() >= 3,
+        "ExplicitMultipathAll2AllCcu requires HCCL explicit-path extension >= 3; "
         "refusing to run through the native AllToAll selector");
 
     const char *active_plan = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID");
     EP_HOST_ASSERT_S(active_plan != nullptr && plan_id == active_plan,
         "plan_id must match A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID provisioned before communicator initialization");
-    const char *active_weights = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS");
-    EP_HOST_ASSERT_S(active_weights != nullptr && weights_text == active_weights,
-        "path_weights must match A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS provisioned before communicator initialization");
     const char *active_manifest = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_MANIFEST");
     EP_HOST_ASSERT_S(active_manifest != nullptr && active_manifest[0] != '\0',
         "A5_CCU_EXPLICIT_MULTIPATH_MANIFEST must be set before communicator initialization");
@@ -348,9 +343,8 @@ torch::Tensor Buffer::explicit_multipath_all2all_ccu(
     // alive for the synchronous workspace query and pass the actual pointers.
     std::string plan_id_text = plan_id;
     char *plan_id_ptr = plan_id_text.data();
-    char *weights_ptr = weights_text.data();
-    EXEC_NPU_CMD(aclnnExplicitMultipathAll2AllCcu, send_data, hcom_ep_name,
-                 num_ranks, rank, plan_id_ptr, weights_ptr, recv_data);
+    EXEC_NPU_CMD(aclnnExplicitMultipathAll2AllCcu, send_data, path_policy,
+                 hcom_ep_name, num_ranks, rank, plan_id_ptr, recv_data);
     return recv_data;
 }
 

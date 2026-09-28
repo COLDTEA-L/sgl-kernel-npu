@@ -56,8 +56,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("get_notify_send_data", &deep_ep::Buffer::get_notify_send_data)
         .def("hccl_all2_all_ccu", &deep_ep::Buffer::hccl_all2_all_ccu)
         .def("explicit_multipath_all2all_ccu", &deep_ep::Buffer::explicit_multipath_all2all_ccu,
-             py::arg("send_data"), py::arg("plan_id"), py::arg("path_weights"),
-             "Graphable A5 CCU+URMA AllToAll using a pre-provisioned explicit path plan")
+             py::arg("send_data"), py::arg("path_policy"), py::arg("plan_id"),
+             "Standard A5 CCU+URMA AllToAll with a runtime path-policy tensor")
         .def("ccu_urma_multiroute_write", &deep_ep::Buffer::ccu_urma_multiroute_write)
         .def("ccu_urma_multiroute_alltoall", &deep_ep::Buffer::ccu_urma_multiroute_alltoall)
         .def("ccu_urma_multiroute_alltoall_out", &deep_ep::Buffer::ccu_urma_multiroute_alltoall_out)

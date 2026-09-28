@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 __attribute__((visibility("default"))) aclnnStatus aclnnExplicitMultipathAll2AllCcuGetWorkspaceSize(
-    const aclTensor *sendData, char *group, int64_t rankSize, int64_t rankId,
-    char *planId, char *pathWeights, const aclTensor *recvData,
+    const aclTensor *sendData, const aclTensor *pathPolicy, char *group,
+    int64_t rankSize, int64_t rankId, char *planId, const aclTensor *recvData,
     uint64_t *workspaceSize, aclOpExecutor **executor);
 
 __attribute__((visibility("default"))) aclnnStatus aclnnExplicitMultipathAll2AllCcu(

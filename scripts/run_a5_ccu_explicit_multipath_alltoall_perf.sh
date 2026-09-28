@@ -22,6 +22,7 @@ topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 profile=0
 profile_iters=20
 graph_backend=none
+replay_path_weights=""
 cases=native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay
 hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --profile) profile=1; shift ;;
         --profile-iters) profile_iters=$2; shift 2 ;;
         --graph-backend) graph_backend=$2; shift 2 ;;
+        --replay-path-weights) replay_path_weights=$2; shift 2 ;;
         --cases) cases=$2; shift 2 ;;
         --hccl-lib-dir) hccl_lib_dir=$2; shift 2 ;;
         --cann-root) cann_root=$2; shift 2 ;;
@@ -82,33 +84,40 @@ case_selected() {
 fixed_relay_count=0
 required_relay_count=0
 need_legacy=0
-need_prepared=0
+need_standard=0
 generic_relay_case=0
 if case_selected native0 || case_selected native2; then
     need_legacy=1
 fi
 if case_selected direct_plus_2relay; then
     fixed_relay_count=2
-    need_prepared=1
+    need_standard=1
 fi
 if case_selected direct_plus_4relay; then
     fixed_relay_count=4
-    need_prepared=1
+    need_standard=1
 fi
 if case_selected direct_plus_6relay; then
     fixed_relay_count=6
-    need_prepared=1
+    need_standard=1
 fi
 if case_selected direct_plus_relays; then
     generic_relay_case=1
-    need_prepared=1
+    need_standard=1
 fi
 
 relay_array=()
-if (( need_prepared )); then
+if (( need_standard )); then
+    case "${graph_backend}" in
+        none|aclgraph) ;;
+        *)
+            echo "standard dynamic-policy cases support --graph-backend none or aclgraph" >&2
+            exit 2
+            ;;
+    esac
     IFS=',' read -ra relay_array <<<"${relay_phys}"
-    (( ${#relay_array[@]} >= 1 && ${#relay_array[@]} <= 63 )) || {
-        echo "prepared cases require 1..63 ordered relay cards in --relay-phys" >&2
+    (( ${#relay_array[@]} >= 1 && ${#relay_array[@]} <= 12 )) || {
+        echo "standard cases require 1..12 ordered relay cards in --relay-phys" >&2
         exit 2
     }
     required_relay_count=${#relay_array[@]}
@@ -137,11 +146,37 @@ unset A5_CCU_DEBUG ASCEND_LAUNCH_BLOCKING
 if [[ -n "${inherited_ld_preload}" ]]; then
     echo "Ignoring inherited LD_PRELOAD: ${inherited_ld_preload}" >&2
 fi
-if [[ -n "${hccl_lib_dir}" ]]; then
-    echo "NOTE: --hccl-lib-dir is no longer used; prepared-plan mode works with the installed stock HCCL." >&2
+hccl_preload=""
+if (( need_standard )); then
+    [[ -n "${hccl_lib_dir}" ]] || {
+        echo "standard cases require --hccl-lib-dir pointing at the patched HCCL runtime" >&2
+        exit 2
+    }
+    hccl_lib_dir=$(readlink -f "${hccl_lib_dir}")
+    hccl_so="${hccl_lib_dir}/libhccl.so"
+    hccl_compat_so="${hccl_lib_dir}/libhccl_compat.so"
+    [[ -f "${hccl_so}" && -f "${hccl_compat_so}" ]] || {
+        echo "missing libhccl.so or libhccl_compat.so under ${hccl_lib_dir}" >&2
+        exit 2
+    }
+    HCCL_COMPAT_SO="${hccl_compat_so}" HCCL_SO="${hccl_so}" \
+      LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH}" python3 - <<'PY'
+import ctypes
+import os
+
+ctypes.CDLL(os.environ["HCCL_COMPAT_SO"], mode=ctypes.RTLD_GLOBAL)
+hccl = ctypes.CDLL(os.environ["HCCL_SO"], mode=ctypes.RTLD_GLOBAL)
+version = hccl.A5HcclExplicitMultipathExtensionVersion
+version.restype = ctypes.c_int
+value = version()
+print(f"Verified patched HCCL: {os.environ['HCCL_SO']} (extension={value})")
+assert value >= 3, f"patched HCCL extension {value}, expected >= 3"
+PY
+    export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH}"
+    hccl_preload="${hccl_compat_so}:${hccl_so}"
 fi
 
-if (( need_legacy || need_prepared )); then
+if (( need_legacy )); then
     route_probe_lib=${A5_CCU_ROUTE_PROBE_LIB:-}
     if [[ -z "${route_probe_lib}" ]]; then
         for candidate in \
@@ -164,20 +199,6 @@ if (( need_legacy || need_prepared )); then
             exit 2
         }
     fi
-    if (( need_prepared )); then
-        nm -D "${route_probe_lib}" | grep ' HcclCcuUrmaExplicitMultipathPlanCreate$' >/dev/null || {
-            echo "route probe is stale: prepared-plan create API is missing from ${route_probe_lib}" >&2
-            exit 2
-        }
-        nm -D "${route_probe_lib}" | grep ' HcclCcuUrmaExplicitMultipathPlanExecute$' >/dev/null || {
-            echo "route probe is stale: prepared-plan execute API is missing from ${route_probe_lib}" >&2
-            exit 2
-        }
-        nm -D "${route_probe_lib}" | grep ' A5CcuUrmaPreparedPlanAbiVersion$' >/dev/null || {
-            echo "route probe is stale: prepared-plan ABI marker is missing from ${route_probe_lib}" >&2
-            exit 2
-        }
-    fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")
     export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"
     export LD_LIBRARY_PATH="$(dirname "${route_probe_lib}"):${LD_LIBRARY_PATH}"
@@ -186,7 +207,7 @@ fi
 
 env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
     A5_CCU_REQUIRE_LEGACY="${need_legacy}" \
-    A5_CCU_REQUIRE_PREPARED="${need_prepared}" \
+    A5_CCU_REQUIRE_STANDARD="${need_standard}" \
 python3 - <<'PY'
 import ctypes
 import os
@@ -197,13 +218,11 @@ import deep_ep.deep_ep_cpp as ext
 extension_path = Path(ext.__file__).resolve()
 print(f"Verified DeepEP extension: {extension_path}")
 need_legacy = os.environ["A5_CCU_REQUIRE_LEGACY"] == "1"
-need_prepared = os.environ["A5_CCU_REQUIRE_PREPARED"] == "1"
+need_standard = os.environ["A5_CCU_REQUIRE_STANDARD"] == "1"
 if need_legacy:
     assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
-if need_prepared:
-    assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
-    assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
-    assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
+if need_standard:
+    assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
 try:
     extension = ctypes.CDLL(str(extension_path))
     abi_version = extension.A5DeepEpExplicitMultipathAttrAbiVersion
@@ -214,25 +233,18 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 6:
+if version < 8:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 6; "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 8; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
-route = ctypes.CDLL(str(Path(os.environ['A5_CCU_ROUTE_PROBE_LIB'])))
-route_abi_value = "NA"
-if need_prepared:
-    route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
-    route_abi.restype = ctypes.c_int
-    route_abi_value = route_abi()
-    assert route_abi_value >= 4
-print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "
-      f"DeepEP ABI={version}; route ABI={route_abi_value}")
+print(f"Verified requested APIs: legacy={need_legacy} standard={need_standard}; "
+      f"DeepEP ABI={version}")
 PY
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases" "${run_dir}/plans" "${run_dir}/profiling"
-if (( need_prepared )); then
+if (( need_standard )); then
     resolved="${run_dir}/resolved_${required_relay_count}_relays.tsv"
     relay_weights=""
     for ((i=0; i<required_relay_count; ++i)); do
@@ -263,6 +275,10 @@ if (( profile )); then
     profile_args=(--profile --profile-iters "${profile_iters}"
                   --profile-root "${run_dir}/profiling")
 fi
+replay_args=()
+if [[ -n "${replay_path_weights}" ]]; then
+    replay_args=(--replay-path-weights "${replay_path_weights}")
+fi
 
 run_case() {
     local name=$1 round=$2
@@ -271,7 +287,7 @@ run_case() {
     local pg_init_file="${run_dir}/cases/${name}_r${round}.pgstore"
     rm -f "${pg_init_file}"
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
-      env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
+      env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
         PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
         A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
@@ -302,25 +318,26 @@ for ((round=1; round<=repeats; ++round)); do
     case_selected native2 && run_case native2 "${round}" --implementation multiroute \
         --route-index 2 --path-weights 1 --schedule concurrent
     case_selected direct_plus_relays && \
-      run_case direct_plus_relays "${round}" --implementation prepared \
+      run_case direct_plus_relays "${round}" --implementation standard \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-${required_relay_count}relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_relays.tsv" \
-        --path-weights "${generic_path_weights}" --schedule concurrent
+        --path-weights "${generic_path_weights}" "${replay_args[@]}" \
+        --schedule concurrent
     case_selected direct_plus_2relay && \
-      run_case direct_plus_2relay "${round}" --implementation prepared \
+      run_case direct_plus_2relay "${round}" --implementation standard \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-2relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_2relay.tsv" \
         --path-weights 2,1,1 --schedule concurrent
     case_selected direct_plus_4relay && \
-      run_case direct_plus_4relay "${round}" --implementation prepared \
+      run_case direct_plus_4relay "${round}" --implementation standard \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-4relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_4relay.tsv" \
         --path-weights 2,1,1,1,1 --schedule concurrent
     case_selected direct_plus_6relay && \
-      run_case direct_plus_6relay "${round}" --implementation prepared \
+      run_case direct_plus_6relay "${round}" --implementation standard \
         --compile-backend "${graph_backend}" \
         --plan-id "explicit-6relay" --direct-route "${direct_route}" \
         --relay-manifest "${run_dir}/plans/direct_plus_6relay.tsv" \

@@ -3,17 +3,19 @@
 
 #include "kernel_tiling/kernel_tiling.h"
 
-constexpr uint32_t A5_EXPLICIT_MULTIPATH_MAX_PATHS = 8U;
+// The CCU launch ABI has room for 48 uint64 task arguments.  Six fixed
+// arguments, three arguments per path and three cache metadata words allow
+// at most thirteen pre-provisioned paths in one launch.
+constexpr uint32_t A5_EXPLICIT_MULTIPATH_MAX_PATHS = 13U;
 
 struct ExplicitMultipathAll2AllCcuInfo {
     uint32_t rankSize;
     uint32_t rankId;
-    uint32_t pathCount;
-    uint32_t reserved;
+    uint32_t maxPaths;
+    uint32_t policyAbi;
     uint64_t sendCount;
     uint64_t perRankBytes;
     uint64_t planHash;
-    uint32_t pathWeights[A5_EXPLICIT_MULTIPATH_MAX_PATHS];
 };
 
 struct ExplicitMultipathAll2AllCcuTilingData {

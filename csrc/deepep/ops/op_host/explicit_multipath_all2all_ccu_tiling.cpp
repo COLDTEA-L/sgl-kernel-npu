@@ -1,9 +1,6 @@
 #include <cstdint>
 #include <cstring>
-#include <limits>
-#include <sstream>
 #include <string>
-#include <vector>
 
 #include "error_log.h"
 #include "mc2_tiling_utils.h"
@@ -43,25 +40,6 @@ uint64_t Fnv1a64(const char *value)
     return hash;
 }
 
-bool ParseWeights(const char *text, std::vector<uint32_t> &weights)
-{
-    if (text == nullptr || text[0] == '\0') return false;
-    std::stringstream stream(text);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        if (item.empty() || weights.size() == A5_EXPLICIT_MULTIPATH_MAX_PATHS) return false;
-        size_t consumed = 0;
-        unsigned long value = 0;
-        try {
-            value = std::stoul(item, &consumed, 10);
-        } catch (...) {
-            return false;
-        }
-        if (consumed != item.size() || value == 0 || value > std::numeric_limits<uint32_t>::max()) return false;
-        weights.push_back(static_cast<uint32_t>(value));
-    }
-    return weights.size() >= 2U;
-}
 }  // namespace
 
 namespace optiling {
@@ -71,8 +49,11 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
     auto *tiling = context->GetTilingData<ExplicitMultipathAll2AllCcuTilingData>();
     const auto *sendShape = context->GetInputShape(0);
     const auto *sendDesc = context->GetInputDesc(0);
+    const auto *policyShape = context->GetInputShape(1);
+    const auto *policyDesc = context->GetInputDesc(1);
     const auto *recvDesc = context->GetOutputDesc(0);
-    OP_TILING_CHECK(tiling == nullptr || sendShape == nullptr || sendDesc == nullptr || recvDesc == nullptr,
+    OP_TILING_CHECK(tiling == nullptr || sendShape == nullptr || sendDesc == nullptr ||
+                        policyShape == nullptr || policyDesc == nullptr || recvDesc == nullptr,
                     OP_LOGE(nodeName, "input/output metadata is null"), return ge::GRAPH_FAILED);
 
     auto attrs = context->GetAttrs();
@@ -81,7 +62,6 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
     auto rankSize = attrs->GetAttrPointer<int64_t>(1);
     auto rankId = attrs->GetAttrPointer<int64_t>(2);
     auto planId = attrs->GetAttrPointer<char>(3);
-    auto weightText = attrs->GetAttrPointer<char>(4);
     OP_TILING_CHECK(group == nullptr || strnlen(group, MAX_ATTR_LENGTH) == 0UL ||
                         strnlen(group, MAX_ATTR_LENGTH) == MAX_ATTR_LENGTH,
                     OP_LOGE(nodeName, "group is invalid"), return ge::GRAPH_FAILED);
@@ -93,14 +73,8 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
     OP_TILING_CHECK(rankId == nullptr || *rankId < 0 || *rankId >= *rankSize,
                     OP_LOGE(nodeName, "rank_id is invalid"), return ge::GRAPH_FAILED);
 
-    std::vector<uint32_t> weights;
-    const bool weightsOk = ParseWeights(weightText, weights);
-    const size_t weightTextLength = weightText == nullptr ? 0UL : strnlen(weightText, MAX_ATTR_LENGTH);
-    OP_TILING_CHECK(!weightsOk,
-                    OP_LOGE(nodeName,
-                            "path_weights must contain 2..8 positive integers; received length=%lu value='%.*s'",
-                            static_cast<unsigned long>(weightTextLength),
-                            static_cast<int>(weightTextLength), weightText == nullptr ? "" : weightText),
+    OP_TILING_CHECK(policyDesc->GetDataType() != ge::DT_INT64 || NumElements(policyShape) != 1UL,
+                    OP_LOGE(nodeName, "pathPolicy must be one int64 value"),
                     return ge::GRAPH_FAILED);
 
     const uint64_t sendCount = NumElements(sendShape);
@@ -113,14 +87,11 @@ static ge::graphStatus ExplicitMultipathAll2AllCcuTiling(gert::TilingContext *co
 
     tiling->info.rankSize = static_cast<uint32_t>(*rankSize);
     tiling->info.rankId = static_cast<uint32_t>(*rankId);
-    tiling->info.pathCount = static_cast<uint32_t>(weights.size());
-    tiling->info.reserved = 0U;
+    tiling->info.maxPaths = A5_EXPLICIT_MULTIPATH_MAX_PATHS;
+    tiling->info.policyAbi = 1U;
     tiling->info.sendCount = sendCount;
     tiling->info.perRankBytes = sendCount / static_cast<uint64_t>(*rankSize) * elementBytes;
     tiling->info.planHash = Fnv1a64(planId);
-    for (uint32_t i = 0; i < A5_EXPLICIT_MULTIPATH_MAX_PATHS; ++i) {
-        tiling->info.pathWeights[i] = i < weights.size() ? weights[i] : 0U;
-    }
 
     // A5 MC2 only accepts HALFALLTOALLV when allocating CCU communication
     // resources.  The paired HCCL extension selects the private fixed-size

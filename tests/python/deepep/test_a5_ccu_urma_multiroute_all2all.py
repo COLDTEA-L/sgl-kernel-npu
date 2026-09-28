@@ -43,6 +43,20 @@ def sanitize(value):
     return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))
 
 
+def encode_path_policy(weights):
+    """Pack ABI-1 runtime path weights into one signed-int64-safe word."""
+    if not 2 <= len(weights) <= 13:
+        raise ValueError("runtime path policy requires 2..13 catalog weights")
+    if any(weight < 0 or weight > 15 for weight in weights):
+        raise ValueError("every runtime path weight must be in [0, 15]")
+    if not any(weights):
+        raise ValueError("runtime path policy must enable at least one path")
+    word = 1 << 60
+    for index, weight in enumerate(weights):
+        word |= weight << (index * 4)
+    return word
+
+
 def prepend_env_path(name, path):
     items = [item for item in os.environ.get(name, "").split(":") if item]
     os.environ[name] = ":".join([path, *(item for item in items if item != path)])
@@ -136,7 +150,7 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        required_version = 4 if IMPLEMENTATION == "prepared" else 3
+        required_version = 4 if IMPLEMENTATION == "prepared" else 8
         if version < required_version:
             raise RuntimeError(
                 f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
@@ -212,6 +226,9 @@ def parse_args():
                         help="comma-separated PATH_CATALOG path_uid values; preferred over route ordinals")
     parser.add_argument("--path-weights", default="",
                         help="comma-separated positive weights, one per selected path")
+    parser.add_argument("--replay-path-weights", default="",
+                        help=("standard-op ACLGraph replay policy; comma-separated 0..15 weights, "
+                              "where zero disables one pre-provisioned path"))
     parser.add_argument("--synthetic-route-manifest", default="",
                         help="TSV of explicitly resolved relay EID pairs")
     parser.add_argument("--direct-route", type=int, default=0,
@@ -242,8 +259,10 @@ def parse_args():
         parser.error("invalid warmup/iters/profile-iters")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
-    if args.compile_backend != "none" and args.implementation != "prepared":
-        parser.error("--compile-backend currently requires --implementation prepared")
+    if args.compile_backend != "none" and args.implementation not in ("prepared", "standard"):
+        parser.error("--compile-backend requires --implementation prepared or standard")
+    if args.implementation == "standard" and args.compile_backend not in ("none", "aclgraph"):
+        parser.error("the standard dynamic-policy operator currently validates graph replay with aclgraph")
     if args.implementation in ("explicit", "standard", "prepared"):
         if not args.relay_manifest:
             parser.error(f"--implementation {args.implementation} requires --relay-manifest")
@@ -258,6 +277,15 @@ def parse_args():
         if len(weights) < 2 or len(weights) > 64 or any(
                 not item.isdigit() or int(item) <= 0 for item in weights):
             parser.error("explicit --path-weights must contain 2..64 positive integers")
+        if args.implementation == "standard":
+            if len(weights) > 13 or any(int(item) > 15 for item in weights):
+                parser.error("standard runtime PathPolicy supports 2..13 weights in [1, 15]")
+            if args.replay_path_weights:
+                replay = args.replay_path_weights.split(",")
+                if len(replay) != len(weights) or any(
+                        not item.isdigit() or int(item) > 15 for item in replay
+                ) or not any(int(item) for item in replay):
+                    parser.error("--replay-path-weights must match path count, use 0..15, and enable a path")
     return args
 
 
@@ -308,7 +336,6 @@ def main():
             manifest = str(Path(args.relay_manifest).resolve())
             os.environ["A5_CCU_EXPLICIT_MULTIPATH_MANIFEST"] = manifest
             os.environ["A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID"] = args.plan_id
-            os.environ["A5_CCU_EXPLICIT_MULTIPATH_WEIGHTS"] = args.path_weights
     if args.debug:
         os.environ["A5_CCU_DEBUG"] = "1"
     else:
@@ -347,6 +374,8 @@ def main():
         mark_phase("deep_ep_buffer_init_done")
 
     explicit_weights = [int(item) for item in args.path_weights.split(",") if item]
+    replay_weights = ([int(item) for item in args.replay_path_weights.split(",")]
+                      if args.replay_path_weights else explicit_weights)
     relay_manifest = str(Path(args.relay_manifest).resolve()) if args.relay_manifest else ""
     if relay_manifest and not Path(relay_manifest).is_file():
         raise RuntimeError(f"relay manifest not found: {relay_manifest}")
@@ -380,6 +409,9 @@ def main():
         for dst in range(world_size)
     ])
     recv = torch.empty_like(send)
+    path_policy = torch.tensor(
+        [encode_path_policy(explicit_weights)], dtype=torch.int64, device="npu"
+    ) if args.implementation == "standard" else None
     expected = torch.stack([
         torch.full((elements,), float(src * 100 + rank + 1),
                    dtype=torch.float32, device="npu")
@@ -417,7 +449,7 @@ def main():
             dist.all_to_all_single(recv, send)
         elif args.implementation == "standard":
             recv = buffer.explicit_multipath_all2all_ccu(
-                send, args.plan_id, explicit_weights
+                send, path_policy, args.plan_id
             )
         elif args.implementation == "prepared":
             if compiled_prepared_op is None:
@@ -449,9 +481,14 @@ def main():
         # capture nor replay may acquire a Channel or register a CCU kernel.
         mark_phase("aclgraph_stream_warmup")
         with torch_npu.npu.stream(capture_stream):
-            recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                send, plan_handle
-            )
+            if args.implementation == "standard":
+                recv = buffer.explicit_multipath_all2all_ccu(
+                    send, path_policy, args.plan_id
+                )
+            else:
+                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+                    send, plan_handle
+                )
         torch.npu.synchronize()
         torch.testing.assert_close(recv, expected)
         file_barrier(sync_dir, "aclgraph_stream_warmup", rank, world_size)
@@ -462,9 +499,14 @@ def main():
         with torch_npu.npu.graph(
             acl_graph, stream=capture_stream, auto_dispatch_capture=True
         ):
-            recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                send, plan_handle
-            )
+            if args.implementation == "standard":
+                recv = buffer.explicit_multipath_all2all_ccu(
+                    send, path_policy, args.plan_id
+                )
+            else:
+                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+                    send, plan_handle
+                )
         torch.npu.synchronize()
         file_barrier(sync_dir, "aclgraph_capture_done", rank, world_size)
         print(f"CASE_ACLGRAPH_CAPTURE rank={rank} PASS", flush=True)
@@ -472,6 +514,9 @@ def main():
         # Mutating the stable captured input makes stale-output replay fail.
         send.add_(1000.0)
         expected.add_(1000.0)
+        if args.implementation == "standard":
+            path_policy.fill_(encode_path_policy(replay_weights))
+            print(f"CASE_DYNAMIC_PATH_POLICY rank={rank} weights={replay_weights}", flush=True)
         torch.npu.synchronize()
         mark_phase("aclgraph_replay")
         acl_graph.replay()

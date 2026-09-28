@@ -10,7 +10,8 @@ using namespace AscendC;
 // AIV is control-only. Payload movement is performed by the CCU kernel and
 // URMA channels provisioned for plan_id by the HCCL extension.
 extern "C" __global__ __aicore__ void explicit_multipath_all2_all_ccu(
-    GM_ADDR sendData, GM_ADDR recvData, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR sendData, GM_ADDR pathPolicy, GM_ADDR recvData,
+    GM_ADDR workspace, GM_ADDR tiling)
 {
     REGISTER_TILING_DEFAULT(ExplicitMultipathAll2AllCcuTilingData);
     GET_TILING_DATA_WITH_STRUCT(ExplicitMultipathAll2AllCcuTilingData, tilingData, tiling);
@@ -25,9 +26,15 @@ extern "C" __global__ __aicore__ void explicit_multipath_all2_all_ccu(
     if ASCEND_IS_AIV {
         SyncAll<true>();
         if (GetBlockIdx() == 0) {
+            GlobalTensor<int64_t> policy;
+            policy.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(pathPolicy), 1);
+            // Explicit multipath repurposes strideCount as a runtime policy
+            // carrier.  The paired HCCL template decodes it instead of using
+            // native AllToAll stride semantics.
+            const uint64_t policyWord = static_cast<uint64_t>(policy.GetValue(0));
             HcclHandle handle = hccl.AlltoAll<true>(
                 sendData, recvData, tilingData.info.perRankBytes,
-                HcclDataType::HCCL_DATA_TYPE_INT8, 0, 1);
+                HcclDataType::HCCL_DATA_TYPE_INT8, policyWord, 1);
             hccl.Wait(handle);
         }
         SyncAll<true>();

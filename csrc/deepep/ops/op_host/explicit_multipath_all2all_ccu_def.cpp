@@ -10,6 +10,18 @@ public:
             .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+        // One int64 policy word.  Nibble i is the runtime weight of path i;
+        // zero disables that path.  The top nibble is the policy ABI.
+        this->Input("pathPolicy")
+            .ParamType(REQUIRED)
+            // Code generation zips dtype/format alternatives across every
+            // input.  Repeat the invariant policy type once for each
+            // sendData alternative so alternatives 1..3 do not acquire a
+            // zero-sized dtype in opbuild.
+            .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat(
+                {ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
         this->Output("recvData")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_INT32})
@@ -22,10 +34,6 @@ public:
         // plan_id is a stable control-plane key.  The graph never contains a
         // manifest pathname and never creates channels during replay.
         this->Attr("plan_id").AttrType(REQUIRED).String();
-        // Comma-separated positive integers.  Kept as a string because the
-        // public OpDef API in the supported CANN builds has no portable list
-        // attribute ABI.
-        this->Attr("path_weights").AttrType(REQUIRED).String();
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)

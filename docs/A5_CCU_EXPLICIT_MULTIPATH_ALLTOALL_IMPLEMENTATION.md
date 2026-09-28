@@ -1,291 +1,226 @@
-# A5 CCU+URMA 显式多路径 AllToAll：方案 2 实现说明
+# A5 CCU+URMA 显式多路径 AllToAll 实现说明
 
-## 1. 为什么改为两阶段模型
+## 1. 目标和结论
 
-旧标准 Ascend C 方案把路径属性放进 host tiling，再调用 MC2 申请通信资源：
+本实现同时满足三项要求：
 
-```text
-aclnn custom op
-  -> host tiling / Mc2CcTilingConfig
-  -> HcclAllocComResourceByTiling
-  -> libmc2_client.so
-  -> system-private mc2_ops_hccl
-```
+1. 图中是标准 Ascend C/ACLNN 算子，而不是 Python 组合通信原语；
+2. direct 和 relay 的物理路径在 communicator 初始化时显式 provision；
+3. ACLGraph replay 时可以通过设备 Tensor 动态改变 path mask/权重，不重新建 Channel。
 
-实际运行表明系统 `libmc2_client.so` 并不消费本分支修改的开源 HCCL selector，因此在进入显式
-CommLink/Channel 构造前就返回 `HCCL_E_NOT_SUPPORT`。继续修改 `libhccl.so` 无法越过这个边界。
-
-方案 2 保留“标准图节点”这个目标，但把不可图捕获的资源初始化前移：
+最终结构不是常驻 CCU worker/mailbox，而是短生命周期标准算子：
 
 ```text
-control plane (once)                   graph/data plane (every iteration)
-----------------------------------     -----------------------------------
-resolve explicit EID pairs             torch.ops.deep_ep...
-HcclChannelAcquire                     validate opaque plan_handle
-HcclThreadAcquireWithStream            HcclCcuKernelLaunch
-HcclCcuKernelRegister/Finish           CCU WriteNb on prepared Channels
-store resources under plan_handle      return recv tensor
+标准 AIV kernel
+  -> 读取设备 pathPolicy
+  -> Hccl::AlltoAll（MC2 消息）
+  -> 配套 HCCL 显式多路径 template
+  -> 单次 CCU kernel
+  -> 多个已准备 Channel 并发 Write
 ```
 
-这与 CUDA/NPU 图常见的“图外创建 communicator/handle，图内只执行算子”一致。
+因此不需要自定义 HBM CommandBlock 或长期占用 CCU，但必须使用配套 HCCL 扩展。系统 stock HCCL
+不知道如何根据显式 relay manifest 构造这些 Channel，也不知道如何解释动态 PathPolicy。
 
-## 2. 总体调用链
-
-### 2.1 控制面准备
+## 2. 完整调用链
 
 ```text
-Python host/controller
-  Buffer.prepare_ccu_urma_explicit_multipath_plan(...)
-    -> deep_ep_cpp pybind
-      -> dlsym(HcclCcuUrmaExplicitMultipathPlanCreate)
-        -> ParseExplicitPlan
-          -> HcclRankGraphGetLayers/GetLinks（取得 direct candidate）
-          -> 读取 controller 提供的 relay manifest
-          -> 构造有序 HcclChannelDesc 列表
-        -> GetRouteResources
-          -> HcclThreadAcquireWithStream
-          -> HcclChannelAcquire(each path)
-          -> HcclCcuKernelRegister
-          -> HcclCcuKernelRegisterFinish
-        -> PreparedPlanRegistry[(comm, initial_stream, plan_id)]
-             -> resources_by_stream[initial_stream]
-        -> uint64 plan_handle
+Python/controller
+  Buffer.explicit_multipath_all2all_ccu(send, path_policy, plan_id)
+    |
+    v
+DeepEP C++
+  Buffer::explicit_multipath_all2all_ccu
+  - 校验 2 ranks、dtype、policy=[1]int64/NPU
+  - 校验 HCCL extension ABI >= 3
+  - 校验 plan_id/manifest 在 communicator 初始化前已设置
+    |
+    v
+ACLNN
+  aclnnExplicitMultipathAll2AllCcuGetWorkspaceSize
+  aclnnExplicitMultipathAll2AllCcu
+    |
+    v
+标准 Ascend C host
+  ExplicitMultipathAll2AllCcu op_def
+  ExplicitMultipathAll2AllCcuTiling
+  - rank_size=2
+  - 输入/输出 dtype 和 shape 校验
+  - pathPolicy=[1]int64
+  - 生成 CCU MC2 tiling
+    |
+    v
+标准 Ascend C AIV kernel
+  explicit_multipath_all2_all_ccu
+  - 从 GM pathPolicy Tensor 读取当前 policyWord
+  - Hccl<CCU>.AlltoAll(..., strideCount=policyWord)
+    |
+    v
+MC2/HCCL resource path
+  HCCL_CMD_HALF_ALLTOALLV（A5 可用的 CCU resource entry）
+  OpParam.DataDes.strideCount = policyWord
+    |
+    v
+HCCL selector
+  AutoSelectorBase::Select
+  - 检测 MC2 + manifest + plan_id + 2 ranks
+  - 选择 CcuExplicitMultipathAllToAll2Rank
+    |
+    v
+HCCL CalcRes（communicator/resource 初始化）
+  CcuTempExplicitMultipathAllToAll::CalcRes
+  - 取得一条 native direct ChannelDesc
+  - 从 relay manifest 读取每条 src/dst EID
+  - 复制 direct desc，并替换两端 CommAddr EID
+  - 为 direct + relay 注册一个 CCU kernel/channel catalog
+    |
+    v
+HCCL KernelRun / FastLaunch（每次执行）
+  - DecodePathPolicy(strideCount)
+  - 按权重和 256-byte 对齐计算每条 path 的 offset/bytes
+  - HcommCcuKernelLaunch
+    |
+    v
+CCU kernel
+  PreSync(active Channels)
+  LocalCopy(self slice)
+  Write(channel_0, direct chunk)
+  Write(channel_1, relay-0 chunk)
+  ...
+  EventWait(all active writes)
+  PostSync(channel_0)
 ```
 
-relay manifest 中只保存已经由拓扑解析器算出的两端 EID/CommAddr，不写死 `P67/P62` 等端口编号。
+并发的因果保证是：所有 active Channel 的 `Write` 都先提交，再开始任何远端 `EventWait`。
 
-### 2.2 图内执行
+## 3. 标准算子接口
+
+### 3.1 OpDef
 
 ```text
-torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall
-  -> PrivateUse1 implementation
-    -> Buffer.ccu_urma_prepared_multipath_alltoall_out
-      -> HcclCcuUrmaExplicitMultipathPlanExecute(plan_handle, ...)
-        -> PreparedPlanRegistry lookup
-        -> resources_by_stream[current_stream] lookup
-          -> graph stream 首次预执行：创建并缓存一次 stream-bound CCU resources
-          -> capture/replay：直接复用缓存，不重新 Acquire/Register
-        -> LaunchPreparedAllToAll
-          -> 计算每条 path 的 byte range
-          -> HcclCcuKernelLaunch
-            -> CCU kernel
-              -> NotifyWait(start)
-              -> WriteNb(channel_0, direct chunk)
-              -> WriteNb(channel_1, relay chunk)
-              -> ...
-              -> WaitEvent(all writes)
-              -> completion notify
+ExplicitMultipathAll2AllCcu(
+    sendData: Tensor,
+    pathPolicy: Tensor[int64, shape=(1,)],
+    group: str,
+    rank_size: int,
+    rank_id: int,
+    plan_id: str,
+) -> recvData
 ```
 
-并发 schedule 的关键是先向所有 Channel 发出 `WriteNb`，最后统一等待；它不是 host 侧依次调用多个完整
-通信算子。
+支持的 payload dtype：`float16`、`bfloat16`、`float32`、`int32`。对应生成 4 个 Ascend950
+kernel；它们共享一份泛型 kernel 源码，由算子编译器按 dtype 实例化。
 
-## 3. API
-
-### 3.1 route runtime C ABI
-
-头文件：`examples/a5_ccu_urma_route_probe/inc/a5_ccu_urma_route_probe.h`
-
-```c
-int A5CcuUrmaPreparedPlanAbiVersion(void);
-
-HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
-    HcclComm comm, aclrtStream stream, const char *planId,
-    uint32_t directRoute, const char *relayManifest,
-    const uint32_t *pathWeights, uint32_t pathCount,
-    uint64_t *planHandle);
-
-HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
-    HcclComm comm, aclrtStream stream, uint64_t planHandle,
-    void *send, void *recv, uint64_t bytesPerPeer);
-```
-
-`PlanCreate` 是 host-only 控制面 API；`PlanExecute` 是固定语义的数据面入口。
-
-route ABI 4 允许一个逻辑 plan handle 拥有多个 stream-bound resource instance。原因是
-`HcclThreadAcquireWithStream` 令 CCU thread/kernel 与 stream 绑定，而 `torch.compile(...,
-backend="npugraphs")` 的 graph stream 通常不同于控制面创建 plan 时的默认 stream。实现不能忽略 stream
-差异：首次 graph-stream 预执行会为该 stream 创建一次资源，后续 capture/replay 必须命中同一缓存。
-
-验证分两层：`--graph-backend aclgraph` 显式创建 capture stream，并在该 stream 上 PlanCreate、capture、
-修改输入和 replay，用于证明底层数据面可捕获；`--graph-backend npugraphs` 再验证 torch.compile 自动管理
-graph stream 时的框架集成。前者失败是数据面/capture blocker，只有后者失败通常是 backend 生命周期适配问题。
-
-### 3.2 Python Buffer API
+### 3.2 DeepEP API
 
 ```python
-plan_handle = buffer.prepare_ccu_urma_explicit_multipath_plan(
-    plan_id, direct_route, relay_manifest, path_weights,
-)
-
-buffer.ccu_urma_prepared_multipath_alltoall_out(
-    send, recv, plan_handle,
+recv = buffer.explicit_multipath_all2all_ccu(
+    send_data,
+    path_policy,
+    plan_id,
 )
 ```
 
-### 3.3 图算子 API
+`path_policy` 必须是 NPU Tensor，地址在 graph capture/replay 间保持不变；控制器通过原地更新其内容
+改变下一次 replay 的路径策略。
 
-```python
-recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-    send, plan_handle,
-)
-```
+## 4. 路径资源如何构造
 
-注册 schema：
+路径目录固定为：
 
 ```text
-ccu_urma_prepared_multipath_alltoall(
-    Tensor send, int plan_handle
-) -> Tensor
+catalog[0]    = HCCL native direct candidate
+catalog[1..N] = controller 解析拓扑后写入 manifest 的显式 relay EID pair
 ```
 
-实现包含 `PrivateUse1` 与 `Meta` dispatch；图接口是 functional op，返回新输出，不带输入/输出 alias
-标注，因而能够通过 AOTAutograd/npugraphs 的 functionalization。图外仍保留显式 `recv` 的 out 接口。
-`plan_handle` 是不透明整数，图内不解析字符串或文件。
+manifest 每行包含 `route_id`、`relay_phy`、`src_die`、`dst_die`、`src_eid`、`dst_eid`。HCCL 不使用
+硬编码的 `P67/P62`，而是把 EID 写入 `HcclChannelDesc.localEndpoint/remoteEndpoint.commAddr` 后走原生
+ChannelAcquire/resource 流程。relay 卡不启动用户进程，转发发生在 IO Die/UB 数据面，不落 relay HBM。
 
-## 4. 路径计划和流量分片
+manifest 和 `plan_id` 必须在 communicator 初始化前设置。它们决定 Channel catalog，是静态控制面；
+图内 `pathPolicy` 只决定本次执行如何使用这个 catalog，是动态数据面。
 
-路径顺序固定为：
+## 5. PathPolicy ABI
+
+一个 64-bit word 的编码为：
 
 ```text
-path 0: HCCL-discovered direct candidate
-path 1..N: controller 显式给出的 relay EID pair
+bits 60..63 = ABI 1
+bits 0..3   = catalog[0] 权重
+bits 4..7   = catalog[1] 权重
+...
 ```
 
-分片采用最大余数法按 `path_weights` 对齐到 256 bytes。为了满足 direct 总量与 relay 总量 `2:1`：
+每个权重为 0..15；0 跳过该路径的变量交换、Write 和 EventWait。若 policy word 为 0，HCCL 为迁移期
+兼容使用 `2,1,1,...`；正式调用始终编码 ABI 1。
 
-| plan | path weights |
-|---|---|
-| direct + 2 relay | `4,1,1` |
-| direct + 4 relay | `8,1,1,1,1` |
-| direct + 6 relay | `12,1,1,1,1,1,1` |
+当前最多 13 条总路径，来源是 HCCL `CCU_MAX_TASK_ARG_NUM=48`：固定参数 6 个，每条路径 3 个参数，
+FastLaunch cache 额外保存 3 个元数据，故 `6 + 3 * 13 + 3 = 48`。
 
-relay 是显式 EID path，不是 UBUS 全局 route override；中转卡不运行 rank 进程，数据在 IO Die/UB 转发，
-不落中转卡 HBM。
+## 6. 动态策略如何进入 ACLGraph replay
 
-## 5. 资源身份和生命周期
-
-注册表 key 为：
+host tiling 不读取 policy 值，只检查它是 `[1]int64`。AIV kernel 每次执行从 GM 读取该值，因此：
 
 ```text
-(communicator identity, aclrtStream, plan_id)
+capture: policy=[2,1,1]
+  -> direct + relay0 + relay1
+
+host/controller 原地写 policy=[2,0,1]
+
+replay:
+  -> 同一图、同一 tensor 地址
+  -> direct + relay1
+  -> 不重建 communicator/channel/kernel catalog
 ```
 
-同一 key、同一 fingerprint 重复 prepare 会返回原 handle；同一 key 但 plan 内容不同会报错，防止控制器
-悄悄改变已捕获图的语义。
+HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首次执行可动态而 graph fast-launch
+退回静态分片。
 
-plan fingerprint 包含 direct candidate、relay manifest 和 weights。当前没有公开销毁接口，因为底层 Channel/
-CCU kernel release 语义仍与 communicator 生命周期绑定；进程退出时统一释放。
+## 7. 修改位置
 
-限制：
+### sgl-kernel-npu
 
-- handle 不能跨进程；每个 torchrun rank 都要各自 prepare；
-- handle 不能跨 stream；换 stream 必须重新 prepare；
-- communicator 被销毁后不能继续 execute；
-- 当前实现只处理两 rank AllToAll；未来多 rank 应把 peer/path matrix 放进 controller plan，而不是扩展图内参数。
+- `csrc/deepep/ops/op_host/explicit_multipath_all2all_ccu_def.cpp`
+- `csrc/deepep/ops/op_host/explicit_multipath_all2all_ccu_tiling.cpp`
+- `csrc/deepep/ops/op_kernel/explicit_multipath_all2_all_ccu.cpp`
+- `csrc/deepep/ops/op_host/op_api/aclnn_explicit_multipath_all2all_ccu.*`
+- `csrc/deepep/deep_ep.cpp` / `deep_ep.hpp`
+- `csrc/deepep/pybind_extension.cpp`
+- `python/deep_ep/deep_ep/buffer.py`
+- `tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py`
 
-## 6. 为什么不需要 patched HCCL 或 MC2 源码
+### hccl
 
-方案 2 直接动态调用已安装 route runtime 中的 prepared APIs。该 runtime 使用系统已经暴露的：
+- `src/ops/op_common/selector/auto_selector_base.cc`
+- `src/ops/all_to_all_v/selector/alltoall_auto_selector.cc`
+- `src/ops/all_to_all_v/executor/ins_v2_all_to_all_v_sole_executor.cc`
+- `src/ops/all_to_all_v/template/ccu/ccu_temp_explicit_multipath_alltoall.*`
+- `src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_explicit_multipath_alltoall.*`
 
-- `HcclRankGraphGetLayers/GetLinks`；
-- `HcclChannelAcquire`；
-- `HcclThreadAcquireWithStream`；
-- `HcclCcuKernelRegister/Finish/Launch`。
+## 8. 生命周期与扩展性
 
-它不要求修改系统 `libmc2_client.so`，也不把新增 selector 接入系统 `mc2_ops_hccl`。HCCL 源码仓仅作为
-编译 route runtime 时的头文件/兼容源码来源，不需要把其 `libhccl.so` 注入运行进程。
+- communicator 初始化：创建完整 direct/relay Channel catalog；
+- graph capture/replay：只传 policy 和 buffer 地址，复用 catalog；
+- communicator 销毁：跟随 HCCL 资源生命周期回收；
+- 新增 relay：需要在下一次 communicator 初始化前更新 manifest；
+- 动态禁用 relay、切换子集、改变比例：只更新 `pathPolicy`；
+- 扩展到 4 ranks：应把当前“一对 rank 的 path catalog”提升为 peer-pair/path matrix，不能简单复用两 rank
+  offset 公式。
 
-## 7. 与旧实现的区别
+## 9. 已验证与待验证边界
 
-| 项目 | 旧 standard/MC2 路径 | 方案 2 prepared 路径 |
-|---|---|---|
-| path plan 入口 | Ascend C attrs/tiling | host controller prepare |
-| Channel 建链 | 期望 MC2 转发到 patched HCCL | route runtime 直接建链 |
-| 热路径建链 | 理论上缓存，但实际未进入 selector | 明确禁止，资源已准备 |
-| 图内文件读取 | 不应有 | 没有 |
-| 图节点 | ACLNN custom op | `torch.ops.deep_ep` PrivateUse1 op |
-| patched HCCL | 需要且仍未解决 MC2 边界 | 不需要 |
-| `libmc2_client` 源码 | 成为 blocker | 不需要 |
+已在 `cam_lyw_dev_91` 完成：
 
-原 Ascend C `ExplicitMultipathAll2AllCcu` 源码保留为实验记录，但性能矩阵的正式显式 case 使用
-`implementation=prepared`，不再使用 `implementation=standard`。
+- HCCL host/CCU 源码完整编译、链接和 run-package 打包；
+- HCCL extension ABI 3 装载验证；
+- 标准 opbuild、4 个 dtype kernel、custom OPP 打包；
+- DeepEP C++ extension 和 wheel 编译；
+- wheel 在容器内 force-reinstall，DeepEP ABI 8 装载成功；
+- 安装后容器仍保持运行。
 
-## 8. 当前验证状态
+仍需有卡环境完成：
 
-已完成无卡编译/装载级验证：
-
-- route package 编译、安装通过；
-- DeepEP wheel 编译、强制安装通过；
-- DeepEP attr ABI `4`；
-- prepared-plan ABI `4`；
-- plan create/execute 动态符号存在；
-- PyTorch graph op 注册与 Meta dispatch 通过。
-- `torch.compile(..., fullgraph=True)` 的 Meta capture 通过。
-
-仍需在有卡环境验证：
-
-1. 每个 rank prepare 一次并获得 handle；
-2. warmup/iters 中只调用 execute；
-3. 数据正确性；
-4. direct+2/4/6 relay 的性能与 HCCN 物理路径；
-5. 有卡 PrivateUse1 执行下的 graph capture/replay（无卡 Meta capture 已通过）。
-
-## 9. 控制面延迟触发数据面的扩展设计
-
-该能力可以在方案 2 上实现，不需要回到 MC2 tiling。推荐使用：
-
-```text
-host/controller
-  1. 在独立 control stream 写 HBM CommandBlock
-  2. 做可见性/顺序保证
-  3. 发送 CCU local-notify doorbell
-                         |
-already-launched CCU kernel
-  4. NotifyWait(doorbell)
-  5. Load(command_addr, command variables)
-  6. 校验 epoch/opcode
-  7. 按 path_mask/path_bytes 发出 WriteNb
-  8. Store completion/status 到 HBM
-```
-
-建议的 `CommandBlock` 至少包含：
-
-```c
-struct CommandBlock {
-    uint64_t submit_epoch;
-    uint64_t opcode;       // EXECUTE / CANCEL
-    uint64_t path_mask;
-    uint64_t bytes[8];
-    uint64_t completion_epoch;
-    uint64_t status;
-};
-```
-
-公开 CCU primitive 已暴露 `Load(Variable addrVar, Variable)`/
-`CcuLoadVarFromVarAddr`，因此 CCU 可以在被唤醒后读取 HBM command；`CCU_IF` 可用于按 mask 条件提交路径。
-
-不推荐只让 CCU 无限轮询 HBM flag：它会长期占用 CCU，超时/取消语义困难，也更依赖缓存一致性。HBM 保存
-命令内容，notify 只作为 doorbell，二者职责分开。
-
-必须避免以下死锁：
-
-```text
-same stream:
-  launch(wait flag) -> memcpy(flag=READY)
-```
-
-后一个 memcpy 永远无法越过正在等待的 kernel。控制器应使用独立 control stream，或使用独立 host API/
-CCU thread 发 doorbell；写 command 必须先于 doorbell 对设备可见。
-
-两 rank 还需要相同 `submit_epoch`。一个 rank 提前启动可以在既有 peer `NotifyWait` 处等待，但控制器必须保证
-另一 rank 最终收到同一命令，并为等待、取消、超时和 completion 提供明确状态机。
-
-建议分三步实现：
-
-1. gate-only：固定路径和 bytes，只验证下发后在 doorbell 前不产生 HCCN 流量；
-2. dynamic mask：由 `path_mask` 选择已经 prepare 的 Channel，验证 direct/relay 组合；
-3. dynamic weights：由 `bytes[8]` 控制分片，加入 epoch、cancel、completion 和错误恢复。
-
-这项扩展不会动态创建新路径：控制器只能在 prepare 阶段已经建好的 Channel 集合中选择。新增 relay 仍应创建
-新的 plan，不能在图 replay 期间修改 plan 的 Channel 资源。
+1. 标准算子单次正确性；
+2. ACLGraph capture/replay 正确性；
+3. replay 修改 policy 后的 HCCN 端口变化；
+4. 1/2/4/6 relay 性能和稳定性。
