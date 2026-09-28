@@ -165,6 +165,30 @@ latest_package=$(
 echo "Build succeeded. Latest package:"
 echo "${latest_package}"
 
+built_library=$(
+    find "${hccl_repo}/build" -type f \
+        -path '*/makeself_staging/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so' \
+        -printf '%T@ %p\n' 2>/dev/null |
+        sort -nr | head -n 1 | cut -d' ' -f2-
+)
+[[ -f "${built_library}" ]] || {
+    echo "Packaged route-probe library was not found below ${hccl_repo}/build." >&2
+    exit 1
+}
+required_symbols=(
+    HcclCcuUrmaMultiRouteAllToAll
+    HcclCcuUrmaExplicitMultipathPlanCreate
+    HcclCcuUrmaExplicitMultipathPlanExecute
+    A5CcuUrmaPreparedPlanAbiVersion
+)
+for required_symbol in "${required_symbols[@]}"; do
+    nm -D "${built_library}" | grep " ${required_symbol}$" >/dev/null || {
+        echo "Packaged route probe is missing ${required_symbol}: ${built_library}" >&2
+        exit 1
+    }
+done
+echo "Verified packaged library: ${built_library}"
+
 if (( install_after_build == 0 )); then
     echo "Run this script again with --install to install into the active CANN tree."
     exit 0
@@ -186,7 +210,35 @@ echo "Installing into CANN: ${install_path}"
 env -u ASCEND_CUSTOM_OPP_PATH -u ASCEND_OPP_PATH \
     "${latest_package}" --quiet --install "--install-path=${install_path}"
 
-test -f "${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
-test -f "${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+installed_header="${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
+installed_library="${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+test -f "${installed_header}"
+test -f "${installed_library}"
+
+# Some existing custom-package registrations return success without replacing
+# an older file in opp/vendors/cust.  The user explicitly requested --install,
+# so make the installed artifact byte-identical to the package just built.
+if ! cmp -s "${built_library}" "${installed_library}"; then
+    echo "Package installer left a stale route library; replacing it with the verified build."
+    /usr/bin/install -m 0755 "${built_library}" "${installed_library}"
+    built_vendor_dir=$(dirname "$(dirname "${built_library}")")
+    /usr/bin/install -m 0644 \
+        "${built_vendor_dir}/include/a5_ccu_urma_route_probe.h" \
+        "${installed_header}"
+    /usr/bin/install -m 0644 \
+        "${built_vendor_dir}/include/a5_uvs_source_route_provider.h" \
+        "${install_path}/opp/vendors/cust/include/a5_uvs_source_route_provider.h"
+fi
+
+for required_symbol in "${required_symbols[@]}"; do
+    nm -D "${installed_library}" | grep " ${required_symbol}$" >/dev/null || {
+        echo "Installed route probe is missing ${required_symbol}: ${installed_library}" >&2
+        exit 1
+    }
+done
+cmp -s "${built_library}" "${installed_library}" || {
+    echo "Installed route probe does not match the package build: ${installed_library}" >&2
+    exit 1
+}
 echo "Installed header: ${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
 echo "Installed library: ${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"

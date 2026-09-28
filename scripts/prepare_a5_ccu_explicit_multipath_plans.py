@@ -33,11 +33,11 @@ def main():
     args = parser.parse_args()
 
     fields, rows = read_tsv(args.resolved_manifest)
-    if len(rows) != 6:
-        raise SystemExit(f"expected exactly six explicit relay rows, got {len(rows)}")
+    if len(rows) not in COUNTS:
+        raise SystemExit(f"expected 2, 4 or 6 explicit relay rows, got {len(rows)}")
     relays = [int(row["relay_phy"]) for row in rows]
-    if len(set(relays)) != 6:
-        raise SystemExit("the six relay rows must name distinct physical devices")
+    if len(set(relays)) != len(rows):
+        raise SystemExit("the relay rows must name distinct physical devices")
     endpoint_pairs = {(row["src_die"], row["dst_die"]) for row in rows}
     if len(endpoint_pairs) != 1:
         raise SystemExit(f"relay paths span endpoint IO dies: {sorted(endpoint_pairs)}")
@@ -50,7 +50,7 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plans = {}
-    for count in COUNTS:
+    for count in (value for value in COUNTS if value <= len(rows)):
         selected = rows[:count]
         path = args.output_dir / f"direct_plus_{count}relay.tsv"
         write_tsv(path, fields, selected)

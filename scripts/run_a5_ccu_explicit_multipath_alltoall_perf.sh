@@ -58,10 +58,6 @@ esac
 [[ "${src_phy}" =~ ^[0-9]+$ && "${dst_phy}" =~ ^[0-9]+$ ]] || {
     echo "--src-phy and --dst-phy are required" >&2; exit 2;
 }
-IFS=',' read -ra relay_array <<<"${relay_phys}"
-(( ${#relay_array[@]} == 6 )) || {
-    echo "--relay-phys must explicitly list exactly six ordered relay cards" >&2; exit 2;
-}
 [[ "${direct_route}" =~ ^[0-9]+$ ]] || { echo "invalid --direct-route" >&2; exit 2; }
 (( bytes > 0 && bytes % 256 == 0 && warmup >= 0 && iterations > 0 &&
    repeats > 0 && profile_iters > 0 )) || {
@@ -83,6 +79,36 @@ case_selected() {
     return 1
 }
 
+required_relay_count=0
+need_legacy=0
+need_prepared=0
+if case_selected native0 || case_selected native2; then
+    need_legacy=1
+fi
+if case_selected direct_plus_2relay; then
+    required_relay_count=2
+    need_prepared=1
+fi
+if case_selected direct_plus_4relay; then
+    required_relay_count=4
+    need_prepared=1
+fi
+if case_selected direct_plus_6relay; then
+    required_relay_count=6
+    need_prepared=1
+fi
+
+relay_array=()
+if (( required_relay_count > 0 )); then
+    IFS=',' read -ra relay_array <<<"${relay_phys}"
+    (( ${#relay_array[@]} == required_relay_count )) || {
+        echo "selected cases require exactly ${required_relay_count} ordered relay cards in --relay-phys" >&2
+        exit 2
+    }
+elif [[ -n "${relay_phys}" ]]; then
+    IFS=',' read -ra relay_array <<<"${relay_phys}"
+fi
+
 cd "${repo_root}"
 source "${cann_root}/set_env.sh"
 set +u
@@ -99,9 +125,7 @@ if [[ -n "${hccl_lib_dir}" ]]; then
     echo "NOTE: --hccl-lib-dir is no longer used; prepared-plan mode works with the installed stock HCCL." >&2
 fi
 
-if case_selected native0 || case_selected native2 ||
-   case_selected direct_plus_2relay || case_selected direct_plus_4relay ||
-   case_selected direct_plus_6relay; then
+if (( need_legacy || need_prepared )); then
     route_probe_lib=${A5_CCU_ROUTE_PROBE_LIB:-}
     if [[ -z "${route_probe_lib}" ]]; then
         for candidate in \
@@ -118,18 +142,26 @@ if case_selected native0 || case_selected native2 ||
         echo "the selected cases require liba5_ccu_urma_route_probe.so; install the latest route probe" >&2
         exit 2
     }
-    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaMultiRouteAllToAll$' || {
-        echo "route probe is stale: HcclCcuUrmaMultiRouteAllToAll is missing from ${route_probe_lib}" >&2
-        exit 2
-    }
-    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaExplicitMultipathPlanCreate$' || {
-        echo "route probe is stale: prepared-plan create API is missing from ${route_probe_lib}" >&2
-        exit 2
-    }
-    nm -D "${route_probe_lib}" | grep -q ' HcclCcuUrmaExplicitMultipathPlanExecute$' || {
-        echo "route probe is stale: prepared-plan execute API is missing from ${route_probe_lib}" >&2
-        exit 2
-    }
+    if (( need_legacy )); then
+        nm -D "${route_probe_lib}" | grep ' HcclCcuUrmaMultiRouteAllToAll$' >/dev/null || {
+            echo "route probe is stale: legacy discovered-path API is missing from ${route_probe_lib}" >&2
+            exit 2
+        }
+    fi
+    if (( need_prepared )); then
+        nm -D "${route_probe_lib}" | grep ' HcclCcuUrmaExplicitMultipathPlanCreate$' >/dev/null || {
+            echo "route probe is stale: prepared-plan create API is missing from ${route_probe_lib}" >&2
+            exit 2
+        }
+        nm -D "${route_probe_lib}" | grep ' HcclCcuUrmaExplicitMultipathPlanExecute$' >/dev/null || {
+            echo "route probe is stale: prepared-plan execute API is missing from ${route_probe_lib}" >&2
+            exit 2
+        }
+        nm -D "${route_probe_lib}" | grep ' A5CcuUrmaPreparedPlanAbiVersion$' >/dev/null || {
+            echo "route probe is stale: prepared-plan ABI marker is missing from ${route_probe_lib}" >&2
+            exit 2
+        }
+    fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")
     export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"
     export LD_LIBRARY_PATH="$(dirname "${route_probe_lib}"):${LD_LIBRARY_PATH}"
@@ -137,19 +169,25 @@ if case_selected native0 || case_selected native2 ||
 fi
 
 env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
+    A5_CCU_REQUIRE_LEGACY="${need_legacy}" \
+    A5_CCU_REQUIRE_PREPARED="${need_prepared}" \
 python3 - <<'PY'
 import ctypes
+import os
 from pathlib import Path
 import torch
 import deep_ep.deep_ep_cpp as ext
 
 extension_path = Path(ext.__file__).resolve()
 print(f"Verified DeepEP extension: {extension_path}")
-assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
-assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
-assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
-assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
-assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
+need_legacy = os.environ["A5_CCU_REQUIRE_LEGACY"] == "1"
+need_prepared = os.environ["A5_CCU_REQUIRE_PREPARED"] == "1"
+if need_legacy:
+    assert hasattr(ext.Buffer, "ccu_urma_multiroute_alltoall_out")
+if need_prepared:
+    assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
+    assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
+    assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
 try:
     extension = ctypes.CDLL(str(extension_path))
     abi_version = extension.A5DeepEpExplicitMultipathAttrAbiVersion
@@ -165,26 +203,37 @@ if version < 4:
         f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 4; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
-route = ctypes.CDLL(str(Path(__import__('os').environ['A5_CCU_ROUTE_PROBE_LIB'])))
-route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
-route_abi.restype = ctypes.c_int
-assert route_abi() >= 1
-print(f"Verified matrix APIs: prepared-plan + graph op + legacy multiroute; DeepEP ABI={version}; route ABI={route_abi()}")
+route = ctypes.CDLL(str(Path(os.environ['A5_CCU_ROUTE_PROBE_LIB'])))
+route_abi_value = "NA"
+if need_prepared:
+    route_abi = route.A5CcuUrmaPreparedPlanAbiVersion
+    route_abi.restype = ctypes.c_int
+    route_abi_value = route_abi()
+    assert route_abi_value >= 1
+print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "
+      f"DeepEP ABI={version}; route ABI={route_abi_value}")
 PY
 
 run_dir="${output_root}/a5_ccu_explicit_multipath_${src_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases" "${run_dir}/plans" "${run_dir}/profiling"
-resolved="${run_dir}/resolved_six_relays.tsv"
-resolve=(python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py"
-    --topology "${topology}" --topology-json "${topology_json}"
-    --src-phy "${src_phy}" --dst-phy "${dst_phy}"
-    --relay-phys "${relay_phys}" --weights 1,1,1,1,1,1)
-[[ -z "${relay_planes}" ]] || resolve+=(--relay-planes "${relay_planes}")
-"${resolve[@]}" >"${resolved}"
+if (( need_prepared )); then
+    resolved="${run_dir}/resolved_${required_relay_count}_relays.tsv"
+    relay_weights=""
+    for ((i=0; i<required_relay_count; ++i)); do
+        [[ -z "${relay_weights}" ]] || relay_weights+=,
+        relay_weights+=1
+    done
+    resolve=(python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py"
+        --topology "${topology}" --topology-json "${topology_json}"
+        --src-phy "${src_phy}" --dst-phy "${dst_phy}"
+        --relay-phys "${relay_phys}" --weights "${relay_weights}")
+    [[ -z "${relay_planes}" ]] || resolve+=(--relay-planes "${relay_planes}")
+    "${resolve[@]}" >"${resolved}"
 
-python3 "${script_dir}/prepare_a5_ccu_explicit_multipath_plans.py" \
-    --resolved-manifest "${resolved}" --output-dir "${run_dir}/plans" \
-    --direct-route "${direct_route}" --direct-relay-ratio 2:1
+    python3 "${script_dir}/prepare_a5_ccu_explicit_multipath_plans.py" \
+        --resolved-manifest "${resolved}" --output-dir "${run_dir}/plans" \
+        --direct-route "${direct_route}" --direct-relay-ratio 2:1
+fi
 
 printf 'case\trepeat\tstatus\tresult\n' >"${run_dir}/case_status.tsv"
 test_script=tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py

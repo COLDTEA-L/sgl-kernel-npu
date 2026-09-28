@@ -223,7 +223,8 @@ PY
 
 ## 5. 快速单 case 验证
 
-以物理卡 2、3 为通信端点，4、5、1、0、6、7 为有序 relay 候选：
+单 case 只要求提供该 case 实际使用的 relay，不再要求固定传入六张卡。例如端点改为物理卡 `0,1`，
+显式指定物理卡 `2,3` 为两条 relay：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -231,8 +232,8 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD
 
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 2 --dst-phy 3 \
-  --relay-phys 4,5,1,0,6,7 \
+  --src-phy 0 --dst-phy 1 \
+  --relay-phys 2,3 \
   --direct-route 0 \
   --cases direct_plus_2relay \
   --bytes 4194304 \
@@ -241,6 +242,14 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
+
+规则如下：
+
+- `direct_plus_2relay`：`--relay-phys` 恰好列 2 张卡；
+- `direct_plus_4relay`：恰好列 4 张卡；
+- `direct_plus_6relay` 或完整矩阵：恰好列 6 张卡；
+- relay 顺序就是 manifest/path 顺序，不能包含 `src-phy` 或 `dst-phy`，卡号不会在脚本中写死；
+- relay 卡不启动 rank，但其 IO Die/端口会承载转发流量，不能把他人正在使用的卡视为完全无影响。
 
 不要再传 `--hccl-lib-dir`，也不要设置 patched HCCL 的 `LD_PRELOAD`。
 
@@ -261,8 +270,8 @@ PASS: ... implementation=prepared
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 2 --dst-phy 3 \
-  --relay-phys 4,5,1,0,6,7 \
+  --src-phy 0 --dst-phy 1 \
+  --relay-phys 2,3 \
   --direct-route 0 \
   --cases direct_plus_2relay \
   --graph-backend eager \
@@ -277,8 +286,8 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 2 --dst-phy 3 \
-  --relay-phys 4,5,1,0,6,7 \
+  --src-phy 0 --dst-phy 1 \
+  --relay-phys 2,3 \
   --direct-route 0 \
   --cases direct_plus_2relay \
   --graph-backend npugraphs \
@@ -366,6 +375,10 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 |---|---|
 | DeepEP ABI `< 4` | 加载了旧 wheel；重新构建并 `--force-reinstall` |
 | prepared-plan ABI 缺失 | route package 是旧版本；重建并安装第 3 节 |
+| 只跑 prepared case，却提示缺少 `HcclCcuUrmaMultiRouteAllToAll` | 旧性能脚本误查了 legacy API；更新到最新分支。prepared case 只校验 PlanCreate/PlanExecute/ABI marker |
+| `nm -D` 手工能看到符号，脚本却报告 missing | 旧脚本在 `set -o pipefail` 下使用 `grep -q`，`grep` 提前退出令 `nm` 收到 SIGPIPE，形成假阴性；更新脚本 |
+| 安装后 SO 仍是旧符号表 | 第 3 节的新构建脚本会比较 packaged/installed SO；安装器未覆盖时会用已验证产物刷新并再次校验 |
+| `--relay-phys must ... six` | 旧脚本把完整矩阵约束错误施加给单 case；更新脚本后按 case 传 2、4 或 6 张 relay |
 | 找不到 `torch.ops.deep_ep...` | wheel 未包含新的 `TORCH_LIBRARY` 注册 |
 | `npugraphs` backend 不存在 | 当前 torch_npu 版本未提供 ACLGraph backend；先用 `python3 -c 'import torch,torch_npu; print(torch._dynamo.list_backends())'` 检查 |
 | fullgraph graph break | 保存完整 `CASE_FAILURE`；不能把 eager PASS 当作设备图 PASS |
