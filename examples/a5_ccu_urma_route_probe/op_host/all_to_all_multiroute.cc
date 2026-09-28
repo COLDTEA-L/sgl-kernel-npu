@@ -404,7 +404,9 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
 extern "C" __attribute__((visibility("default"))) int
 A5CcuHbmCommandPunctureAbiVersion()
 {
-    return 1;
+    // Version 2 uses a single CCU polling loop.  The nested WHILE form in V1
+    // was rejected by the A5 instruction builder during kernel registration.
+    return 2;
 }
 
 extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(

@@ -61,6 +61,19 @@ done
 export A5_CCU_ROUTE_PROBE_LIB=$(readlink -f "${route_so}")
 export LD_LIBRARY_PATH="$(dirname "${A5_CCU_ROUTE_PROBE_LIB}"):${LD_LIBRARY_PATH}"
 
+python3 - "${A5_CCU_ROUTE_PROBE_LIB}" <<'PY'
+import ctypes
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve()
+lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+abi = lib.A5CcuHbmCommandPunctureAbiVersion
+abi.restype = ctypes.c_int
+print("Route puncture:", path, "ABI=", abi())
+assert abi() >= 2, "route package predates the single-loop CCU worker fix"
+PY
+
 python3 - <<'PY'
 import ctypes
 from pathlib import Path

@@ -102,7 +102,7 @@ fn = lib.A5CcuHbmCommandPunctureAbiVersion
 fn.restype = ctypes.c_int
 print("route library:", p)
 print("command puncture ABI:", fn())
-assert fn() >= 1
+assert fn() >= 2
 PY
 ```
 
@@ -222,6 +222,15 @@ PUNCTURE_RESULT PASS
 5. 普通 transfer 通过但 capture/replay 失败：检查是否在 capture 内重新 prepare/stop，以及 command/completion 是否正确清零。
 6. 外层 timeout 中止进程时，`finally` 可能来不及发 STOP；进程退出后资源由 runtime 回收，但不要在同一进程中遗留 worker 后继续其他测试。
 7. 当前公开 HCOMM 边界没有与 `HcclThreadAcquireWithStream`/`HcclChannelAcquire` 配对的 release API。穿刺程序会发 STOP 并等待 worker 退出，但不在存活进程内销毁仍被 HCCL thread/channel 引用的专用 stream。因此该版本用于一次性穿刺，不应在长寿命进程中反复 prepare/stop。
+8. `register command_block_worker end: status=4` 表示失败在 CCU kernel 注册，尚未进入 HBM handshake。ABI 2 已将 V1 的嵌套 `CCU_WHILE` 改为单层轮询，并输出 `COMMAND_BLOCK_REGISTER_TRACE`。如果 ABI 2 仍失败，使用下列命令区分 primitive 生成失败和 register finalize 失败：
+
+```bash
+grep -nE \
+'COMMAND_BLOCK_REGISTER_TRACE|register command_block_worker|HcclCcuKernelRegister' \
+"${RUN_DIR}/puncture.log"
+```
+
+`primitive_failed` 会给出失败源码行；如果已出现 `algorithm_ready` 但 Register 仍返回 4，则问题在 HCOMM 对整个 instruction group 的 finalize/verify，不在 relay Channel 或 CommandBlock 可见性。
 
 ## 10. 通过后的下一步
 

@@ -1,5 +1,7 @@
 #include "command_block_worker_kernel.h"
 
+#include <cstdio>
+
 namespace a5_ccu_urma_probe {
 namespace {
 constexpr uint32_t OUTPUT_VAR_INDEX = 0;
@@ -11,7 +13,13 @@ constexpr uint32_t NOTIFY_MASK = 1;
 
 #define CCU_KERNEL_CHECK(expression) do { \
     HcclResult status = (expression); \
-    if (status != HCCL_SUCCESS) return status; \
+    if (status != HCCL_SUCCESS) { \
+        std::fprintf(stderr, \
+            "COMMAND_BLOCK_REGISTER_TRACE phase=primitive_failed line=%d status=%d\n", \
+            __LINE__, static_cast<int>(status)); \
+        std::fflush(stderr); \
+        return status; \
+    } \
 } while (0)
 
 uint64_t AddressAt(uint64_t base, uint64_t word)
@@ -57,6 +65,9 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
     }
 
     if (commandBlockAddress_ == 0U) return HCCL_E_PARA;
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_begin paths=%zu command_block=0x%lx\n",
+                channels_.size(), static_cast<unsigned long>(commandBlockAddress_));
+    std::fflush(stdout);
     using namespace hcomm;
     using hcomm::CcuRep::CompletedEvent;
     using hcomm::CcuRep::LocalAddr;
@@ -69,15 +80,21 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], OUTPUT_VAR_INDEX, &remoteOutputs[i]));
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], TOKEN_VAR_INDEX, &remoteTokens[i]));
     }
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=remote_variables_ready paths=%zu\n",
+                channels_.size());
+    std::fflush(stdout);
 
     Variable stop;
     stop = 0;
     CCU_WHILE(stop == 0) {
         Variable command;
         command = 0;
-        CCU_WHILE(command == 0) {
-            LoadVariable(AddressAt(commandBlockAddress_, COMMAND_OPCODE), command);
-        }
+        // Keep a single CCU control-flow loop.  The A5 instruction builder
+        // rejects the nested WHILE form used by an earlier puncture revision
+        // during HcclCcuKernelRegister.  IDLE simply performs one load and
+        // advances to the next outer iteration, which is the same busy-poll
+        // behaviour without nested loop metadata.
+        LoadVariable(AddressAt(commandBlockAddress_, COMMAND_OPCODE), command);
 
         CCU_IF(command == COMMAND_OPCODE_STOP) {
             Variable status;
@@ -186,6 +203,9 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
             StoreVariable(completed, AddressAt(commandBlockAddress_, COMMAND_COMPLETION));
         }
     }
+    std::printf("COMMAND_BLOCK_REGISTER_TRACE phase=algorithm_ready paths=%zu\n",
+                channels_.size());
+    std::fflush(stdout);
     return HCCL_SUCCESS;
 }
 
