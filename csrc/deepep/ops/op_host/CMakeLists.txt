@@ -29,6 +29,11 @@ if("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
             ${CMAKE_CURRENT_SOURCE_DIR}/explicit_multipath_all2all_ccu_def.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/explicit_multipath_all2all_ccu_tiling.cpp)
         message(STATUS "DeepEP single-op host build: ExplicitMultipathAll2AllCcu")
+    elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "ccu_hbm_command_puncture")
+        set(ops_srcs
+            ${CMAKE_CURRENT_SOURCE_DIR}/ccu_hbm_command_puncture_def.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/ccu_hbm_command_puncture_tiling.cpp)
+        message(STATUS "DeepEP single-op host build: CcuHbmCommandPuncture")
     else()
         # Keep one FusedDeepMoe definition visible to code generation on A5.
         list(REMOVE_ITEM ops_srcs
@@ -75,6 +80,10 @@ elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "explicit_multipath_all2all_ccu")
     file(GLOB pregen_file
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_explicit_multipath_all2all_ccu.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_explicit_multipath_all2all_ccu.h")
+elseif("$ENV{DEEPEP_SINGLE_OP}" STREQUAL "ccu_hbm_command_puncture")
+    file(GLOB pregen_file
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_ccu_hbm_command_puncture.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/op_api/aclnn_ccu_hbm_command_puncture.h")
 elseif("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
     # Keep all existing ACLNN wrappers (including low-latency dispatch/combine)
     # and overlay only the A5-specific FusedDeepMoe wrapper.

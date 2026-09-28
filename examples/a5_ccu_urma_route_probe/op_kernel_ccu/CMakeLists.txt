@@ -1,6 +1,7 @@
 set(op_kernel_ccu_src_list
     ${CMAKE_CURRENT_SOURCE_DIR}/route_kernel.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/all_to_all_multiroute_kernel.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/command_block_worker_kernel.cc
 )
 
 target_sources(a5_ccu_urma_route_probe PRIVATE

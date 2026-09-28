@@ -93,6 +93,26 @@ HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
     HcclDataType dataType, HcclComm comm, aclrtStream stream,
     uint64_t planHandle);
 
+/**
+ * Experimental cross-engine mailbox ABI.
+ *
+ * Create provisions explicit direct/relay Channels on a dedicated stream,
+ * registers a persistent CCU worker and starts it polling commandBlock.  The
+ * graph-visible AIV operator is the only producer of EXECUTE commands.
+ */
+int A5CcuHbmCommandPunctureAbiVersion(void);
+
+HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, void *commandBlock, uint64_t commandBlockBytes,
+    HcclComm comm, aclrtStream controlStream, const char *planId,
+    const char *relayManifest, uint32_t directRoute,
+    const uint32_t *pathWeights, uint32_t pathCount,
+    uint64_t *workerHandle);
+
+HcclResult HcclCcuUrmaCommandBlockWorkerStop(
+    uint64_t workerHandle, aclrtStream controlStream);
+
 #ifdef __cplusplus
 }
 #endif

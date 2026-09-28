@@ -1,0 +1,233 @@
+# A5 AIV → HBM CommandBlock → CCU worker 穿刺实验
+
+## 1. 目的和判定边界
+
+本实验用来验证不修改系统 `libhccl.so` 的标准算子架构：
+
+```text
+图外 prepare
+  → 显式构造 direct/relay CommLink
+  → HcclChannelAcquire
+  → 启动常驻 CCU worker
+  → 返回 worker_handle
+
+图内标准 Ascend C AIV 算子
+  → 将 send/recv 地址、分片、path mask 写入 HBM CommandBlock
+  → flush/fence
+  → 发布 EXECUTE
+  → 轮询 completion/status
+
+常驻 CCU worker
+  → 轮询 CommandBlock
+  → 读取这一次的控制参数
+  → 对已准备的 Channels 并发 WriteNb
+  → 写回 completion/status
+```
+
+实验分三层：
+
+1. `HANDSHAKE`：`path_mask=0`，不搬运数据。通过只能证明 AIV → HBM → CCU 命令可见，以及 CCU → HBM → AIV 完成可见。
+2. `TRANSFER`：同一 worker 读取 AIV 写入的地址和分片，通过显式 direct/relay Channels 完成真实两 rank AllToAll 并校验数据。
+3. `ACLGRAPH_CAPTURE/REPLAY`：将 AIV 算子 capture 后改变输入并 replay，证明图中重放使用的仍是已准备的 worker/Channels，且数据不是首次执行的旧结果。
+
+本穿刺不证明最终性能，也不以 HCCN counter 代替数据正确性。
+
+## 2. 实现位置
+
+| 层次 | 文件 | 作用 |
+|---|---|---|
+| CCU kernel | `examples/a5_ccu_urma_route_probe/op_kernel_ccu/command_block_worker_kernel.cc` | 轮询 mailbox，执行 `WriteNb`，写回 completion |
+| 图外控制面 | `examples/a5_ccu_urma_route_probe/op_host/all_to_all_multiroute.cc` | 构造 Channels，启动/停止 worker |
+| 标准 op def/tiling | `csrc/deepep/ops/op_host/ccu_hbm_command_puncture_*.cpp` | 定义 Ascend C 算子、shape/attr 校验和 tiling |
+| AIV kernel | `csrc/deepep/ops/op_kernel/ccu_hbm_command_puncture.cpp` | 写 CommandBlock，flush，等待 completion |
+| Python/C++ 绑定 | `csrc/deepep/deep_ep.cpp` | prepare/execute/stop 入口 |
+| 两 rank 用例 | `tests/python/deepep/test_a5_ccu_hbm_command_puncture.py` | 三阶段验证和数据校验 |
+| 一键脚本 | `scripts/run_a5_ccu_hbm_command_puncture.sh` | 解析 relay EID、生成 manifest、启动 torchrun |
+
+## 3. CommandBlock ABI
+
+CommandBlock 是一块至少 38 个 `uint64_t` word 的 NPU HBM：
+
+| word | 字段 |
+|---:|---|
+| 0 | magic |
+| 1 | command: `0=IDLE, 1=EXECUTE, 2=STOP` |
+| 2 | completion |
+| 3 | worker status |
+| 4,5 | send/recv GM address |
+| 6,7 | send/recv token，由图外 prepare 填入 |
+| 8 | bytes per peer |
+| 9,10,11 | self-copy source offset / destination offset / bytes |
+| 12,13 | path count / path mask |
+| 14..21 | 每条 path 的 source offset |
+| 22..29 | 每条 path 的 remote offset |
+| 30..37 | 每条 path 的 bytes |
+
+发布顺序不能更改：AIV 先清 completion、写完 payload 并 flush，最后单独写/flush command。CCU 完成后先写 status、将 command 恢复 IDLE，最后才发布 completion。`completion=1` 是该 epoch 的 release 标志；如果在 completion 之后再清 command，有可能覆盖下一次 ACLGraph replay 刚提交的命令。
+
+## 4. 拉取代码
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+```
+
+## 5. 编译并安装 route/CCU package
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+
+HCCL_REPO=/home/l00934901/hccl \
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
+```
+
+验证实际装入 CANN 的 SO：
+
+```bash
+ROUTE_SO=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
+
+nm -D "${ROUTE_SO}" | grep -E \
+'HcclCcuUrmaCommandBlockWorker(Create|Stop)|A5CcuHbmCommandPunctureAbiVersion'
+
+python3 - "${ROUTE_SO}" <<'PY'
+import ctypes, pathlib, sys
+p = pathlib.Path(sys.argv[1]).resolve()
+lib = ctypes.CDLL(str(p), mode=ctypes.RTLD_GLOBAL)
+fn = lib.A5CcuHbmCommandPunctureAbiVersion
+fn.restype = ctypes.c_int
+print("route library:", p)
+print("command puncture ABI:", fn())
+assert fn() >= 1
+PY
+```
+
+## 6. 编译标准 AIV 算子并重装 wheel
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+
+DEEPEP_SINGLE_OP=ccu_hbm_command_puncture \
+bash build.sh -a deepep Ascend950
+
+WHEEL=$(ls -t output/deep_ep-*.whl | head -1)
+python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
+```
+
+某些旧构建脚本在单个 Ascend C kernel 编译失败后仍继续打 wheel，因此不能只用“生成了 wheel”作为成功
+判据。构建结束后还必须确认本算子的二进制 JSON 已生成，且日志没有该算子的编译失败：
+
+```bash
+find csrc/deepep/ops/build_out/op_kernel/ascendc_kernels/binary/ascend950 \
+  -path '*ccu_hbm_command_puncture*' -name '*.json' -print
+
+! grep -RniE \
+'CcuHbmCommandPuncture.*compile failed|Kernel Compilation Error: OpType CcuHbmCommandPuncture' \
+  csrc/deepep/ops/build_out 2>/dev/null
+```
+
+验证加载的 wheel 不是旧版：
+
+```bash
+python3 - <<'PY'
+import ctypes
+from pathlib import Path
+import deep_ep.deep_ep_cpp as ext
+
+p = Path(ext.__file__).resolve()
+lib = ctypes.CDLL(str(p), mode=ctypes.RTLD_GLOBAL)
+abi = lib.A5DeepEpExplicitMultipathAttrAbiVersion
+abi.restype = ctypes.c_int
+print("loaded deep_ep_cpp:", p)
+print("command puncture ABI carrier:", abi())
+assert abi() >= 7
+for name in (
+    "prepare_ccu_hbm_command_worker",
+    "ccu_hbm_command_puncture",
+    "stop_ccu_hbm_command_worker",
+):
+    assert hasattr(ext.Buffer, name), name
+print("command puncture Python APIs: PASS")
+PY
+```
+
+## 7. 运行穿刺
+
+例如端点使用物理卡 2、3，relay 显式指定为 0、1：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_hbm_command_puncture.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
+  --direct-route 0 \
+  --bytes 4194304 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+```
+
+relay 不限于两张；穿刺版最多支持 7 张 relay（加一条 direct 后共 8 paths）。例如只有卡 0、1 可作端点时，可改为：
+
+```bash
+bash scripts/run_a5_ccu_hbm_command_puncture.sh \
+  --src-phy 0 --dst-phy 1 \
+  --relay-phys 2 \
+  --direct-route 0 \
+  --bytes 4194304 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+```
+
+先只验证非图路径时增加 `--no-graph`。
+
+## 8. 查看结果
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_hbm_command_puncture_* | head -1)
+
+cat "${RUN_DIR}/status.tsv"
+grep -nE \
+'COMMAND_BLOCK_WORKER|PUNCTURE_(WORKER|HANDSHAKE|TRANSFER|GRAPH_WARMUP|ACLGRAPH_CAPTURE|ACLGRAPH_REPLAY|STOP|RESULT)' \
+"${RUN_DIR}/puncture.log"
+```
+
+完整通过应同时看到两个 rank 的：
+
+```text
+PUNCTURE_HANDSHAKE ... PASS
+PUNCTURE_TRANSFER ... PASS
+PUNCTURE_ACLGRAPH_CAPTURE ... PASS
+PUNCTURE_ACLGRAPH_REPLAY ... PASS
+PUNCTURE_STOP ... PASS
+PUNCTURE_RESULT PASS
+```
+
+`COMMAND_BLOCK_WORKER phase=ready` 应只在 prepare 阶段出现，不应在 capture/replay 间重新创建 Channel。
+
+## 9. 失败定位
+
+1. 缺少 worker symbol：安装的 route SO 过旧，重做第 5 节。
+2. DeepEP ABI `< 7`：导入了旧 wheel，重做第 6 节并核对 `ext.__file__`。
+3. `HANDSHAKE` 超时：优先检查 AIV/CCU 对 CommandBlock 的 cache flush/可见性和 worker 是否真正启动，此时与 URMA 路径无关。
+4. `HANDSHAKE` 通过但 `TRANSFER` 失败：查 relay manifest、Channel acquire、token 和分片；不要归因为 mailbox 不可见。
+5. 普通 transfer 通过但 capture/replay 失败：检查是否在 capture 内重新 prepare/stop，以及 command/completion 是否正确清零。
+6. 外层 timeout 中止进程时，`finally` 可能来不及发 STOP；进程退出后资源由 runtime 回收，但不要在同一进程中遗留 worker 后继续其他测试。
+7. 当前公开 HCOMM 边界没有与 `HcclThreadAcquireWithStream`/`HcclChannelAcquire` 配对的 release API。穿刺程序会发 STOP 并等待 worker 退出，但不在存活进程内销毁仍被 HCCL thread/channel 引用的专用 stream。因此该版本用于一次性穿刺，不应在长寿命进程中反复 prepare/stop。
+
+## 10. 通过后的下一步
+
+三层全部通过后，才将该协议收敛成最终标准算子：
+
+- CommandBlock 改为可版本化结构，增加 epoch 避免 ABA；
+- `path_mask`、weights 和每路 bytes 改为图内动态控制输入；
+- 增加错误码、超时、并发调用与 worker 生命周期管理；
+- 再用 HCCN counter 验证每条显式 relay 的物理 footprint。

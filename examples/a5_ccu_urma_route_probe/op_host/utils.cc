@@ -1,6 +1,7 @@
 #include "utils.h"
 #include "route_kernel.h"
 #include "all_to_all_multiroute_kernel.h"
+#include "command_block_worker_kernel.h"
 #include "source_route_provider.h"
 
 #include <hccl/hccl_rank_graph.h>
@@ -820,6 +821,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
     }
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
+    if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
+        if (!explicitPlan || plan->commandBlockAddress == 0U) return HCCL_E_PARA;
+        routeKey += ":command_block=" + std::to_string(plan->commandBlockAddress);
+    }
     routeKey += ":mutation=" + std::string(mutationKeyValue == nullptr ? "none" : mutationKeyValue);
     routeKey += ":donor=" + std::string(donorKeyValue == nullptr ? "none" : donorKeyValue);
     routeKey += ":synthetic_local=" + std::string(syntheticLocal == nullptr ? "none" : syntheticLocal);
@@ -1118,12 +1123,21 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     std::printf("[A5 CCU URMA][rank=%u] register %s begin\n", rank,
                 kernelKind == RouteKernelKind::ROUTE_WRITE ? "route_write" :
                 (kernelKind == RouteKernelKind::ALLTOALL_SERIAL ?
-                    "alltoall_serial" : "alltoall_concurrent"));
+                    "alltoall_serial" :
+                    (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER ?
+                        "command_block_worker" : "alltoall_concurrent")));
     std::fflush(stdout);
     if (kernelKind == RouteKernelKind::ROUTE_WRITE) {
         kernelName = "route_write";
         RouteKernelArg kernelArg(created.channels, routeIndices);
         hcomm::KernelCreator creator = CreateRouteKernel;
+        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+    } else if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
+        kernelName = "command_block_worker";
+        CommandBlockWorkerKernelArg kernelArg(
+            created.channels, routeIndices, created.weights,
+            plan->commandBlockAddress);
+        hcomm::KernelCreator creator = CreateCommandBlockWorkerKernel;
         registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
     } else {
         const bool serialized = kernelKind == RouteKernelKind::ALLTOALL_SERIAL;

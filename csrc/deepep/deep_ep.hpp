@@ -107,6 +107,19 @@ public:
         const torch::Tensor &send_data, const torch::Tensor &recv_data,
         int64_t plan_handle);
 
+    int64_t prepare_ccu_hbm_command_worker(
+        const torch::Tensor &send_data, const torch::Tensor &recv_data,
+        const torch::Tensor &command_block, const std::string &plan_id,
+        const std::string &relay_manifest, int64_t direct_route,
+        const std::vector<int64_t> &path_weights);
+
+    torch::Tensor ccu_hbm_command_puncture(
+        const torch::Tensor &send_data, const torch::Tensor &recv_data,
+        const torch::Tensor &command_block,
+        const std::vector<int64_t> &path_weights, bool transfer);
+
+    void stop_ccu_hbm_command_worker(int64_t worker_handle);
+
     torch::Tensor all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids);
 
     std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,

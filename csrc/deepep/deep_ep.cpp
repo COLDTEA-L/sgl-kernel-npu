@@ -21,7 +21,8 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
 {
     // Version 6 makes the graph-visible prepared operator functional: it
     // allocates and returns a fresh output instead of aliasing an out tensor.
-    return 6;
+    // Version 7 adds the graph-visible AIV/HBM/CCU command-block puncture.
+    return 7;
 }
 
 namespace deep_ep {
@@ -58,6 +59,11 @@ using CcuUrmaExplicitMultipathPlanCreateFn = HcclResult (*)(
     const uint32_t *, uint32_t, uint64_t *);
 using CcuUrmaExplicitMultipathPlanExecuteFn = HcclResult (*)(
     void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream, uint64_t);
+using CcuUrmaCommandBlockWorkerCreateFn = HcclResult (*)(
+    void *, void *, uint64_t, HcclDataType, void *, uint64_t,
+    HcclComm, aclrtStream, const char *, const char *, uint32_t,
+    const uint32_t *, uint32_t, uint64_t *);
+using CcuUrmaCommandBlockWorkerStopFn = HcclResult (*)(uint64_t, aclrtStream);
 
 HcclComm ResolveComm(const std::string &group_name, HcclComm owned_comm)
 {
@@ -160,6 +166,39 @@ CcuUrmaExplicitMultipathPlanExecuteFn GetCcuUrmaExplicitMultipathPlanExecute()
             "HcclCcuUrmaExplicitMultipathPlanExecute not found in ", library,
             "; rebuild and install the prepared-plan package");
         return reinterpret_cast<CcuUrmaExplicitMultipathPlanExecuteFn>(symbol);
+    }();
+    return function;
+}
+
+CcuUrmaCommandBlockWorkerCreateFn GetCcuUrmaCommandBlockWorkerCreate()
+{
+    static CcuUrmaCommandBlockWorkerCreateFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaCommandBlockWorkerCreate");
+        EP_HOST_ASSERT_S(symbol != nullptr,
+            "HcclCcuUrmaCommandBlockWorkerCreate not found in ", library,
+            "; rebuild and install the command-block puncture package");
+        return reinterpret_cast<CcuUrmaCommandBlockWorkerCreateFn>(symbol);
+    }();
+    return function;
+}
+
+CcuUrmaCommandBlockWorkerStopFn GetCcuUrmaCommandBlockWorkerStop()
+{
+    static CcuUrmaCommandBlockWorkerStopFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaCommandBlockWorkerStop");
+        EP_HOST_ASSERT_S(symbol != nullptr,
+            "HcclCcuUrmaCommandBlockWorkerStop not found in ", library);
+        return reinterpret_cast<CcuUrmaCommandBlockWorkerStopFn>(symbol);
     }();
     return function;
 }
@@ -482,6 +521,83 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
     return torch::empty_like(send_data);
+}
+
+int64_t Buffer::prepare_ccu_hbm_command_worker(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    const torch::Tensor &command_block, const std::string &plan_id,
+    const std::string &relay_manifest, int64_t direct_route,
+    const std::vector<int64_t> &path_weights)
+{
+    EP_HOST_ASSERT(num_ranks == 2 && !plan_id.empty() && !relay_manifest.empty());
+    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous() &&
+                   command_block.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 &&
+                   send_data.sizes() == recv_data.sizes());
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kFloat &&
+                   recv_data.scalar_type() == at::kFloat &&
+                   command_block.scalar_type() == at::kLong && command_block.numel() >= 38);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) &&
+                   torch_npu::utils::is_npu(recv_data) &&
+                   torch_npu::utils::is_npu(command_block));
+    EP_HOST_ASSERT(direct_route >= 0 && direct_route <= static_cast<int64_t>(UINT32_MAX));
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+    std::vector<uint32_t> weights;
+    for (const int64_t weight : path_weights) {
+        EP_HOST_ASSERT(weight > 0 && weight <= static_cast<int64_t>(UINT32_MAX));
+        weights.push_back(static_cast<uint32_t>(weight));
+    }
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    uint64_t workerHandle = 0;
+    HCCL_CHECK(GetCcuUrmaCommandBlockWorkerCreate()(
+        send_data.data_ptr(), recv_data.data_ptr(),
+        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        command_block.data_ptr(),
+        static_cast<uint64_t>(command_block.numel() * command_block.element_size()),
+        comm, stream, plan_id.c_str(), relay_manifest.c_str(),
+        static_cast<uint32_t>(direct_route), weights.data(),
+        static_cast<uint32_t>(weights.size()), &workerHandle));
+    EP_HOST_ASSERT(workerHandle != 0);
+    return static_cast<int64_t>(workerHandle);
+}
+
+torch::Tensor Buffer::ccu_hbm_command_puncture(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    const torch::Tensor &command_block,
+    const std::vector<int64_t> &path_weights, bool transfer)
+{
+    RECORD_FUNCTION("deep_ep::ccu_hbm_command_puncture",
+                    std::vector<c10::IValue>({send_data, recv_data, command_block}));
+    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous() &&
+                   command_block.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 &&
+                   send_data.sizes() == recv_data.sizes());
+    EP_HOST_ASSERT(send_data.scalar_type() == at::kFloat &&
+                   recv_data.scalar_type() == at::kFloat &&
+                   command_block.scalar_type() == at::kLong && command_block.numel() >= 38);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 8);
+    std::string weightsText;
+    for (size_t i = 0; i < path_weights.size(); ++i) {
+        EP_HOST_ASSERT(path_weights[i] > 0 &&
+                       path_weights[i] <= static_cast<int64_t>(UINT32_MAX));
+        if (i != 0) weightsText += ',';
+        weightsText += std::to_string(path_weights[i]);
+    }
+    auto ack = torch::empty({1}, send_data.options().dtype(torch::kInt32));
+    char *weights = weightsText.data();
+    EXEC_NPU_CMD(aclnnCcuHbmCommandPuncture,
+                 send_data, recv_data, command_block, rank,
+                 weights, transfer, ack);
+    return ack;
+}
+
+void Buffer::stop_ccu_hbm_command_worker(int64_t worker_handle)
+{
+    EP_HOST_ASSERT(worker_handle > 0);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaCommandBlockWorkerStop()(
+        static_cast<uint64_t>(worker_handle), stream));
 }
 
 torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)

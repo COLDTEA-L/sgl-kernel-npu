@@ -180,6 +180,9 @@ required_symbols=(
     HcclCcuUrmaExplicitMultipathPlanCreate
     HcclCcuUrmaExplicitMultipathPlanExecute
     A5CcuUrmaPreparedPlanAbiVersion
+    HcclCcuUrmaCommandBlockWorkerCreate
+    HcclCcuUrmaCommandBlockWorkerStop
+    A5CcuHbmCommandPunctureAbiVersion
 )
 for required_symbol in "${required_symbols[@]}"; do
     nm -D "${built_library}" | grep " ${required_symbol}$" >/dev/null || {

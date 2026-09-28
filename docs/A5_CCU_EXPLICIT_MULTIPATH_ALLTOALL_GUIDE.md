@@ -1,5 +1,9 @@
 # A5 CCU+URMA 显式多路径 AllToAll：方案 2 操作指南
 
+> AIV → HBM CommandBlock → CCU 常驻 worker 的独立穿刺、编译和 ACLGraph 验证见
+> `docs/A5_CCU_HBM_COMMAND_PUNCTURE_GUIDE.md`。该穿刺是将当前 prepared-plan 方案收敛成
+> 标准 Ascend C 算子前的硬件/内存可见性 gate。
+
 ## 1. 方案结论
 
 本分支不再把显式路径计划塞进 Ascend C/MC2 tiling，也不要求修改或替换系统 HCCL。

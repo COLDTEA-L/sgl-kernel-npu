@@ -16,6 +16,7 @@ enum class RouteKernelKind {
     ROUTE_WRITE,
     ALLTOALL_CONCURRENT,
     ALLTOALL_SERIAL,
+    COMMAND_BLOCK_WORKER,
 };
 
 struct RouteResources {
@@ -43,6 +44,7 @@ struct RoutePlanRequest {
     std::string relayManifest;
     std::vector<uint32_t> weights;
     std::string planName;
+    uint64_t commandBlockAddress = 0;
 };
 
 HcclResult GetCcuRouteIndex(uint32_t *routeIndex);

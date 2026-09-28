@@ -1,5 +1,6 @@
 #include "a5_ccu_urma_route_probe.h"
 #include "all_to_all_multiroute_kernel.h"
+#include "command_block_worker_kernel.h"
 #include "utils.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -16,10 +17,12 @@
 #include <vector>
 
 using a5_ccu_urma_probe::AllToAllMultiRouteTaskArg;
+using a5_ccu_urma_probe::CommandBlockWorkerTaskArg;
 using a5_ccu_urma_probe::GetRouteResources;
 using a5_ccu_urma_probe::RouteKernelKind;
 using a5_ccu_urma_probe::RoutePlanRequest;
 using a5_ccu_urma_probe::RouteResources;
+using namespace a5_ccu_urma_probe;
 
 namespace {
 constexpr uint32_t MAX_EXPLICIT_PATHS = 64U;
@@ -37,11 +40,20 @@ struct PreparedPlan {
     std::unordered_map<uintptr_t, RouteResources> resourcesByStream;
 };
 
+struct CommandWorker {
+    HcclComm comm = nullptr;
+    aclrtStream workerStream = nullptr;
+    RouteResources resources{};
+    void *commandBlock = nullptr;
+};
+
 std::mutex g_planMutex;
 std::mutex g_planBuildMutex;
 std::unordered_map<uint64_t, PreparedPlan> g_plans;
 std::unordered_map<std::string, uint64_t> g_planIds;
 std::atomic<uint64_t> g_nextPlanHandle{1U};
+std::unordered_map<uint64_t, CommandWorker> g_commandWorkers;
+std::atomic<uint64_t> g_nextCommandWorkerHandle{1U};
 
 bool DebugEnabled()
 {
@@ -387,4 +399,138 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
     }
     return LaunchPreparedAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
                                   preparedComm, resources, false);
+}
+
+extern "C" __attribute__((visibility("default"))) int
+A5CcuHbmCommandPunctureAbiVersion()
+{
+    return 1;
+}
+
+extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, void *commandBlock, uint64_t commandBlockBytes,
+    HcclComm comm, aclrtStream controlStream, const char *planId,
+    const char *relayManifest, uint32_t directRoute,
+    const uint32_t *pathWeights, uint32_t pathCount,
+    uint64_t *workerHandle)
+{
+    if (sendBuf == nullptr || recvBuf == nullptr || commandBlock == nullptr ||
+        comm == nullptr || controlStream == nullptr || workerHandle == nullptr) {
+        return HCCL_E_PTR;
+    }
+    if (dataType != HCCL_DATA_TYPE_FP32 || elementsPerPeer == 0 ||
+        commandBlockBytes < COMMAND_WORDS * sizeof(uint64_t) ||
+        planId == nullptr || planId[0] == '\0' || relayManifest == nullptr ||
+        relayManifest[0] == '\0' || pathWeights == nullptr || pathCount < 2U ||
+        pathCount > COMMAND_MAX_PATHS) {
+        return HCCL_E_PARA;
+    }
+    for (uint32_t i = 0; i < pathCount; ++i) {
+        if (pathWeights[i] == 0U) return HCCL_E_PARA;
+    }
+
+    aclrtStream workerStream = nullptr;
+    if (aclrtCreateStream(&workerStream) != ACL_SUCCESS) return HCCL_E_RUNTIME;
+
+    RoutePlanRequest request;
+    request.includeDiscoveredRoute = true;
+    request.discoveredRoute = directRoute;
+    request.relayManifest = relayManifest;
+    request.weights.assign(pathWeights, pathWeights + pathCount);
+    request.planName = std::string(planId) + "-command-worker";
+    request.commandBlockAddress = reinterpret_cast<uint64_t>(commandBlock);
+    RouteResources resources;
+    HcclResult status = GetRouteResources(
+        comm, workerStream, RouteKernelKind::COMMAND_BLOCK_WORKER,
+        &resources, &request);
+    if (status != HCCL_SUCCESS) return status;
+
+    std::vector<uint64_t> initial(COMMAND_WORDS, 0U);
+    const uint64_t totalBytes = elementsPerPeer * resources.rankSize * sizeof(float);
+    initial[COMMAND_MAGIC] = COMMAND_BLOCK_MAGIC;
+    initial[COMMAND_INPUT_TOKEN] = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(sendBuf), totalBytes);
+    initial[COMMAND_OUTPUT_TOKEN] = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(recvBuf), totalBytes);
+    const aclError copyStatus = aclrtMemcpyAsync(
+        commandBlock, commandBlockBytes, initial.data(),
+        initial.size() * sizeof(uint64_t), ACL_MEMCPY_HOST_TO_DEVICE,
+        controlStream);
+    if (copyStatus != ACL_SUCCESS || aclrtSynchronizeStream(controlStream) != ACL_SUCCESS) {
+        return HCCL_E_RUNTIME;
+    }
+
+    if (resources.routeThread != resources.mainThread) {
+        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+            resources.mainThread, resources.routeThread,
+            THREAD_NOTIFY_INDEX));
+        if (status != HCCL_SUCCESS) return status;
+        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+            resources.routeThread, THREAD_NOTIFY_INDEX,
+            THREAD_NOTIFY_TIMEOUT));
+        if (status != HCCL_SUCCESS) return status;
+    }
+
+    CommandBlockWorkerTaskArg taskArg(reinterpret_cast<uint64_t>(commandBlock));
+    status = HcclCcuKernelLaunch(
+        comm, resources.routeThread, resources.kernel, &taskArg);
+    if (status != HCCL_SUCCESS) return status;
+
+    uint64_t handle = g_nextCommandWorkerHandle.fetch_add(1U);
+    if (handle == 0U) handle = g_nextCommandWorkerHandle.fetch_add(1U);
+    CommandWorker worker;
+    worker.comm = comm;
+    worker.workerStream = workerStream;
+    worker.resources = resources;
+    worker.commandBlock = commandBlock;
+    {
+        std::lock_guard<std::mutex> lock(g_planMutex);
+        g_commandWorkers.emplace(handle, worker);
+    }
+    *workerHandle = handle;
+    std::printf("COMMAND_BLOCK_WORKER phase=ready handle=%lu rank=%u paths=%zu "
+                "command_block=%p stream=%p\n",
+                static_cast<unsigned long>(handle), resources.rank,
+                resources.channels.size(), commandBlock, workerStream);
+    std::fflush(stdout);
+    return HCCL_SUCCESS;
+}
+
+extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerStop(
+    uint64_t workerHandle, aclrtStream controlStream)
+{
+    if (workerHandle == 0U || controlStream == nullptr) return HCCL_E_PARA;
+    CommandWorker worker;
+    {
+        std::lock_guard<std::mutex> lock(g_planMutex);
+        const auto found = g_commandWorkers.find(workerHandle);
+        if (found == g_commandWorkers.end()) return HCCL_E_NOT_FOUND;
+        worker = found->second;
+    }
+    const uint64_t zero = 0;
+    const uint64_t stop = COMMAND_OPCODE_STOP;
+    auto *base = reinterpret_cast<unsigned char *>(worker.commandBlock);
+    aclError aclStatus = aclrtMemcpyAsync(
+        base + COMMAND_COMPLETION * sizeof(uint64_t), sizeof(uint64_t),
+        &zero, sizeof(zero), ACL_MEMCPY_HOST_TO_DEVICE, controlStream);
+    if (aclStatus == ACL_SUCCESS) {
+        aclStatus = aclrtMemcpyAsync(
+            base + COMMAND_OPCODE * sizeof(uint64_t), sizeof(uint64_t),
+            &stop, sizeof(stop), ACL_MEMCPY_HOST_TO_DEVICE, controlStream);
+    }
+    if (aclStatus != ACL_SUCCESS || aclrtSynchronizeStream(controlStream) != ACL_SUCCESS) {
+        return HCCL_E_RUNTIME;
+    }
+    aclrtStream executionStream = worker.resources.slaveStream != nullptr ?
+        worker.resources.slaveStream : worker.workerStream;
+    if (aclrtSynchronizeStream(executionStream) != ACL_SUCCESS) return HCCL_E_RUNTIME;
+    {
+        std::lock_guard<std::mutex> lock(g_planMutex);
+        g_commandWorkers.erase(workerHandle);
+    }
+    std::printf("COMMAND_BLOCK_WORKER phase=stopped handle=%lu\n",
+                static_cast<unsigned long>(workerHandle));
+    std::fflush(stdout);
+    return HCCL_SUCCESS;
 }

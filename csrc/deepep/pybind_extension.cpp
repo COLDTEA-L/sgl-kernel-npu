@@ -83,6 +83,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall_out,
              py::arg("send_data"), py::arg("recv_data"), py::arg("plan_handle"),
              "Out variant of the prepared explicit multipath CCU plan")
+        .def("prepare_ccu_hbm_command_worker",
+             &deep_ep::Buffer::prepare_ccu_hbm_command_worker,
+             py::arg("send_data"), py::arg("recv_data"), py::arg("command_block"),
+             py::arg("plan_id"), py::arg("relay_manifest"),
+             py::arg("direct_route"), py::arg("path_weights"),
+             "Prepare a dedicated-stream persistent CCU mailbox worker")
+        .def("ccu_hbm_command_puncture",
+             &deep_ep::Buffer::ccu_hbm_command_puncture,
+             py::arg("send_data"), py::arg("recv_data"), py::arg("command_block"),
+             py::arg("path_weights"), py::arg("transfer"),
+             "Publish one AIV HBM command and wait for CCU completion")
+        .def("stop_ccu_hbm_command_worker",
+             &deep_ep::Buffer::stop_ccu_hbm_command_worker,
+             py::arg("worker_handle"),
+             "Stop and join a persistent CCU mailbox worker")
         .def("all2_all_detour_io_die", &deep_ep::Buffer::all2_all_detour_io_die)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
