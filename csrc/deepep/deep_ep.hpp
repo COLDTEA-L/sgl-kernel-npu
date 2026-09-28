@@ -16,12 +16,10 @@
 namespace deep_ep {
 
 torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
-    const torch::Tensor &send_data, const torch::Tensor &recv_data,
-    int64_t plan_handle);
+    const torch::Tensor &send_data, int64_t plan_handle);
 
 torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
-    const torch::Tensor &send_data, const torch::Tensor &recv_data,
-    int64_t plan_handle);
+    const torch::Tensor &send_data, int64_t plan_handle);
 
 struct Buffer {
     int64_t rank, rdma_rank, nvl_rank;

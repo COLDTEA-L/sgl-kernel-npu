@@ -214,9 +214,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 5:
+if version < 6:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 5; "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 6; "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 route = ctypes.CDLL(str(Path(os.environ['A5_CCU_ROUTE_PROBE_LIB'])))

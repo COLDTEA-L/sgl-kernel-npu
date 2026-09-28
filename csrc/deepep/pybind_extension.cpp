@@ -18,7 +18,7 @@ namespace py = pybind11;
 TORCH_LIBRARY_FRAGMENT(deep_ep, m)
 {
     m.def(
-        "ccu_urma_prepared_multipath_alltoall(Tensor send_data, Tensor(a!) recv_data, int plan_handle) -> Tensor(a!)");
+        "ccu_urma_prepared_multipath_alltoall(Tensor send_data, int plan_handle) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(deep_ep, PrivateUse1, m)

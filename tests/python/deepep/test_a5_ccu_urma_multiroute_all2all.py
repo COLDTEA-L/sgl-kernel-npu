@@ -379,9 +379,9 @@ def main():
     if args.compile_backend != "none":
         mark_phase(f"compile_graph_{args.compile_backend}")
 
-        def prepared_graph_op(send_tensor, recv_tensor):
+        def prepared_graph_op(send_tensor):
             return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                send_tensor, recv_tensor, plan_handle
+                send_tensor, plan_handle
             )
 
         compiled_prepared_op = torch.compile(
@@ -410,7 +410,7 @@ def main():
                     send, recv, plan_handle
                 )
             else:
-                compiled_prepared_op(send, recv)
+                recv = compiled_prepared_op(send)
         elif args.implementation == "explicit":
             buffer.ccu_urma_explicit_multipath_alltoall_out(
                 send, recv, relay_manifest, args.direct_route, explicit_weights

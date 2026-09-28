@@ -19,8 +19,9 @@
 // in the actually imported extension, so a stale wheel fails before tiling.
 extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathAttrAbiVersion()
 {
-    // Version 5 raises prepared-plan capacity to 64 total direct+relay paths.
-    return 5;
+    // Version 6 makes the graph-visible prepared operator functional: it
+    // allocates and returns a fresh output instead of aliasing an out tensor.
+    return 6;
 }
 
 namespace deep_ep {
@@ -461,15 +462,13 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall(
 }
 
 torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
-    const torch::Tensor &send_data, const torch::Tensor &recv_data,
-    int64_t plan_handle)
+    const torch::Tensor &send_data, int64_t plan_handle)
 {
-    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
-    EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
     EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
-    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat && plan_handle > 0);
-    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
+    EP_HOST_ASSERT(plan_handle > 0 && torch_npu::utils::is_npu(send_data));
+    auto recv_data = torch::empty_like(send_data);
     auto stream = c10_npu::getCurrentNPUStream().stream(false);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
@@ -479,9 +478,10 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
 }
 
 torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
-    const torch::Tensor &, const torch::Tensor &recv_data, int64_t)
+    const torch::Tensor &send_data, int64_t plan_handle)
 {
-    return recv_data;
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
+    return torch::empty_like(send_data);
 }
 
 torch::Tensor Buffer::all2_all_detour_io_die(const torch::Tensor &send_data, const torch::Tensor &comm_rank_ids)

@@ -62,7 +62,7 @@ def main():
         "- `native0/native2` mean one HCCL-discovered CommLink candidate; "
         "they are not UDMA route_addr_idx values.",
         "- explicit cases use one direct Channel plus the named relay Channels.",
-        "- direct total bytes : all relay bytes = `2:1`.", "",
+        "- direct path bytes : each relay path bytes = `2:1`.", "",
         "| case | samples | median_us | min_us | max_us |", "|---|---:|---:|---:|---:|",
     ]
     for row in rows:

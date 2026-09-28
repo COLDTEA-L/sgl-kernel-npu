@@ -13,7 +13,7 @@
 图内入口为：
 
 ```python
-torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, recv, plan_handle)
+torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, plan_handle)
 ```
 
 因此热路径不读取文件、不枚举 RankGraph、不重新建 Channel，也不经过
@@ -199,27 +199,27 @@ print("loaded deep_ep_cpp:", path)
 print("explicit multipath attr ABI:", version())
 print("prepared graph op:", torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall)
 
-assert version() >= 5
+assert version() >= 6
 assert hasattr(ext.Buffer, "prepare_ccu_urma_explicit_multipath_plan")
 assert hasattr(ext.Buffer, "ccu_urma_prepared_multipath_alltoall_out")
 assert hasattr(torch.ops.deep_ep, "ccu_urma_prepared_multipath_alltoall")
 
 send = torch.empty((2, 8), device="meta", dtype=torch.float32)
-recv = torch.empty_like(send)
-out = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, recv, 1)
-assert out is recv
+out = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, 1)
+assert out.shape == send.shape and out.device.type == "meta"
 print("Meta dispatch: PASS")
 
-def graph_fn(send, recv):
-    return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, recv, 1)
+def graph_fn(send):
+    return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(send, 1)
 
 compiled = torch.compile(graph_fn, backend="eager", fullgraph=True)
-assert compiled(send, recv) is recv
+compiled_out = compiled(send)
+assert compiled_out.shape == send.shape
 print("torch.compile fullgraph Meta capture: PASS")
 PY
 ```
 
-预期 DeepEP ABI 至少为 `5`、prepared-plan ABI 至少为 `3`，并输出 `Meta dispatch: PASS` 和
+预期 DeepEP ABI 至少为 `6`、prepared-plan ABI 至少为 `3`，并输出 `Meta dispatch: PASS` 和
 `torch.compile fullgraph Meta capture: PASS`。
 
 ## 5. 快速单 case 验证
@@ -413,7 +413,7 @@ grep -nE \
 
 | 现象 | 原因/处理 |
 |---|---|
-| DeepEP ABI `< 5` | 加载了仍限制为 8 条总路径的旧 wheel；重新构建并 `--force-reinstall` |
+| DeepEP ABI `< 6` | 加载了旧的 alias-output 图接口；重新构建并 `--force-reinstall` wheel |
 | prepared-plan ABI 缺失 | route package 是旧版本；重建并安装第 3 节 |
 | 只跑 prepared case，却提示缺少 `HcclCcuUrmaMultiRouteAllToAll` | 旧性能脚本误查了 legacy API；更新到最新分支。prepared case 只校验 PlanCreate/PlanExecute/ABI marker |
 | `nm -D` 手工能看到符号，脚本却报告 missing | 旧脚本在 `set -o pipefail` 下使用 `grep -q`，`grep` 提前退出令 `nm` 收到 SIGPIPE，形成假阴性；更新脚本 |

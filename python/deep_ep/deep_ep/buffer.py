@@ -569,10 +569,9 @@ class Buffer:
     def ccu_urma_prepared_multipath_alltoall(
         self, send_data: torch.Tensor, plan_handle: int
     ) -> torch.Tensor:
-        """Launch a prepared plan without rebuilding communication resources."""
-        recv_data = torch.empty_like(send_data)
-        return self.ccu_urma_prepared_multipath_alltoall_out(
-            send_data, recv_data, plan_handle
+        """Launch the functional, graph-visible prepared-plan operator."""
+        return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+            send_data, int(plan_handle)
         )
 
     def ccu_urma_prepared_multipath_alltoall_out(
@@ -581,8 +580,8 @@ class Buffer:
         recv_data: torch.Tensor,
         plan_handle: int,
     ) -> torch.Tensor:
-        """Graph-visible out variant backed by a prebuilt CCU resource plan."""
-        return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
+        """Eager out variant backed by a prebuilt CCU resource plan."""
+        return self.runtime.ccu_urma_prepared_multipath_alltoall_out(
             send_data, recv_data, int(plan_handle)
         )
 

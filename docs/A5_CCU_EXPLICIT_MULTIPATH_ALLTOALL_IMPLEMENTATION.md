@@ -114,7 +114,7 @@ buffer.ccu_urma_prepared_multipath_alltoall_out(
 
 ```python
 recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-    send, recv, plan_handle,
+    send, plan_handle,
 )
 ```
 
@@ -122,11 +122,12 @@ recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
 
 ```text
 ccu_urma_prepared_multipath_alltoall(
-    Tensor send, Tensor(a!) recv, int plan_handle
-) -> Tensor(a!)
+    Tensor send, int plan_handle
+) -> Tensor
 ```
 
-实现包含 `PrivateUse1` 与 `Meta` dispatch；编译器能看到一个有固定输入/输出 alias 关系的算子节点。
+实现包含 `PrivateUse1` 与 `Meta` dispatch；图接口是 functional op，返回新输出，不带输入/输出 alias
+标注，因而能够通过 AOTAutograd/npugraphs 的 functionalization。图外仍保留显式 `recv` 的 out 接口。
 `plan_handle` 是不透明整数，图内不解析字符串或文件。
 
 ## 4. 路径计划和流量分片
