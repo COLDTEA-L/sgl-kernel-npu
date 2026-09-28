@@ -382,6 +382,31 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 ## 8. 常见故障
 
+### 8.1 正确性失败时检查 rank 与路径计划
+
+如果 case 已完成 plan/Channel 准备，但在 `warmup_correctness` 报 `Tensor-likes are not close`，先分析
+现有日志，不要立即重跑。例如：
+
+```bash
+RUN_DIR=/home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_20260928_104753
+LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+grep -nE \
+'PREPARED_MULTIPATH_PLAN|explicit multipath direct|explicit relay|PATH_CHANNEL|launch kernel' \
+"${LOG}"
+```
+
+应分别看到 `PREPARED_MULTIPATH_PLAN ... rank=0 ...` 和
+`PREPARED_MULTIPATH_PLAN ... rank=1 ...`：
+
+- 如果两个进程都显示同一个 rank，优先检查 DeepEP communicator 到 route runtime 的逻辑 rank 传递；
+- 如果 rank 分别为 0 和 1，再检查 `AllToAllMultiRouteTaskArg -> GeneArgs -> CCU Load` 的
+  `selfDestinationOffset`、`sourceOffsets` 和 `remoteOffsets`；
+- `explicit multipath direct`、`explicit relay` 和 `PATH_CHANNEL` 用于确认计划中的 direct/relay 数量、
+  顺序、权重及 Channel 是否与请求一致。
+
+将 `RUN_DIR` 替换为实际失败目录。上述命令只读已有日志，不会重新建链或再次运行算子。
+
 | 现象 | 原因/处理 |
 |---|---|
 | DeepEP ABI `< 5` | 加载了仍限制为 8 条总路径的旧 wheel；重新构建并 `--force-reinstall` |
