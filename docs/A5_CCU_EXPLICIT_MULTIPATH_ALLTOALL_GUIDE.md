@@ -21,9 +21,29 @@
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
-当前有卡环境的旧 HCCL 工作区曾用于手工穿刺，并且已经出现损坏的 loose object。此时不能再用
-`stash/reset/pull` 修补原仓库；Git 不会因为普通 fetch 自动替换它误认为已经存在的损坏对象。
-保留整个旧仓库，然后重新 clone 干净分支：
+如果 `/home/l00934901/hccl` 是健康仓库，直接拉取配套分支：
+
+```bash
+cd /home/l00934901/hccl
+
+# 确认没有遗留的 Git 锁或损坏对象。
+test ! -e .git/HEAD.lock
+git fsck --full
+
+git fetch origin feature/a5-ccu-explicit-multipath-alltoall
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+
+git rev-parse --short HEAD
+git status --short
+```
+
+预期 HEAD 至少包含 `62f2a7b`（ABI 4 / `ALLTOALL + CCU_SCHED`）。如果 `git status --short`
+列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
+
+只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
+重新 clone 流程。Git 不会因为普通 fetch 自动替换它误认为已经存在的损坏对象。保留整个旧仓库，
+然后重新 clone 干净分支：
 
 ```bash
 cd /home/l00934901
