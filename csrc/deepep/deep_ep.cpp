@@ -319,8 +319,8 @@ torch::Tensor Buffer::explicit_multipath_all2all_ccu(
     using ExtensionVersionFn = int (*)();
     static auto extension_version = reinterpret_cast<ExtensionVersionFn>(
         dlsym(RTLD_DEFAULT, "A5HcclExplicitMultipathExtensionVersion"));
-    EP_HOST_ASSERT_S(extension_version != nullptr && extension_version() >= 7,
-        "ExplicitMultipathAll2AllCcu requires HCCL explicit-path extension >= 7; "
+    EP_HOST_ASSERT_S(extension_version != nullptr && extension_version() >= 8,
+        "ExplicitMultipathAll2AllCcu requires HCCL explicit-path extension >= 8; "
         "refusing to run through the native AllToAll selector");
 
     const char *active_plan = std::getenv("A5_CCU_EXPLICIT_MULTIPATH_PLAN_ID");

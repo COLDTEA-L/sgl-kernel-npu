@@ -175,7 +175,7 @@ version = hccl.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified patched HCCL: {os.environ['HCCL_SO']} (extension={value})")
-assert value >= 7, f"patched HCCL extension {value}, expected >= 7 (native AllToAll completion notification layout)"
+assert value >= 8, f"patched HCCL extension {value}, expected >= 8 (T560 legacy-object CCU backend)"
 PY
     export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH}"
     hccl_preload="${hccl_compat_so}:${hccl_so}"

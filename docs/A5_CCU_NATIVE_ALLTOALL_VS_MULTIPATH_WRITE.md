@@ -527,10 +527,11 @@ hcomm::CcuRep / WriteNb
 
 后续应改造已经能在 T560 运行的原生 CCU AllToAll，而不是继续要求不存在的新版 ABI。
 
-## 9. 此前标准化方案及当前结论
+## 9. 原生 HCCL CCU 增量改造（ABI 8）
 
-此前实现不是把旧 Write 包进 Ascend C 外壳，而是保留其“显式多 Channel + 加权分片 + 并发 Write”
-思想，并尝试接入原生 HCCL 生命周期：
+前述控制面设计保留不变：标准 Ascend C/MC2 仍以 `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入
+HCCL selector/template，路径仍由 EID pair/ChannelDesc 在资源准备阶段决定。ABI 8 只替换
+T560 无法执行的数据面后端：
 
 ```text
 标准 ExplicitMultipathAll2AllCcu
@@ -540,36 +541,31 @@ hcomm::CcuRep / WriteNb
   -> template::CalcRes
        native direct ChannelDesc
        + manifest relay ChannelDesc
-       + CcuKernelInfo
-  -> HCCL resource allocator
-  -> TemplateResource
-  -> KernelRun / FastLaunch
-  -> 原生 CCU resource/notify 协议
-  -> direct/relay Write 全部提交后统一等待
+  -> CalcRes 保存 direct/relay ChannelDesc catalog
+  -> KernelRun 首次执行
+       HcclThreadAcquireWithStream
+       HcclChannelAcquire
+       HcclCcuKernelRegister / Finish
+       按 (comm, stream, plan_id) 缓存资源
+  -> HcclCcuKernelLaunch
+  -> hcomm::CcuKernel / CcuRep
+  -> direct/relay WriteNb 全部提交后统一 WaitEvent
+  -> FastLaunch 复用同一资源并更新 buffer/policy task args
 ```
 
-该控制面设计仍然正确：不修改 MUE、UVS、TP 或 UB route table，显式路径由 EID pair/ChannelDesc
-在资源准备阶段确定。但是其自定义 template/kernel 使用了 T560 未导出的新版 `HcommCcu*`/`Ccu*`
-执行 ABI，所以当前实现不能作为目标版本的最终数据面。
+该实现已经在开发容器完整编译，并确认 `libhccl.so` 对
+`HcclCcuKernelRegister/Finish/Launch` 形成强动态引用；它不再要求 T560 缺失的
+`HcommCcuKernelRegisterStart/Register/End`。项目扩展版本提升为 ABI 8。
 
-下一步采用“原生实现内增量改造”：
+当前尚不能宣称有卡完成。第一版主动限制 `localDie == 0`；资源缓存清理、失败恢复、标准算子首次
+执行、ACLGraph FastLaunch/replay 和 HCCN 物理路径仍需有卡验证。`CalcRes` 不向通用 allocator
+提交 `ccuKernelInfos`，因为该 allocator 正是缺失新接口的调用方；旧对象资源在 `KernelRun` 首次
+执行时创建。这是对目标 T560 的兼容接入点，不应描述成已经完全等同于上游原生
+`TemplateResource` 生命周期。
 
-```text
-communicator 初始化
-  -> 解析 direct/relay 拓扑与 EID pair
-  -> 保存 plan_id -> explicit CommLink catalog
-
-原生 HCCL CCU AllToAll
-  -> 保留 selector/executor/CalcRes/TemplateResource
-  -> 将 explicit CommLink catalog 合入 Channel request
-  -> 保留原生 input/output/token、notify、thread 和 FastLaunch 协议
-  -> 使用目标 T560 已支持的原生/旧对象 CCU 注册与 launch 路径
-  -> direct 与每条 relay 按 2:1 分片并并发提交
-```
-
-第一阶段把 `plan_id` 和路径权重固定在一次建图/capture 生命周期内；Host 控制器可以在建图或发射
-前选择不同 plan。若要求同一已 capture 图在每次 replay 中只改 HBM flag 就改变路径，仍需要另行
-确认原生 CCU kernel 是否能读取动态 GM 控制变量，不能再次假定缺失的 AIV->CCU doorbell 存在。
+`plan_id` 和路径目录固定在一次 communicator/capture 生命周期内；图内 `pathPolicy` 仍可在
+replay 前改变已准备路径的启用状态与权重，但不能在 replay 中创建新 relay。下一步不是继续逆向
+MUE/UVS，而是先在有卡 T560 验证 ABI 8 的旧对象资源生命周期与 FastLaunch。
 
 ## 10. 相关源码
 

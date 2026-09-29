@@ -32,7 +32,7 @@ Python/controller
 DeepEP C++
   Buffer::explicit_multipath_all2all_ccu
   - 校验 2 ranks、dtype、policy=[1]int64/NPU
-  - 校验 HCCL extension ABI >= 7
+  - 校验 HCCL extension ABI >= 8
   - 校验 plan_id/manifest 在 communicator 初始化前已设置
     |
     v
@@ -69,18 +69,29 @@ HCCL selector
   - 选择 CcuExplicitMultipathAllToAll2Rank
     |
     v
-HCCL CalcRes（communicator/resource 初始化）
+HCCL CalcRes（标准 selector/template 资源规划）
   CcuTempExplicitMultipathAllToAll::CalcRes
   - 取得一条 native direct ChannelDesc
   - 从 relay manifest 读取每条 src/dst EID
   - 复制 direct desc，并替换两端 CommAddr EID
-  - 为 direct + relay 注册一个 CCU kernel/channel catalog
+  - 保存 direct + relay ChannelDesc catalog
+  - 不提交 ccuKernelInfos，避开 T560 未导出的新式 HcommCcuKernelRegister* ABI
     |
     v
-HCCL KernelRun / FastLaunch（每次执行）
+HCCL KernelRun（首次执行；T560 旧对象式后端）
+  - HcclThreadAcquireWithStream
+  - HcclChannelAcquire(direct + relay descriptors)
+  - HcclCcuKernelRegister / HcclCcuKernelRegisterFinish
+  - 按 (comm, stream, plan_id) 缓存 thread/channel/kernel
   - DecodePathPolicy(strideCount)
   - 按权重和 256-byte 对齐计算每条 path 的 offset/bytes
-  - HcommCcuKernelLaunch
+  - HcclCcuKernelLaunch
+    |
+    v
+HCCL FastLaunch（图重放）
+  - 查找同一 (comm, stream, plan_id) 的已准备资源
+  - 用本次 buffer 和 policy 重新生成 task args
+  - HcclCcuKernelLaunch
     |
     v
 CCU kernel
@@ -89,7 +100,7 @@ CCU kernel
   Write(channel_0, direct chunk)
   Write(channel_1, relay-0 chunk)
   ...
-  EventWait(all active writes)
+  WaitEvent(all active writes)
   PostSync(channel_0)
 ```
 
@@ -213,9 +224,11 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 
 ## 8. 生命周期与扩展性
 
-- communicator 初始化：创建完整 direct/relay Channel catalog；
+- communicator/首次 KernelRun：CalcRes 建立描述符目录，旧对象后端首次执行时创建并缓存完整
+  direct/relay Channel 与 CCU kernel；
 - graph capture/replay：只传 policy 和 buffer 地址，复用 catalog；
-- communicator 销毁：跟随 HCCL 资源生命周期回收；
+- communicator 销毁：ABI 8 首版尚需在有卡环境验证缓存清理和异常恢复；当前缓存键为
+  `(comm, stream, plan_id)`，不能把进程内长期反复销毁/重建 communicator 视为已验证能力；
 - 新增 relay：需要在下一次 communicator 初始化前更新 manifest；
 - 动态禁用 relay、切换子集、改变比例：只更新 `pathPolicy`；
 - 扩展到 4 ranks：应把当前“一对 rank 的 path catalog”提升为 peer-pair/path matrix，不能简单复用两 rank
@@ -226,7 +239,8 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 已在 `cam_lyw_dev_91` 完成：
 
 - HCCL host/CCU 源码完整编译、链接和 run-package 打包；
-- HCCL extension ABI 7 装载验证；
+- HCCL extension ABI 8 编译、动态符号检查；显式 template 强引用
+  `HcclCcuKernelRegister/Finish/Launch`；
 - 标准 opbuild、4 个 dtype kernel、custom OPP 打包；
 - DeepEP C++ extension 和 wheel 编译；
 - wheel 在容器内 force-reinstall，DeepEP ABI 8 装载成功；
@@ -244,12 +258,14 @@ warmup completion。ABI 5 改用 HCCL 原生 1/2 output/token index；ABI 6 对�
 最终定位到 completion mask 沿用了 route-probe 的 `1<<5`，而原生 AllToAll 固定使用
 `POST_SYNC_ID=3`。ABI 7 已改为 `1<<3`。
 
-ABI 7 仍需有卡环境完成：
+ABI 8 仍需有卡环境完成：
 
 1. 标准算子单次正确性；
 2. ACLGraph capture/replay 正确性；
 3. replay 修改 policy 后的 HCCN 端口变化；
 4. 1/2/4/6 relay 性能和稳定性。
+5. communicator 销毁/重建后的缓存清理，以及失败路径中的资源回收；
+6. 第一版只支持 `localDie == 0`；die1 需要第二 stream 和 main/slave thread handshake。
 
 ## 10. 底层接口边界与替代架构
 
@@ -259,29 +275,31 @@ ABI 7 仍需有卡环境完成：
 作用是拒绝旧 HCCL、旧 wheel、旧 OPP 与新算子混装。ABI 4..7 分别记录 selector、资源槽、
 Channel 生命周期和完成通知的修正，不表示 CANN/HCOMM 额外暴露了 4..7 套接口。
 
-当前模板只依赖以下既有能力：
+ABI 8 当前模板只依赖以下既有能力：
 
 | 层次 | 当前使用的接口或对象 | 是否由本项目新增 |
 |---|---|---|
 | HCCL 模板层 | `CcuKernelInfo`、`AlgResourceRequest`、`HcclChannelDesc` | 新增模板逻辑，不新增底层 ABI |
 | HCOMM Channel | `HcclChannelAcquire` | 否 |
-| HCOMM CCU 注册/执行 | `HcommCcuKernelRegister*`、`HcommCcuKernelLaunch` | 否 |
-| CCU primitive | `GetResByChannel`、`Write`、`EventWait`、`NotifyRecord/Wait` | 否 |
+| HCOMM CCU 注册/执行 | `HcclCcuKernelRegister/Finish`、`HcclCcuKernelLaunch` | 否 |
+| 旧对象 CCU primitive | `hcomm::CcuKernel`、`CcuRep`、`WriteNb`、`WaitEvent`、`NotifyRecord/Wait` | 否 |
 | TP/MUE/固件 | TPN、`route_addr_idx`、私有 path object | 未直接访问，也没有公开修改接口 |
 
 ABI 7 中的 `POST_SYNC_ID=3` 是 notify 内部的 mask bit，真正使用的 notify 槽是
 `POST_SYNC_CKE=1`。原生 Channel 的 `NORMAL_NOTIFY_NUM=3` 已覆盖该槽，因此 ABI 7 没有要求
 底层新增“第 4 个 notify”。
 
-HCCL 的 9.1 兼容层以 weak symbol + `dlsym` 解析 HCOMM CCU 接口。这意味着：
+ABI 7 曾依赖 HCCL 9.1 兼容层以 weak symbol + `dlsym` 解析新式 HCOMM CCU 接口；T560
+实测没有导出它们。ABI 8 不再让显式多路径 template 经过这条新接口，而是复用 route-probe
+已验证的旧对象式接口。这意味着：
 
-- 目标 `9.1.T560` 有这些符号时，修改开源 HCCL 模板是可行的；
-- 另一个 9.1 预览包可能缺少相同符号，所以必须锁定 CANN/HCOMM 版本；
+- 目标 `9.1.T560` 必须导出三个 `HcclCcuKernel*` 符号；
+- 另一个 9.1 预览包仍可能缺少相同符号，所以必须锁定 CANN/HCOMM 版本；
 - 仅编译成功不能证明运行时支持；操作指南第 4.1、4.2 节的 preflight 才是运行前 gate；
 - 如果 preflight 已通过，而程序卡在 device synchronize，阻塞点是 CCU 指令/资源语义，
   不是“底层 ABI 数量不足”。
 
-### 10.2 不修改核心 HCCL 的首选替代方案
+### 10.2 不修改核心 HCCL 的回退方案
 
 如果目标包不允许当前 HCCL 模板继续运行，首选迁移为独立 HCOMM 自定义通信算子插件：
 
@@ -289,13 +307,13 @@ HCCL 的 9.1 兼容层以 weak symbol + `dlsym` 解析 HCOMM CCU 接口。这意
 communicator/resource initialization
   -> 根据 direct/relay EID 构造 HcclChannelDesc
   -> HcclChannelAcquire
-  -> HcommCcuKernelRegister*
+  -> HcclCcuKernelRegister / HcclCcuKernelRegisterFinish
   -> 缓存 plan/channel/kernel handles
 
 GE/ACLNN 可识别的通信算子
   -> 输入 plan handle、path mask、weights 和 buffer
   -> 通过 HCOMM 自定义通信算子资源上下文取得已准备资源
-  -> HcommCcuKernelLaunch
+  -> HcclCcuKernelLaunch
 
 CCU kernel
   -> 先提交所有启用路径的 Write
@@ -303,8 +321,9 @@ CCU kernel
   -> 完成 NotifyRecord/NotifyWait
 ```
 
-该结构不修改核心 `libhccl.so`，也不需要 HBM mailbox 或常驻 CCU worker；但仍依赖目标版本
-公开/可解析的 HCOMM CCU 接口，因此必须做相同的版本预检。
+该结构不修改核心 `libhccl.so`，也不需要 HBM mailbox 或常驻 CCU worker；T560 的旧对象接口
+足以实现它。但外部插件需要自行接管 communicator、stream、FastLaunch、异常恢复和销毁，无法像
+HCCL template 一样自然接入原生 AllToAll 生命周期，所以当前成本高于 ABI 8 的 HCCL 增量改造。
 
 ### 10.3 如果 CCU 接口确实不可用
 

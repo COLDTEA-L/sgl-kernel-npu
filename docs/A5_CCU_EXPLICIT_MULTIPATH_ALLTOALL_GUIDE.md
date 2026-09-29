@@ -15,11 +15,12 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 7 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
+- 需要本分支配套的 HCCL 扩展 ABI 8 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
   `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
   `HALF_ALLTOALLV + CCU_MS`；ABI 5 进一步修正 HCCL 原生 AllToAll Channel 的资源槽位为
   `INPUT=0、OUTPUT=1、TOKEN=2`；ABI 6 对齐原生 AllToAll/MultiJetty 的完整 Channel
-  生命周期；ABI 7 进一步把完成通知改为原生 AllToAll 的 `POST_SYNC_ID=3`。
+  生命周期；ABI 7 进一步把完成通知改为原生 AllToAll 的 `POST_SYNC_ID=3`；ABI 8 将
+  显式多路径 template 切到 T560 实际导出的旧对象式 `HcclCcuKernel*` 后端。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -40,7 +41,7 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少包含 `8c0a4d3`（ABI 7 / 原生 `POST_SYNC_ID=3`）。如果 `git status --short`
+预期 HEAD 至少包含 `fd2be0a`（ABI 8 / T560 旧对象式 CCU 后端）。如果 `git status --short`
 列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
 
 只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
@@ -75,7 +76,7 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `8c0a4d3`（ABI 7 / 原生 `POST_SYNC_ID=3`），且 `git fsck --full` 不报告
+预期 HEAD 至少包含 `fd2be0a`（ABI 8 / T560 旧对象式 CCU 后端），且 `git fsck --full` 不报告
 损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
@@ -197,15 +198,20 @@ working tree 没有额外 tracked 修改、index 又精确等于 `863b035`，才
 
 ## 4. 编译配套 HCCL
 
-### 4.1 先核对目标 CANN/HCOMM 是否提供 CCU 运行接口
+### 4.1 核对 T560 实际提供的旧对象式 CCU 接口
 
-本项目中的 HCCL ABI 4/5/6/7 是自定义扩展版本号，只用于防止旧 HCCL、旧 wheel 和新算子
-混装；它们不是 CANN/HCOMM 提供的 4 组底层 ABI。当前实现真正依赖的是一组固定的 Channel、
-CCU kernel register/launch 和 CCU primitive 接口。
+ABI 7 使用开源新接口 `HcommCcuKernelRegisterStart/Register/End` 和
+`HcommCcuKernelLaunch`。T560 的 `libhcomm.so` 没有导出这些符号；继续增加 notify、resource
+slot 或项目 ABI 版本不能修复这一运行时缺口。成功的 route-probe 使用的是同一 T560 已导出的
+旧对象式接口，因此 ABI 8 只让显式多路径 template 改用：
 
-不同的 CANN 9.1 预览包可能只安装头文件、只导出部分符号，或者依靠 `libhccl_compat.so`
-在运行时用 `dlsym` 解析接口。因此“源码编译通过”不能单独证明有卡环境可运行。先在实际
-`9.1.T560` 容器内执行以下预检：
+```text
+HcclCcuKernelRegister
+HcclCcuKernelRegisterFinish
+HcclCcuKernelLaunch
+```
+
+先在实际有卡容器中执行以下 gate：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -227,16 +233,9 @@ if path is None:
 lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 symbols = [
     "HcclChannelAcquire",
-    "HcommCcuKernelRegisterStart",
-    "HcommCcuKernelRegister",
-    "HcommCcuKernelRegisterEnd",
-    "HcommCcuKernelLaunch",
-    "CcuVariableCreateByChannel",
-    "CcuNotifyRecord",
-    "CcuNotifyWait",
-    "CcuWriteVariableWithNotify",
-    "CcuWriteMemToMem",
-    "CcuEventWait",
+    "HcclCcuKernelRegister",
+    "HcclCcuKernelRegisterFinish",
+    "HcclCcuKernelLaunch",
 ]
 
 missing = []
@@ -250,15 +249,12 @@ for name in symbols:
         print("MISSING", name)
 
 if missing:
-    print("WARNING: direct libhcomm export is incomplete:", ",".join(missing))
-    print("Continue with the libhccl_compat support-flag check below;")
-    print("do not interpret an HCCL build success as runtime support.")
+    raise SystemExit("T560 legacy-object CCU preflight failed: " + ",".join(missing))
+print("T560 legacy-object CCU preflight: PASS")
 PY
 ```
 
-如果 `libhcomm.so` 没有直接导出全部 CCU 符号，仍需在第 4.2 节编译 HCCL 后检查配套
-`libhccl_compat.so` 的运行时支持标志。`MISSING` 本身不等于硬件不支持；但如果 support flag
-也为 0，则本版本不能运行当前 CCU 模板，禁止继续仅通过增加本项目 ABI 版本号尝试规避。
+任何一个符号缺失都应停止；不要退回 ABI 7 的新接口，也不要把编译成功解释为运行时支持。
 
 ### 4.2 编译并检查配套 HCCL
 
@@ -292,62 +288,29 @@ lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 print("HCCL explicit-multipath ABI:", version())
-assert version() >= 7
+assert version() >= 8
 PY
 ```
 
-继续检查兼容层是否实际解析到了本模板依赖的 CCU 接口：
+继续检查构建产物的动态符号。显式多路径后端必须强引用三个旧接口；看到
+`HcommCcuKernelLaunch` 的 weak 引用并不代表本模板仍使用它，因为 HCCL 其他原生源码仍会引用新接口：
 
 ```bash
-LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
-python3 - "${HCCL_RUNTIME}/libhccl_compat.so" \
-          "${HCCL_RUNTIME}/libhccl.so" <<'PY'
-import ctypes
-import sys
-
-compat = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
-ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
-
-checks = [
-    "HcommIsSupportHcommCcuKernelRegisterStart",
-    "HcommIsSupportHcommCcuKernelRegister",
-    "HcommIsSupportHcommCcuKernelRegisterEnd",
-    "HcommIsSupportHcommCcuKernelLaunch",
-    "HcommIsSupportCcuVariableCreateByChannel",
-    "HcommIsSupportCcuNotifyRecord",
-    "HcommIsSupportCcuNotifyWait",
-    "HcommIsSupportCcuWriteVariableWithNotify",
-    "HcommIsSupportCcuWriteMemToMem",
-    "HcommIsSupportCcuEventWait",
-]
-
-missing = []
-for name in checks:
-    try:
-        func = getattr(compat, name)
-    except AttributeError:
-        missing.append(f"{name}=NO_CHECK_SYMBOL")
-        continue
-    func.restype = ctypes.c_bool
-    supported = bool(func())
-    print(name, int(supported))
-    if not supported:
-        missing.append(f"{name}=0")
-
-if missing:
-    raise SystemExit("CCU runtime preflight failed: " + ", ".join(missing))
-print("CCU runtime preflight: PASS")
-PY
+nm -D "${HCCL_RUNTIME}/libhccl.so" | grep -E \
+  'A5HcclExplicitMultipathExtensionVersion|HcclCcuKernel(RegisterFinish|Register|Launch)'
 ```
 
-判定顺序：
+预期至少包含：
 
-1. preflight PASS：可以继续 ABI 7 单 case；
-2. preflight PASS、但 ABI 7 卡在首次 device synchronize：说明接口存在，问题位于生成的
-   CCU 指令、Channel 生命周期或资源布局，不能解释为“底层没有 ABI”；
-3. preflight FAIL：停止当前 HCCL CCU 模板路线，转向实现说明中的 HCOMM 自定义通信算子或
-   AICPU_TS/AIV+URMA 后备方案；
-4. 不允许把 ABI 8、9 当作修复底层缺失符号的办法。
+```text
+T A5HcclExplicitMultipathExtensionVersion
+U HcclCcuKernelLaunch
+U HcclCcuKernelRegister
+U HcclCcuKernelRegisterFinish
+```
+
+完成上述静态检查后才运行 ABI 8 单 case。若它卡在首次 device synchronize，下一步检查的是
+旧对象 kernel 的变量交换、notify/event 与 Channel 生命周期，而不是再回到缺失的新接口。
 
 不要把这套实验库覆盖到公共 CANN 目录。测试脚本通过 `--hccl-lib-dir` 只给本次子进程注入它。
 
@@ -574,7 +537,7 @@ ABI 5 有卡运行仍卡在首次 warmup。进一步对比原生 AllToAll/MultiJ
 Channel 都必须参与 pre/post sync，且 remote write 的 source/destination 必须使用该
 Channel 交换的 peer token。ABI 5 只对 channel 0 执行 post-sync，且 source 错用本地
 token。ABI 6 已对齐这两点，但仍错误沿用了 standalone route-probe 的完成位 `1<<5`；
-原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；运行脚本和
+原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；ABI 8 继续沿用该映射，运行脚本和
 DeepEP C++ 都会拒绝 ABI `< 7`。
 
 Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
