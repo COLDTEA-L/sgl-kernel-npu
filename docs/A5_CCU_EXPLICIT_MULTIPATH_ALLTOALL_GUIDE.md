@@ -295,11 +295,12 @@ MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 W
 
 | 现象 | 处理 |
 |---|---|
-| HCCL extension `< 3` 或 symbol missing | 重新编译第 3 节分支，并传正确的 `--hccl-lib-dir` |
-| DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 4 节 wheel |
+| HCCL extension `< 3` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
+| DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 5 节 wheel |
 | opbuild 报 input dtype size 0 | `pathPolicy` 必须为 sendData 的 4 个 dtype 组合分别声明 `DT_INT64` |
 | `IsHcommDefaultTimeoutSupported` undefined | 先加载同目录 `libhccl_compat.so`，再加载 `libhccl.so` |
 | `ChannelAcquire status=9` | 指定 EID path 当前未 provision；检查 relay manifest、plane 和拓扑 |
 | standard case 提示 route-probe stale | 脚本过旧；标准 case 不依赖 prepared-plan route API |
 | `--graph-backend npugraphs` 被拒绝 | 当前标准动态 policy 验证使用 `aclgraph`；不要套用旧 prepared backend |
+| `status=137`，栈停在 `triton/tools/get_ascend_devices.py` 的 `npu-smi` | 旧脚本让 `npu-smi` 继承了实验 HCCL 的 `LD_PRELOAD`；更新脚本后会通过 `scripts/wrappers/npu-smi` 自动隔离。该 137 是外层 timeout 强杀，不是算子 OOM |
 | replay 正确但端口没有变化 | 先确认 `CASE_DYNAMIC_PATH_POLICY`，再用 HCCN 在同一时间窗验证物理路径 |

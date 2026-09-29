@@ -139,6 +139,11 @@ source "${cann_root}/set_env.sh"
 set +u
 source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 set -u
+# Save the unmodified tool environment before prepending the experimental
+# HCCL runtime.  Triton's Ascend backend spawns npu-smi while torch_npu is
+# imported, and npu-smi must not inherit the worker's private libhccl preload.
+a5_real_npu_smi=$(command -v npu-smi || true)
+a5_npu_smi_ld_library_path=${LD_LIBRARY_PATH:-}
 export ASCEND_RT_VISIBLE_DEVICES="${src_phy},${dst_phy}"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
@@ -174,6 +179,16 @@ assert value >= 3, f"patched HCCL extension {value}, expected >= 3"
 PY
     export LD_LIBRARY_PATH="${hccl_lib_dir}:${LD_LIBRARY_PATH}"
     hccl_preload="${hccl_compat_so}:${hccl_so}"
+fi
+
+worker_path=${PATH}
+if [[ -n "${hccl_preload}" ]]; then
+    npu_smi_wrapper_dir="${script_dir}/wrappers"
+    [[ -x "${npu_smi_wrapper_dir}/npu-smi" ]] || {
+        echo "missing executable npu-smi preload-isolation wrapper: ${npu_smi_wrapper_dir}/npu-smi" >&2
+        exit 2
+    }
+    worker_path="${npu_smi_wrapper_dir}:${PATH}"
 fi
 
 if (( need_legacy )); then
@@ -288,6 +303,8 @@ run_case() {
     rm -f "${pg_init_file}"
     timeout --signal=TERM --kill-after=5 "${timeout_seconds}" \
       env LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" LD_PRELOAD="${hccl_preload}" \
+        PATH="${worker_path}" A5_REAL_NPU_SMI="${a5_real_npu_smi}" \
+        A5_NPU_SMI_LD_LIBRARY_PATH="${a5_npu_smi_ld_library_path}" \
         PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
         A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \

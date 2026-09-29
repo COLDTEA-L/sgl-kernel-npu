@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The explicit-multipath worker preloads a private HCCL runtime.  Triton's
+# Ascend backend probes the device by spawning `npu-smi info`; that utility is
+# not part of the experiment and must not inherit the private HCCL loader
+# state, otherwise some driver releases block during Python module import.
+unset LD_PRELOAD
+if [[ -n "${A5_NPU_SMI_LD_LIBRARY_PATH+x}" ]]; then
+    export LD_LIBRARY_PATH="${A5_NPU_SMI_LD_LIBRARY_PATH}"
+fi
+
+real_npu_smi=${A5_REAL_NPU_SMI:-}
+if [[ -z "${real_npu_smi}" || ! -x "${real_npu_smi}" ]]; then
+    for candidate in \
+        /usr/local/Ascend/driver/tools/npu-smi \
+        /usr/local/bin/npu-smi \
+        /usr/bin/npu-smi
+    do
+        if [[ -x "${candidate}" ]]; then
+            real_npu_smi=${candidate}
+            break
+        fi
+    done
+fi
+
+if [[ -z "${real_npu_smi}" || ! -x "${real_npu_smi}" ]]; then
+    echo "npu-smi wrapper: real executable not found" >&2
+    exit 127
+fi
+
+exec "${real_npu_smi}" "$@"
