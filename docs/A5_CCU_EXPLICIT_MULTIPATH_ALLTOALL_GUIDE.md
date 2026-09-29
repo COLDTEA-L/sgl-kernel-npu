@@ -15,12 +15,13 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 8 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
+- 需要本分支配套的 HCCL 扩展 ABI 9 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
   `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
   `HALF_ALLTOALLV + CCU_MS`；ABI 5 进一步修正 HCCL 原生 AllToAll Channel 的资源槽位为
   `INPUT=0、OUTPUT=1、TOKEN=2`；ABI 6 对齐原生 AllToAll/MultiJetty 的完整 Channel
   生命周期；ABI 7 进一步把完成通知改为原生 AllToAll 的 `POST_SYNC_ID=3`；ABI 8 将
-  显式多路径 template 切到 T560 实际导出的旧对象式 `HcclCcuKernel*` 后端。
+  显式多路径 template 切到 T560 实际导出的旧对象式 `HcclCcuKernel*` 后端；ABI 9 让
+  `CalcRes` 通过原生资源层一次性创建 3-notify main thread，避免首次 KernelRun 二次 Acquire。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -41,7 +42,7 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少包含 `46ccbfd`（ABI 8 / T560 旧对象式 CCU 后端与动态路径禁用）。如果 `git status --short`
+预期 HEAD 至少包含 `ec9ad85`（ABI 9 / 原生 main-thread 生命周期）。如果 `git status --short`
 列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
 
 只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
@@ -76,7 +77,7 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `46ccbfd`（ABI 8 / T560 旧对象式 CCU 后端与动态路径禁用），且 `git fsck --full` 不报告
+预期 HEAD 至少包含 `ec9ad85`（ABI 9 / 原生 main-thread 生命周期），且 `git fsck --full` 不报告
 损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
@@ -288,7 +289,7 @@ lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 print("HCCL explicit-multipath ABI:", version())
-assert version() >= 8
+assert version() >= 9
 PY
 ```
 
@@ -309,7 +310,9 @@ U HcclCcuKernelRegister
 U HcclCcuKernelRegisterFinish
 ```
 
-完成上述静态检查后才运行 ABI 8 单 case。若它卡在首次 device synchronize，下一步检查的是
+完成上述静态检查后才运行 ABI 9 单 case。若它卡在首次 device synchronize，下一步按 plog 中的
+`phase=native_thread_ready/channel_acquire/kernel_register/kernel_launch` 定位，而不是只看 Python 栈。
+若 launch 已返回成功但 synchronize 仍挂起，检查的是
 旧对象 kernel 的变量交换、notify/event 与 Channel 生命周期，而不是再回到缺失的新接口。
 
 不要把这套实验库覆盖到公共 CANN 目录。测试脚本通过 `--hccl-lib-dir` 只给本次子进程注入它。
@@ -537,8 +540,8 @@ ABI 5 有卡运行仍卡在首次 warmup。进一步对比原生 AllToAll/MultiJ
 Channel 都必须参与 pre/post sync，且 remote write 的 source/destination 必须使用该
 Channel 交换的 peer token。ABI 5 只对 channel 0 执行 post-sync，且 source 错用本地
 token。ABI 6 已对齐这两点，但仍错误沿用了 standalone route-probe 的完成位 `1<<5`；
-原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；ABI 8 继续沿用该映射，运行脚本和
-DeepEP C++ 都会拒绝 ABI `< 7`。
+原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；ABI 8/9 继续沿用该映射，
+当前运行脚本和 DeepEP C++ 会拒绝 HCCL ABI `< 9`。
 
 Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
 仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
@@ -553,7 +556,7 @@ RUN_DIR=$(ls -dt \
 LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
 
 grep -nE \
-'selector MATCH|CalcRes begin|CalcRes ready|provisioned|KernelRun begin|CASE_FAILURE|PASS:' \
+'selector MATCH|CalcRes begin|CalcRes ready|provisioned|KernelRun begin|ExplicitMultipathLegacy|CASE_FAILURE|PASS:' \
 "${LOG}"
 ```
 
@@ -565,6 +568,10 @@ grep -nE \
 [ExplicitMultipath] provisioned 3 channels (direct + 2 relays)
 [ExplicitMultipath] CalcRes ready ... paths[3]
 [ExplicitMultipath] KernelRun begin ...
+[ExplicitMultipathLegacy] phase=native_thread_ready ... notifyNum[3]
+[ExplicitMultipathLegacy] phase=channel_acquire_done ...
+[ExplicitMultipathLegacy] phase=kernel_register_done ...
+[ExplicitMultipathLegacy] phase=kernel_launch_done ... status[0]
 PASS: implementation=standard ...
 ```
 
@@ -610,7 +617,7 @@ if [[ ! -f "${LOG}" ]]; then
 fi
 
 PIDS=$(
-  grep -oE 'PID: ?[0-9]+' "${LOG}" |
+  grep -oE '(PID: ?|pid=)[0-9]+' "${LOG}" |
   grep -oE '[0-9]+' |
   sort -u
 )
@@ -632,7 +639,7 @@ TRACE_OUT="${RUN_DIR}/hccl_resource_failure_trace.txt"
 
 while IFS= read -r file; do
   grep -HnE \
-'ExplicitMultipath|CcuExplicit|ALLTOALL|CCU_MS|CCU_SCHED|GetTilingAccelerator|Select|CalcRes|BuildExplicitChannels|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
+'ExplicitMultipath|CcuExplicit|ALLTOALL|CCU_MS|CCU_SCHED|GetTilingAccelerator|Select|CalcRes|BuildExplicitChannels|native_thread_ready|channel_acquire|kernel_register|kernel_launch|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
   "${file}" >> "${TRACE_OUT}" 2>/dev/null || true
 done < "${PLOG_LIST}"
 
@@ -648,10 +655,15 @@ sed -n '1,300p' "${TRACE_OUT}"
 | ABI 4、warmup 后卡在 `torch.npu.synchronize()` | 旧 CCU kernel 使用错误的 `OUTPUT=0/TOKEN=1`；更新到 ABI 5 并重编 HCCL |
 | ABI 5、warmup 后仍卡在 `torch.npu.synchronize()` | 所有 Channel 未完成 pre/post sync，remote source token 也未按 Channel 绑定；更新到 ABI 6 |
 | ABI 6、warmup 后仍卡在 `torch.npu.synchronize()` | 完成通知仍使用 route-probe 的 bit 5，未对齐原生 AllToAll 的 bit 3；更新到 ABI 7 |
+| ABI 8、两 rank 进入 warmup 后卡在 `torch.npu.synchronize()` | native main thread 先按 0 notify 创建，又被二次 Acquire；更新到 ABI 9 |
+| ABI 9 有 `native_thread_ready`、没有 `channel_acquire_done` | 卡在显式 Channel Acquire，检查 EID plan 与两 rank 的 ChannelDesc 对称性 |
+| ABI 9 有 `channel_acquire_done`、没有 `kernel_register_done` | 卡在旧对象 CCU 指令生成/注册 |
+| ABI 9 有 `kernel_register_done`、没有 `kernel_launch_done` | 卡在 host launch 提交或 thread/stream 绑定 |
+| ABI 9 有 `kernel_launch_done status[0]`、仍卡同步 | kernel 已提交，死锁位于地址/token 交换、Write event 或 completion notify |
 | `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
 | `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
 | `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
-| ABI `< 7` 或完全没有 `[ExplicitMultipath]` | manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
+| ABI `< 9` 或完全没有 `[ExplicitMultipath]` | HCCL/wheel 未更新，manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
 | 已有 `provisioned N channels`，随后仍 `ret=5` | HCCL 已构造 Channel，失败在 MC2/libmc2_client 资源序列化或 instruction 生成 |
 | `CcuInstructions isEmpty` | 闭源 MC2 未识别新的 CCU instruction，与早期标准算子尝试的失败相同 |
 | `param.varMemSize ... invalid` | 固定 AllToAll 与 `HALFALLTOALLV` 资源协议不匹配 |
