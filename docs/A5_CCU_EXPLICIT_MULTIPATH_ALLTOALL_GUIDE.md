@@ -306,11 +306,30 @@ path weight 或性能参数，先执行下面两组检查。
 
 ### 11.1 收集 HCCL/MC2 资源分配边界日志
 
-将 `RUN_DIR` 替换为本次失败的输出目录：
+下面的命令会自动选择最新的显式多路径运行目录；不要把
+`YYYYMMDD_HHMMSS` 当成实际目录名执行。如需检查更早的运行，再将第一行手工改成该目录的完整路径。
 
 ```bash
-RUN_DIR=/home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_YYYYMMDD_HHMMSS
+(
+set -e
+
+RUN_DIR=$(
+  ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_* \
+    2>/dev/null | head -1
+)
+
+if [[ -z "${RUN_DIR}" || ! -d "${RUN_DIR}" ]]; then
+  echo "ERROR: no explicit-multipath result directory found" >&2
+  false
+fi
+
+echo "RUN_DIR=${RUN_DIR}"
 LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+if [[ ! -f "${LOG}" ]]; then
+  echo "ERROR: missing case log: ${LOG}" >&2
+  false
+fi
 
 PIDS=$(
   grep -oE 'PID: ?[0-9]+' "${LOG}" |
@@ -340,6 +359,7 @@ while IFS= read -r file; do
 done < "${PLOG_LIST}"
 
 sed -n '1,300p' "${TRACE_OUT}"
+)
 ```
 
 按下表判读：
@@ -355,7 +375,23 @@ sed -n '1,300p' "${TRACE_OUT}"
 
 ### 11.2 核对实际传入 HCCL 的 relay plan
 
+这一段可以脱离 11.1 单独复制执行，因此会重新自动确定 `RUN_DIR`：
+
 ```bash
+(
+set -e
+
+RUN_DIR=$(
+  ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_* \
+    2>/dev/null | head -1
+)
+
+if [[ -z "${RUN_DIR}" || ! -d "${RUN_DIR}" ]]; then
+  echo "ERROR: no explicit-multipath result directory found" >&2
+  false
+fi
+
+echo "RUN_DIR=${RUN_DIR}"
 find "${RUN_DIR}/plans" -maxdepth 2 -type f -print
 
 for file in "${RUN_DIR}"/plans/*.tsv; do
@@ -365,6 +401,7 @@ for file in "${RUN_DIR}"/plans/*.tsv; do
 done
 
 sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
+)
 ```
 
 重点核对：
