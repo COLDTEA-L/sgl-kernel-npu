@@ -356,10 +356,181 @@ route-probe 0/1 variable layout
 FP32-only、两卡 write 数据布局
 ```
 
-## 8. 当前标准化方案
+## 8. 已完成的尝试及其边界
 
-当前实现不是把旧 Write 包进 Ascend C 外壳，而是保留其“显式多 Channel + 加权分片 + 并发 Write”
-思想，并接入原生 HCCL 生命周期：
+本节按时间顺序记录已经验证过的方向。这里的“不可行”只表示该实现路径不能同时满足当前的
+标准算子、显式路径和图执行要求，不表示 A5 硬件没有 relay 或多路径能力。
+
+### 8.1 早期独立多路径 Write
+
+做法：在 `liba5_ccu_urma_route_probe.so` 中直接调用旧版对象接口：
+
+```text
+HcclRankGraphGetLayers/GetLinks
+  -> HcclChannelAcquire
+  -> HcclCcuKernelRegister/Finish
+  -> HcclCcuKernelLaunch
+  -> CcuRep::WriteNb
+```
+
+结果：route0、route2 以及多条显式 relay Channel 均能正确搬运数据；多个 `WriteNb` 在第一次
+`WaitEvent` 前提交时能够并发。后续通过拓扑 JSON 和 EID inventory 合成的 CommLink 还证明：
+
+```text
+指定 relay physical ID
+  -> 求 src->relay 与 relay->dst 的拓扑边
+  -> 选出相应 destination EID
+  -> 构造 HcclChannelDesc
+  -> HcclChannelAcquire 成功
+  -> 数据正确
+```
+
+保留价值：它验证了显式 relay 的控制点是 CommLink/Endpoint EID pair，而不是必须修改 UBUS
+全局路由表；其路径解析、分片和并发下发逻辑都可以复用。
+
+不能直接作为最终方案的原因：它是独立 host API、私有 cache 和私有同步协议，不进入标准
+AllToAll selector/executor、`CalcRes`、`TemplateResource` 和 FastLaunch 生命周期；语义也只是
+两卡 remote-write/all-gather 穿刺。
+
+### 8.2 UBUS route table FORCE/ADD
+
+黑箱分析确认 UBUS route table 的核心含义是：
+
+```text
+destination CNA -> egress-port bitmap
+```
+
+理论上把源 entity 的目的 CNA 映射到 relay first-hop port，可以强制 `src -> relay -> dst`；增加
+多个 port bit 还可用于验证底层 bitmap 是否是现有 multipath selector。
+
+未采用原因：该表是整机共享硬件状态，不是 per-process、per-communicator 或 per-Channel 状态。
+加载修改后的 `ubus.ko` 或覆盖 route entry 会影响公共服务器上的其他任务，也不能满足每个算子
+独立选择路径的要求。这个方向适合专机上的硬件机制验证，不适合作为算子控制面。
+
+### 8.3 普通用户态 URMA EID 和 TP selector
+
+尝试过：
+
+- 用 `urma_admin`/`liburma` 枚举和绑定 EID；
+- 扫描 EID pair 并结合 HCCN counter 推测 relay；
+- 比较 `flow_label`、`spray_en`、`port_id`、`route_addr_idx` 等 TP 属性；
+- hook `urma_cmd_get_tp_list()`、`urma_get_tp_attr()` 等公开边界。
+
+结果：HCCL route endpoint 中的完整 `df12` EID 不一定出现在普通用户态可直接查询和绑定的本地
+EID 清单中；route0/route2 的 `GET_TP_LIST` 返回资源集合和公开 TP 属性也没有稳定的路径差异。
+后续追踪表明，不同 candidate 会在 `HcclChannelAcquire -> URMA import` 阶段激活不同 TP/TPN，
+但 path matcher 和 TPN 到物理路径的映射位于 HCCP/MUE/driver 私有控制面。
+
+未采用原因：公开结构中“存在字段”不等于用户能用它强制 HCCL Channel 走某个物理出口；普通
+URMA TP 的行为也不能直接等价于 HCCL/MUE provision 的 TP。继续只追 `GET_TP_LIST` 无法得到可编程
+的 relay 创建接口。
+
+### 8.4 ChannelDesc/EndpointDesc 因果替换
+
+针对 candidate0 和 candidate2 做了以下交叉实验：
+
+```text
+只换 local endpoint       -> Acquire 失败
+只换 remote endpoint      -> Acquire 失败
+同时换 endpoint pair      -> Acquire 成功
+同时换 CommAddr pair      -> Acquire 成功
+只换 location             -> 不能解释路径切换
+```
+
+结果说明完整 CommAddr/Endpoint pair 是匹配一个已 provision path object 的 key；单端混合不是合法
+路径。该实验定位了“既有路径如何被选择”，但不能凭空生成任意 relay path。
+
+保留价值：它指导后续不再修改 TP handle，而是在 communicator/RankGraph 资源准备阶段构造完整、
+一致的 EID pair。合成 CommLink 实验最终证明：只要 EID pair 与实际拓扑边一致，candidate 不必先由
+`HcclRankGraphGetLinks` 返回，也能被 `HcclChannelAcquire` 接受。
+
+### 8.5 HCCN counter、profiling 与显式多 relay
+
+通过 topology JSON、端口/EID inventory 和 HCCN counter，已经验证了 `2 -> 4 -> 3` 等显式 relay
+链；进一步构造两条、三条和四条 relay Channel 并发时，性能从约 86 us 降至 74 us、69 us，证明
+显式增加可用路径能够带来收益。
+
+HCCN counter 能证明指定物理端口在同一 workload 窗口内承载流量，CCU kernel 中“所有 WriteNb
+先提交、之后统一等待”的结构提供并发因果条件；counter 本身不提供 cycle-level overlap。
+
+### 8.6 prepared-plan `torch.ops` 方案
+
+做法：图外创建 CommLink/Channel/CCU kernel，返回 `plan_handle`；图内 `torch.ops` 只引用已经准备
+好的 plan。npugraphs 和 ACLGraph 已完成首次 capture 与重复 replay，证明 host 资源只创建一次、
+图 replay 可以复用准备好的显式路径。
+
+未作为最终标准算子的原因：该接口仍是 DeepEP 自定义 `torch.ops` 加独立 route-probe 资源注册，
+不是完整的标准 Ascend C/HCCL AllToAll；HCCL communicator 看不到这些资源，无法统一管理
+FastLaunch、异常恢复、profiling 和销毁。
+
+保留价值：当标准 HCCL 改造尚未完成时，它是功能正确、可入图的回退实现，也证明“图外准备、
+图内复用”这一生命周期设计是成立的。
+
+### 8.7 AIV -> HBM CommandBlock -> 常驻 CCU worker
+
+这个方向试图用标准 Ascend C AIV kernel 写 HBM command，再由常驻 CCU worker 轮询或 doorbell
+唤醒，从而同时获得标准算子外壳和 device-time 动态 path mask。
+
+未采用原因：当前软件栈没有公开、可验证的 AIV->CCU doorbell；自定义 HBM 地址虽可分配，但
+不能仅凭地址证明 CCU worker 能稳定读取、被唤醒并与图 stream 建立完成语义。轮询会长期占用 CCU
+资源，也缺少标准的退出和异常恢复协议。原生 HCCL 内部可能有类似机制，但没有暴露成可供外部
+自定义算子复用的接口。
+
+### 8.8 标准 Ascend C 外壳直接申请 HCCL/MC2 资源
+
+做法：实现 OpDef、tiling、AIV kernel 和 ACLNN，并让 MC2/HCCL 按 `HCCL_CMD_ALLTOALL + CCU_SCHED`
+为自定义模板分配资源。
+
+实验中曾出现：
+
+```text
+HcclAllocComResourceByTiling / tiling function 失败
+CcuInstructions isEmpty
+运行时返回 NOT_SUPPORT/ret=5
+```
+
+根因不是 OpDef 或 tiling 形式不标准，而是自定义 CCU 模板最终依赖目标 HCOMM 的 CCU 开发 ABI。
+`libmc2_client.so` 只能消费 HCOMM 已提供的资源能力，不能替代缺失的底层接口。
+
+### 8.9 基于新版 `HcommCcu*`/`Ccu*` 接口修改 HCCL
+
+为接入 HCCL 原生生命周期，曾实现自定义 AllToAll selector/template/kernel，并使用：
+
+```text
+HcommCcuKernelRegisterStart/Register/End
+HcommCcuKernelLaunch
+CcuVariableCreateByChannel
+CcuNotifyRecord/Wait
+CcuWriteVariableWithNotify
+CcuWriteMemToMem
+CcuEventWait
+```
+
+ABI 4~7 是本项目用于标记 selector、资源槽、Channel 生命周期和 completion 修正的版本号，不是
+厂商 HCOMM ABI。源码能编译，是因为 HCCL compatibility/dlsym 层允许弱符号构建；编译成功并不
+代表目标 runtime 提供这些函数。
+
+在目标有卡环境 CANN `9.1.T560` 上直接检查 `libhcomm.so`：除 `HcclChannelAcquire` 外，上述新版
+接口均未导出。相同检查在开发 Docker 的 beta/T500 环境也得到一致结果；compat support flag 若为
+0，则可最终确认运行时不支持。因此 ABI7 的卡死不能继续只按 resource slot 或 notify bug 调试：
+当前软件包没有承载这套新模板所需的底层执行接口。
+
+这否定的是“依赖新版 HCOMM CCU ABI 的自定义模板”，不是“修改 HCCL”本身。目标 CANN 当前仍
+提供早期 Write 和原生 CCU AllToAll 已实际使用的旧对象接口：
+
+```text
+HcclCcuKernelRegister
+HcclCcuKernelRegisterFinish
+HcclCcuKernelLaunch
+hcomm::CcuRep / WriteNb
+```
+
+后续应改造已经能在 T560 运行的原生 CCU AllToAll，而不是继续要求不存在的新版 ABI。
+
+## 9. 此前标准化方案及当前结论
+
+此前实现不是把旧 Write 包进 Ascend C 外壳，而是保留其“显式多 Channel + 加权分片 + 并发 Write”
+思想，并尝试接入原生 HCCL 生命周期：
 
 ```text
 标准 ExplicitMultipathAll2AllCcu
@@ -377,10 +548,30 @@ FP32-only、两卡 write 数据布局
   -> direct/relay Write 全部提交后统一等待
 ```
 
-这条路线仍不修改 MUE、UVS、TP 或 UB route table。显式路径由 EID pair/ChannelDesc 在资源准备阶段
-确定；每次执行只通过设备上的 `pathPolicy` 选择已经准备好的 Channel 及权重。
+该控制面设计仍然正确：不修改 MUE、UVS、TP 或 UB route table，显式路径由 EID pair/ChannelDesc
+在资源准备阶段确定。但是其自定义 template/kernel 使用了 T560 未导出的新版 `HcommCcu*`/`Ccu*`
+执行 ABI，所以当前实现不能作为目标版本的最终数据面。
 
-## 9. 相关源码
+下一步采用“原生实现内增量改造”：
+
+```text
+communicator 初始化
+  -> 解析 direct/relay 拓扑与 EID pair
+  -> 保存 plan_id -> explicit CommLink catalog
+
+原生 HCCL CCU AllToAll
+  -> 保留 selector/executor/CalcRes/TemplateResource
+  -> 将 explicit CommLink catalog 合入 Channel request
+  -> 保留原生 input/output/token、notify、thread 和 FastLaunch 协议
+  -> 使用目标 T560 已支持的原生/旧对象 CCU 注册与 launch 路径
+  -> direct 与每条 relay 按 2:1 分片并并发提交
+```
+
+第一阶段把 `plan_id` 和路径权重固定在一次建图/capture 生命周期内；Host 控制器可以在建图或发射
+前选择不同 plan。若要求同一已 capture 图在每次 replay 中只改 HBM flag 就改变路径，仍需要另行
+确认原生 CCU kernel 是否能读取动态 GM 控制变量，不能再次假定缺失的 AIV->CCU doorbell 存在。
+
+## 10. 相关源码
 
 HCCL 原生 CCU AllToAll：
 
@@ -400,7 +591,7 @@ examples/a5_ccu_urma_route_probe/op_kernel_ccu/route_kernel.cc
 tests/python/deepep/test_a5_ccu_urma_multiroute_write.py
 ```
 
-当前标准显式多路径 AllToAll：
+此前基于新版 HCOMM ABI 的标准显式多路径 AllToAll 尝试：
 
 ```text
 csrc/deepep/ops/op_host/explicit_multipath_all2all_ccu_def.cpp
