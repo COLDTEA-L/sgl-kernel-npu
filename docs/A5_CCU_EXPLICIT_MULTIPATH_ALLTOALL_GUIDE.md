@@ -53,7 +53,8 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `c6e51b2`，且 `git fsck --full` 不报告损坏对象。不要从旧仓库执行
+预期 HEAD 至少包含 `62f2a7b`（ABI 4 / `ALLTOALL + CCU_SCHED`），且 `git fsck --full` 不报告
+损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
 如果离线编译确实需要旧仓库中的未跟踪 `third_party`，只复用这个依赖目录：
