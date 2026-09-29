@@ -291,7 +291,96 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 Write，不能用 launch 数量推断
 物理路径数量；relay 身份仍以 manifest 和 HCCN 端口计数为准。
 
-## 11. 常见故障
+## 11. `HcclAllocComResourceByTiling ret=5` 定向检查
+
+如果标准算子在第一次 warmup 失败，且日志包含：
+
+```text
+Nnopbase fails to invoke the HcclAllocComResourceByTiling function
+ret = 5
+```
+
+说明失败发生在 MC2/HCCL 通信资源分配阶段，还没有进入 CCU kernel 和
+`WriteNb`。当前 HCCL 错误码中 `5` 为 `HCCL_E_NOT_SUPPORT`。不要先调整数据切分、
+path weight 或性能参数，先执行下面两组检查。
+
+### 11.1 收集 HCCL/MC2 资源分配边界日志
+
+将 `RUN_DIR` 替换为本次失败的输出目录：
+
+```bash
+RUN_DIR=/home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_YYYYMMDD_HHMMSS
+LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+PIDS=$(
+  grep -oE 'PID: ?[0-9]+' "${LOG}" |
+  grep -oE '[0-9]+' |
+  sort -u
+)
+
+echo "PIDS=${PIDS}"
+
+PLOG_LIST="${RUN_DIR}/hccl_plogs.txt"
+: > "${PLOG_LIST}"
+
+for pid in ${PIDS}; do
+  find /root/ascend/log -type f \
+    -name "plog-${pid}_*.log" -print 2>/dev/null
+done | sort -u > "${PLOG_LIST}"
+
+cat "${PLOG_LIST}"
+
+TRACE_OUT="${RUN_DIR}/hccl_resource_failure_trace.txt"
+: > "${TRACE_OUT}"
+
+while IFS= read -r file; do
+  grep -HnE \
+'ExplicitMultipath|CcuExplicit|HALF.*ALLTOALL|Select|CalcRes|BuildExplicitChannels|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
+  "${file}" >> "${TRACE_OUT}" 2>/dev/null || true
+done < "${PLOG_LIST}"
+
+sed -n '1,300p' "${TRACE_OUT}"
+```
+
+按下表判读：
+
+| 日志特征 | 结论 |
+|---|---|
+| `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
+| `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
+| 完全没有 `[ExplicitMultipath]` | 自定义 selector 没有选中，或 manifest/plan 环境变量未传入 worker |
+| 已有 `provisioned N channels`，随后仍 `ret=5` | HCCL 已构造 Channel，失败在 MC2/libmc2_client 资源序列化或 instruction 生成 |
+| `CcuInstructions isEmpty` | 闭源 MC2 未识别新的 CCU instruction，与早期标准算子尝试的失败相同 |
+| `param.varMemSize ... invalid` | 固定 AllToAll 与 `HALFALLTOALLV` 资源协议不匹配 |
+
+### 11.2 核对实际传入 HCCL 的 relay plan
+
+```bash
+find "${RUN_DIR}/plans" -maxdepth 2 -type f -print
+
+for file in "${RUN_DIR}"/plans/*.tsv; do
+  test -f "${file}" || continue
+  echo "===== ${file} ====="
+  column -s $'\t' -t "${file}"
+done
+
+sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
+```
+
+重点核对：
+
+- `src_phy/dst_phy/relay_phy` 是否为本次实际卡号；
+- 每条 relay 的 `src_eid/dst_eid` 是否完整；
+- 同一次 CCU launch 中各 relay 的本地 die 是否一致；
+- plan id 是否与用例日志中传入的 plan id 一致；
+- 不要将 HCCL extension 版本检查通过解释为 MC2 已接受自定义 CCU template。
+
+如果 11.1 已证明 `provisioned N channels`，而资源分配仍失败，下一步应改为复用
+MC2 已支持的原生 AllToAllV/MultiJetty CCU instruction schema，只在 HCCL 资源构造阶段
+注入显式 direct/relay ChannelDesc；不要继续要求闭源 `libmc2_client.so` 识别新的
+CCU kernel/instruction 类型。
+
+## 12. 常见故障
 
 | 现象 | 处理 |
 |---|---|
