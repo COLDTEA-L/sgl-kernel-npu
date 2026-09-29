@@ -90,12 +90,74 @@ fi
 
 ## 3. 拉取 sgl-kernel-npu
 
+正常且干净的仓库使用下面的快进流程：
+
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-git fetch origin
+BRANCH=feature/a5-ccu-explicit-multipath-alltoall
+
+git fetch origin "${BRANCH}"
 git switch feature/a5-ccu-explicit-multipath-alltoall
-git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+git merge --ff-only "origin/${BRANCH}"
+
+git rev-parse --short HEAD
+git status --short
 ```
+
+预期 HEAD 至少为 `863b035`。如果提示 `.git/HEAD.lock` 存在，不要继续重复
+`pull`；先确认没有活跃 Git 进程：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+ps -ef | grep -E '[g]it( |$)|[g]it-'
+```
+
+如果上面没有输出，说明 lock 是崩溃进程遗留的。先保留 lock 和当前两份 diff，
+不删除任何未跟踪文件：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+STAMP=$(date +%Y%m%d_%H%M%S)
+
+test -f .git/HEAD.lock && \
+  mv .git/HEAD.lock "/tmp/sgl-kernel-npu_HEAD.lock.${STAMP}"
+
+git diff > "/tmp/sgl-kernel-npu_worktree.${STAMP}.patch"
+git diff --cached > "/tmp/sgl-kernel-npu_index.${STAMP}.patch"
+```
+
+然后获取远端并检查是否属于“快进内容已写入 index，只有 HEAD 没有更新”：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+BRANCH=feature/a5-ccu-explicit-multipath-alltoall
+TARGET="origin/${BRANCH}"
+
+git fetch origin "${BRANCH}"
+
+test "$(git branch --show-current)" = "${BRANCH}" || {
+  echo "ERROR: current branch is not ${BRANCH}; stop here"
+  exit 1
+}
+
+if git diff --cached --quiet "${TARGET}" --; then
+  echo "index exactly matches ${TARGET}; repairing HEAD only"
+  git reset --soft "${TARGET}"
+else
+  echo "ERROR: index differs from ${TARGET}; patches were saved in /tmp"
+  git diff --cached --stat "${TARGET}" --
+  exit 1
+fi
+
+git rev-parse --short HEAD
+git status --short
+```
+
+这次日志中的 4 个 `M  ` 文件正是中断的 fast-forward 写入的 index 内容；只有上面的
+`git diff --cached --quiet "${TARGET}"` 成功后才能执行 `reset --soft`。该命令只修正 branch/HEAD，
+不会覆盖 working tree，也不会删除 `?? TX`、`?? echo`、编译产物或其他未跟踪文件。不要使用
+`git clean -fd`。恢复后 HEAD 应为 `863b035`，4 个 `M  ` 应消失；剩余 `??` 文件可在确认用途后
+另行归档或清理。
 
 ## 4. 编译配套 HCCL
 
