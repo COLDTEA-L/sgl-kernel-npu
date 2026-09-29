@@ -41,7 +41,7 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少包含 `fd2be0a`（ABI 8 / T560 旧对象式 CCU 后端）。如果 `git status --short`
+预期 HEAD 至少包含 `46ccbfd`（ABI 8 / T560 旧对象式 CCU 后端与动态路径禁用）。如果 `git status --short`
 列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
 
 只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
@@ -76,7 +76,7 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `fd2be0a`（ABI 8 / T560 旧对象式 CCU 后端），且 `git fsck --full` 不报告
+预期 HEAD 至少包含 `46ccbfd`（ABI 8 / T560 旧对象式 CCU 后端与动态路径禁用），且 `git fsck --full` 不报告
 损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 

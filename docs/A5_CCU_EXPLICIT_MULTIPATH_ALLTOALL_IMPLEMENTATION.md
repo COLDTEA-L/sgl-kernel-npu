@@ -172,8 +172,9 @@ bits 4..7   = catalog[1] 权重
 ...
 ```
 
-每个权重为 0..15；0 跳过该路径的变量交换、Write 和 EventWait。若 policy word 为 0，HCCL 为迁移期
-兼容使用 `2,1,1,...`；正式调用始终编码 ABI 1。
+每个权重为 0..15；0 使旧对象 kernel 跳过该路径的 `WriteNb` 和 `WaitEvent`。Channel catalog
+仍在初始化阶段完整 provision，当前执行仍会为目录中的 Channel 完成地址/token 控制握手。若
+policy word 为 0，HCCL 为迁移期兼容使用 `2,1,1,...`；正式调用始终编码 ABI 1。
 
 当前最多 13 条总路径，来源是 HCCL `CCU_MAX_TASK_ARG_NUM=48`：固定参数 6 个，每条路径 3 个参数，
 FastLaunch cache 额外保存 3 个元数据，故 `6 + 3 * 13 + 3 = 48`。
