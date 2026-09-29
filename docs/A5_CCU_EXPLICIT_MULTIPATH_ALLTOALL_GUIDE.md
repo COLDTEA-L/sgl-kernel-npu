@@ -17,51 +17,56 @@
 - 不安装 `ubus.ko`，不修改全局 UB route table；
 - 需要本分支配套的 HCCL 扩展 ABI 3 和 DeepEP ABI 8。
 
-## 2. 清理有卡环境的旧 HCCL 工作区
+## 2. 在有卡环境准备干净的 HCCL 仓库
 
-如果有卡环境的 HCCL 仓库保留了此前手工穿刺产生的已跟踪文件修改，先把它们放入 stash，
-再切到远端已提交的完整实现。旧修改只作为临时备份，不要在新分支上执行 `git stash pop`。
-
-如果首先报告 `.git/HEAD.lock`，必须确认没有 Git 进程仍在操作该仓库；确认是崩溃遗留锁后，
-将其移动到 `/tmp`，不要一开始就删除工作区文件：
+当前有卡环境的旧 HCCL 工作区曾用于手工穿刺，并且已经出现损坏的 loose object。此时不能再用
+`stash/reset/pull` 修补原仓库；Git 不会因为普通 fetch 自动替换它误认为已经存在的损坏对象。
+保留整个旧仓库，然后重新 clone 干净分支：
 
 ```bash
-cd /home/l00934901/hccl
+cd /home/l00934901
 
-ps -ef | grep -E '[g]it( |$)|[g]it-'
+STAMP=$(date +%Y%m%d_%H%M%S)
+OLD_HCCL="/home/l00934901/hccl_corrupt_${STAMP}"
 
-# 仅当上面确认没有活跃 Git 进程时执行。
-if test -f .git/HEAD.lock; then
-  mv .git/HEAD.lock "/tmp/hccl_HEAD.lock.$(date +%Y%m%d_%H%M%S)"
-fi
+# 同一文件系统内只是重命名，旧源码、stash 和构建依赖仍可恢复。
+mv /home/l00934901/hccl "${OLD_HCCL}"
+echo "old HCCL: ${OLD_HCCL}"
+
+env -u GIT_ASKPASS -u SSH_ASKPASS \
+git clone \
+  --single-branch \
+  --branch feature/a5-ccu-explicit-multipath-alltoall \
+  https://gitcode.com/yuanwenliu/hccl.git \
+  /home/l00934901/hccl
 ```
 
-保存旧修改并同步远端分支：
+检查新仓库：
 
 ```bash
 cd /home/l00934901/hccl
-
-git stash push -m "obsolete-local-hccl-changes-before-c6e51b2"
-
-git fetch origin feature/a5-ccu-explicit-multipath-alltoall
-git switch feature/a5-ccu-explicit-multipath-alltoall
-git reset --keep origin/feature/a5-ccu-explicit-multipath-alltoall
 
 git rev-parse --short HEAD
 git status --short
+git fsck --full
 ```
 
-预期 HCCL HEAD 至少包含提交 `c6e51b2`。确认新版本编译通过前保留 stash；编译通过后可用
-`git stash drop stash@{0}` 删除旧备份。
+预期 HEAD 至少包含 `c6e51b2`，且 `git fsck --full` 不报告损坏对象。不要从旧仓库执行
+`stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
-## 3. 拉取两个仓
+如果离线编译确实需要旧仓库中的未跟踪 `third_party`，只复用这个依赖目录：
 
 ```bash
-cd /home/l00934901/hccl
-git fetch origin
-git switch feature/a5-ccu-explicit-multipath-alltoall
-git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
+if test -d "${OLD_HCCL}/third_party"; then
+  ln -s "${OLD_HCCL}/third_party" /home/l00934901/hccl/third_party
+fi
+```
 
+旧仓库先保留；新仓库编译、运行通过后再人工清理。
+
+## 3. 拉取 sgl-kernel-npu
+
+```bash
 cd /home/l00934901/sgl-kernel-npu
 git fetch origin
 git switch feature/a5-ccu-explicit-multipath-alltoall
