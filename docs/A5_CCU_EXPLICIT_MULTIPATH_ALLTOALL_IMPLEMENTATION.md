@@ -32,7 +32,7 @@ Python/controller
 DeepEP C++
   Buffer::explicit_multipath_all2all_ccu
   - 校验 2 ranks、dtype、policy=[1]int64/NPU
-  - 校验 HCCL extension ABI >= 5
+  - 校验 HCCL extension ABI >= 6
   - 校验 plan_id/manifest 在 communicator 初始化前已设置
     |
     v
@@ -226,7 +226,7 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 已在 `cam_lyw_dev_91` 完成：
 
 - HCCL host/CCU 源码完整编译、链接和 run-package 打包；
-- HCCL extension ABI 5 装载验证；
+- HCCL extension ABI 6 装载验证；
 - 标准 opbuild、4 个 dtype kernel、custom OPP 打包；
 - DeepEP C++ extension 和 wheel 编译；
 - wheel 在容器内 force-reinstall，DeepEP ABI 8 装载成功；
@@ -239,9 +239,11 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 - relay plan 本身完整，`src/dst/relay die` 与 EID 均已解析，不能用 plan 问题解释上述失败。
 
 ABI 4 已在有卡环境跨过资源分配，但因沿用 route-probe 的 0/1 resource index 卡在首次
-warmup completion。ABI 5 已改用 HCCL 原生 1/2 output/token index，并通过 HCCL 增量编译。
+warmup completion。ABI 5 改用 HCCL 原生 1/2 output/token index；ABI 6 继续对齐
+原生 AllToAll/MultiJetty：所有 Channel 无论当前权重是否为 0，都执行 pre/post sync，
+且 remote source/destination 都使用该 Channel 交换的 token。两组修改均通过 HCCL 增量编译。
 
-ABI 5 仍需有卡环境完成：
+ABI 6 仍需有卡环境完成：
 
 1. 标准算子单次正确性；
 2. ACLGraph capture/replay 正确性；
