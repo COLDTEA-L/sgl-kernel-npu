@@ -140,11 +140,19 @@ test "$(git branch --show-current)" = "${BRANCH}" || {
   exit 1
 }
 
+PARTIAL_FAST_FORWARD=863b035
+
 if git diff --cached --quiet "${TARGET}" --; then
   echo "index exactly matches ${TARGET}; repairing HEAD only"
   git reset --soft "${TARGET}"
+elif git diff --quiet -- && \
+     git cat-file -e "${PARTIAL_FAST_FORWARD}^{commit}" && \
+     git diff --cached --quiet "${PARTIAL_FAST_FORWARD}" --; then
+  echo "index is the known interrupted ${PARTIAL_FAST_FORWARD} fast-forward"
+  echo "remote advanced again; replacing tracked files with ${TARGET}"
+  git reset --hard "${TARGET}"
 else
-  echo "ERROR: index differs from ${TARGET}; patches were saved in /tmp"
+  echo "ERROR: tracked files are not a known interrupted fast-forward; stop"
   git diff --cached --stat "${TARGET}" --
   exit 1
 fi
@@ -153,11 +161,12 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-这次日志中的 4 个 `M  ` 文件正是中断的 fast-forward 写入的 index 内容；只有上面的
-`git diff --cached --quiet "${TARGET}"` 成功后才能执行 `reset --soft`。该命令只修正 branch/HEAD，
-不会覆盖 working tree，也不会删除 `?? TX`、`?? echo`、编译产物或其他未跟踪文件。不要使用
-`git clean -fd`。恢复后 HEAD 应为 `863b035`，4 个 `M  ` 应消失；剩余 `??` 文件可在确认用途后
-另行归档或清理。
+这次日志中的 4 个 `M  ` 文件正是中断的 `863b035` fast-forward 写入的 index 内容。如果远端仍是
+`863b035`，第一条分支只修正 HEAD；如果远端已经包含后续文档提交 `ee31327`，第二条分支先确认
+working tree 没有额外 tracked 修改、index 又精确等于 `863b035`，才用 `reset --hard` 将 tracked
+文件更新到最新远端。两条分支都不会删除 `?? TX`、`?? echo`、编译产物或其他未跟踪文件。
+不要使用 `git clean -fd`。恢复后 HEAD 应至少为 `ee31327`，4 个 `M  ` 应消失；剩余 `??` 文件
+可在确认用途后另行归档或清理。
 
 ## 4. 编译配套 HCCL
 
