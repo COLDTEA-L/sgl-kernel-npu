@@ -15,9 +15,10 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 4 和 DeepEP ABI 8。ABI 4 的关键变化是标准算子通过
+- 需要本分支配套的 HCCL 扩展 ABI 5 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
   `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
-  `HALF_ALLTOALLV + CCU_MS`。
+  `HALF_ALLTOALLV + CCU_MS`；ABI 5 进一步修正 HCCL 原生 AllToAll Channel 的资源槽位为
+  `INPUT=0、OUTPUT=1、TOKEN=2`。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -38,7 +39,7 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少包含 `62f2a7b`（ABI 4 / `ALLTOALL + CCU_SCHED`）。如果 `git status --short`
+预期 HEAD 至少包含 `a9eb52a`（ABI 5 / 原生 AllToAll Channel 资源布局）。如果 `git status --short`
 列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
 
 只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
@@ -73,7 +74,7 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `62f2a7b`（ABI 4 / `ALLTOALL + CCU_SCHED`），且 `git fsck --full` 不报告
+预期 HEAD 至少包含 `a9eb52a`（ABI 5 / 原生 AllToAll Channel 资源布局），且 `git fsck --full` 不报告
 损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
@@ -128,7 +129,7 @@ lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 print("HCCL explicit-multipath ABI:", version())
-assert version() >= 4
+assert version() >= 5
 PY
 ```
 
@@ -221,7 +222,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 日志应包含：
 
 ```text
-Verified patched HCCL: ... extension=4
+Verified patched HCCL: ... extension=5
 Verified requested APIs: ... standard=True; DeepEP ABI=8
 PASS: implementation=standard ...
 ```
@@ -316,7 +317,7 @@ MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 W
 
 ## 11. 标准算子进入 HCCL 的正确路径
 
-ABI 4 修正后的控制链是：
+ABI 4/5 修正后的控制链是：
 
 ```text
 ExplicitMultipathAll2AllCcu host tiling
@@ -340,6 +341,19 @@ HcclAllocComResourceByTilingV2 ret=5
 
 这不是 relay EID、Channel 或 CCU kernel 的错误。ABI 4 删除了通用 selector 中针对
 `HALF_ALLTOALLV` 的提前劫持，也删除了该 op type 下的重复 template 注册。
+
+ABI 4 首次有卡运行已跨过上述 gate，但两个 rank 卡在 warmup 的 `torch.npu.synchronize()`。
+与原生 `ccu_kernel_all_to_all_mesh1d.cc` 对比后确认，HCCL provision 的 Channel 使用：
+
+```text
+XN 0 = peer input
+XN 1 = peer output
+XN 2 = peer token
+```
+
+旧自定义 kernel 沿用了 route-probe 的私有 `OUTPUT=0、TOKEN=1` 布局，导致把 peer input 当输出、
+把 peer output 当 token，并卡在 `PreSync/Write/EventWait`。ABI 5 改为原生 `OUTPUT=1、TOKEN=2`；
+运行脚本和 DeepEP C++ 都会拒绝 ABI 4，防止误用旧库。
 
 Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
 仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
@@ -445,7 +459,8 @@ sed -n '1,300p' "${TRACE_OUT}"
 
 | 日志特征 | 结论 |
 |---|---|
-| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 4`；重新执行第 4、5 节 |
+| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 5`；重新执行第 4、5 节 |
+| ABI 4、warmup 后卡在 `torch.npu.synchronize()` | 旧 CCU kernel 使用错误的 `OUTPUT=0/TOKEN=1`；更新到 ABI 5 并重编 HCCL |
 | `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
 | `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
 | `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
@@ -501,7 +516,7 @@ sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
 
 | 现象 | 处理 |
 |---|---|
-| HCCL extension `< 4` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
+| HCCL extension `< 5` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
 | DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 5 节 wheel |
 | opbuild 报 input dtype size 0 | `pathPolicy` 必须为 sendData 的 4 个 dtype 组合分别声明 `DT_INT64` |
 | `IsHcommDefaultTimeoutSupported` undefined | 先加载同目录 `libhccl_compat.so`，再加载 `libhccl.so` |
