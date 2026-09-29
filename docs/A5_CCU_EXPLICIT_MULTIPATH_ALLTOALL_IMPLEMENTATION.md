@@ -250,3 +250,72 @@ ABI 7 仍需有卡环境完成：
 2. ACLGraph capture/replay 正确性；
 3. replay 修改 policy 后的 HCCN 端口变化；
 4. 1/2/4/6 relay 性能和稳定性。
+
+## 10. 底层接口边界与替代架构
+
+### 10.1 本项目 ABI 不是厂商底层 ABI
+
+`A5HcclExplicitMultipathExtensionVersion()` 和 DeepEP attr ABI 是本项目自己的兼容性标记，
+作用是拒绝旧 HCCL、旧 wheel、旧 OPP 与新算子混装。ABI 4..7 分别记录 selector、资源槽、
+Channel 生命周期和完成通知的修正，不表示 CANN/HCOMM 额外暴露了 4..7 套接口。
+
+当前模板只依赖以下既有能力：
+
+| 层次 | 当前使用的接口或对象 | 是否由本项目新增 |
+|---|---|---|
+| HCCL 模板层 | `CcuKernelInfo`、`AlgResourceRequest`、`HcclChannelDesc` | 新增模板逻辑，不新增底层 ABI |
+| HCOMM Channel | `HcclChannelAcquire` | 否 |
+| HCOMM CCU 注册/执行 | `HcommCcuKernelRegister*`、`HcommCcuKernelLaunch` | 否 |
+| CCU primitive | `GetResByChannel`、`Write`、`EventWait`、`NotifyRecord/Wait` | 否 |
+| TP/MUE/固件 | TPN、`route_addr_idx`、私有 path object | 未直接访问，也没有公开修改接口 |
+
+ABI 7 中的 `POST_SYNC_ID=3` 是 notify 内部的 mask bit，真正使用的 notify 槽是
+`POST_SYNC_CKE=1`。原生 Channel 的 `NORMAL_NOTIFY_NUM=3` 已覆盖该槽，因此 ABI 7 没有要求
+底层新增“第 4 个 notify”。
+
+HCCL 的 9.1 兼容层以 weak symbol + `dlsym` 解析 HCOMM CCU 接口。这意味着：
+
+- 目标 `9.1.T560` 有这些符号时，修改开源 HCCL 模板是可行的；
+- 另一个 9.1 预览包可能缺少相同符号，所以必须锁定 CANN/HCOMM 版本；
+- 仅编译成功不能证明运行时支持；操作指南第 4.1、4.2 节的 preflight 才是运行前 gate；
+- 如果 preflight 已通过，而程序卡在 device synchronize，阻塞点是 CCU 指令/资源语义，
+  不是“底层 ABI 数量不足”。
+
+### 10.2 不修改核心 HCCL 的首选替代方案
+
+如果目标包不允许当前 HCCL 模板继续运行，首选迁移为独立 HCOMM 自定义通信算子插件：
+
+```text
+communicator/resource initialization
+  -> 根据 direct/relay EID 构造 HcclChannelDesc
+  -> HcclChannelAcquire
+  -> HcommCcuKernelRegister*
+  -> 缓存 plan/channel/kernel handles
+
+GE/ACLNN 可识别的通信算子
+  -> 输入 plan handle、path mask、weights 和 buffer
+  -> 通过 HCOMM 自定义通信算子资源上下文取得已准备资源
+  -> HcommCcuKernelLaunch
+
+CCU kernel
+  -> 先提交所有启用路径的 Write
+  -> 再统一 EventWait
+  -> 完成 NotifyRecord/NotifyWait
+```
+
+该结构不修改核心 `libhccl.so`，也不需要 HBM mailbox 或常驻 CCU worker；但仍依赖目标版本
+公开/可解析的 HCOMM CCU 接口，因此必须做相同的版本预检。
+
+### 10.3 如果 CCU 接口确实不可用
+
+严格的“标准算子 + CCU 数据面 + 显式 relay”无法只靠普通 Ascend C tiling/AIV kernel完成：
+tiling 阶段不能代替运行时创建 Channel，AIV kernel 也不能调用 host 侧 `HcclChannelAcquire`。
+此时只有以下降级路线：
+
+1. 标准 AICPU_TS/HCOMM 通信算子：继续显式构造 Channel，使用
+   `HcommWriteOnThread`/notify 原语，性能可能低于 CCU；
+2. 标准 AIV+URMA/UMDK CAM 算子：可保留显式 EID 多路径，但数据面不再是 CCU；
+3. 已验证的 prepared-plan + ACLGraph 方案：保留 CCU 和显式路径，但它不是完整标准通信算子。
+
+不再推荐 HBM mailbox + 常驻 CCU worker：现有穿刺没有确认公开、可靠的 AIV 到 CCU doorbell；
+也不推荐直接设置 TPN、`route_addr_idx` 或私有 path object，因为当前没有稳定公开接口。

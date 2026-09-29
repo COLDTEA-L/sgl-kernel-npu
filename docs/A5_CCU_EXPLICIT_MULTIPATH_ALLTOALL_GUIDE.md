@@ -197,6 +197,71 @@ working tree 没有额外 tracked 修改、index 又精确等于 `863b035`，才
 
 ## 4. 编译配套 HCCL
 
+### 4.1 先核对目标 CANN/HCOMM 是否提供 CCU 运行接口
+
+本项目中的 HCCL ABI 4/5/6/7 是自定义扩展版本号，只用于防止旧 HCCL、旧 wheel 和新算子
+混装；它们不是 CANN/HCOMM 提供的 4 组底层 ABI。当前实现真正依赖的是一组固定的 Channel、
+CCU kernel register/launch 和 CCU primitive 接口。
+
+不同的 CANN 9.1 预览包可能只安装头文件、只导出部分符号，或者依靠 `libhccl_compat.so`
+在运行时用 `dlsym` 解析接口。因此“源码编译通过”不能单独证明有卡环境可运行。先在实际
+`9.1.T560` 容器内执行以下预检：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+
+python3 - <<'PY'
+import ctypes
+from pathlib import Path
+
+candidates = [
+    Path("/usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so"),
+    Path("/usr/local/Ascend/cann-9.1.T560/aarch64-linux/lib64/libhcomm.so"),
+]
+path = next((item for item in candidates if item.is_file()), None)
+if path is None:
+    raise SystemExit(f"libhcomm.so not found; checked: {candidates}")
+
+lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+symbols = [
+    "HcclChannelAcquire",
+    "HcommCcuKernelRegisterStart",
+    "HcommCcuKernelRegister",
+    "HcommCcuKernelRegisterEnd",
+    "HcommCcuKernelLaunch",
+    "CcuVariableCreateByChannel",
+    "CcuNotifyRecord",
+    "CcuNotifyWait",
+    "CcuWriteVariableWithNotify",
+    "CcuWriteMemToMem",
+    "CcuEventWait",
+]
+
+missing = []
+print("libhcomm:", path)
+for name in symbols:
+    try:
+        getattr(lib, name)
+        print("FOUND  ", name)
+    except AttributeError:
+        missing.append(name)
+        print("MISSING", name)
+
+if missing:
+    print("WARNING: direct libhcomm export is incomplete:", ",".join(missing))
+    print("Continue with the libhccl_compat support-flag check below;")
+    print("do not interpret an HCCL build success as runtime support.")
+PY
+```
+
+如果 `libhcomm.so` 没有直接导出全部 CCU 符号，仍需在第 4.2 节编译 HCCL 后检查配套
+`libhccl_compat.so` 的运行时支持标志。`MISSING` 本身不等于硬件不支持；但如果 support flag
+也为 0，则本版本不能运行当前 CCU 模板，禁止继续仅通过增加本项目 ABI 版本号尝试规避。
+
+### 4.2 编译并检查配套 HCCL
+
 ```bash
 cd /home/l00934901/hccl
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
@@ -230,6 +295,59 @@ print("HCCL explicit-multipath ABI:", version())
 assert version() >= 7
 PY
 ```
+
+继续检查兼容层是否实际解析到了本模板依赖的 CCU 接口：
+
+```bash
+LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
+python3 - "${HCCL_RUNTIME}/libhccl_compat.so" \
+          "${HCCL_RUNTIME}/libhccl.so" <<'PY'
+import ctypes
+import sys
+
+compat = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
+ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
+
+checks = [
+    "HcommIsSupportHcommCcuKernelRegisterStart",
+    "HcommIsSupportHcommCcuKernelRegister",
+    "HcommIsSupportHcommCcuKernelRegisterEnd",
+    "HcommIsSupportHcommCcuKernelLaunch",
+    "HcommIsSupportCcuVariableCreateByChannel",
+    "HcommIsSupportCcuNotifyRecord",
+    "HcommIsSupportCcuNotifyWait",
+    "HcommIsSupportCcuWriteVariableWithNotify",
+    "HcommIsSupportCcuWriteMemToMem",
+    "HcommIsSupportCcuEventWait",
+]
+
+missing = []
+for name in checks:
+    try:
+        func = getattr(compat, name)
+    except AttributeError:
+        missing.append(f"{name}=NO_CHECK_SYMBOL")
+        continue
+    func.restype = ctypes.c_bool
+    supported = bool(func())
+    print(name, int(supported))
+    if not supported:
+        missing.append(f"{name}=0")
+
+if missing:
+    raise SystemExit("CCU runtime preflight failed: " + ", ".join(missing))
+print("CCU runtime preflight: PASS")
+PY
+```
+
+判定顺序：
+
+1. preflight PASS：可以继续 ABI 7 单 case；
+2. preflight PASS、但 ABI 7 卡在首次 device synchronize：说明接口存在，问题位于生成的
+   CCU 指令、Channel 生命周期或资源布局，不能解释为“底层没有 ABI”；
+3. preflight FAIL：停止当前 HCCL CCU 模板路线，转向实现说明中的 HCOMM 自定义通信算子或
+   AICPU_TS/AIV+URMA 后备方案；
+4. 不允许把 ABI 8、9 当作修复底层缺失符号的办法。
 
 不要把这套实验库覆盖到公共 CANN 目录。测试脚本通过 `--hccl-lib-dir` 只给本次子进程注入它。
 
