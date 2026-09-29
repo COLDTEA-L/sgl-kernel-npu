@@ -15,11 +15,11 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 6 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
+- 需要本分支配套的 HCCL 扩展 ABI 7 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
   `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
   `HALF_ALLTOALLV + CCU_MS`；ABI 5 进一步修正 HCCL 原生 AllToAll Channel 的资源槽位为
-  `INPUT=0、OUTPUT=1、TOKEN=2`；ABI 6 再对齐原生 AllToAll/MultiJetty 的完整 Channel
-  生命周期：所有已建 Channel 都参与 pre/post sync，远端 write 使用该 Channel 交换的 token。
+  `INPUT=0、OUTPUT=1、TOKEN=2`；ABI 6 对齐原生 AllToAll/MultiJetty 的完整 Channel
+  生命周期；ABI 7 进一步把完成通知改为原生 AllToAll 的 `POST_SYNC_ID=3`。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -40,7 +40,7 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少包含 `8581a20`（ABI 6 / 完整原生 AllToAll Channel 生命周期）。如果 `git status --short`
+预期 HEAD 至少包含 `8c0a4d3`（ABI 7 / 原生 `POST_SYNC_ID=3`）。如果 `git status --short`
 列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
 
 只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
@@ -75,7 +75,7 @@ git status --short
 git fsck --full
 ```
 
-预期 HEAD 至少包含 `8581a20`（ABI 6 / 完整原生 AllToAll Channel 生命周期），且 `git fsck --full` 不报告
+预期 HEAD 至少包含 `8c0a4d3`（ABI 7 / 原生 `POST_SYNC_ID=3`），且 `git fsck --full` 不报告
 损坏对象。不要从旧仓库执行
 `stash pop`，也不要复制旧 `.git`、源码或构建目录。
 
@@ -227,7 +227,7 @@ lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 print("HCCL explicit-multipath ABI:", version())
-assert version() >= 6
+assert version() >= 7
 PY
 ```
 
@@ -320,7 +320,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 日志应包含：
 
 ```text
-Verified patched HCCL: ... extension=6
+Verified patched HCCL: ... extension=7
 Verified requested APIs: ... standard=True; DeepEP ABI=8
 PASS: implementation=standard ...
 ```
@@ -455,7 +455,9 @@ XN 2 = peer token
 ABI 5 有卡运行仍卡在首次 warmup。进一步对比原生 AllToAll/MultiJetty 确认，所有已建
 Channel 都必须参与 pre/post sync，且 remote write 的 source/destination 必须使用该
 Channel 交换的 peer token。ABI 5 只对 channel 0 执行 post-sync，且 source 错用本地
-token。ABI 6 已对齐这两点；运行脚本和 DeepEP C++ 都会拒绝 ABI `< 6`。
+token。ABI 6 已对齐这两点，但仍错误沿用了 standalone route-probe 的完成位 `1<<5`；
+原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；运行脚本和
+DeepEP C++ 都会拒绝 ABI `< 7`。
 
 Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
 仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
@@ -561,13 +563,14 @@ sed -n '1,300p' "${TRACE_OUT}"
 
 | 日志特征 | 结论 |
 |---|---|
-| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 6`；重新执行第 4、5 节 |
+| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 7`；重新执行第 4、5 节 |
 | ABI 4、warmup 后卡在 `torch.npu.synchronize()` | 旧 CCU kernel 使用错误的 `OUTPUT=0/TOKEN=1`；更新到 ABI 5 并重编 HCCL |
 | ABI 5、warmup 后仍卡在 `torch.npu.synchronize()` | 所有 Channel 未完成 pre/post sync，remote source token 也未按 Channel 绑定；更新到 ABI 6 |
+| ABI 6、warmup 后仍卡在 `torch.npu.synchronize()` | 完成通知仍使用 route-probe 的 bit 5，未对齐原生 AllToAll 的 bit 3；更新到 ABI 7 |
 | `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
 | `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
 | `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
-| ABI `< 6` 或完全没有 `[ExplicitMultipath]` | manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
+| ABI `< 7` 或完全没有 `[ExplicitMultipath]` | manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
 | 已有 `provisioned N channels`，随后仍 `ret=5` | HCCL 已构造 Channel，失败在 MC2/libmc2_client 资源序列化或 instruction 生成 |
 | `CcuInstructions isEmpty` | 闭源 MC2 未识别新的 CCU instruction，与早期标准算子尝试的失败相同 |
 | `param.varMemSize ... invalid` | 固定 AllToAll 与 `HALFALLTOALLV` 资源协议不匹配 |
@@ -619,7 +622,7 @@ sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
 
 | 现象 | 处理 |
 |---|---|
-| HCCL extension `< 6` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
+| HCCL extension `< 7` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
 | DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 5 节 wheel |
 | opbuild 报 input dtype size 0 | `pathPolicy` 必须为 sendData 的 4 个 dtype 组合分别声明 `DT_INT64` |
 | `IsHcommDefaultTimeoutSupported` undefined | 先加载同目录 `libhccl_compat.so`，再加载 `libhccl.so` |
