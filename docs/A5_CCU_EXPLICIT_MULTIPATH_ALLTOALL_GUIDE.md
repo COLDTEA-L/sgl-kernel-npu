@@ -17,7 +17,44 @@
 - 不安装 `ubus.ko`，不修改全局 UB route table；
 - 需要本分支配套的 HCCL 扩展 ABI 3 和 DeepEP ABI 8。
 
-## 2. 拉取两个仓
+## 2. 清理有卡环境的旧 HCCL 工作区
+
+如果有卡环境的 HCCL 仓库保留了此前手工穿刺产生的已跟踪文件修改，先把它们放入 stash，
+再切到远端已提交的完整实现。旧修改只作为临时备份，不要在新分支上执行 `git stash pop`。
+
+如果首先报告 `.git/HEAD.lock`，必须确认没有 Git 进程仍在操作该仓库；确认是崩溃遗留锁后，
+将其移动到 `/tmp`，不要一开始就删除工作区文件：
+
+```bash
+cd /home/l00934901/hccl
+
+ps -ef | grep -E '[g]it( |$)|[g]it-'
+
+# 仅当上面确认没有活跃 Git 进程时执行。
+if test -f .git/HEAD.lock; then
+  mv .git/HEAD.lock "/tmp/hccl_HEAD.lock.$(date +%Y%m%d_%H%M%S)"
+fi
+```
+
+保存旧修改并同步远端分支：
+
+```bash
+cd /home/l00934901/hccl
+
+git stash push -m "obsolete-local-hccl-changes-before-c6e51b2"
+
+git fetch origin feature/a5-ccu-explicit-multipath-alltoall
+git switch feature/a5-ccu-explicit-multipath-alltoall
+git reset --keep origin/feature/a5-ccu-explicit-multipath-alltoall
+
+git rev-parse --short HEAD
+git status --short
+```
+
+预期 HCCL HEAD 至少包含提交 `c6e51b2`。确认新版本编译通过前保留 stash；编译通过后可用
+`git stash drop stash@{0}` 删除旧备份。
+
+## 3. 拉取两个仓
 
 ```bash
 cd /home/l00934901/hccl
@@ -31,7 +68,7 @@ git switch feature/a5-ccu-explicit-multipath-alltoall
 git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
 ```
 
-## 3. 编译配套 HCCL
+## 4. 编译配套 HCCL
 
 ```bash
 cd /home/l00934901/hccl
@@ -69,7 +106,7 @@ PY
 
 不要把这套实验库覆盖到公共 CANN 目录。测试脚本通过 `--hccl-lib-dir` 只给本次子进程注入它。
 
-## 4. 编译标准算子和 DeepEP wheel
+## 5. 编译标准算子和 DeepEP wheel
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -107,7 +144,7 @@ assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
 PY
 ```
 
-## 5. PathPolicy 格式
+## 6. PathPolicy 格式
 
 `pathPolicy` 是设备上的 `[1]`、`int64` Tensor：
 
@@ -130,7 +167,7 @@ direct 数据量 : 每一条 relay 数据量 = 2 : 1
 
 因此 direct + 2 relay 使用 `2,1,1`，不是 `4,1,1`。
 
-## 6. 快速单 case
+## 7. 快速单 case
 
 下面以物理卡 `2,3` 为通信端点、`0,1` 为 relay：
 
@@ -161,7 +198,7 @@ Verified requested APIs: ... standard=True; DeepEP ABI=8
 PASS: implementation=standard ...
 ```
 
-## 7. ACLGraph capture/replay 与动态选路
+## 8. ACLGraph capture/replay 与动态选路
 
 该实验第一次执行使用 `2,1,1`，replay 前把稳定地址的 policy Tensor 原地改为 `2,0,1`，即关闭
 relay 0、保留 direct 和 relay 1：
@@ -203,7 +240,7 @@ CASE_DYNAMIC_PATH_POLICY ... weights=[2, 0, 1]
 这证明 policy 是 replay 时从设备 Tensor 读取，而非固化在 host tiling。数据正确性只能证明动态图执行
 正确；若要证明被关闭的 relay 确实无 payload，需同时采 HCCN 端口计数。
 
-## 8. 性能矩阵
+## 9. 性能矩阵
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
@@ -229,7 +266,7 @@ sed -n '1,240p' "${RUN_DIR}/explicit_multipath_perf_report.md"
 grep -RHnE 'PASS:|CASE_FAILURE|ExplicitMultipath' "${RUN_DIR}/cases"
 ```
 
-## 9. 只采多路径 profiling
+## 10. 只采多路径 profiling
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
@@ -249,7 +286,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 Write，不能用 launch 数量推断
 物理路径数量；relay 身份仍以 manifest 和 HCCN 端口计数为准。
 
-## 10. 常见故障
+## 11. 常见故障
 
 | 现象 | 处理 |
 |---|---|
