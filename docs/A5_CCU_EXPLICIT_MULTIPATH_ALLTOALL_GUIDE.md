@@ -90,6 +90,8 @@ fi
 
 ## 3. 拉取 sgl-kernel-npu
 
+### 3.1 正常拉取（没有 HEAD.lock 时）
+
 正常且干净的仓库使用下面的快进流程：
 
 ```bash
@@ -105,15 +107,37 @@ git status --short
 ```
 
 预期 HEAD 至少为 `863b035`。如果提示 `.git/HEAD.lock` 存在，不要继续重复
-`pull`；先确认没有活跃 Git 进程：
+`pull`，改为执行 3.2。
+
+### 3.2 从 HEAD.lock 和中断的 fast-forward 恢复
+
+#### 3.2-A 检查并结束遗留 Git 进程
+
+先查看进程的 PID、状态和持续时间：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-ps -ef | grep -E '[g]it( |$)|[g]it-'
+ps -eo pid,ppid,stat,etime,args | grep -E '[g]it( |$)|[g]it-'
 ```
 
-如果上面没有输出，说明 lock 是崩溃进程遗留的。先保留 lock 和当前两份 diff，
-不删除任何未跟踪文件：
+如果输出的是已经卡住、不再需要的 `git fetch` / `git switch` / `git-remote-https`，
+先在命令中填入实际 PID，例如本次是 `6857 6858 6859 6860 6876`：
+
+```bash
+STALE_GIT_PIDS="6857 6858 6859 6860 6876"
+
+kill -TERM ${STALE_GIT_PIDS} 2>/dev/null || true
+sleep 2
+
+ps -eo pid,ppid,stat,etime,args | grep -E '[g]it( |$)|[g]it-'
+```
+
+不同次运行的 PID 会变；不要盲目复用示例 PID。如果最后一条命令仍显示正在正常执行的
+Git 操作，先停止，不要移动 lock。只有确认没有需要保留的 Git 进程后才继续。
+
+#### 3.2-B 保留 lock 和 diff
+
+将 lock 移到 `/tmp` 并保留当前两份 diff；这一步不删除任何未跟踪文件：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -126,7 +150,9 @@ git diff > "/tmp/sgl-kernel-npu_worktree.${STAMP}.patch"
 git diff --cached > "/tmp/sgl-kernel-npu_index.${STAMP}.patch"
 ```
 
-然后获取远端并检查是否属于“快进内容已写入 index，只有 HEAD 没有更新”：
+#### 3.2-C 确认中间状态并恢复 HEAD
+
+获取远端并检查是否属于“快进内容已写入 index，只有 HEAD 没有更新”：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
