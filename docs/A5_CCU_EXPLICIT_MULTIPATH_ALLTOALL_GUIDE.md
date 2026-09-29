@@ -15,7 +15,9 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 3 和 DeepEP ABI 8。
+- 需要本分支配套的 HCCL 扩展 ABI 4 和 DeepEP ABI 8。ABI 4 的关键变化是标准算子通过
+  `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
+  `HALF_ALLTOALLV + CCU_MS`。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -105,7 +107,7 @@ lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5HcclExplicitMultipathExtensionVersion
 version.restype = ctypes.c_int
 print("HCCL explicit-multipath ABI:", version())
-assert version() >= 3
+assert version() >= 4
 PY
 ```
 
@@ -198,7 +200,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 日志应包含：
 
 ```text
-Verified patched HCCL: ... extension=3
+Verified patched HCCL: ... extension=4
 Verified requested APIs: ... standard=True; DeepEP ABI=8
 PASS: implementation=standard ...
 ```
@@ -291,7 +293,65 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 Write，不能用 launch 数量推断
 物理路径数量；relay 身份仍以 manifest 和 HCCN 端口计数为准。
 
-## 11. `HcclAllocComResourceByTiling ret=5` 定向检查
+## 11. 标准算子进入 HCCL 的正确路径
+
+ABI 4 修正后的控制链是：
+
+```text
+ExplicitMultipathAll2AllCcu host tiling
+  -> opType = HCCL_CMD_ALLTOALL
+  -> commEngine = CCU_SCHED (6)
+  -> HcclAllocComResourceByTilingV2
+  -> AlltoAllAutoSelector::SelectCcuScheduleAlgo
+  -> CcuExplicitMultipathAllToAll2Rank
+  -> CcuTempExplicitMultipathAllToAll::CalcRes
+  -> direct + 显式 relay Channel catalog
+  -> custom CCU kernel
+```
+
+旧 ABI 3 使用 `HALF_ALLTOALLV + CCU_MS (5)`。有卡日志已经证明它会在 selector 之前被
+`communicator_impl.cc:GetTilingAccelerator` 拒绝：
+
+```text
+Tiling hcclAccelerator not support, hcclAccelerator[HcclAccelerator::CCU_MS]
+HcclAllocComResourceByTilingV2 ret=5
+```
+
+这不是 relay EID、Channel 或 CCU kernel 的错误。ABI 4 删除了通用 selector 中针对
+`HALF_ALLTOALLV` 的提前劫持，也删除了该 op type 下的重复 template 注册。
+
+Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
+仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
+
+### 11.1 首次最小验证
+
+完成第 4、5 节的重新编译后，先跑第 7 节单 case，然后检查：
+
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multipath_* | head -1)
+LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+grep -nE \
+'selector MATCH|CalcRes begin|CalcRes ready|provisioned|KernelRun begin|CASE_FAILURE|PASS:' \
+"${LOG}"
+```
+
+若普通 case log 没包含 HCCL INFO 日志，再按 11.2 收集对应 plog。成功路径至少应依次看到：
+
+```text
+[ExplicitMultipath] selector MATCH ... opType[10] executeConfig[6]
+[ExplicitMultipath] CalcRes begin ...
+[ExplicitMultipath] provisioned 3 channels (direct + 2 relays)
+[ExplicitMultipath] CalcRes ready ... paths[3]
+[ExplicitMultipath] KernelRun begin ...
+PASS: implementation=standard ...
+```
+
+其中 `opType[10]` 对应本仓枚举里的 `HCCL_CMD_ALLTOALL`；以符号和日志语义为准，不要把
+数字 10 与 route index 混淆。
+
+### 11.2 失败时收集 HCCL/MC2 边界日志
 
 如果标准算子在第一次 warmup 失败，且日志包含：
 
@@ -303,8 +363,6 @@ ret = 5
 说明失败发生在 MC2/HCCL 通信资源分配阶段，还没有进入 CCU kernel 和
 `WriteNb`。当前 HCCL 错误码中 `5` 为 `HCCL_E_NOT_SUPPORT`。不要先调整数据切分、
 path weight 或性能参数，先执行下面两组检查。
-
-### 11.1 收集 HCCL/MC2 资源分配边界日志
 
 下面的命令会自动选择最新的显式多路径运行目录；不要把
 `YYYYMMDD_HHMMSS` 当成实际目录名执行。如需检查更早的运行，再将第一行手工改成该目录的完整路径。
@@ -354,7 +412,7 @@ TRACE_OUT="${RUN_DIR}/hccl_resource_failure_trace.txt"
 
 while IFS= read -r file; do
   grep -HnE \
-'ExplicitMultipath|CcuExplicit|HALF.*ALLTOALL|Select|CalcRes|BuildExplicitChannels|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
+'ExplicitMultipath|CcuExplicit|ALLTOALL|CCU_MS|CCU_SCHED|GetTilingAccelerator|Select|CalcRes|BuildExplicitChannels|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
   "${file}" >> "${TRACE_OUT}" 2>/dev/null || true
 done < "${PLOG_LIST}"
 
@@ -366,14 +424,16 @@ sed -n '1,300p' "${TRACE_OUT}"
 
 | 日志特征 | 结论 |
 |---|---|
+| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 4`；重新执行第 4、5 节 |
+| `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
 | `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
 | `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
-| 完全没有 `[ExplicitMultipath]` | 自定义 selector 没有选中，或 manifest/plan 环境变量未传入 worker |
+| ABI 为 4 但完全没有 `[ExplicitMultipath]` | manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
 | 已有 `provisioned N channels`，随后仍 `ret=5` | HCCL 已构造 Channel，失败在 MC2/libmc2_client 资源序列化或 instruction 生成 |
 | `CcuInstructions isEmpty` | 闭源 MC2 未识别新的 CCU instruction，与早期标准算子尝试的失败相同 |
 | `param.varMemSize ... invalid` | 固定 AllToAll 与 `HALFALLTOALLV` 资源协议不匹配 |
 
-### 11.2 核对实际传入 HCCL 的 relay plan
+### 11.3 核对实际传入 HCCL 的 relay plan
 
 这一段可以脱离 11.1 单独复制执行，因此会重新自动确定 `RUN_DIR`：
 
@@ -412,16 +472,15 @@ sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
 - plan id 是否与用例日志中传入的 plan id 一致；
 - 不要将 HCCL extension 版本检查通过解释为 MC2 已接受自定义 CCU template。
 
-如果 11.1 已证明 `provisioned N channels`，而资源分配仍失败，下一步应改为复用
-MC2 已支持的原生 AllToAllV/MultiJetty CCU instruction schema，只在 HCCL 资源构造阶段
-注入显式 direct/relay ChannelDesc；不要继续要求闭源 `libmc2_client.so` 识别新的
-CCU kernel/instruction 类型。
+如果已经出现 `selector MATCH` 而未出现 `CalcRes begin`，问题位于 selector 到 executor/template
+注册之间；如果出现 `CalcRes ready` 后失败，才进入 Channel 资源序列化或 CCU instruction 生成范围。
+不要再回退到 `HALF_ALLTOALLV + CCU_MS`。
 
 ## 12. 常见故障
 
 | 现象 | 处理 |
 |---|---|
-| HCCL extension `< 3` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
+| HCCL extension `< 4` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
 | DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 5 节 wheel |
 | opbuild 报 input dtype size 0 | `pathPolicy` 必须为 sendData 的 4 个 dtype 组合分别声明 `DT_INT64` |
 | `IsHcommDefaultTimeoutSupported` undefined | 先加载同目录 `libhccl_compat.so`，再加载 `libhccl.so` |

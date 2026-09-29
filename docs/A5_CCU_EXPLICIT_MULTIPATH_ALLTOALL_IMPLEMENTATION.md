@@ -32,7 +32,7 @@ Python/controller
 DeepEP C++
   Buffer::explicit_multipath_all2all_ccu
   - 校验 2 ranks、dtype、policy=[1]int64/NPU
-  - 校验 HCCL extension ABI >= 3
+  - 校验 HCCL extension ABI >= 4
   - 校验 plan_id/manifest 在 communicator 初始化前已设置
     |
     v
@@ -57,13 +57,15 @@ ACLNN
     |
     v
 MC2/HCCL resource path
-  HCCL_CMD_HALF_ALLTOALLV（A5 可用的 CCU resource entry）
+  HCCL_CMD_ALLTOALL
+  OpExecuteConfig = CCU_SCHED (6)
   OpParam.DataDes.strideCount = policyWord
     |
     v
 HCCL selector
   AutoSelectorBase::Select
-  - 检测 MC2 + manifest + plan_id + 2 ranks
+  -> AlltoAllAutoSelector::SelectCcuScheduleAlgo
+  - 检测 ALLTOALL + CCU_SCHED + manifest + plan_id + 2 ranks
   - 选择 CcuExplicitMultipathAllToAll2Rank
     |
     v
@@ -92,6 +94,10 @@ CCU kernel
 ```
 
 并发的因果保证是：所有 active Channel 的 `Write` 都先提交，再开始任何远端 `EventWait`。
+
+这里不把显式路径塞进原生 MultiJetty。MultiJetty 证明固定 AllToAll 的合法资源入口是
+`ALLTOALL + CCU_SCHED`，但它没有公开 `jetty index -> EID/relay` 映射；因此最终数据面仍是
+direct/每条 relay 各自一个 `HcclChannelDesc`，由自定义 CCU kernel 并发提交。
 
 ## 3. 标准算子接口
 
@@ -197,6 +203,10 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 - `src/ops/all_to_all_v/template/ccu/ccu_temp_explicit_multipath_alltoall.*`
 - `src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_explicit_multipath_alltoall.*`
 
+其中 `auto_selector_base.cc` 不再包含显式多路径的 `HALF_ALLTOALLV` 特判；路径选择只位于
+`AlltoallAutoSelector::SelectCcuScheduleAlgo`。executor 也只在 `HCCL_CMD_ALLTOALL` 下注册该模板，
+避免一个固定 AllToAll 模板被两个不兼容的资源协议同时命中。
+
 ## 8. 生命周期与扩展性
 
 - communicator 初始化：创建完整 direct/relay Channel catalog；
@@ -212,13 +222,19 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 已在 `cam_lyw_dev_91` 完成：
 
 - HCCL host/CCU 源码完整编译、链接和 run-package 打包；
-- HCCL extension ABI 3 装载验证；
+- HCCL extension ABI 4 装载验证；
 - 标准 opbuild、4 个 dtype kernel、custom OPP 打包；
 - DeepEP C++ extension 和 wheel 编译；
 - wheel 在容器内 force-reinstall，DeepEP ABI 8 装载成功；
 - 安装后容器仍保持运行。
 
-仍需有卡环境完成：
+有卡环境已经完成、并直接推动本次修正的验证：
+
+- ABI 3 的 `HALF_ALLTOALLV + CCU_MS` 在 `GetTilingAccelerator` 阶段返回
+  `HCCL_E_NOT_SUPPORT (5)`，尚未进入 selector；
+- relay plan 本身完整，`src/dst/relay die` 与 EID 均已解析，不能用 plan 问题解释上述失败。
+
+ABI 4 仍需有卡环境完成：
 
 1. 标准算子单次正确性；
 2. ACLGraph capture/replay 正确性；

@@ -69,6 +69,9 @@ constexpr char HCCL_DETERMINISTIC[] = "HCCL_DETERMINISTIC";
 
 constexpr uint8_t AIV_ENGINE = 3;
 constexpr uint8_t A5_CCU_ENGINE = 5;
+// HCCL OpExecuteConfig::CCU_SCHED.  Fixed-size AllToAll is not supported by
+// CCU_MS (5); it must enter the native CCU scheduler/resource path with 6.
+constexpr uint8_t A5_CCU_SCHED_ENGINE = 6;
 constexpr uint8_t Y_INDEX = 3;
 constexpr uint8_t COMM_ALG_DEFAULT = 0;
 constexpr uint8_t COMM_ALG_FULL_MESH = 1;
