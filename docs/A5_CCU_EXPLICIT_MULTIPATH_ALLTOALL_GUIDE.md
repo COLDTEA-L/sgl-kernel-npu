@@ -314,6 +314,18 @@ CASE_PROFILE_LAUNCH_MODE ... mode=complete_each_prepared_invocation
 AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化；CCU kernel 内仍然是所有
 `WriteNb` 提交后才统一等待。
 
+正式计时的 20 次同时就是 profiler 采集的 20 次，不会先计时 20 次、再额外运行 20 次。
+因此上述命令在图外 plan 初始化完成后总共执行：
+
+```text
+100 次独立且完成的 warmup
++ 20 次独立且完成的正式计时/profiling
+= 120 次 AllToAll
+```
+
+启用 `--profile` 时，`--iters` 必须与 `--profile-iters` 相等；不一致会在启动前报参数错误，
+防止性能报告与 profiling 样本数不一致。
+
 如果日志在 profiler 启动前就于 `warmup_correctness` 报 100% 数据不一致，且没有上述
 `CASE_PROFILE_LAUNCH_MODE`，说明测试脚本仍是旧版本；这不是 `msprof` 初始化错误。先拉取包含
 该门禁的最新分支，再重新运行第 8 节。

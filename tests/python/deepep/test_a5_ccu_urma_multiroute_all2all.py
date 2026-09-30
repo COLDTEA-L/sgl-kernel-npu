@@ -257,6 +257,11 @@ def parse_args():
         parser.error("--bytes must be a positive multiple of sizeof(float)")
     if args.warmup < 0 or args.iters <= 0 or args.profile_iters <= 0:
         parser.error("invalid warmup/iters/profile-iters")
+    if args.profile and args.profile_iters != args.iters:
+        parser.error(
+            "profiling measures the same formal iterations as --iters; "
+            "set --profile-iters equal to --iters"
+        )
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
     if args.compile_backend != "none" and args.implementation not in ("prepared", "standard"):
@@ -573,12 +578,24 @@ def main():
     torch.testing.assert_close(recv, expected)
     file_barrier(sync_dir, "warmup_done", rank, world_size)
 
-    mark_phase("timing")
+    profiler = None
+    profile_dir = None
+    if args.profile:
+        mark_phase("profiling")
+        profile_dir = (Path(args.profile_root) /
+                       f"a5_ccu_alltoall_{case_tag}_{run_id}" / f"rank{rank}")
+        profiler = make_profiler(profile_dir, rank)
+        profiler.start()
+    else:
+        mark_phase("timing")
     torch.npu.synchronize()
     begin = time.perf_counter()
     run_repeated(args.iters)
     torch.npu.synchronize()
     average_us = (time.perf_counter() - begin) * 1e6 / args.iters
+    if profiler is not None:
+        profiler.stop()
+        print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
     torch.testing.assert_close(recv, expected)
 
     (sync_dir / f"average.rank{rank}.json").write_text(json.dumps(average_us))
@@ -586,18 +603,6 @@ def main():
     averages = [json.loads((sync_dir / f"average.rank{item}.json").read_text())
                 for item in range(world_size)]
     result_us = max(averages)
-
-    if args.profile:
-        mark_phase("profiling")
-        profile_dir = (Path(args.profile_root) /
-                       f"a5_ccu_alltoall_{case_tag}_{run_id}" / f"rank{rank}")
-        profiler = make_profiler(profile_dir, rank)
-        profiler.start()
-        run_repeated(args.profile_iters)
-        torch.npu.synchronize()
-        profiler.stop()
-        print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
-        torch.testing.assert_close(recv, expected)
 
     if rank == 0:
         result = {
