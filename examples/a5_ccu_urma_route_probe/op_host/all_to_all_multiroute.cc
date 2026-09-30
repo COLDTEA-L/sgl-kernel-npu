@@ -273,11 +273,11 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    // Version 7 additionally uses the native AllToAll notify layout: output
-    // and token occupy two bits in one pre-sync slot, while every route uses
-    // the native post-sync bit in a second slot.  This keeps repeated launches
-    // from accumulating independent notify-slot state.
-    return 7;
+    // Version 8 keeps the T560 object API's independently provisioned
+    // output/token/completion notify slots and synchronizes every route.  It
+    // also pairs with per-iteration diagnostics in the host test.  The newer
+    // primitive API's combined bitmask layout is not valid for this provider.
+    return 8;
 }
 
 namespace {

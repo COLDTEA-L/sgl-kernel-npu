@@ -4,13 +4,10 @@ namespace a5_ccu_urma_probe {
 namespace {
 constexpr uint32_t OUTPUT_VAR_INDEX = 0;
 constexpr uint32_t TOKEN_VAR_INDEX = 1;
-constexpr uint32_t PRE_SYNC_NOTIFY_INDEX = 0;
-constexpr uint32_t POST_SYNC_NOTIFY_INDEX = 1;
-constexpr uint32_t OUTPUT_MASK = 1U << OUTPUT_VAR_INDEX;
-constexpr uint32_t TOKEN_MASK = 1U << TOKEN_VAR_INDEX;
-constexpr uint32_t PRE_SYNC_MASK = OUTPUT_MASK | TOKEN_MASK;
-// Native HCCL AllToAll reserves one non-address bit for the post-sync phase.
-constexpr uint32_t POST_SYNC_MASK = 1U << 5;
+constexpr uint32_t OUTPUT_NOTIFY_INDEX = 0;
+constexpr uint32_t TOKEN_NOTIFY_INDEX = 1;
+constexpr uint32_t COMPLETION_NOTIFY_INDEX = 2;
+constexpr uint32_t NOTIFY_MASK = 1;
 constexpr size_t MAX_EXPLICIT_PATHS = 64U;
 
 #define CCU_KERNEL_CHECK(expression) do { \
@@ -30,7 +27,7 @@ AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
 hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append("A5CcuUrmaMultiRouteAllToAllV4");
+    signature.Append("A5CcuUrmaMultiRouteAllToAllV5");
     signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
     for (const uint32_t routeIndex : routeIndices_) {
         signature.Append(routeIndex);
@@ -79,13 +76,14 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         remoteOutputs.emplace_back(); remoteTokens.emplace_back();
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], OUTPUT_VAR_INDEX, &remoteOutputs.back()));
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], TOKEN_VAR_INDEX, &remoteTokens.back()));
-        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], PRE_SYNC_NOTIFY_INDEX, OUTPUT_VAR_INDEX,
-                                      output, OUTPUT_MASK));
-        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], PRE_SYNC_NOTIFY_INDEX, TOKEN_VAR_INDEX,
-                                      outputToken, TOKEN_MASK));
+        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], OUTPUT_NOTIFY_INDEX, OUTPUT_VAR_INDEX,
+                                      output, NOTIFY_MASK));
+        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], TOKEN_NOTIFY_INDEX, TOKEN_VAR_INDEX,
+                                      outputToken, NOTIFY_MASK));
     }
     for (const ChannelHandle channel : channels_) {
-        CCU_KERNEL_CHECK(NotifyWait(channel, PRE_SYNC_NOTIFY_INDEX, PRE_SYNC_MASK));
+        CCU_KERNEL_CHECK(NotifyWait(channel, OUTPUT_NOTIFY_INDEX, NOTIFY_MASK));
+        CCU_KERNEL_CHECK(NotifyWait(channel, TOKEN_NOTIFY_INDEX, NOTIFY_MASK));
     }
 
     hcomm::CcuRep::LocalAddr localSource = CreateLocalAddr();
@@ -126,10 +124,10 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
     // while writes issued on the other channels are still becoming visible.
     // This mirrors the native HCCL AllToAll/MultiJetty post-sync protocol.
     for (const ChannelHandle channel : channels_) {
-        CCU_KERNEL_CHECK(NotifyRecord(channel, POST_SYNC_NOTIFY_INDEX, POST_SYNC_MASK));
+        CCU_KERNEL_CHECK(NotifyRecord(channel, COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
     }
     for (const ChannelHandle channel : channels_) {
-        CCU_KERNEL_CHECK(NotifyWait(channel, POST_SYNC_NOTIFY_INDEX, POST_SYNC_MASK));
+        CCU_KERNEL_CHECK(NotifyWait(channel, COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
     }
     return HCCL_SUCCESS;
 }
