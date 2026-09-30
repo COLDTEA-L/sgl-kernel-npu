@@ -17,6 +17,7 @@ def main():
     args = parser.parse_args()
 
     samples = {}
+    measurement_modes = {}
     missing = []
     for log in sorted((args.run_dir / "cases").glob("*.log")):
         match = RESULT_RE.search(log.read_text(errors="replace"))
@@ -26,6 +27,9 @@ def main():
         result = json.loads(match.group(1))
         case = re.sub(r"_r\d+$", "", log.stem)
         samples.setdefault(case, []).append(float(result["host_batch_avg_us"]))
+        measurement_modes.setdefault(case, set()).add(
+            result.get("measurement_mode", "legacy_unspecified")
+        )
 
     expected = []
     status_path = args.run_dir / "case_status.tsv"
@@ -42,6 +46,7 @@ def main():
         values = samples.get(case, [])
         rows.append({
             "case": case,
+            "measurement_mode": ",".join(sorted(measurement_modes.get(case, {"NA"}))),
             "samples": len(values),
             "median_us": statistics.median(values) if values else None,
             "min_us": min(values) if values else None,
@@ -63,13 +68,16 @@ def main():
         "they are not UDMA route_addr_idx values.",
         "- explicit cases use one direct Channel plus the named relay Channels.",
         "- direct path bytes : each relay path bytes = `2:1`.", "",
-        "| case | samples | median_us | min_us | max_us |", "|---|---:|---:|---:|---:|",
+        "- `prepared_eager` measures the operator without graph capture; `aclgraph_replay` "
+        "measures replay after capture has completed.", "",
+        "| case | measurement_mode | samples | median_us | min_us | max_us |",
+        "|---|---|---:|---:|---:|---:|",
     ]
     for row in rows:
         def fmt(value):
             return "NA" if value is None else f"{value:.3f}"
         lines.append(
-            f"| {row['case']} | {row['samples']} | {fmt(row['median_us'])} | "
+            f"| {row['case']} | {row['measurement_mode']} | {row['samples']} | {fmt(row['median_us'])} | "
             f"{fmt(row['min_us'])} | {fmt(row['max_us'])} |"
         )
     if missing:

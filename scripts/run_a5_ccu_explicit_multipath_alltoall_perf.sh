@@ -57,6 +57,13 @@ case "${graph_backend}" in
     *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
 esac
 
+case "${graph_backend}" in
+    none) measurement_mode=eager_no_graph ;;
+    aclgraph) measurement_mode=aclgraph_replay ;;
+    *) measurement_mode="torch_compile_${graph_backend}" ;;
+esac
+echo "Measurement mode: ${measurement_mode} (graph capture is never included in timed iterations)"
+
 [[ "${src_phy}" =~ ^[0-9]+$ && "${dst_phy}" =~ ^[0-9]+$ ]] || {
     echo "--src-phy and --dst-phy are required" >&2; exit 2;
 }

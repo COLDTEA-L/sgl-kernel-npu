@@ -181,6 +181,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --relay-phys 0,1 \
   --direct-route 0 \
   --cases direct_plus_relays \
+  --graph-backend none \
   --bytes 4194304 \
   --warmup 1 --iters 1 --repeats 1 \
   --timeout-seconds 300 \
@@ -217,7 +218,7 @@ grep -nE \
 ## 6. ACLGraph capture/replay
 
 plan 必须在 capture stream 上图外准备。测试程序已经这样做；capture/replay 中不会
-Acquire Channel 或注册 kernel：
+Acquire Channel 或注册 kernel。本节用于验证“可入图”，不作为裸算子性能结论：
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
@@ -252,6 +253,9 @@ grep -nE \
 - replay 窗口内不能再次出现 Channel Acquire/kernel register；
 - send tensor 在 replay 前被修改，结果校验通过，因此不是复用旧输出。
 
+capture 和第一次校验 replay 都位于性能计时窗口之前。如果需要测图模式稳态性能，
+本命令后续的 `warmup/iters` 测到的是 `aclgraph_replay`，而不是 capture 时间。
+
 当前 `path_weights` 是图常量。eager 调用可以对同一 plan 传另一组正权重；ACLGraph
 需要为另一组权重 capture 另一张图。`--replay-path-weights` 对 prepared case 会直接报错，
 避免把未生效的策略更新误判为动态选路。权重 0 暂不开放，因为 T560 对零字节
@@ -259,19 +263,23 @@ grep -nE \
 
 ## 7. relay 数量和性能矩阵
 
+裸算子通信性能统一使用 `--graph-backend none`。这不会执行 ACLGraph capture，
+结果中会标记 `measurement_mode=prepared_eager`。每一次 prepared AllToAll 完成后才会
+进入下一次，避免把异步批量排队吞吐误当成单次通信延迟。
+
 `direct_plus_relays` 使用 `--relay-phys` 中的全部 relay，支持 1..12 张，不要求偶数：
 
 ```bash
 # 1 条 relay
---relay-phys 0 --cases direct_plus_relays
+--relay-phys 0 --cases direct_plus_relays --graph-backend none
 
 # 3 条 relay
---relay-phys 0,1,4 --cases direct_plus_relays
+--relay-phys 0,1,4 --cases direct_plus_relays --graph-backend none
 
 # 固定性能矩阵别名
---relay-phys 4,5 --cases direct_plus_2relay
---relay-phys 4,5,1,0 --cases direct_plus_4relay
---relay-phys 4,5,1,0,6,7 --cases direct_plus_6relay
+--relay-phys 4,5 --cases direct_plus_2relay --graph-backend none
+--relay-phys 4,5,1,0 --cases direct_plus_4relay --graph-backend none
+--relay-phys 4,5,1,0,6,7 --cases direct_plus_6relay --graph-backend none
 ```
 
 默认权重为：
@@ -292,6 +300,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --relay-phys 0,1 \
   --direct-route 0 \
   --cases direct_plus_relays \
+  --graph-backend none \
   --bytes 4194304 \
   --warmup 100 --iters 20 --repeats 1 \
   --profile --profile-iters 20 \
@@ -306,7 +315,8 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 profiling harness 会在每次 prepared-plan 调用后执行一次 NPU synchronize，并打印：
 
 ```text
-CASE_PROFILE_LAUNCH_MODE ... mode=complete_each_prepared_invocation
+CASE_LAUNCH_COMPLETION ... mode=complete_each_prepared_invocation
+CASE_MEASUREMENT_MODE ... mode=prepared_eager capture_in_timing=0
 ```
 
 这是为了让 100 次 warmup 表示 100 个已经完成的样本，而不是一次性排队 100 个复用
@@ -327,7 +337,7 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 防止性能报告与 profiling 样本数不一致。
 
 如果日志在 profiler 启动前就于 `warmup_correctness` 报 100% 数据不一致，且没有上述
-`CASE_PROFILE_LAUNCH_MODE`，说明测试脚本仍是旧版本；这不是 `msprof` 初始化错误。先拉取包含
+`CASE_LAUNCH_COMPLETION`，说明测试脚本仍是旧版本；这不是 `msprof` 初始化错误。先拉取包含
 该门禁的最新分支，再重新运行第 8 节。
 
 ## 9. 常见故障

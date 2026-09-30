@@ -470,15 +470,15 @@ def main():
         else:
             buffer.ccu_urma_multiroute_alltoall_out(send, recv)
 
-    # Profiling wants many completed samples, not one batch containing many
-    # outstanding launches that all reuse the same Channel notify/event set
-    # and output buffer.  Completing each prepared-plan invocation does not
-    # serialize the direct/relay paths inside that invocation: the CCU kernel
-    # still submits every path's WriteNb before waiting for any path event.
-    profile_sync_each = args.profile and args.implementation == "prepared"
-    if profile_sync_each:
+    # A prepared-plan performance sample is one completed AllToAll invocation,
+    # not one host-side enqueue into a batch of outstanding launches that reuse
+    # the same Channel notify/event set and output buffer.  Completing each
+    # invocation does not serialize the direct/relay paths inside it: the CCU
+    # kernel still submits every path's WriteNb before waiting for any event.
+    complete_each_invocation = args.implementation == "prepared"
+    if complete_each_invocation:
         print(
-            f"CASE_PROFILE_LAUNCH_MODE rank={rank} "
+            f"CASE_LAUNCH_COMPLETION rank={rank} "
             "mode=complete_each_prepared_invocation",
             flush=True,
         )
@@ -486,7 +486,7 @@ def main():
     def run_repeated(count):
         for _ in range(count):
             run_op()
-            if profile_sync_each:
+            if complete_each_invocation:
                 torch.npu.synchronize()
 
     run_id = sanitize(
@@ -578,6 +578,18 @@ def main():
     torch.testing.assert_close(recv, expected)
     file_barrier(sync_dir, "warmup_done", rank, world_size)
 
+    if args.compile_backend == "aclgraph":
+        measurement_mode = "aclgraph_replay"
+    elif args.compile_backend == "none":
+        measurement_mode = "prepared_eager" if args.implementation == "prepared" else "eager"
+    else:
+        measurement_mode = f"torch_compile_{args.compile_backend}"
+    print(
+        f"CASE_MEASUREMENT_MODE rank={rank} mode={measurement_mode} "
+        f"capture_in_timing=0",
+        flush=True,
+    )
+
     profiler = None
     profile_dir = None
     if args.profile:
@@ -620,6 +632,7 @@ def main():
             "synthetic_route_manifest": args.synthetic_route_manifest or "",
             "relay_manifest": relay_manifest,
             "compile_backend": args.compile_backend,
+            "measurement_mode": measurement_mode,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "
