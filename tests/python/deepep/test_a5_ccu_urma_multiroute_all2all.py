@@ -465,6 +465,25 @@ def main():
         else:
             buffer.ccu_urma_multiroute_alltoall_out(send, recv)
 
+    # Profiling wants many completed samples, not one batch containing many
+    # outstanding launches that all reuse the same Channel notify/event set
+    # and output buffer.  Completing each prepared-plan invocation does not
+    # serialize the direct/relay paths inside that invocation: the CCU kernel
+    # still submits every path's WriteNb before waiting for any path event.
+    profile_sync_each = args.profile and args.implementation == "prepared"
+    if profile_sync_each:
+        print(
+            f"CASE_PROFILE_LAUNCH_MODE rank={rank} "
+            "mode=complete_each_prepared_invocation",
+            flush=True,
+        )
+
+    def run_repeated(count):
+        for _ in range(count):
+            run_op()
+            if profile_sync_each:
+                torch.npu.synchronize()
+
     run_id = sanitize(
         f"{os.environ.get('TORCHELASTIC_RUN_ID', 'standalone')}_"
         f"{os.environ.get('MASTER_PORT', '0')}")
@@ -548,8 +567,7 @@ def main():
         print(f"CASE_GRAPH_REPLAY rank={rank} backend={args.compile_backend} PASS", flush=True)
 
     mark_phase("warmup")
-    for _ in range(args.warmup):
-        run_op()
+    run_repeated(args.warmup)
     torch.npu.synchronize()
     mark_phase("warmup_correctness")
     torch.testing.assert_close(recv, expected)
@@ -558,8 +576,7 @@ def main():
     mark_phase("timing")
     torch.npu.synchronize()
     begin = time.perf_counter()
-    for _ in range(args.iters):
-        run_op()
+    run_repeated(args.iters)
     torch.npu.synchronize()
     average_us = (time.perf_counter() - begin) * 1e6 / args.iters
     torch.testing.assert_close(recv, expected)
@@ -576,8 +593,7 @@ def main():
                        f"a5_ccu_alltoall_{case_tag}_{run_id}" / f"rank{rank}")
         profiler = make_profiler(profile_dir, rank)
         profiler.start()
-        for _ in range(args.profile_iters):
-            run_op()
+        run_repeated(args.profile_iters)
         torch.npu.synchronize()
         profiler.stop()
         print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)

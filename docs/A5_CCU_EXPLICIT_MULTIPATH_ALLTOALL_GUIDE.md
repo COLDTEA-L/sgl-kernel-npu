@@ -303,6 +303,21 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 `msprof`/MindStudio 产物位于本次 `RUN_DIR/profiling`。先用普通单 case 验证正确性，
 再采 profiling，避免把建链失败误判为 profiler 问题。
 
+profiling harness 会在每次 prepared-plan 调用后执行一次 NPU synchronize，并打印：
+
+```text
+CASE_PROFILE_LAUNCH_MODE ... mode=complete_each_prepared_invocation
+```
+
+这是为了让 100 次 warmup 表示 100 个已经完成的样本，而不是一次性排队 100 个复用
+同一输出 buffer、Channel notify 和 completion event 的未完成 launch。该同步只隔离不同的
+AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化；CCU kernel 内仍然是所有
+`WriteNb` 提交后才统一等待。
+
+如果日志在 profiler 启动前就于 `warmup_correctness` 报 100% 数据不一致，且没有上述
+`CASE_PROFILE_LAUNCH_MODE`，说明测试脚本仍是旧版本；这不是 `msprof` 初始化错误。先拉取包含
+该门禁的最新分支，再重新运行第 8 节。
+
 ## 9. 常见故障
 
 ### 9.1 route runtime ABI 小于 5
