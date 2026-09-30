@@ -567,6 +567,15 @@ class Buffer:
             plan_id, relay_manifest, direct_route, path_weights
         )
 
+    def bind_ccu_urma_explicit_multipath_plan(self, plan_handle: int) -> None:
+        """Bind a prepared plan to the current NPU stream before capture.
+
+        T560 HCOMM threads and Channels are stream-affine.  Call this while an
+        ACLGraph capture stream is current; graph replay then performs only a
+        cached CCU launch and never creates communication resources.
+        """
+        self.runtime.bind_ccu_urma_explicit_multipath_plan(int(plan_handle))
+
     def ccu_urma_prepared_multipath_alltoall(
         self, send_data: torch.Tensor, plan_handle: int
     ) -> torch.Tensor:
@@ -584,6 +593,37 @@ class Buffer:
         """Eager out variant backed by a prebuilt CCU resource plan."""
         return self.runtime.ccu_urma_prepared_multipath_alltoall_out(
             send_data, recv_data, int(plan_handle)
+        )
+
+    def ccu_urma_prepared_multipath_alltoall_policy(
+        self,
+        send_data: torch.Tensor,
+        plan_handle: int,
+        path_weights: list[int],
+    ) -> torch.Tensor:
+        """Graph-visible prepared launch with host-controller path weights.
+
+        The route catalog is immutable.  Positive weights may change on eager
+        launches without reacquiring Channels.  ACLGraph captures the weights
+        supplied during capture; use a new graph for a different policy.
+        """
+        return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
+            send_data, int(plan_handle), [int(value) for value in path_weights]
+        )
+
+    def ccu_urma_prepared_multipath_alltoall_policy_out(
+        self,
+        send_data: torch.Tensor,
+        recv_data: torch.Tensor,
+        plan_handle: int,
+        path_weights: list[int],
+    ) -> torch.Tensor:
+        """Eager out variant with positive per-launch host weights."""
+        return self.runtime.ccu_urma_prepared_multipath_alltoall_policy_out(
+            send_data,
+            recv_data,
+            int(plan_handle),
+            [int(value) for value in path_weights],
         )
 
     def all2_all_detour_io_die(

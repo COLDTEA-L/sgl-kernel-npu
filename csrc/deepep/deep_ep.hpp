@@ -21,6 +21,14 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
 torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
     const torch::Tensor &send_data, int64_t plan_handle);
 
+torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
+    const torch::Tensor &send_data, int64_t plan_handle,
+    const c10::List<int64_t> &path_weights);
+
+torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
+    const torch::Tensor &send_data, int64_t plan_handle,
+    const c10::List<int64_t> &path_weights);
+
 struct Buffer {
     int64_t rank, rdma_rank, nvl_rank;
     int64_t num_ranks, num_rdma_ranks, num_nvl_ranks;
@@ -100,12 +108,22 @@ public:
         const std::string &plan_id, const std::string &relay_manifest,
         int64_t direct_route, const std::vector<int64_t> &path_weights);
 
+    void bind_ccu_urma_explicit_multipath_plan(int64_t plan_handle);
+
     torch::Tensor ccu_urma_prepared_multipath_alltoall(
         const torch::Tensor &send_data, int64_t plan_handle);
 
     torch::Tensor ccu_urma_prepared_multipath_alltoall_out(
         const torch::Tensor &send_data, const torch::Tensor &recv_data,
         int64_t plan_handle);
+
+    torch::Tensor ccu_urma_prepared_multipath_alltoall_policy(
+        const torch::Tensor &send_data, int64_t plan_handle,
+        const std::vector<int64_t> &path_weights);
+
+    torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_out(
+        const torch::Tensor &send_data, const torch::Tensor &recv_data,
+        int64_t plan_handle, const std::vector<int64_t> &path_weights);
 
     int64_t prepare_ccu_hbm_command_worker(
         const torch::Tensor &send_data, const torch::Tensor &recv_data,

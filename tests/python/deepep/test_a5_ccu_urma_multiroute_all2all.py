@@ -150,7 +150,7 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        required_version = 4 if IMPLEMENTATION == "prepared" else 8
+        required_version = 9 if IMPLEMENTATION == "prepared" else 8
         if version < required_version:
             raise RuntimeError(
                 f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
@@ -166,7 +166,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 4:
+            if plan_abi() < 5:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -424,8 +424,8 @@ def main():
         mark_phase(f"compile_graph_{args.compile_backend}")
 
         def prepared_graph_op(send_tensor):
-            return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                send_tensor, plan_handle
+            return torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
+                send_tensor, plan_handle, explicit_weights
             )
 
         compiled_prepared_op = torch.compile(
@@ -453,8 +453,8 @@ def main():
             )
         elif args.implementation == "prepared":
             if compiled_prepared_op is None:
-                buffer.ccu_urma_prepared_multipath_alltoall_out(
-                    send, recv, plan_handle
+                buffer.ccu_urma_prepared_multipath_alltoall_policy_out(
+                    send, recv, plan_handle, explicit_weights
                 )
             else:
                 recv = compiled_prepared_op(send)
@@ -486,8 +486,8 @@ def main():
                     send, path_policy, args.plan_id
                 )
             else:
-                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                    send, plan_handle
+                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
+                    send, plan_handle, explicit_weights
                 )
         torch.npu.synchronize()
         torch.testing.assert_close(recv, expected)
@@ -504,8 +504,8 @@ def main():
                     send, path_policy, args.plan_id
                 )
             else:
-                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall(
-                    send, plan_handle
+                recv = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
+                    send, plan_handle, explicit_weights
                 )
         torch.npu.synchronize()
         file_barrier(sync_dir, "aclgraph_capture_done", rank, world_size)

@@ -21,9 +21,9 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
 {
     // Version 6 makes the graph-visible prepared operator functional: it
     // allocates and returns a fresh output instead of aliasing an out tensor.
-    // Version 8 replaces the standard operator's static path-weight string
-    // with a graph-visible int64 runtime PathPolicy tensor.
-    return 8;
+    // Version 9 exposes prepared-plan ABI 5: explicit stream binding and
+    // positive per-launch host path weights, without the MC2 device server.
+    return 9;
 }
 
 namespace deep_ep {
@@ -60,6 +60,11 @@ using CcuUrmaExplicitMultipathPlanCreateFn = HcclResult (*)(
     const uint32_t *, uint32_t, uint64_t *);
 using CcuUrmaExplicitMultipathPlanExecuteFn = HcclResult (*)(
     void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream, uint64_t);
+using CcuUrmaExplicitMultipathPlanBindStreamFn = HcclResult (*)(
+    uint64_t, HcclComm, aclrtStream);
+using CcuUrmaExplicitMultipathPlanExecuteV2Fn = HcclResult (*)(
+    void *, void *, uint64_t, HcclDataType, HcclComm, aclrtStream, uint64_t,
+    const uint32_t *, uint32_t);
 using CcuUrmaCommandBlockWorkerCreateFn = HcclResult (*)(
     void *, void *, uint64_t, HcclDataType, void *, uint64_t,
     HcclComm, aclrtStream, const char *, const char *, uint32_t,
@@ -167,6 +172,40 @@ CcuUrmaExplicitMultipathPlanExecuteFn GetCcuUrmaExplicitMultipathPlanExecute()
             "HcclCcuUrmaExplicitMultipathPlanExecute not found in ", library,
             "; rebuild and install the prepared-plan package");
         return reinterpret_cast<CcuUrmaExplicitMultipathPlanExecuteFn>(symbol);
+    }();
+    return function;
+}
+
+CcuUrmaExplicitMultipathPlanBindStreamFn GetCcuUrmaExplicitMultipathPlanBindStream()
+{
+    static CcuUrmaExplicitMultipathPlanBindStreamFn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaExplicitMultipathPlanBindStream");
+        EP_HOST_ASSERT_S(symbol != nullptr,
+            "HcclCcuUrmaExplicitMultipathPlanBindStream not found in ", library,
+            "; rebuild and install prepared-plan ABI 5");
+        return reinterpret_cast<CcuUrmaExplicitMultipathPlanBindStreamFn>(symbol);
+    }();
+    return function;
+}
+
+CcuUrmaExplicitMultipathPlanExecuteV2Fn GetCcuUrmaExplicitMultipathPlanExecuteV2()
+{
+    static CcuUrmaExplicitMultipathPlanExecuteV2Fn function = []() {
+        const char *configured_path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        const char *library = configured_path != nullptr && configured_path[0] != '\0' ?
+            configured_path : "liba5_ccu_urma_route_probe.so";
+        void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle != nullptr, "dlopen ", library, " failed: ", dlerror());
+        void *symbol = dlsym(handle, "HcclCcuUrmaExplicitMultipathPlanExecuteV2");
+        EP_HOST_ASSERT_S(symbol != nullptr,
+            "HcclCcuUrmaExplicitMultipathPlanExecuteV2 not found in ", library,
+            "; rebuild and install prepared-plan ABI 5");
+        return reinterpret_cast<CcuUrmaExplicitMultipathPlanExecuteV2Fn>(symbol);
     }();
     return function;
 }
@@ -409,7 +448,7 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     EP_HOST_ASSERT(!relay_manifest.empty());
     constexpr auto kMaxUint32 = static_cast<int64_t>(UINT32_MAX);
     EP_HOST_ASSERT(direct_route >= 0 && direct_route <= kMaxUint32);
-    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 64);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 13);
 
     std::vector<uint32_t> weights;
     weights.reserve(path_weights.size());
@@ -444,7 +483,7 @@ int64_t Buffer::prepare_ccu_urma_explicit_multipath_plan(
     EP_HOST_ASSERT(!plan_id.empty() && !relay_manifest.empty());
     constexpr auto kMaxUint32 = static_cast<int64_t>(UINT32_MAX);
     EP_HOST_ASSERT(direct_route >= 0 && direct_route <= kMaxUint32);
-    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 64);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 13);
     std::vector<uint32_t> weights;
     weights.reserve(path_weights.size());
     for (const int64_t weight : path_weights) {
@@ -462,6 +501,38 @@ int64_t Buffer::prepare_ccu_urma_explicit_multipath_plan(
     EP_HOST_ASSERT(plan_handle != 0);
     return static_cast<int64_t>(plan_handle);
 }
+
+void Buffer::bind_ccu_urma_explicit_multipath_plan(int64_t plan_handle)
+{
+    EP_HOST_ASSERT(num_ranks == 2 && plan_handle > 0);
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanBindStream()(
+        static_cast<uint64_t>(plan_handle), comm, stream));
+}
+
+namespace {
+std::vector<uint32_t> NormalizePreparedPathWeights(
+    const std::vector<int64_t> &pathWeights)
+{
+    EP_HOST_ASSERT(pathWeights.size() >= 2 && pathWeights.size() <= 13);
+    std::vector<uint32_t> weights;
+    weights.reserve(pathWeights.size());
+    for (const int64_t weight : pathWeights) {
+        EP_HOST_ASSERT(weight > 0 && weight <= static_cast<int64_t>(UINT32_MAX));
+        weights.push_back(static_cast<uint32_t>(weight));
+    }
+    return weights;
+}
+
+std::vector<int64_t> ToWeightVector(const c10::List<int64_t> &pathWeights)
+{
+    std::vector<int64_t> weights;
+    weights.reserve(pathWeights.size());
+    for (const int64_t weight : pathWeights) weights.push_back(weight);
+    return weights;
+}
+} // namespace
 
 torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     const torch::Tensor &send_data, const torch::Tensor &recv_data,
@@ -494,6 +565,40 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall(
         send_data, recv_data, plan_handle);
 }
 
+torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
+    const torch::Tensor &send_data, const torch::Tensor &recv_data,
+    int64_t plan_handle, const std::vector<int64_t> &path_weights)
+{
+    RECORD_FUNCTION("deep_ep::ccu_urma_prepared_multipath_alltoall_policy",
+                    std::vector<c10::IValue>({send_data, recv_data}));
+    EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
+    EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
+    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(num_ranks == 2 && plan_handle > 0);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
+    const std::vector<uint32_t> weights = NormalizePreparedPathWeights(path_weights);
+
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
+        send_data.data_ptr(), recv_data.data_ptr(),
+        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        comm, stream, static_cast<uint64_t>(plan_handle), weights.data(),
+        static_cast<uint32_t>(weights.size())));
+    return recv_data;
+}
+
+torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy(
+    const torch::Tensor &send_data, int64_t plan_handle,
+    const std::vector<int64_t> &path_weights)
+{
+    auto recv_data = torch::empty_like(send_data);
+    return ccu_urma_prepared_multipath_alltoall_policy_out(
+        send_data, recv_data, plan_handle, path_weights);
+}
+
 torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     const torch::Tensor &send_data, int64_t plan_handle)
 {
@@ -514,6 +619,35 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
     const torch::Tensor &send_data, int64_t plan_handle)
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
+    return torch::empty_like(send_data);
+}
+
+torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
+    const torch::Tensor &send_data, int64_t plan_handle,
+    const c10::List<int64_t> &path_weights)
+{
+    EP_HOST_ASSERT(send_data.is_contiguous());
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
+    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(plan_handle > 0 && torch_npu::utils::is_npu(send_data));
+    const std::vector<uint32_t> weights = NormalizePreparedPathWeights(
+        ToWeightVector(path_weights));
+    auto recv_data = torch::empty_like(send_data);
+    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
+        send_data.data_ptr(), recv_data.data_ptr(),
+        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        nullptr, stream, static_cast<uint64_t>(plan_handle), weights.data(),
+        static_cast<uint32_t>(weights.size())));
+    return recv_data;
+}
+
+torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
+    const torch::Tensor &send_data, int64_t plan_handle,
+    const c10::List<int64_t> &path_weights)
+{
+    EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
+    EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 13);
     return torch::empty_like(send_data);
 }
 

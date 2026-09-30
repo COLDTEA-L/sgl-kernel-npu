@@ -1,327 +1,121 @@
-# A5 CCU+URMA 显式多路径 AllToAll 操作指南
+# A5 CCU+URMA prepared-plan 显式多路径 AllToAll 操作指南
 
-## 1. 当前实现
+## 1. 当前实现和边界
 
-当前正式实现是标准 Ascend C 算子 `ExplicitMultipathAll2AllCcu`，不是 prepared-plan
-`torch.ops` 包装。它具备标准 `op_def`、host tiling、AIV kernel、ACLNN API 和二进制 kernel。
+当前可运行主线不再修改 `libhccl.so`，也不再让标准 Ascend C AIV kernel 进入
+T560 未开放的 MC2 资源入口。实现分为两层：
 
-路径资源在 communicator 初始化时由配套 HCCL 扩展建立；每次图执行时，AIV 从 NPU 上的
-`pathPolicy` Tensor 读取路径权重并通过 MC2 消息交给 HCCL/CCU。ACLGraph replay 前可以原地更新
-这个 Tensor，从而动态启用、禁用或重新分配已经 provision 的 direct/relay Channel。
+```text
+图外控制面
+  显式 direct/relay CommLink
+    -> HcclChannelAcquire
+    -> HcclThreadAcquireWithStream
+    -> HcclCcuKernelRegister/Finish
+    -> (comm, plan_id, stream) 对应的已注册资源
+    -> plan_handle
 
-边界如下：
-
-- 当前仅支持同机两 rank；
-- 路径目录为 1 条 direct 加 1..12 条显式 relay；
-- 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
-- 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 10 和 DeepEP ABI 8。ABI 4..7 对新式 MC2/HCOMM
-  resource layout 的尝试已经废弃；ABI 8 将显式多路径 template 切到 T560 实际导出的
-  旧对象式 `HcclCcuKernel*` 后端；ABI 9 让
-  KernelRun 复用原生资源层创建的 main thread，避免对同一 stream 二次 Acquire。ABI 10
-  进一步修正 main thread 的 notify 数量为 0：output/token/completion 是 Channel notify，
-  不是 `HcclThreadAcquireWithStream` 的 thread notify。当前旧对象 kernel 使用与已跑通
-  route-probe 相同的 Channel 变量/notify 协议，不能再套用新式原生 kernel 的 CKE 编号。
-
-## 2. 在有卡环境准备干净的 HCCL 仓库
-
-如果 `/home/l00934901/hccl` 是健康仓库，直接拉取配套分支：
-
-```bash
-cd /home/l00934901/hccl
-
-# 确认没有遗留的 Git 锁或损坏对象。
-test ! -e .git/HEAD.lock
-git fsck --full
-
-git fetch origin feature/a5-ccu-explicit-multipath-alltoall
-git switch feature/a5-ccu-explicit-multipath-alltoall
-git pull --ff-only origin feature/a5-ccu-explicit-multipath-alltoall
-
-git rev-parse --short HEAD
-git status --short
+图内执行面
+  plan_handle + tensor + 本次 path weights
+    -> deep_ep prepared torch op
+    -> 自有薄 host runtime
+    -> 在当前 stream 上 HcclCcuKernelLaunch
+    -> 多个 Channel WriteNb
 ```
 
-预期 HEAD 至少包含后文 ABI 10 的 zero-notify 修复。如果 `git status --short`
-列出源码修改，不要直接 reset；先确认它们是否为需要保留的本地工作。
+它已经具备：
 
-只有当 `git fsck --full` 报告 corrupt loose object，或者正常 fetch/pull 因对象损坏失败时，才使用下面的
-重新 clone 流程。Git 不会因为普通 fetch 自动替换它误认为已经存在的损坏对象。保留整个旧仓库，
-然后重新 clone 干净分支：
+- 1 条 direct 加 1..12 条显式 relay；
+- relay 卡号由命令行/manifest 指定，没有写死；
+- direct 与每条 relay 默认按 `2:1` 分片；
+- Channel 和 CCU kernel 只在 plan 绑定 stream 时创建，执行阶段只 launch；
+- eager 和 ACLGraph capture/replay；
+- 不安装 `ubus.ko`，不修改全局 route table；
+- 使用系统 HCCL communicator，不需要实验版 HCCL runtime。
 
-```bash
-cd /home/l00934901
+准确边界：它目前是 PyTorch 图可见的 prepared custom op，不是最终的原生
+GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能直接调用
+host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
+原生 Ascend C 算子。
 
-STAMP=$(date +%Y%m%d_%H%M%S)
-OLD_HCCL="/home/l00934901/hccl_corrupt_${STAMP}"
+ABI 要求：route runtime ABI >= 5，DeepEP ABI >= 9。
 
-# 同一文件系统内只是重命名，旧源码、stash 和构建依赖仍可恢复。
-mv /home/l00934901/hccl "${OLD_HCCL}"
-echo "old HCCL: ${OLD_HCCL}"
+## 2. 拉取代码
 
-env -u GIT_ASKPASS -u SSH_ASKPASS \
-git clone \
-  --single-branch \
-  --branch feature/a5-ccu-explicit-multipath-alltoall \
-  https://gitcode.com/yuanwenliu/hccl.git \
-  /home/l00934901/hccl
-```
-
-检查新仓库：
-
-```bash
-cd /home/l00934901/hccl
-
-git rev-parse --short HEAD
-git status --short
-git fsck --full
-```
-
-预期 HEAD 至少包含后文 ABI 10 的 zero-notify 修复，且 `git fsck --full` 不报告
-损坏对象。不要从旧仓库执行
-`stash pop`，也不要复制旧 `.git`、源码或构建目录。
-
-如果离线编译确实需要旧仓库中的未跟踪 `third_party`，只复用这个依赖目录：
-
-```bash
-if test -d "${OLD_HCCL}/third_party"; then
-  ln -s "${OLD_HCCL}/third_party" /home/l00934901/hccl/third_party
-fi
-```
-
-旧仓库先保留；新仓库编译、运行通过后再人工清理。
-
-## 3. 拉取 sgl-kernel-npu
-
-### 3.1 正常拉取（没有 HEAD.lock 时）
-
-正常且干净的仓库使用下面的快进流程：
+正常干净仓库：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 BRANCH=feature/a5-ccu-explicit-multipath-alltoall
 
 git fetch origin "${BRANCH}"
-git switch feature/a5-ccu-explicit-multipath-alltoall
+git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
 
 git rev-parse --short HEAD
 git status --short
 ```
 
-预期 HEAD 至少为 `863b035`。如果提示 `.git/HEAD.lock` 存在，不要继续重复
-`pull`，改为执行 3.2。
-
-### 3.2 从 HEAD.lock 和中断的 fast-forward 恢复
-
-#### 3.2-A 检查并结束遗留 Git 进程
-
-先查看进程的 PID、状态和持续时间：
+`??` 未跟踪文件不会阻止 fast-forward，除非它将覆盖远端同名文件。不要在公共机器上
+使用 `git clean -fd`。若存在 tracked 修改，先保存补丁再处理：
 
 ```bash
-cd /home/l00934901/sgl-kernel-npu
-ps -eo pid,ppid,stat,etime,args | grep -E '[g]it( |$)|[g]it-'
-```
-
-如果输出的是已经卡住、不再需要的 `git fetch` / `git switch` / `git-remote-https`，
-先在命令中填入实际 PID，例如本次是 `6857 6858 6859 6860 6876`：
-
-```bash
-STALE_GIT_PIDS="6857 6858 6859 6860 6876"
-
-kill -TERM ${STALE_GIT_PIDS} 2>/dev/null || true
-sleep 2
-
-ps -eo pid,ppid,stat,etime,args | grep -E '[g]it( |$)|[g]it-'
-```
-
-不同次运行的 PID 会变；不要盲目复用示例 PID。如果最后一条命令仍显示正在正常执行的
-Git 操作，先停止，不要移动 lock。只有确认没有需要保留的 Git 进程后才继续。
-
-#### 3.2-B 保留 lock 和 diff
-
-将 lock 移到 `/tmp` 并保留当前两份 diff；这一步不删除任何未跟踪文件：
-
-```bash
-cd /home/l00934901/sgl-kernel-npu
 STAMP=$(date +%Y%m%d_%H%M%S)
-
-test -f .git/HEAD.lock && \
-  mv .git/HEAD.lock "/tmp/sgl-kernel-npu_HEAD.lock.${STAMP}"
-
 git diff > "/tmp/sgl-kernel-npu_worktree.${STAMP}.patch"
 git diff --cached > "/tmp/sgl-kernel-npu_index.${STAMP}.patch"
-```
-
-#### 3.2-C 确认中间状态并恢复 HEAD
-
-获取远端并检查是否属于“快进内容已写入 index，只有 HEAD 没有更新”：
-
-```bash
-cd /home/l00934901/sgl-kernel-npu
-BRANCH=feature/a5-ccu-explicit-multipath-alltoall
-TARGET="origin/${BRANCH}"
-
-git fetch origin "${BRANCH}"
-
-test "$(git branch --show-current)" = "${BRANCH}" || {
-  echo "ERROR: current branch is not ${BRANCH}; stop here"
-  exit 1
-}
-
-PARTIAL_FAST_FORWARD=863b035
-
-if git diff --cached --quiet "${TARGET}" --; then
-  echo "index exactly matches ${TARGET}; repairing HEAD only"
-  git reset --soft "${TARGET}"
-elif git diff --quiet -- && \
-     git cat-file -e "${PARTIAL_FAST_FORWARD}^{commit}" && \
-     git diff --cached --quiet "${PARTIAL_FAST_FORWARD}" --; then
-  echo "index is the known interrupted ${PARTIAL_FAST_FORWARD} fast-forward"
-  echo "remote advanced again; replacing tracked files with ${TARGET}"
-  git reset --hard "${TARGET}"
-else
-  echo "ERROR: tracked files are not a known interrupted fast-forward; stop"
-  git diff --cached --stat "${TARGET}" --
-  exit 1
-fi
-
-git rev-parse --short HEAD
 git status --short
 ```
 
-这次日志中的 4 个 `M  ` 文件正是中断的 `863b035` fast-forward 写入的 index 内容。如果远端仍是
-`863b035`，第一条分支只修正 HEAD；如果远端已经包含后续文档提交 `ee31327`，第二条分支先确认
-working tree 没有额外 tracked 修改、index 又精确等于 `863b035`，才用 `reset --hard` 将 tracked
-文件更新到最新远端。两条分支都不会删除 `?? TX`、`?? echo`、编译产物或其他未跟踪文件。
-不要使用 `git clean -fd`。恢复后 HEAD 应至少为 `ee31327`，4 个 `M  ` 应消失；剩余 `??` 文件
-可在确认用途后另行归档或清理。
+本方案不要求切换、编译或安装实验 HCCL 分支。`/home/l00934901/hccl` 仅被自定义
+CCU package 构建脚本用作 CMake/头文件工具树；运行时仍使用当前 CANN 的系统 HCCL。
 
-## 4. 编译配套 HCCL
-
-### 4.1 核对 T560 实际提供的旧对象式 CCU 接口
-
-ABI 7 使用开源新接口 `HcommCcuKernelRegisterStart/Register/End` 和
-`HcommCcuKernelLaunch`。T560 的 `libhcomm.so` 没有导出这些符号；继续增加 notify、resource
-slot 或项目 ABI 版本不能修复这一运行时缺口。成功的 route-probe 使用的是同一 T560 已导出的
-旧对象式接口，因此 ABI 8 只让显式多路径 template 改用：
-
-```text
-HcclCcuKernelRegister
-HcclCcuKernelRegisterFinish
-HcclCcuKernelLaunch
-```
-
-先在实际有卡容器中执行以下 gate：
+## 3. 编译并安装 route runtime
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD
 
-python3 - <<'PY'
-import ctypes
-from pathlib import Path
-
-candidates = [
-    Path("/usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so"),
-    Path("/usr/local/Ascend/cann-9.1.T560/aarch64-linux/lib64/libhcomm.so"),
-]
-path = next((item for item in candidates if item.is_file()), None)
-if path is None:
-    raise SystemExit(f"libhcomm.so not found; checked: {candidates}")
-
-lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
-symbols = [
-    "HcclChannelAcquire",
-    "HcclCcuKernelRegister",
-    "HcclCcuKernelRegisterFinish",
-    "HcclCcuKernelLaunch",
-]
-
-missing = []
-print("libhcomm:", path)
-for name in symbols:
-    try:
-        getattr(lib, name)
-        print("FOUND  ", name)
-    except AttributeError:
-        missing.append(name)
-        print("MISSING", name)
-
-if missing:
-    raise SystemExit("T560 legacy-object CCU preflight failed: " + ",".join(missing))
-print("T560 legacy-object CCU preflight: PASS")
-PY
+HCCL_REPO=/home/l00934901/hccl \
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install \
+  --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-任何一个符号缺失都应停止；不要退回 ABI 7 的新接口，也不要把编译成功解释为运行时支持。
-
-### 4.2 编译并检查配套 HCCL
-
-```bash
-cd /home/l00934901/hccl
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
-
-./build.sh --pkg -j4 -p /usr/local/Ascend/cann-9.1.T560
-
-HCCL_RUNTIME=$(find /home/l00934901/hccl/build/_CPack_Packages \
-  -type f -name libhccl.so -printf '%T@ %h\n' 2>/dev/null | \
-  sort -nr | awk 'NR == 1 { print $2 }')
-
-echo "HCCL_RUNTIME=${HCCL_RUNTIME}"
-test -f "${HCCL_RUNTIME}/libhccl.so"
-test -f "${HCCL_RUNTIME}/libhccl_compat.so"
-```
-
-验证扩展 ABI。必须先以 global 模式加载同一目录的 `libhccl_compat.so`，否则直接 `ctypes.CDLL`
-可能报告 `IsHcommDefaultTimeoutSupported` 等未解析符号：
-
-```bash
-LD_LIBRARY_PATH="${HCCL_RUNTIME}:${LD_LIBRARY_PATH:-}" \
-python3 - "${HCCL_RUNTIME}/libhccl_compat.so" \
-          "${HCCL_RUNTIME}/libhccl.so" <<'PY'
-import ctypes
-import sys
-
-ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
-lib = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
-version = lib.A5HcclExplicitMultipathExtensionVersion
-version.restype = ctypes.c_int
-print("HCCL explicit-multipath ABI:", version())
-assert version() >= 10
-PY
-```
-
-继续检查构建产物的动态符号。显式多路径后端必须强引用三个旧接口；看到
-`HcommCcuKernelLaunch` 的 weak 引用并不代表本模板仍使用它，因为 HCCL 其他原生源码仍会引用新接口：
-
-```bash
-nm -D "${HCCL_RUNTIME}/libhccl.so" | grep -E \
-  'A5HcclExplicitMultipathExtensionVersion|HcclCcuKernel(RegisterFinish|Register|Launch)'
-```
-
-预期至少包含：
+脚本会强制检查三个 prepared-plan 入口以及 ABI 5：
 
 ```text
-T A5HcclExplicitMultipathExtensionVersion
-U HcclCcuKernelLaunch
-U HcclCcuKernelRegister
-U HcclCcuKernelRegisterFinish
+HcclCcuUrmaExplicitMultipathPlanCreate
+HcclCcuUrmaExplicitMultipathPlanBindStream
+HcclCcuUrmaExplicitMultipathPlanExecuteV2
+A5CcuUrmaPreparedPlanAbiVersion() >= 5
 ```
 
-完成上述静态检查后才运行 ABI 10 单 case。若它卡在首次 device synchronize，下一步按 plog 中的
-`phase=native_thread_ready/channel_acquire/kernel_register/kernel_launch` 定位，而不是只看 Python 栈。
-若 launch 已返回成功但 synchronize 仍挂起，检查的是
-旧对象 kernel 的变量交换、notify/event 与 Channel 生命周期，而不是再回到缺失的新接口。
+也可以手工检查已安装文件：
 
-不要把这套实验库覆盖到公共 CANN 目录。测试脚本通过 `--hccl-lib-dir` 只给本次子进程注入它。
+```bash
+ROUTE_SO=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
 
-## 5. 编译标准算子和 DeepEP wheel
+nm -D "${ROUTE_SO}" | grep -E \
+'HcclCcuUrmaExplicitMultipathPlan(Create|BindStream|ExecuteV2)|A5CcuUrmaPreparedPlanAbiVersion'
+
+ROUTE_SO="${ROUTE_SO}" python3 - <<'PY'
+import ctypes
+import os
+
+lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
+version = lib.A5CcuUrmaPreparedPlanAbiVersion
+version.restype = ctypes.c_int
+print("prepared-plan route ABI:", version())
+assert version() >= 5
+PY
+```
+
+## 4. 编译并安装 DeepEP wheel
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
 
 DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu \
 bash build.sh -a deepep Ascend950
@@ -330,64 +124,51 @@ WHEEL=$(ls -t output/deep_ep-*.whl | head -1)
 python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
 ```
 
-如果在开发 Docker `cam_lyw_dev_91` 中构建，先进入包含 torch/torch_npu 的 Python 环境：
+在开发 Docker 中先进入包含 torch/torch_npu 的环境：
 
 ```bash
 source /opt/conda/bin/activate cam_py311_pt28
 ```
 
-安装后不会退出 Docker。验证 wheel：
+验证 ABI、Python wrapper 和 Meta dispatch：
 
 ```bash
 python3 - <<'PY'
 import ctypes
 from pathlib import Path
+import torch
 import deep_ep.deep_ep_cpp as ext
+from deep_ep import Buffer
 
 path = Path(ext.__file__).resolve()
-lib = ctypes.CDLL(str(path))
+lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
 version = lib.A5DeepEpExplicitMultipathAttrAbiVersion
 version.restype = ctypes.c_int
+
 print("loaded deep_ep_cpp:", path)
-print("dynamic PathPolicy ABI:", version())
-assert version() >= 8
-assert hasattr(ext.Buffer, "explicit_multipath_all2all_ccu")
+print("prepared-plan DeepEP ABI:", version())
+print("bind API:", hasattr(Buffer, "bind_ccu_urma_explicit_multipath_plan"))
+print("policy API:", hasattr(Buffer, "ccu_urma_prepared_multipath_alltoall_policy_out"))
+
+x = torch.empty((2, 16), device="meta", dtype=torch.float32)
+y = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
+    x, 1, [2, 1]
+)
+print("Meta:", y.device, tuple(y.shape), y.dtype)
+
+assert version() >= 9
+assert tuple(y.shape) == tuple(x.shape)
 PY
 ```
 
-## 6. PathPolicy 格式
+## 5. 快速单 case
 
-`pathPolicy` 是设备上的 `[1]`、`int64` Tensor：
-
-```text
-bits 60..63 : ABI，当前为 1
-nibble 0    : direct 权重
-nibble 1    : relay 0 权重
-nibble 2    : relay 1 权重
-...
-```
-
-每个权重为 `0..15`；0 表示本次执行不在该路径发 payload。至少一条路径必须非零。
-路径目录最多 13 条，因为当前 CCU task argument cache 最多容纳 1 direct + 12 relay。
-HCCL 同时以 15 paths 作为硬上限；再多会超出 64-bit policy 除 ABI nibble 外的编码空间，
-现在会在建链前直接报参数错误，而不会进入未定义位移或设备侧等待。
-
-默认性能约定是：
-
-```text
-direct 数据量 : 每一条 relay 数据量 = 2 : 1
-```
-
-因此 direct + 2 relay 使用 `2,1,1`，不是 `4,1,1`。
-
-## 7. 快速单 case
-
-下面以物理卡 `2,3` 为通信端点、`0,1` 为 relay：
+下面使用物理卡 2、3 通信，显式指定 0、1 为 relay：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
-unset LD_PRELOAD
+unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM
 
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --src-phy 2 --dst-phy 3 \
@@ -397,24 +178,40 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --bytes 4194304 \
   --warmup 1 --iters 1 --repeats 1 \
   --timeout-seconds 300 \
-  --hccl-lib-dir "${HCCL_RUNTIME}" \
   --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
 
-`direct_plus_relays` 使用 `--relay-phys` 中的全部卡，可传 1..12 张 relay；卡号没有写死。
-日志应包含：
+不要再传 `--hccl-lib-dir`。即使传入，脚本也会忽略它，避免重新注入失败的实验
+`libhccl.so`。
+
+成功日志应包含：
 
 ```text
-Verified patched HCCL: ... extension=7
-Verified requested APIs: ... standard=True; DeepEP ABI=8
-PASS: implementation=standard ...
+Verified prepared-plan route runtime: ... (ABI=5)
+Verified requested APIs: ... prepared=True; DeepEP ABI=9
+PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
+PREPARED_MULTIPATH_PLAN ... paths=3
+PASS: implementation=prepared ...
 ```
 
-## 8. ACLGraph capture/replay 与动态选路
+检查最新结果：
 
-该实验第一次执行使用 `2,1,1`，replay 前把稳定地址的 policy Tensor 原地改为 `2,0,1`，即关闭
-relay 0、保留 direct 和 relay 1：
+```bash
+RUN_DIR=$(ls -dt \
+  /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
+LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
+
+column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+grep -nE \
+'explicit multipath direct|explicit relay|PATH_CHANNEL|PREPARED_MULTIPATH_(PLAN|STREAM)|CASE_FAILURE|PASS:' \
+"${LOG}"
+```
+
+## 6. ACLGraph capture/replay
+
+plan 必须在 capture stream 上图外准备。测试程序已经这样做；capture/replay 中不会
+Acquire Channel 或注册 kernel：
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
@@ -423,11 +220,9 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --direct-route 0 \
   --cases direct_plus_relays \
   --graph-backend aclgraph \
-  --replay-path-weights 2,0,1 \
   --bytes 4194304 \
   --warmup 1 --iters 3 --repeats 1 \
   --timeout-seconds 600 \
-  --hccl-lib-dir "${HCCL_RUNTIME}" \
   --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
@@ -440,310 +235,92 @@ RUN_DIR=$(ls -dt \
 LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
 
 grep -nE \
-'CASE_ACLGRAPH_CAPTURE|CASE_DYNAMIC_PATH_POLICY|CASE_ACLGRAPH_REPLAY|CASE_FAILURE|PASS:' \
+'CASE_(PREPARED_PLAN|ACLGRAPH_CAPTURE|ACLGRAPH_REPLAY)|PREPARED_MULTIPATH_(PLAN|STREAM)|HcclChannelAcquire|PASS:' \
 "${LOG}"
 ```
 
-必须看到两个 rank 的 capture/replay PASS，并看到：
+判据：
+
+- `bind_ready` 在 capture 前只出现一次；
+- capture 与 replay 都 PASS；
+- replay 窗口内不能再次出现 Channel Acquire/kernel register；
+- send tensor 在 replay 前被修改，结果校验通过，因此不是复用旧输出。
+
+当前 `path_weights` 是图常量。eager 调用可以对同一 plan 传另一组正权重；ACLGraph
+需要为另一组权重 capture 另一张图。`--replay-path-weights` 对 prepared case 会直接报错，
+避免把未生效的策略更新误判为动态选路。权重 0 暂不开放，因为 T560 对零字节
+`WriteNb` 的 provider 行为没有可靠契约。
+
+## 7. relay 数量和性能矩阵
+
+`direct_plus_relays` 使用 `--relay-phys` 中的全部 relay，支持 1..12 张，不要求偶数：
+
+```bash
+# 1 条 relay
+--relay-phys 0 --cases direct_plus_relays
+
+# 3 条 relay
+--relay-phys 0,1,4 --cases direct_plus_relays
+
+# 固定性能矩阵别名
+--relay-phys 4,5 --cases direct_plus_2relay
+--relay-phys 4,5,1,0 --cases direct_plus_4relay
+--relay-phys 4,5,1,0,6,7 --cases direct_plus_6relay
+```
+
+默认权重为：
 
 ```text
-CASE_DYNAMIC_PATH_POLICY ... weights=[2, 0, 1]
+direct : 每一条 relay = 2 : 1
 ```
 
-这证明 policy 是 replay 时从设备 Tensor 读取，而非固化在 host tiling。数据正确性只能证明动态图执行
-正确；若要证明被关闭的 relay 确实无 payload，需同时采 HCCN 端口计数。
+即两条 relay 为 `2,1,1`，不是 direct 与 relay 总量之比 `2:1`。
 
-## 9. 性能矩阵
+## 8. profiling
+
+只采显式多路径 case：
 
 ```bash
 bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --src-phy 2 --dst-phy 3 \
-  --relay-phys 4,5,1,0,6,7 \
+  --relay-phys 0,1 \
   --direct-route 0 \
-  --cases native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay \
-  --bytes 4194304 \
-  --warmup 100 --iters 20 --repeats 3 \
-  --timeout-seconds 600 \
-  --hccl-lib-dir "${HCCL_RUNTIME}" \
-  --cann-root /usr/local/Ascend/cann-9.1.T560 \
-  --output-root /home/l00934901/profiling
-```
-
-`native0/native2` 仍由 route-probe baseline 执行；显式 case 使用标准算子。查看结果：
-
-```bash
-RUN_DIR=$(ls -dt \
-  /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* | head -1)
-column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
-sed -n '1,240p' "${RUN_DIR}/explicit_multipath_perf_report.md"
-grep -RHnE 'PASS:|CASE_FAILURE|ExplicitMultipath' "${RUN_DIR}/cases"
-```
-
-## 10. 只采多路径 profiling
-
-```bash
-bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
-  --src-phy 2 --dst-phy 3 \
-  --relay-phys 4,5,1,0,6,7 \
-  --direct-route 0 \
-  --cases direct_plus_6relay \
+  --cases direct_plus_relays \
   --bytes 4194304 \
   --warmup 100 --iters 20 --repeats 1 \
   --profile --profile-iters 20 \
   --timeout-seconds 600 \
-  --hccl-lib-dir "${HCCL_RUNTIME}" \
   --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
 
-MindStudio 中一个 AIV/CCU launch 内部可以包含多个 Channel 的并发 Write，不能用 launch 数量推断
-物理路径数量；relay 身份仍以 manifest 和 HCCN 端口计数为准。
+`msprof`/MindStudio 产物位于本次 `RUN_DIR/profiling`。先用普通单 case 验证正确性，
+再采 profiling，避免把建链失败误判为 profiler 问题。
 
-## 11. 标准算子进入 HCCL 的正确路径
+## 9. 常见故障
 
-ABI 4/5 修正后的控制链是：
+### 9.1 route runtime ABI 小于 5
 
-```text
-ExplicitMultipathAll2AllCcu host tiling
-  -> opType = HCCL_CMD_ALLTOALL
-  -> commEngine = CCU_SCHED (6)
-  -> HcclAllocComResourceByTilingV2
-  -> AlltoAllAutoSelector::SelectCcuScheduleAlgo
-  -> CcuExplicitMultipathAllToAll2Rank
-  -> CcuTempExplicitMultipathAllToAll::CalcRes
-  -> direct + 显式 relay Channel catalog
-  -> custom CCU kernel
-```
+重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
+custom package installer 留下旧文件。
 
-旧 ABI 3 使用 `HALF_ALLTOALLV + CCU_MS (5)`。有卡日志已经证明它会在 selector 之前被
-`communicator_impl.cc:GetTilingAccelerator` 拒绝：
+### 9.2 DeepEP ABI 小于 9
 
-```text
-Tiling hcclAccelerator not support, hcclAccelerator[HcclAccelerator::CCU_MS]
-HcclAllocComResourceByTilingV2 ret=5
-```
+重新构建并 `--force-reinstall` wheel，然后用第 4 节确认实际加载路径。不要只看源码
+分支。
 
-这不是 relay EID、Channel 或 CCU kernel 的错误。ABI 4 删除了通用 selector 中针对
-`HALF_ALLTOALLV` 的提前劫持，也删除了该 op type 下的重复 template 注册。
+### 9.3 plan 未绑定当前 stream
 
-ABI 4 首次有卡运行已跨过上述 gate，但两个 rank 卡在 warmup 的 `torch.npu.synchronize()`。
-与原生 `ccu_kernel_all_to_all_mesh1d.cc` 对比后确认，HCCL provision 的 Channel 使用：
+错误会明确提示 `call PlanBindStream outside graph capture`。不能在 capture/replay 内懒建
+资源。测试用 `A5_CCU_PREPARED_ALLOW_LAZY_STREAM=1` 仅用于兼容性排查，不是正式路径。
 
-```text
-XN 0 = peer input
-XN 1 = peer output
-XN 2 = peer token
-```
+### 9.4 更改已有 plan_id 的路径目录
 
-ABI 4..7 曾尝试使用新式原生 resource/CKE 布局；T560 缺少对应注册 ABI，因此这段实现没有
-继续沿用。ABI 8..10 的实际数据面是旧对象式 `hcomm::CcuKernel/CcuRep`：每个 Channel 使用
-变量槽 0/1 交换 output/token，notify 槽 0/1 完成地址交换，notify 槽 2 完成最终握手，mask
-均为 1。该协议已经由 standalone route-probe 的重复迭代验证。main thread 的 notify 数量为
-0，不影响这些 Channel 私有 notify。
+plan `(communicator, plan_id)` 是不可变路径目录。更换 relay manifest 或路径数量必须用
+新的 `plan_id`；每次执行只允许改变同长度的正权重。
 
-Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
-仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
+### 9.5 资源释放
 
-### 11.1 首次最小验证
-
-完成第 4、5 节的重新编译后，先跑第 7 节单 case，然后检查：
-
-```bash
-RUN_DIR=$(ls -dt \
-  /home/l00934901/profiling/a5_ccu_explicit_multipath_* | head -1)
-LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
-
-grep -nE \
-'selector MATCH|CalcRes begin|CalcRes ready|provisioned|KernelRun begin|ExplicitMultipathLegacy|CASE_FAILURE|PASS:' \
-"${LOG}"
-```
-
-若普通 case log 没包含 HCCL INFO 日志，再按 11.2 收集对应 plog。成功路径至少应依次看到：
-
-```text
-[ExplicitMultipath] selector MATCH ... opType[10] executeConfig[6]
-[ExplicitMultipath] CalcRes begin ...
-[ExplicitMultipath] provisioned 3 channels (direct + 2 relays)
-[ExplicitMultipath] CalcRes ready ... paths[3]
-[ExplicitMultipath] KernelRun begin ...
-[ExplicitMultipathLegacy] phase=native_thread_ready ... notifyNum[0]
-[ExplicitMultipathLegacy] phase=channel_acquire_done ...
-[ExplicitMultipathLegacy] phase=kernel_register_done ...
-[ExplicitMultipathLegacy] phase=kernel_launch_done ... status[0]
-PASS: implementation=standard ...
-```
-
-其中 `opType[10]` 对应本仓枚举里的 `HCCL_CMD_ALLTOALL`；以符号和日志语义为准，不要把
-数字 10 与 route index 混淆。
-
-### 11.2 失败时收集 HCCL/MC2 边界日志
-
-如果标准算子在第一次 warmup 失败，且日志包含：
-
-```text
-Nnopbase fails to invoke the HcclAllocComResourceByTiling function
-ret = 5
-```
-
-说明失败发生在 MC2/HCCL 通信资源分配阶段，还没有进入 CCU kernel 和
-`WriteNb`。当前 HCCL 错误码中 `5` 为 `HCCL_E_NOT_SUPPORT`。不要先调整数据切分、
-path weight 或性能参数，先执行下面两组检查。
-
-下面的命令会自动选择最新的显式多路径运行目录；不要把
-`YYYYMMDD_HHMMSS` 当成实际目录名执行。如需检查更早的运行，再将第一行手工改成该目录的完整路径。
-
-```bash
-(
-set -e
-
-RUN_DIR=$(
-  ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_* \
-    2>/dev/null | head -1
-)
-
-if [[ -z "${RUN_DIR}" || ! -d "${RUN_DIR}" ]]; then
-  echo "ERROR: no explicit-multipath result directory found" >&2
-  false
-fi
-
-echo "RUN_DIR=${RUN_DIR}"
-LOG="${RUN_DIR}/cases/direct_plus_relays_r1.log"
-
-if [[ ! -f "${LOG}" ]]; then
-  echo "ERROR: missing case log: ${LOG}" >&2
-  false
-fi
-
-PIDS=$(
-  grep -oE '(PID: ?|pid=)[0-9]+' "${LOG}" |
-  grep -oE '[0-9]+' |
-  sort -u
-)
-
-echo "PIDS=${PIDS}"
-
-PLOG_LIST="${RUN_DIR}/hccl_plogs.txt"
-: > "${PLOG_LIST}"
-
-for pid in ${PIDS}; do
-  find /root/ascend/log -type f \
-    -name "plog-${pid}_*.log" -print 2>/dev/null
-done | sort -u > "${PLOG_LIST}"
-
-cat "${PLOG_LIST}"
-
-TRACE_OUT="${RUN_DIR}/hccl_resource_failure_trace.txt"
-: > "${TRACE_OUT}"
-
-while IFS= read -r file; do
-  grep -HnE \
-'ExplicitMultipath|CcuExplicit|ALLTOALL|CCU_MS|CCU_SCHED|GetTilingAccelerator|Select|CalcRes|BuildExplicitChannels|native_thread_ready|channel_acquire|kernel_register|kernel_launch|exactly two ranks|same local die|provisioned|HcclAllocComResourceByTiling|CcuInstructions|isEmpty|NOT_SUPPORT|not support|ret.?=.?5' \
-  "${file}" >> "${TRACE_OUT}" 2>/dev/null || true
-done < "${PLOG_LIST}"
-
-sed -n '1,300p' "${TRACE_OUT}"
-)
-```
-
-按下表判读：
-
-| 日志特征 | 结论 |
-|---|---|
-| `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 7`；重新执行第 4、5 节 |
-| ABI 4..7、warmup 后卡在 `torch.npu.synchronize()` | 已废弃的新式 resource/CKE 集成路线；不要继续调槽位或 bit，更新到 ABI 10 旧对象式后端 |
-| ABI 8、两 rank 进入 warmup 后卡在 `torch.npu.synchronize()` | native main thread 先按 0 notify 创建，又被二次 Acquire；更新到 ABI 9 |
-| ABI 9、两 rank 的 `run_op()` 已返回但卡在 warmup `torch.npu.synchronize()` | `CalcRes` 错把 3 个 Channel notify 当作 main-thread notify；更新到 ABI 10 |
-| ABI 10 有 `native_thread_ready`、没有 `channel_acquire_done` | 卡在显式 Channel Acquire，检查 EID plan 与两 rank 的 ChannelDesc 对称性 |
-| ABI 10 有 `channel_acquire_done`、没有 `kernel_register_done` | 卡在旧对象 CCU 指令生成/注册 |
-| ABI 10 有 `kernel_register_done`、没有 `kernel_launch_done` | 卡在 host launch 提交或 thread/stream 绑定 |
-| ABI 10 有 `kernel_launch_done status[0]`、仍卡同步 | kernel 已提交，死锁位于地址/token 交换、Write event 或 completion notify |
-| `duplicate endpoint pair` | direct/relay 或两条 relay 的 EID pair 相同；修正 manifest，HCCL 不再带重复路径进入设备 |
-| `invalid or duplicate acquired Channel` | 不同描述符被 provider 合并为同一个 Channel；当前协议不能对同一 notify 槽等待两次，必须换 EID/path |
-| `fast launch has no prepared resource` | graph replay 的 `(comm, stream, plan_id, manifest 摘要)` 与首次执行不一致；不要在 communicator 生命周期内覆盖 manifest |
-| `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
-| `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
-| `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
-| ABI `< 10` 或完全没有 `[ExplicitMultipath]` | HCCL/wheel 未更新，manifest/plan 环境变量未传入 worker，或标准算子仍未发出 `HCCL_CMD_ALLTOALL` |
-| 已有 `provisioned N channels`，随后仍 `ret=5` | HCCL 已构造 Channel，失败在 MC2/libmc2_client 资源序列化或 instruction 生成 |
-| `CcuInstructions isEmpty` | 闭源 MC2 未识别新的 CCU instruction，与早期标准算子尝试的失败相同 |
-| `param.varMemSize ... invalid` | 固定 AllToAll 与 `HALFALLTOALLV` 资源协议不匹配 |
-
-### 11.3 核对实际传入 HCCL 的 relay plan
-
-这一段可以脱离 11.1 单独复制执行，因此会重新自动确定 `RUN_DIR`：
-
-```bash
-(
-set -e
-
-RUN_DIR=$(
-  ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_* \
-    2>/dev/null | head -1
-)
-
-if [[ -z "${RUN_DIR}" || ! -d "${RUN_DIR}" ]]; then
-  echo "ERROR: no explicit-multipath result directory found" >&2
-  false
-fi
-
-echo "RUN_DIR=${RUN_DIR}"
-find "${RUN_DIR}/plans" -maxdepth 2 -type f -print
-
-for file in "${RUN_DIR}"/plans/*.tsv; do
-  test -f "${file}" || continue
-  echo "===== ${file} ====="
-  column -s $'\t' -t "${file}"
-done
-
-sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
-)
-```
-
-重点核对：
-
-- `src_phy/dst_phy/relay_phy` 是否为本次实际卡号；
-- 每条 relay 的 `src_eid/dst_eid` 是否完整；
-- 同一次 CCU launch 中各 relay 的本地 die 是否一致；
-- plan id 是否与用例日志中传入的 plan id 一致；
-- 不要将 HCCL extension 版本检查通过解释为 MC2 已接受自定义 CCU template。
-
-如果已经出现 `selector MATCH` 而未出现 `CalcRes begin`，问题位于 selector 到 executor/template
-注册之间；如果出现 `CalcRes ready` 后失败，才进入 Channel 资源序列化或 CCU instruction 生成范围。
-不要再回退到 `HALF_ALLTOALLV + CCU_MS`。
-
-### 11.4 本版本的死锁防护与剩余边界
-
-HCCL 在进入 CCU kernel 前会执行以下 fail-fast 校验：
-
-- main thread handle 非零，且只复用原生 `TemplateResource.threads[0]`，不再对同一 stream 二次 Acquire；
-- `notifyNumOnMainThread=0`；output/token/completion 使用每个 Channel 自身的 notify 槽；
-- direct 与所有 relay 的 endpoint pair 必须互不重复；
-- native direct `ChannelDesc` 必须提供至少 3 个 Channel notify 槽，满足 output/token/completion 协议；
-- `HcclChannelAcquire` 返回的 handle 必须非零且互不重复，避免对同一 notify 槽等待两次；
-- path 数不能超过 policy word 可编码的 15 条；SGL runner 的产品上限仍为 13 条；
-- 一个 launch 内所有显式 relay 必须位于同一个本地 die，当前只接受 die0；
-- 缓存键包含 manifest 路径与内容摘要，不能让相同 `plan_id` 静默复用旧 Channel catalog；
-- 旧对象式 template 即使没有新式 `submitInfo` 也保存 engine context，使 graph replay 进入
-  `FastLaunch()` 而不是重复走资源创建。
-- 首次 `KernelRun` 的 HCCL input/output base offset 会随资源缓存；FastLaunch 只替换新 buffer
-  基址。若同一缓存键下 offset 变化则直接失败，避免重放从错误地址生成 token。
-
-仍需调用方保证：两个 rank 使用完全相同的 manifest 顺序和 `pathPolicy`，且在 communicator
-生命周期内不覆盖 manifest。动态 policy 要由控制器在两端原子更新；若两端使用不同权重，地址和
-completion 握手仍可能完成，但 AllToAll 数据布局不再有定义。当前还没有公开的旧对象 Channel
-release API，因此 Channel Acquire 后的失败应终止本轮进程再重试，不能在同一进程内反复恢复。
-communicator 销毁后同进程重建的缓存清理也仍是待验证项。
-
-## 12. 常见故障
-
-| 现象 | 处理 |
-|---|---|
-| HCCL extension `< 7` 或 symbol missing | 重新编译第 4 节分支，并传正确的 `--hccl-lib-dir` |
-| DeepEP ABI `< 8` | 重新编译并 force-reinstall 第 5 节 wheel |
-| opbuild 报 input dtype size 0 | `pathPolicy` 必须为 sendData 的 4 个 dtype 组合分别声明 `DT_INT64` |
-| `IsHcommDefaultTimeoutSupported` undefined | 先加载同目录 `libhccl_compat.so`，再加载 `libhccl.so` |
-| `ChannelAcquire status=9` | 指定 EID path 当前未 provision；检查 relay manifest、plane 和拓扑 |
-| standard case 提示 route-probe stale | 脚本过旧；标准 case 不依赖 prepared-plan route API |
-| `--graph-backend npugraphs` 被拒绝 | 当前标准动态 policy 验证使用 `aclgraph`；不要套用旧 prepared backend |
-| `status=137`，栈停在 `triton/tools/get_ascend_devices.py` 的 `npu-smi` | 旧脚本让 `npu-smi` 继承了实验 HCCL 的 `LD_PRELOAD`；更新脚本后会通过 `scripts/wrappers/npu-smi` 自动隔离。该 137 是外层 timeout 强杀，不是算子 OOM |
-| replay 正确但端口没有变化 | 先确认 `CASE_DYNAMIC_PATH_POLICY`，再用 HCCN 在同一时间窗验证物理路径 |
+当前公开 T560 接口没有提供完整、可证明安全的 Channel/thread/kernel 对称释放链。
+prepared plan 因此按 communicator/process 生命周期持有资源。不要循环创建大量一次性
+plan_id；每个稳定路径目录复用一个 plan。

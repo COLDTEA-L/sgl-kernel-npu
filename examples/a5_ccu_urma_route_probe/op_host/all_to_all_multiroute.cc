@@ -25,7 +25,9 @@ using a5_ccu_urma_probe::RouteResources;
 using namespace a5_ccu_urma_probe;
 
 namespace {
-constexpr uint32_t MAX_EXPLICIT_PATHS = 64U;
+// The legacy T560 object-style CCU launch accepts at most 48 uint64 task
+// arguments.  This kernel uses seven fixed words and three words per path.
+constexpr uint32_t MAX_EXPLICIT_PATHS = 13U;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
 constexpr uint64_t PATH_ALIGNMENT = 256;
@@ -77,12 +79,10 @@ HcclResult GetSerializedSchedule(bool *serialized)
     return HCCL_E_PARA;
 }
 
-std::string MakePlanIdentity(HcclComm comm, aclrtStream stream,
-                             const std::string &planId)
+std::string MakePlanIdentity(HcclComm comm, const std::string &planId)
 {
     std::ostringstream output;
-    output << reinterpret_cast<uintptr_t>(comm) << ':'
-           << reinterpret_cast<uintptr_t>(stream) << ':' << planId;
+    output << reinterpret_cast<uintptr_t>(comm) << ':' << planId;
     return output.str();
 }
 
@@ -113,9 +113,27 @@ HcclResult ValidatePlanArguments(HcclComm comm, aclrtStream stream,
     return HCCL_SUCCESS;
 }
 
+HcclResult ValidateLaunchWeights(const uint32_t *weights, uint32_t pathCount,
+                                 size_t expectedPathCount)
+{
+    if (weights == nullptr) return HCCL_E_PTR;
+    if (pathCount != expectedPathCount || pathCount < 2U ||
+        pathCount > MAX_EXPLICIT_PATHS) {
+        return HCCL_E_PARA;
+    }
+    for (uint32_t i = 0; i < pathCount; ++i) {
+        // Zero-byte WriteNb has provider-dependent behaviour on T560.  Keep
+        // ABI 5 fail-closed; path masking needs a separately compiled subset
+        // kernel rather than silently submitting a zero-byte transfer.
+        if (weights[i] == 0U) return HCCL_E_PARA;
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
-    const RouteResources &resources, bool serialized)
+    const RouteResources &resources, const std::vector<uint32_t> &launchWeights,
+    bool serialized)
 {
     if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr) {
         return HCCL_E_PTR;
@@ -123,7 +141,7 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     if (dataType != HCCL_DATA_TYPE_FP32 || elementsPerPeer == 0) {
         return HCCL_E_NOT_SUPPORT;
     }
-    if (resources.channels.empty() || resources.weights.size() != resources.channels.size() ||
+    if (resources.channels.empty() || launchWeights.size() != resources.channels.size() ||
         resources.kernel == 0 || resources.rankSize != 2U) {
         return HCCL_E_INTERNAL;
     }
@@ -137,18 +155,26 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
 
     uint64_t totalWeight = 0;
-    for (const uint32_t weight : resources.weights) {
+    for (const uint32_t weight : launchWeights) {
+        if (weight == 0U) return HCCL_E_PARA;
         totalWeight += weight;
     }
     std::vector<uint64_t> sourceOffsets;
     std::vector<uint64_t> remoteOffsets;
     std::vector<uint64_t> pathBytes;
     uint64_t assigned = 0;
-    for (size_t i = 0; i < resources.weights.size(); ++i) {
+    for (size_t i = 0; i < launchWeights.size(); ++i) {
         uint64_t currentBytes = bytes - assigned;
-        if (i + 1 != resources.weights.size()) {
-            currentBytes = (bytes * resources.weights[i] / totalWeight) /
+        if (i + 1 != launchWeights.size()) {
+            currentBytes = (bytes * launchWeights[i] / totalWeight) /
                            PATH_ALIGNMENT * PATH_ALIGNMENT;
+        }
+        if (currentBytes == 0U) {
+            std::fprintf(stderr,
+                "[A5 CCU URMA] payload is too small for %zu positive paths "
+                "with 256-byte aligned chunks\n",
+                launchWeights.size());
+            return HCCL_E_PARA;
         }
         sourceOffsets.push_back(static_cast<uint64_t>(peer) * bytes + assigned);
         remoteOffsets.push_back(static_cast<uint64_t>(resources.rank) * bytes + assigned);
@@ -214,7 +240,7 @@ HcclResult RunMultiRouteAllToAll(void *sendBuf, void *recvBuf,
         &resources, plan);
     if (status != HCCL_SUCCESS) return status;
     return LaunchPreparedAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
-                                  comm, resources, serialized);
+                                  comm, resources, resources.weights, serialized);
 }
 }
 
@@ -247,11 +273,141 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    // Version 4 caches one prepared CCU resource set per execution stream so
-    // torch.compile/npugraphs can warm up on its private graph stream before
-    // capture without reusing a thread that was bound to the default stream.
-    return 4;
+    // Version 5 makes stream binding an explicit control-plane operation and
+    // accepts positive per-launch weights without rebuilding the path catalog.
+    return 5;
 }
+
+namespace {
+HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
+                                        aclrtStream stream,
+                                        RouteResources *boundResources)
+{
+    if (planHandle == 0U || stream == nullptr) return HCCL_E_PARA;
+    const uintptr_t streamKey = reinterpret_cast<uintptr_t>(stream);
+    HcclComm preparedComm = nullptr;
+    RoutePlanRequest request;
+    {
+        std::lock_guard<std::mutex> lock(g_planMutex);
+        const auto found = g_plans.find(planHandle);
+        if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
+        const PreparedPlan &prepared = found->second;
+        if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
+        const auto existing = prepared.resourcesByStream.find(streamKey);
+        if (existing != prepared.resourcesByStream.end()) {
+            if (boundResources != nullptr) *boundResources = existing->second;
+            return HCCL_SUCCESS;
+        }
+        preparedComm = prepared.comm;
+        request.includeDiscoveredRoute = true;
+        request.discoveredRoute = prepared.directRoute;
+        request.relayManifest = prepared.relayManifest;
+        request.weights = prepared.weights;
+        request.planName = prepared.planId;
+    }
+
+    std::printf("PREPARED_MULTIPATH_STREAM phase=bind_begin handle=%lu stream=%p\n",
+                static_cast<unsigned long>(planHandle), stream);
+    std::fflush(stdout);
+    RouteResources created;
+    const HcclResult status = GetRouteResources(
+        preparedComm, stream, RouteKernelKind::ALLTOALL_CONCURRENT,
+        &created, &request);
+    if (status != HCCL_SUCCESS) return status;
+    {
+        std::lock_guard<std::mutex> lock(g_planMutex);
+        const auto found = g_plans.find(planHandle);
+        if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
+        found->second.resourcesByStream.emplace(streamKey, created);
+    }
+    if (boundResources != nullptr) *boundResources = created;
+    std::printf("PREPARED_MULTIPATH_STREAM phase=bind_ready handle=%lu stream=%p rank=%u paths=%zu\n",
+                static_cast<unsigned long>(planHandle), stream,
+                created.rank, created.channels.size());
+    std::fflush(stdout);
+    return HCCL_SUCCESS;
+}
+
+HcclResult BindPreparedPlanStream(uint64_t planHandle, HcclComm comm,
+                                  aclrtStream stream,
+                                  RouteResources *boundResources)
+{
+    std::lock_guard<std::mutex> buildLock(g_planBuildMutex);
+    return BindPreparedPlanStreamLocked(
+        planHandle, comm, stream, boundResources);
+}
+
+bool LazyStreamBindingEnabled()
+{
+    const char *value = std::getenv("A5_CCU_PREPARED_ALLOW_LAZY_STREAM");
+    return value != nullptr && std::string(value) == "1";
+}
+
+HcclResult LookupPreparedPlan(uint64_t planHandle, HcclComm comm,
+                              aclrtStream stream, HcclComm *preparedComm,
+                              RouteResources *resources,
+                              std::vector<uint32_t> *defaultWeights)
+{
+    if (preparedComm == nullptr || resources == nullptr ||
+        defaultWeights == nullptr || planHandle == 0U || stream == nullptr) {
+        return HCCL_E_PARA;
+    }
+    const uintptr_t streamKey = reinterpret_cast<uintptr_t>(stream);
+    std::lock_guard<std::mutex> lock(g_planMutex);
+    const auto found = g_plans.find(planHandle);
+    if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
+    const PreparedPlan &prepared = found->second;
+    if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
+    const auto bound = prepared.resourcesByStream.find(streamKey);
+    if (bound == prepared.resourcesByStream.end()) return HCCL_E_NOT_FOUND;
+    *preparedComm = prepared.comm;
+    *resources = bound->second;
+    *defaultWeights = prepared.weights;
+    return HCCL_SUCCESS;
+}
+
+HcclResult ExecutePreparedPlan(void *sendBuf, void *recvBuf,
+    uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
+    aclrtStream stream, uint64_t planHandle, const uint32_t *launchWeights,
+    uint32_t pathCount, bool useDefaultWeights)
+{
+    HcclComm preparedComm = nullptr;
+    RouteResources resources;
+    std::vector<uint32_t> defaultWeights;
+    HcclResult status = LookupPreparedPlan(
+        planHandle, comm, stream, &preparedComm, &resources, &defaultWeights);
+    if (status == HCCL_E_NOT_FOUND && LazyStreamBindingEnabled()) {
+        // Compatibility only for compilers that hide their private stream
+        // until the first eager pre-execution.  Production ACLGraph callers
+        // must bind the capture stream explicitly before capture.
+        status = BindPreparedPlanStream(
+            planHandle, comm, stream, &resources);
+        if (status == HCCL_SUCCESS) {
+            status = LookupPreparedPlan(
+                planHandle, comm, stream, &preparedComm, &resources,
+                &defaultWeights);
+        }
+    }
+    if (status != HCCL_SUCCESS) {
+        if (status == HCCL_E_NOT_FOUND) {
+            std::fprintf(stderr,
+                "[A5 CCU URMA] plan %lu is not bound to stream %p; call PlanBindStream outside graph capture\n",
+                static_cast<unsigned long>(planHandle), stream);
+        }
+        return status;
+    }
+
+    std::vector<uint32_t> weights = defaultWeights;
+    if (!useDefaultWeights) {
+        status = ValidateLaunchWeights(
+            launchWeights, pathCount, resources.channels.size());
+        if (status != HCCL_SUCCESS) return status;
+        weights.assign(launchWeights, launchWeights + pathCount);
+    }
+    return LaunchPreparedAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
+                                  preparedComm, resources, weights, false);
+}
+} // namespace
 
 extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
     HcclComm comm, aclrtStream stream, const char *planId,
@@ -264,58 +420,43 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
         comm, stream, planId, relayManifest, pathWeights, pathCount);
     if (status != HCCL_SUCCESS) return status;
 
-    const std::string identity = MakePlanIdentity(comm, stream, planId);
+    const std::string identity = MakePlanIdentity(comm, planId);
     const std::string fingerprint = MakePlanFingerprint(
         relayManifest, directRoute, pathWeights, pathCount);
+    uint64_t handle = 0U;
     {
+        // Plan IDs are communicator-scoped, not stream-scoped.  Serialize
+        // creation so two graph-compilation threads cannot leak duplicate
+        // Channels/kernels for the same controller key.
+        std::lock_guard<std::mutex> buildLock(g_planBuildMutex);
         std::lock_guard<std::mutex> lock(g_planMutex);
         const auto existing = g_planIds.find(identity);
         if (existing != g_planIds.end()) {
-            const PreparedPlan &prepared = g_plans.at(existing->second);
-            if (prepared.fingerprint != fingerprint) {
+            const PreparedPlan &installed = g_plans.at(existing->second);
+            if (installed.fingerprint != fingerprint) {
                 std::fprintf(stderr,
                     "[A5 CCU URMA] prepared plan id %s is immutable; use a new id for a new path set\n",
                     planId);
                 return HCCL_E_PARA;
             }
-            *planHandle = existing->second;
-            return HCCL_SUCCESS;
+            handle = existing->second;
+        } else {
+            PreparedPlan prepared;
+            prepared.comm = comm;
+            prepared.planId = planId;
+            prepared.fingerprint = fingerprint;
+            prepared.relayManifest = relayManifest;
+            prepared.directRoute = directRoute;
+            prepared.weights.assign(pathWeights, pathWeights + pathCount);
+            handle = g_nextPlanHandle.fetch_add(1U);
+            if (handle == 0U) handle = g_nextPlanHandle.fetch_add(1U);
+            g_plans.emplace(handle, prepared);
+            g_planIds.emplace(identity, handle);
         }
     }
-
-    RoutePlanRequest request;
-    request.includeDiscoveredRoute = true;
-    request.discoveredRoute = directRoute;
-    request.relayManifest = relayManifest;
-    request.weights.assign(pathWeights, pathWeights + pathCount);
-    request.planName = planId;
     RouteResources resources;
-    status = GetRouteResources(comm, stream, RouteKernelKind::ALLTOALL_CONCURRENT,
-                               &resources, &request);
+    status = BindPreparedPlanStream(handle, comm, stream, &resources);
     if (status != HCCL_SUCCESS) return status;
-
-    PreparedPlan prepared;
-    prepared.comm = comm;
-    prepared.planId = planId;
-    prepared.fingerprint = fingerprint;
-    prepared.relayManifest = relayManifest;
-    prepared.directRoute = directRoute;
-    prepared.weights.assign(pathWeights, pathWeights + pathCount);
-    prepared.resourcesByStream.emplace(reinterpret_cast<uintptr_t>(stream), resources);
-    uint64_t handle = g_nextPlanHandle.fetch_add(1U);
-    if (handle == 0U) handle = g_nextPlanHandle.fetch_add(1U);
-    {
-        std::lock_guard<std::mutex> lock(g_planMutex);
-        const auto existing = g_planIds.find(identity);
-        if (existing != g_planIds.end()) {
-            const PreparedPlan &installed = g_plans.at(existing->second);
-            if (installed.fingerprint != fingerprint) return HCCL_E_PARA;
-            *planHandle = existing->second;
-            return HCCL_SUCCESS;
-        }
-        g_plans.emplace(handle, prepared);
-        g_planIds.emplace(identity, handle);
-    }
     *planHandle = handle;
     std::printf("PREPARED_MULTIPATH_PLAN plan_id=%s handle=%lu rank=%u paths=%zu die=%u\n",
                 planId, static_cast<unsigned long>(handle), resources.rank,
@@ -324,81 +465,30 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
     return HCCL_SUCCESS;
 }
 
+extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanBindStream(
+    uint64_t planHandle, HcclComm comm, aclrtStream stream)
+{
+    return BindPreparedPlanStream(planHandle, comm, stream, nullptr);
+}
+
 extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
     void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
     HcclDataType dataType, HcclComm comm, aclrtStream stream,
     uint64_t planHandle)
 {
-    if (planHandle == 0U || stream == nullptr) return HCCL_E_PARA;
-    const uintptr_t streamKey = reinterpret_cast<uintptr_t>(stream);
-    HcclComm preparedComm = nullptr;
-    RouteResources resources;
-    bool foundResources = false;
-    {
-        std::lock_guard<std::mutex> lock(g_planMutex);
-        const auto found = g_plans.find(planHandle);
-        if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
-        const PreparedPlan &prepared = found->second;
-        if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
-        preparedComm = prepared.comm;
-        const auto streamResources = prepared.resourcesByStream.find(streamKey);
-        if (streamResources != prepared.resourcesByStream.end()) {
-            resources = streamResources->second;
-            foundResources = true;
-        }
-    }
+    return ExecutePreparedPlan(sendBuf, recvBuf, elementsPerPeer, dataType,
+                               comm, stream, planHandle, nullptr, 0U, true);
+}
 
-    if (!foundResources) {
-        // torch.compile/npugraphs performs an eager pre-execution on its graph
-        // stream before capture. Build the stream-bound HCOMM resources once
-        // in that pre-execution, then reuse the exact handles during capture
-        // and replay. Serializing this slow path avoids leaking duplicate CCU
-        // threads/channels if two host threads see the same stream at once.
-        std::lock_guard<std::mutex> buildLock(g_planBuildMutex);
-        RoutePlanRequest request;
-        {
-            std::lock_guard<std::mutex> lock(g_planMutex);
-            const auto found = g_plans.find(planHandle);
-            if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
-            const PreparedPlan &prepared = found->second;
-            if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
-            preparedComm = prepared.comm;
-            const auto streamResources = prepared.resourcesByStream.find(streamKey);
-            if (streamResources != prepared.resourcesByStream.end()) {
-                resources = streamResources->second;
-                foundResources = true;
-            } else {
-                request.includeDiscoveredRoute = true;
-                request.discoveredRoute = prepared.directRoute;
-                request.relayManifest = prepared.relayManifest;
-                request.weights = prepared.weights;
-                request.planName = prepared.planId;
-            }
-        }
-        if (!foundResources) {
-            std::printf("PREPARED_MULTIPATH_STREAM phase=begin handle=%lu stream=%p\n",
-                        static_cast<unsigned long>(planHandle), stream);
-            std::fflush(stdout);
-            RouteResources created;
-            const HcclResult status = GetRouteResources(
-                preparedComm, stream, RouteKernelKind::ALLTOALL_CONCURRENT,
-                &created, &request);
-            if (status != HCCL_SUCCESS) return status;
-            {
-                std::lock_guard<std::mutex> lock(g_planMutex);
-                const auto found = g_plans.find(planHandle);
-                if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
-                found->second.resourcesByStream.emplace(streamKey, created);
-            }
-            resources = created;
-            std::printf("PREPARED_MULTIPATH_STREAM phase=ready handle=%lu stream=%p rank=%u paths=%zu\n",
-                        static_cast<unsigned long>(planHandle), stream,
-                        resources.rank, resources.channels.size());
-            std::fflush(stdout);
-        }
-    }
-    return LaunchPreparedAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
-                                  preparedComm, resources, false);
+extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecuteV2(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, HcclComm comm, aclrtStream stream,
+    uint64_t planHandle, const uint32_t *launchWeights,
+    uint32_t pathCount)
+{
+    return ExecutePreparedPlan(sendBuf, recvBuf, elementsPerPeer, dataType,
+                               comm, stream, planHandle, launchWeights,
+                               pathCount, false);
 }
 
 extern "C" __attribute__((visibility("default"))) int

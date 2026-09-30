@@ -459,12 +459,14 @@ HCCN counter 能证明指定物理端口在同一 workload 窗口内承载流量
 好的 plan。npugraphs 和 ACLGraph 已完成首次 capture 与重复 replay，证明 host 资源只创建一次、
 图 replay 可以复用准备好的显式路径。
 
-未作为最终标准算子的原因：该接口仍是 DeepEP 自定义 `torch.ops` 加独立 route-probe 资源注册，
-不是完整的标准 Ascend C/HCCL AllToAll；HCCL communicator 看不到这些资源，无法统一管理
-FastLaunch、异常恢复、profiling 和销毁。
+在原生 MC2/HCCL 增量改造被 T560 闭源边界阻塞后，这条路径已升级为当前正式实现：route runtime
+ABI 5 将 plan identity 改成 `(communicator, plan_id)`，显式增加 capture stream bind，并提供
+ExecuteV2 让每次 eager launch 使用同长度的正权重。DeepEP ABI 9 提供图可见 policy op 和 Meta
+kernel。正式路径不再 preload 实验 `libhccl.so`。
 
-保留价值：当标准 HCCL 改造尚未完成时，它是功能正确、可入图的回退实现，也证明“图外准备、
-图内复用”这一生命周期设计是成立的。
+它仍有一个必须准确描述的边界：这是 PyTorch 图可见 custom op，不是原生 GE/Ascend C
+`op_def + tiling.cpp + AIV kernel`。后者若要调用 host runtime，需要公开 host task 或 AIV->CCU
+launch/doorbell，目前 T560 没有暴露。
 
 ### 8.7 AIV -> HBM CommandBlock -> 常驻 CCU worker
 
@@ -527,7 +529,14 @@ hcomm::CcuRep / WriteNb
 
 后续应改造已经能在 T560 运行的原生 CCU AllToAll，而不是继续要求不存在的新版 ABI。
 
-## 9. 原生 HCCL CCU 增量改造（ABI 10）
+## 9. 已停止的原生 HCCL CCU 增量改造（ABI 8~10）
+
+> 状态：这不是当前可运行实现。开发容器中的编译和静态符号检查通过，但有卡执行时两个 rank
+> 都在首次 device synchronize 等待三分钟超时；新增的 selector/template 阶段标记没有进入
+> 实际 plog。证据表明标准 Ascend C AIV 的 `hccl.AllToAll()` 进入闭源 MC2 device server/resource
+> contract，host `libhccl.so` patch 没有控制实际设备路径。当前正式实现见 8.6 的 prepared plan。
+
+下面保留 ABI 8~10 的设计和排错记录，仅供说明为什么停止该路线，不能作为部署步骤。
 
 前述控制面设计保留不变：标准 Ascend C/MC2 仍以 `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入
 HCCL selector/template，路径仍由 EID pair/ChannelDesc 在资源准备阶段决定。ABI 8 首先替换
@@ -570,18 +579,17 @@ thread。ABI 9 的第一次有卡结果进一步证明两个 rank 都能完成 c
 `HcclCcuKernelRegister/Finish/Launch` 形成强动态引用；它不再要求 T560 缺失的
 `HcommCcuKernelRegisterStart/Register/End`。项目扩展版本提升为 ABI 10。
 
-当前尚不能宣称有卡完成。第一版主动限制 `localDie == 0`；资源缓存清理、失败恢复、标准算子首次
-执行、ACLGraph FastLaunch/replay 和 HCCN 物理路径仍需有卡验证。当前已补上旧对象模板专用的
-zero-submitInfo engine context，使 replay 可以进入模板 `FastLaunch()`；但这一行为仍需有卡验证。
+有卡验证最终确认该实现没有进入自定义 template，而不是“只差一次 FastLaunch 验证”。第一版主动
+限制 `localDie == 0`，并补过旧对象模板专用的 zero-submitInfo engine context；这些修改都不能
+跨越闭源 MC2 resource contract，因此不再继续作为产品主线。
 `CalcRes` 不向通用 allocator
 提交 `ccuKernelInfos`，因为该 allocator 正是缺失新接口的调用方；旧对象资源在 `KernelRun` 首次
 执行时创建。这是对目标 T560 的兼容接入点，不应描述成已经完全等同于上游原生
 `TemplateResource` 生命周期。
 
-`plan_id` 和路径目录固定在一次 communicator/capture 生命周期内；缓存键已经加入 manifest
-内容摘要，覆盖文件不会再静默复用旧 catalog，而会 fail-fast。图内 `pathPolicy` 仍可在
-replay 前改变已准备路径的启用状态与权重，但不能在 replay 中创建新 relay。下一步不是继续逆向
-MUE/UVS，而是先在有卡 T560 验证 ABI 10 的 zero-notify 旧对象资源生命周期与 FastLaunch。
+该实验分支曾把 `plan_id`、manifest 摘要和 policy 加入缓存键，并拒绝重复 endpoint/Channel；
+这些防护只证明 host 侧设计完整，不证明 device server 会消费它们。后续若没有官方 MC2 自定义
+资源接口，不再安排 ABI 10 的有卡重试。
 
 为避免错误计划演化为 device wait，当前 HCCL 还会在 launch 前拒绝：重复的 endpoint pair、
 空或重复的 acquired Channel handle，以及超过 15 条路径的 policy。SGL 产品接口保持更保守的

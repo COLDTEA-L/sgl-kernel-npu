@@ -19,18 +19,24 @@ TORCH_LIBRARY_FRAGMENT(deep_ep, m)
 {
     m.def(
         "ccu_urma_prepared_multipath_alltoall(Tensor send_data, int plan_handle) -> Tensor");
+    m.def(
+        "ccu_urma_prepared_multipath_alltoall_policy(Tensor send_data, int plan_handle, int[] path_weights) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(deep_ep, PrivateUse1, m)
 {
     m.impl("ccu_urma_prepared_multipath_alltoall",
            TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_op));
+    m.impl("ccu_urma_prepared_multipath_alltoall_policy",
+           TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_policy_op));
 }
 
 TORCH_LIBRARY_IMPL(deep_ep, Meta, m)
 {
     m.impl("ccu_urma_prepared_multipath_alltoall",
            TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_meta));
+    m.impl("ccu_urma_prepared_multipath_alltoall_policy",
+           TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_policy_meta));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -75,6 +81,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              py::arg("plan_id"), py::arg("relay_manifest"),
              py::arg("direct_route"), py::arg("path_weights"),
              "Prepare explicit CommLinks, Channels and a CCU kernel outside graph execution")
+        .def("bind_ccu_urma_explicit_multipath_plan",
+             &deep_ep::Buffer::bind_ccu_urma_explicit_multipath_plan,
+             py::arg("plan_handle"),
+             "Bind an existing plan to the current NPU stream outside graph capture")
         .def("ccu_urma_prepared_multipath_alltoall",
              &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall,
              py::arg("send_data"), py::arg("plan_handle"),
@@ -83,6 +93,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall_out,
              py::arg("send_data"), py::arg("recv_data"), py::arg("plan_handle"),
              "Out variant of the prepared explicit multipath CCU plan")
+        .def("ccu_urma_prepared_multipath_alltoall_policy",
+             &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall_policy,
+             py::arg("send_data"), py::arg("plan_handle"),
+             py::arg("path_weights"),
+             "Launch a prepared plan with positive per-launch host weights")
+        .def("ccu_urma_prepared_multipath_alltoall_policy_out",
+             &deep_ep::Buffer::ccu_urma_prepared_multipath_alltoall_policy_out,
+             py::arg("send_data"), py::arg("recv_data"),
+             py::arg("plan_handle"), py::arg("path_weights"),
+             "Out variant with positive per-launch host weights")
         .def("prepare_ccu_hbm_command_worker",
              &deep_ep::Buffer::prepare_ccu_hbm_command_worker,
              py::arg("send_data"), py::arg("recv_data"), py::arg("command_block"),

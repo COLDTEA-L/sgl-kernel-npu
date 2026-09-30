@@ -178,7 +178,9 @@ built_library=$(
 required_symbols=(
     HcclCcuUrmaMultiRouteAllToAll
     HcclCcuUrmaExplicitMultipathPlanCreate
+    HcclCcuUrmaExplicitMultipathPlanBindStream
     HcclCcuUrmaExplicitMultipathPlanExecute
+    HcclCcuUrmaExplicitMultipathPlanExecuteV2
     A5CcuUrmaPreparedPlanAbiVersion
     HcclCcuUrmaCommandBlockWorkerCreate
     HcclCcuUrmaCommandBlockWorkerStop
@@ -190,6 +192,25 @@ for required_symbol in "${required_symbols[@]}"; do
         exit 1
     }
 done
+verify_prepared_plan_abi()
+{
+    local library_path=$1
+    python3 - "${library_path}" <<'PY'
+import ctypes
+import pathlib
+import sys
+
+library_path = pathlib.Path(sys.argv[1]).resolve()
+library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+version = library.A5CcuUrmaPreparedPlanAbiVersion
+version.restype = ctypes.c_int
+actual = version()
+print(f"Verified prepared-plan ABI: {actual} ({library_path})")
+if actual < 5:
+    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 5")
+PY
+}
+verify_prepared_plan_abi "${built_library}"
 echo "Verified packaged library: ${built_library}"
 
 if (( install_after_build == 0 )); then
@@ -239,6 +260,7 @@ for required_symbol in "${required_symbols[@]}"; do
         exit 1
     }
 done
+verify_prepared_plan_abi "${installed_library}"
 cmp -s "${built_library}" "${installed_library}" || {
     echo "Installed route probe does not match the package build: ${installed_library}" >&2
     exit 1

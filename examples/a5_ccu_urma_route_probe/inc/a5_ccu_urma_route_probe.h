@@ -63,7 +63,8 @@ HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
     const char *relayManifest, uint32_t directRoute,
     const uint32_t *pathWeights, uint32_t pathCount);
 
-/** ABI marker for the prepared-plan API below. */
+/** ABI marker for the prepared-plan API below.  ABI 5 adds explicit
+ * stream binding and per-launch host path weights. */
 int A5CcuUrmaPreparedPlanAbiVersion(void);
 
 /**
@@ -83,6 +84,14 @@ HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
     uint64_t *planHandle);
 
 /**
+ * Bind an existing plan to an additional execution stream outside graph
+ * capture.  Channel and CCU resources are stream-affine on T560, so graph
+ * capture must call this before the first PlanExecute on that stream.
+ */
+HcclResult HcclCcuUrmaExplicitMultipathPlanBindStream(
+    uint64_t planHandle, HcclComm comm, aclrtStream stream);
+
+/**
  * Execute a previously prepared plan. This data-plane-only entry does not
  * parse a manifest, enumerate RankGraph links, acquire a Channel or register a
  * CCU kernel. It only updates buffer tokens/offsets and launches the cached
@@ -92,6 +101,19 @@ HcclResult HcclCcuUrmaExplicitMultipathPlanExecute(
     void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
     HcclDataType dataType, HcclComm comm, aclrtStream stream,
     uint64_t planHandle);
+
+/**
+ * Execute with a per-launch host policy.  launchWeights has one positive
+ * entry per prepared Channel; changing the values changes the byte split but
+ * never rebuilds CommLinks, Channels or the CCU kernel.  This API is intended
+ * for a host controller.  Graph replay keeps the values captured at graph
+ * construction time.
+ */
+HcclResult HcclCcuUrmaExplicitMultipathPlanExecuteV2(
+    void *sendBuf, void *recvBuf, uint64_t elementsPerPeer,
+    HcclDataType dataType, HcclComm comm, aclrtStream stream,
+    uint64_t planHandle, const uint32_t *launchWeights,
+    uint32_t pathCount);
 
 /**
  * Experimental cross-engine mailbox ABI.
