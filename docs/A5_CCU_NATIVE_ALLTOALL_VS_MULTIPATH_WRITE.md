@@ -527,7 +527,7 @@ hcomm::CcuRep / WriteNb
 
 后续应改造已经能在 T560 运行的原生 CCU AllToAll，而不是继续要求不存在的新版 ABI。
 
-## 9. 原生 HCCL CCU 增量改造（ABI 9）
+## 9. 原生 HCCL CCU 增量改造（ABI 10）
 
 前述控制面设计保留不变：标准 Ascend C/MC2 仍以 `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入
 HCCL selector/template，路径仍由 EID pair/ChannelDesc 在资源准备阶段决定。ABI 8 首先替换
@@ -542,7 +542,7 @@ T560 无法执行的数据面后端：
        native direct ChannelDesc
        + manifest relay ChannelDesc
   -> CalcRes 保存 direct/relay ChannelDesc catalog
-  -> 原生资源层按 notifyNumOnMainThread=3 创建 main thread
+  -> 原生资源层按 notifyNumOnMainThread=0 创建 main thread
   -> KernelRun 首次执行
        复用 TemplateResource.threads[0]
        HcclChannelAcquire
@@ -557,11 +557,15 @@ T560 无法执行的数据面后端：
 ABI 9 修复了第一次有卡 ABI 8 单 case 暴露的 main-thread 生命周期问题：ABI 8 先以 0 notify
 创建 native main thread，又在 KernelRun 对同一 stream 二次 Acquire 3-notify thread，首次 launch
 后卡在 device synchronize。ABI 9 改为由 `CalcRes` 声明 3 个 notify，并直接复用原生资源层返回的
-thread。
+thread。ABI 9 的第一次有卡结果进一步证明两个 rank 都能完成 communicator/Buffer 初始化，
+`run_op()` 也能异步返回，但都卡在紧随其后的 `torch.npu.synchronize()`。静态核对发现 ABI 9
+把 output/token/completion 三个 **Channel notify** 错当成了 main-thread notify，并令
+`notifyNumOnMainThread=3`。原生一 die CCU AllToAll 在此处使用 0，且本项目 CCU kernel 没有产生
+任何 thread-level notify。ABI 10 因此保留原生 thread 复用，但把 thread notify 数量改回 0。
 
 该实现已经在开发容器完整编译，并确认 `libhccl.so` 对
 `HcclCcuKernelRegister/Finish/Launch` 形成强动态引用；它不再要求 T560 缺失的
-`HcommCcuKernelRegisterStart/Register/End`。项目扩展版本提升为 ABI 9。
+`HcommCcuKernelRegisterStart/Register/End`。项目扩展版本提升为 ABI 10。
 
 当前尚不能宣称有卡完成。第一版主动限制 `localDie == 0`；资源缓存清理、失败恢复、标准算子首次
 执行、ACLGraph FastLaunch/replay 和 HCCN 物理路径仍需有卡验证。`CalcRes` 不向通用 allocator
@@ -571,7 +575,7 @@ thread。
 
 `plan_id` 和路径目录固定在一次 communicator/capture 生命周期内；图内 `pathPolicy` 仍可在
 replay 前改变已准备路径的启用状态与权重，但不能在 replay 中创建新 relay。下一步不是继续逆向
-MUE/UVS，而是先在有卡 T560 验证 ABI 9 的旧对象资源生命周期与 FastLaunch。
+MUE/UVS，而是先在有卡 T560 验证 ABI 10 的 zero-notify 旧对象资源生命周期与 FastLaunch。
 
 ## 10. 相关源码
 

@@ -32,7 +32,7 @@ Python/controller
 DeepEP C++
   Buffer::explicit_multipath_all2all_ccu
   - 校验 2 ranks、dtype、policy=[1]int64/NPU
-  - 校验 HCCL extension ABI >= 9
+  - 校验 HCCL extension ABI >= 10
   - 校验 plan_id/manifest 在 communicator 初始化前已设置
     |
     v
@@ -233,7 +233,7 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 - communicator/首次 KernelRun：CalcRes 建立描述符目录和 3-notify main thread，旧对象后端首次执行时创建并缓存完整
   direct/relay Channel 与 CCU kernel；
 - graph capture/replay：只传 policy 和 buffer 地址，复用 catalog；
-- communicator 销毁：ABI 8/9 旧对象后端尚需在有卡环境验证缓存清理和异常恢复；当前缓存键为
+- communicator 销毁：ABI 8..10 旧对象后端尚需在有卡环境验证缓存清理和异常恢复；当前缓存键为
   `(comm, stream, plan_id)`，不能把进程内长期反复销毁/重建 communicator 视为已验证能力；
 - 新增 relay：需要在下一次 communicator 初始化前更新 manifest；
 - 动态禁用 relay、切换子集、改变比例：只更新 `pathPolicy`；
@@ -245,7 +245,7 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 已在 `cam_lyw_dev_91` 完成：
 
 - HCCL host/CCU 源码完整编译、链接和 run-package 打包；
-- HCCL extension ABI 9 编译、动态符号检查；显式 template 强引用
+- HCCL extension ABI 10 编译、动态符号检查；显式 template 强引用
   `HcclCcuKernelRegister/Finish/Launch`；
 - 标准 opbuild、4 个 dtype kernel、custom OPP 打包；
 - DeepEP C++ extension 和 wheel 编译；
@@ -264,7 +264,7 @@ warmup completion。ABI 5 改用 HCCL 原生 1/2 output/token index；ABI 6 对�
 最终定位到 completion mask 沿用了 route-probe 的 `1<<5`，而原生 AllToAll 固定使用
 `POST_SYNC_ID=3`。ABI 7 已改为 `1<<3`。
 
-ABI 9 仍需有卡环境完成：
+ABI 10 仍需有卡环境完成：
 
 1. 标准算子单次正确性；
 2. ACLGraph capture/replay 正确性；
@@ -281,7 +281,7 @@ ABI 9 仍需有卡环境完成：
 作用是拒绝旧 HCCL、旧 wheel、旧 OPP 与新算子混装。ABI 4..7 分别记录 selector、资源槽、
 Channel 生命周期和完成通知的修正，不表示 CANN/HCOMM 额外暴露了 4..7 套接口。
 
-ABI 9 当前模板只依赖以下既有能力：
+ABI 10 当前模板只依赖以下既有能力：
 
 | 层次 | 当前使用的接口或对象 | 是否由本项目新增 |
 |---|---|---|
@@ -296,7 +296,7 @@ ABI 7 中的 `POST_SYNC_ID=3` 是 notify 内部的 mask bit，真正使用的 no
 底层新增“第 4 个 notify”。
 
 ABI 7 曾依赖 HCCL 9.1 兼容层以 weak symbol + `dlsym` 解析新式 HCOMM CCU 接口；T560
-实测没有导出它们。ABI 8/9 不再让显式多路径 template 经过这条新接口，而是复用 route-probe
+实测没有导出它们。ABI 8..10 不再让显式多路径 template 经过这条新接口，而是复用 route-probe
 已验证的旧对象式接口。这意味着：
 
 - 目标 `9.1.T560` 必须导出三个 `HcclCcuKernel*` 符号；
@@ -329,7 +329,7 @@ CCU kernel
 
 该结构不修改核心 `libhccl.so`，也不需要 HBM mailbox 或常驻 CCU worker；T560 的旧对象接口
 足以实现它。但外部插件需要自行接管 communicator、stream、FastLaunch、异常恢复和销毁，无法像
-HCCL template 一样自然接入原生 AllToAll 生命周期，所以当前成本高于 ABI 9 的 HCCL 增量改造。
+HCCL template 一样自然接入原生 AllToAll 生命周期，所以当前成本高于 ABI 10 的 HCCL 增量改造。
 
 ### 10.3 如果 CCU 接口确实不可用
 
