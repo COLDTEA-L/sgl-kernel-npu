@@ -274,10 +274,11 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
     // Version 8 keeps the T560 object API's independently provisioned
-    // output/token/completion notify slots and synchronizes every route.  It
-    // also pairs with per-iteration diagnostics in the host test.  The newer
-    // primitive API's combined bitmask layout is not valid for this provider.
-    return 8;
+    // output/token/completion notify slots and synchronizes every route.  ABI
+    // 9 additionally stabilizes the CompletedEvent objects referenced by the
+    // concurrent WriteNb instruction graph.  The newer primitive API's
+    // combined bitmask layout is not valid for this provider.
+    return 9;
 }
 
 namespace {

@@ -27,7 +27,10 @@ AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
 hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append("A5CcuUrmaMultiRouteAllToAllV5");
+    // Keep this signature in step with changes to the generated instruction
+    // graph.  Otherwise HCOMM may reuse a kernel registered from an older
+    // package in the same communicator.
+    signature.Append("A5CcuUrmaMultiRouteAllToAllV6");
     signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
     for (const uint32_t routeIndex : routeIndices_) {
         signature.Append(routeIndex);
@@ -95,6 +98,13 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
     CCU_KERNEL_CHECK(LocalCopyNb(localDestination, localSource, selfBytes, localEvent));
 
     std::vector<hcomm::CcuRep::CompletedEvent> remoteEvents;
+    // WriteNb records references to these representation objects while the
+    // CCU instruction graph is being built.  Growing the vector after the
+    // first submission moves the wrappers and leaves those instructions
+    // referring to invalid representation objects.  RouteKernel has always
+    // reserved this vector; the AllToAll variant must obey the same lifetime
+    // rule before it submits concurrent writes.
+    remoteEvents.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
         hcomm::CcuRep::LocalAddr source = CreateLocalAddr();
         source.addr = input; source.addr += sourceOffsets[i]; source.token = inputToken;
