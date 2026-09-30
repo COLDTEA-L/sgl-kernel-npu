@@ -37,7 +37,7 @@ GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能�
 host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
 原生 Ascend C 算子。
 
-ABI 要求：route runtime ABI >= 9，DeepEP ABI >= 9。
+ABI 要求：route runtime ABI >= 10，DeepEP ABI >= 9。
 
 ## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
@@ -87,13 +87,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-脚本会强制检查三个 prepared-plan 入口以及 ABI 9：
+脚本会强制检查三个 prepared-plan 入口以及 route ABI 10：
 
 ```text
 HcclCcuUrmaExplicitMultipathPlanCreate
 HcclCcuUrmaExplicitMultipathPlanBindStream
 HcclCcuUrmaExplicitMultipathPlanExecuteV2
-A5CcuUrmaPreparedPlanAbiVersion() >= 9
+A5CcuUrmaPreparedPlanAbiVersion() >= 10
 ```
 
 也可以手工检查已安装文件：
@@ -112,7 +112,7 @@ lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("prepared-plan route ABI:", version())
-assert version() >= 9
+assert version() >= 10
 PY
 ```
 
@@ -195,7 +195,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 成功日志应包含：
 
 ```text
-Verified prepared-plan route runtime: ... (ABI=9)
+Verified prepared-plan route runtime: ... (ABI=10)
 Verified requested APIs: ... prepared=True; DeepEP ABI=9
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
@@ -342,26 +342,29 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 
 ## 9. 常见故障
 
-### 9.1 route runtime ABI 小于 9
+### 9.1 route runtime ABI 小于 10
 
 重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
 custom package installer 留下旧文件。
 
 ### 9.2 warmup 正确性出现 50% 或 100% 不一致
 
-先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。如果建链成功，但相同命令曾经
-首轮通过、随后出现 50% 或 100% 不一致，不要把它解释为 EID 或权重变化。根因是旧 kernel
-在提交多个并发 `WriteNb` 时没有为 `CompletedEvent` vector 预留容量；vector 扩容会搬移已被
-CCU 指令引用的 representation 对象，因此结果随内存布局和时序变化。可工作的单向
-`RouteKernel` 一直有对应的 `reserve()`，ABI 9 将同一生命周期约束补到 AllToAll kernel，
-并更换 kernel signature，避免 communicator 复用旧注册结果。
+先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。如果建链成功但输出严格缺少
+row 0（rank0 最大差值为 1、rank1 最大差值为 2），说明问题不是某一条 relay，而是实验性
+AllToAll CCU graph 中组合的 `LocalCopyNb + WriteNb` 没有可靠提交目标 row 0。ABI 9 的
+`CompletedEvent` 容器修复并未改变这个结果，因此它不是本次故障的根因。
+
+ABI 10 不再让 prepared-plan 使用该实验性组合 graph。它恢复已经在显式多 relay Write
+实验中验证过的数据面：caller stream 上用 D2D copy 完成本地 slice，已验证的 `RouteKernel`
+只负责 peer slice，并把 peer slice 按权重拆给 direct/relay Channels。实验性组合 graph 仅保留
+在 legacy probe 入口中，不再服务 production prepared-plan。
 
 ABI 6 的逐 Channel post-sync 和 ABI 8 的 T560 独立 output/token/completion slot 仍然保留。
 ABI 7 曾照搬新版 primitive API 的 bitmask 布局，但 T560 object API 首次 launch 返回全零，
 因此不能使用该布局。
 
 升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
-出现 `ABI=9`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+出现 `ABI=10`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
 实验。
 
 如果短序列通过而 100 次 warmup 失败，用下面的诊断模式定位第一轮错误；该选项每轮读取并

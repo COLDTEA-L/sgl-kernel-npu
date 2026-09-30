@@ -206,8 +206,8 @@ version = library.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 actual = version()
 print(f"Verified prepared-plan ABI: {actual} ({library_path})")
-if actual < 9:
-    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 9 (stable CCU event storage)")
+if actual < 10:
+    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 10 (prepared RouteKernel data plane)")
 PY
 }
 verify_prepared_plan_abi "${built_library}"

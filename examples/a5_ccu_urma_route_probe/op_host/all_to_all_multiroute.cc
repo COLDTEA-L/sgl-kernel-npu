@@ -1,6 +1,7 @@
 #include "a5_ccu_urma_route_probe.h"
 #include "all_to_all_multiroute_kernel.h"
 #include "command_block_worker_kernel.h"
+#include "route_kernel.h"
 #include "utils.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -19,6 +20,7 @@
 using a5_ccu_urma_probe::AllToAllMultiRouteTaskArg;
 using a5_ccu_urma_probe::CommandBlockWorkerTaskArg;
 using a5_ccu_urma_probe::GetRouteResources;
+using a5_ccu_urma_probe::RouteTaskArg;
 using a5_ccu_urma_probe::RouteKernelKind;
 using a5_ccu_urma_probe::RoutePlanRequest;
 using a5_ccu_urma_probe::RouteResources;
@@ -217,6 +219,98 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
         resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
 }
 
+// Production prepared plans deliberately reuse the RouteKernel data plane that
+// was validated by the explicit multi-relay write experiments. The local
+// rank's slice is an ordinary D2D copy on the caller stream; RouteKernel only
+// owns the peer slice and splits that slice across the prepared Channels.
+HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
+    uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
+    aclrtStream stream, const RouteResources &resources,
+    const std::vector<uint32_t> &launchWeights)
+{
+    if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr || stream == nullptr) {
+        return HCCL_E_PTR;
+    }
+    if (dataType != HCCL_DATA_TYPE_FP32 || elementsPerPeer == 0) {
+        return HCCL_E_NOT_SUPPORT;
+    }
+    if (resources.channels.empty() || launchWeights.size() != resources.channels.size() ||
+        resources.kernel == 0 || resources.rankSize != 2U) {
+        return HCCL_E_INTERNAL;
+    }
+
+    const uint64_t bytes = elementsPerPeer * sizeof(float);
+    const uint64_t totalBytes = bytes * resources.rankSize;
+    const uint32_t peer = 1U - resources.rank;
+    auto *input = static_cast<unsigned char *>(sendBuf);
+    auto *output = static_cast<unsigned char *>(recvBuf);
+    const aclError copyStatus = aclrtMemcpyAsync(
+        output + static_cast<uint64_t>(resources.rank) * bytes, bytes,
+        input + static_cast<uint64_t>(resources.rank) * bytes, bytes,
+        ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    if (copyStatus != ACL_SUCCESS) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA A2A][rank=%u] prepared self copy failed: status=%d\n",
+            resources.rank, static_cast<int>(copyStatus));
+        return HCCL_E_RUNTIME;
+    }
+
+    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(sendBuf), totalBytes);
+    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
+        reinterpret_cast<uint64_t>(recvBuf), totalBytes);
+    uint64_t totalWeight = 0;
+    for (const uint32_t weight : launchWeights) {
+        if (weight == 0U) return HCCL_E_PARA;
+        totalWeight += weight;
+    }
+
+    std::vector<uint64_t> sourceOffsets;
+    std::vector<uint64_t> remoteOffsets;
+    std::vector<uint64_t> pathBytes;
+    sourceOffsets.reserve(launchWeights.size());
+    remoteOffsets.reserve(launchWeights.size());
+    pathBytes.reserve(launchWeights.size());
+    uint64_t assigned = 0;
+    for (size_t i = 0; i < launchWeights.size(); ++i) {
+        uint64_t currentBytes = bytes - assigned;
+        if (i + 1 != launchWeights.size()) {
+            currentBytes = (bytes * launchWeights[i] / totalWeight) /
+                           PATH_ALIGNMENT * PATH_ALIGNMENT;
+        }
+        if (currentBytes == 0U) return HCCL_E_PARA;
+        sourceOffsets.push_back(static_cast<uint64_t>(peer) * bytes + assigned);
+        remoteOffsets.push_back(static_cast<uint64_t>(resources.rank) * bytes + assigned);
+        pathBytes.push_back(currentBytes);
+        assigned += currentBytes;
+    }
+
+    RouteTaskArg taskArg(
+        reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
+        inputToken, outputToken, sourceOffsets, remoteOffsets, pathBytes);
+
+    HcclResult status = HCCL_SUCCESS;
+    if (resources.routeThread != resources.mainThread) {
+        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+            resources.mainThread, resources.routeThread, THREAD_NOTIFY_INDEX));
+        if (status != HCCL_SUCCESS) return status;
+        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+            resources.routeThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+        if (status != HCCL_SUCCESS) return status;
+    }
+
+    status = HcclCcuKernelLaunch(
+        comm, resources.routeThread, resources.kernel, &taskArg);
+    if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
+        return status;
+    }
+    status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
+        resources.mainThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
+    if (status != HCCL_SUCCESS) return status;
+    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
+}
+
 HcclResult RunMultiRouteAllToAll(void *sendBuf, void *recvBuf,
     uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
     aclrtStream stream, const RoutePlanRequest *plan)
@@ -275,10 +369,11 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
 {
     // Version 8 keeps the T560 object API's independently provisioned
     // output/token/completion notify slots and synchronizes every route.  ABI
-    // 9 additionally stabilizes the CompletedEvent objects referenced by the
-    // concurrent WriteNb instruction graph.  The newer primitive API's
-    // combined bitmask layout is not valid for this provider.
-    return 9;
+    // 9 additionally stabilized the CompletedEvent objects referenced by the
+    // experimental combined AllToAll graph. ABI 10 makes prepared plans use
+    // the proven RouteKernel for peer traffic and a stream-ordered D2D copy for
+    // the self slice.
+    return 10;
 }
 
 namespace {
@@ -314,7 +409,7 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
     std::fflush(stdout);
     RouteResources created;
     const HcclResult status = GetRouteResources(
-        preparedComm, stream, RouteKernelKind::ALLTOALL_CONCURRENT,
+        preparedComm, stream, RouteKernelKind::ROUTE_WRITE,
         &created, &request);
     if (status != HCCL_SUCCESS) return status;
     {
@@ -407,8 +502,8 @@ HcclResult ExecutePreparedPlan(void *sendBuf, void *recvBuf,
         if (status != HCCL_SUCCESS) return status;
         weights.assign(launchWeights, launchWeights + pathCount);
     }
-    return LaunchPreparedAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
-                                  preparedComm, resources, weights, false);
+    return LaunchPreparedRouteAllToAll(sendBuf, recvBuf, elementsPerPeer, dataType,
+                                       preparedComm, stream, resources, weights);
 }
 } // namespace
 
