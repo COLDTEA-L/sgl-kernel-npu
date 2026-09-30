@@ -273,9 +273,10 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    // Version 5 makes stream binding an explicit control-plane operation and
-    // accepts positive per-launch weights without rebuilding the path catalog.
-    return 5;
+    // Version 6 makes every route channel participate in the CCU post-sync so
+    // a prepared kernel can be launched repeatedly without reusing incomplete
+    // remote writes or stale completion state.
+    return 6;
 }
 
 namespace {

@@ -37,7 +37,7 @@ GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能�
 host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
 原生 Ascend C 算子。
 
-ABI 要求：route runtime ABI >= 5，DeepEP ABI >= 9。
+ABI 要求：route runtime ABI >= 6，DeepEP ABI >= 9。
 
 ## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
@@ -54,7 +54,7 @@ git merge --ff-only "origin/${BRANCH}"
 git rev-parse --short HEAD
 git status --short
 
-# prepared-plan ABI5/DeepEP ABI9 的最低源码门禁
+# prepared-plan ABI6/DeepEP ABI9 的最低源码门禁
 git merge-base --is-ancestor fa86838 HEAD
 grep -n 'prepared-plan cases support' \
   scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh
@@ -87,13 +87,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-脚本会强制检查三个 prepared-plan 入口以及 ABI 5：
+脚本会强制检查三个 prepared-plan 入口以及 ABI 6：
 
 ```text
 HcclCcuUrmaExplicitMultipathPlanCreate
 HcclCcuUrmaExplicitMultipathPlanBindStream
 HcclCcuUrmaExplicitMultipathPlanExecuteV2
-A5CcuUrmaPreparedPlanAbiVersion() >= 5
+A5CcuUrmaPreparedPlanAbiVersion() >= 6
 ```
 
 也可以手工检查已安装文件：
@@ -112,7 +112,7 @@ lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("prepared-plan route ABI:", version())
-assert version() >= 5
+assert version() >= 6
 PY
 ```
 
@@ -195,7 +195,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 成功日志应包含：
 
 ```text
-Verified prepared-plan route runtime: ... (ABI=5)
+Verified prepared-plan route runtime: ... (ABI=6)
 Verified requested APIs: ... prepared=True; DeepEP ABI=9
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
@@ -342,27 +342,39 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 
 ## 9. 常见故障
 
-### 9.1 route runtime ABI 小于 5
+### 9.1 route runtime ABI 小于 6
 
 重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
 custom package installer 留下旧文件。
 
-### 9.2 DeepEP ABI 小于 9
+### 9.2 warmup 正确性出现 50% 或 100% 不一致
+
+先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。若 plan 建链成功，但第一次
+执行约 50% 不一致、重复 warmup 后变成 100% 不一致，说明旧 route runtime 只在第一条
+Channel 上做了 post-sync，其他 Channel 的远端写入和完成状态会泄漏到下一次 launch；这
+不是 EID、权重或“首轮预热不足”。安装 ABI 6 后，每条 route Channel 都会执行 completion
+record/wait，与原生 HCCL AllToAll/MultiJetty 的 post-sync 范围一致。
+
+升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
+出现 `ABI=6`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+实验。
+
+### 9.3 DeepEP ABI 小于 9
 
 重新构建并 `--force-reinstall` wheel，然后用第 4 节确认实际加载路径。不要只看源码
 分支。
 
-### 9.3 plan 未绑定当前 stream
+### 9.4 plan 未绑定当前 stream
 
 错误会明确提示 `call PlanBindStream outside graph capture`。不能在 capture/replay 内懒建
 资源。测试用 `A5_CCU_PREPARED_ALLOW_LAZY_STREAM=1` 仅用于兼容性排查，不是正式路径。
 
-### 9.4 更改已有 plan_id 的路径目录
+### 9.5 更改已有 plan_id 的路径目录
 
 plan `(communicator, plan_id)` 是不可变路径目录。更换 relay manifest 或路径数量必须用
 新的 `plan_id`；每次执行只允许改变同长度的正权重。
 
-### 9.5 资源释放
+### 9.6 资源释放
 
 当前公开 T560 接口没有提供完整、可证明安全的 Channel/thread/kernel 对称释放链。
 prepared plan 因此按 communicator/process 生命周期持有资源。不要循环创建大量一次性

@@ -27,7 +27,7 @@ AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
 hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append("A5CcuUrmaMultiRouteAllToAllV2");
+    signature.Append("A5CcuUrmaMultiRouteAllToAllV3");
     signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
     for (const uint32_t routeIndex : routeIndices_) {
         signature.Append(routeIndex);
@@ -117,10 +117,18 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         }
     }
 
-    // All data routes target the same peer. One peer-level completion handshake
-    // is sufficient after every local completion event has fired.
-    CCU_KERNEL_CHECK(NotifyRecord(channels_.front(), COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
-    CCU_KERNEL_CHECK(NotifyWait(channels_.front(), COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
+    // A local WriteNb completion is not a substitute for the remote channel's
+    // post-sync.  Every route owns an independent channel/jetty and therefore
+    // every route must participate in the completion handshake.  Synchronizing
+    // only channels_.front() lets a later invocation reuse output/event state
+    // while writes issued on the other channels are still becoming visible.
+    // This mirrors the native HCCL AllToAll/MultiJetty post-sync protocol.
+    for (const ChannelHandle channel : channels_) {
+        CCU_KERNEL_CHECK(NotifyRecord(channel, COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
+    }
+    for (const ChannelHandle channel : channels_) {
+        CCU_KERNEL_CHECK(NotifyWait(channel, COMPLETION_NOTIFY_INDEX, NOTIFY_MASK));
+    }
     return HCCL_SUCCESS;
 }
 

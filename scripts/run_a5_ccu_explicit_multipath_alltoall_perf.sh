@@ -221,7 +221,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 5, f"prepared-plan ABI {value}, expected >= 5"
+assert value >= 6, f"prepared-plan ABI {value}, expected >= 6 (all-channel post-sync)"
 PY
     fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")

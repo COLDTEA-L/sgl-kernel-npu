@@ -286,7 +286,7 @@ route0、route2 的 `WriteNb` 都在第一个 `WaitEvent` 之前提交。这使�
 | self copy | `GroupCopy`/内部 LocalCopy | `LocalCopyNb` | 使用公开 object API |
 | remote write | `ccu::Write` + event bit | `WriteNb` + CompletedEvent | API 层次不同，都是 CCU 单边写 |
 | 数据等待 | 共享 event bitmask | 每个 route 的 CompletedEvent | object API 未公开 event bitmask 聚合接口 |
-| post-sync | 每个 peer channel | 多 route 共用第一条 channel做一次 peer 同步 | 多 route 的远端 peer 相同 |
+| post-sync | 每个 peer channel | 每条 route channel 都做 record/wait | 各 route 拥有独立 channel/jetty；逐 channel 同步才能保证重复 launch 前远端写入已可见 |
 | host thread 同步 | executor 管理主从 thread | die1 时显式 thread notify | 保证用户 stream 与 slave CCU thread 有序 |
 
 远端 output 地址和 token 不能直接删除。Python out 接口虽然复用本地 `recv`，但对端 CCU 仍需要获得该地址及其
