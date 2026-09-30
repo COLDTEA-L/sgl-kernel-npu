@@ -39,7 +39,7 @@ host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层
 
 ABI 要求：route runtime ABI >= 5，DeepEP ABI >= 9。
 
-## 2. 拉取代码
+## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
 正常干净仓库：
 
@@ -53,6 +53,11 @@ git merge --ff-only "origin/${BRANCH}"
 
 git rev-parse --short HEAD
 git status --short
+
+# prepared-plan ABI5/DeepEP ABI9 的最低源码门禁
+git merge-base --is-ancestor fa86838 HEAD
+grep -n 'prepared-plan cases support' \
+  scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh
 ```
 
 `??` 未跟踪文件不会阻止 fast-forward，除非它将覆盖远端同名文件。不要在公共机器上
@@ -65,8 +70,9 @@ git diff --cached > "/tmp/sgl-kernel-npu_index.${STAMP}.patch"
 git status --short
 ```
 
-本方案不要求切换、编译或安装实验 HCCL 分支。`/home/l00934901/hccl` 仅被自定义
-CCU package 构建脚本用作 CMake/头文件工具树；运行时仍使用当前 CANN 的系统 HCCL。
+本方案不要求 fetch、switch、编译或安装实验 HCCL 分支。已有且健康的
+`/home/l00934901/hccl` 仅被自定义 CCU package 构建脚本用作 CMake/头文件工具树；
+运行时仍使用当前 CANN 的系统 HCCL。
 
 ## 3. 编译并安装 route runtime
 
