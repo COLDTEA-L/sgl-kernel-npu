@@ -15,15 +15,13 @@
 - 路径目录为 1 条 direct 加 1..12 条显式 relay；
 - 动态 policy 只能选择已建好的 Channel，不能在 replay 中新建 relay；
 - 不安装 `ubus.ko`，不修改全局 UB route table；
-- 需要本分支配套的 HCCL 扩展 ABI 10 和 DeepEP ABI 8。ABI 4 首先让标准算子通过
-  `HCCL_CMD_ALLTOALL + CCU_SCHED` 进入 HCCL，而不再伪装成
-  `HALF_ALLTOALLV + CCU_MS`；ABI 5 进一步修正 HCCL 原生 AllToAll Channel 的资源槽位为
-  `INPUT=0、OUTPUT=1、TOKEN=2`；ABI 6 对齐原生 AllToAll/MultiJetty 的完整 Channel
-  生命周期；ABI 7 进一步把完成通知改为原生 AllToAll 的 `POST_SYNC_ID=3`；ABI 8 将
-  显式多路径 template 切到 T560 实际导出的旧对象式 `HcclCcuKernel*` 后端；ABI 9 让
+- 需要本分支配套的 HCCL 扩展 ABI 10 和 DeepEP ABI 8。ABI 4..7 对新式 MC2/HCOMM
+  resource layout 的尝试已经废弃；ABI 8 将显式多路径 template 切到 T560 实际导出的
+  旧对象式 `HcclCcuKernel*` 后端；ABI 9 让
   KernelRun 复用原生资源层创建的 main thread，避免对同一 stream 二次 Acquire。ABI 10
   进一步修正 main thread 的 notify 数量为 0：output/token/completion 是 Channel notify，
-  不是 `HcclThreadAcquireWithStream` 的 thread notify。
+  不是 `HcclThreadAcquireWithStream` 的 thread notify。当前旧对象 kernel 使用与已跑通
+  route-probe 相同的 Channel 变量/notify 协议，不能再套用新式原生 kernel 的 CKE 编号。
 
 ## 2. 在有卡环境准备干净的 HCCL 仓库
 
@@ -371,6 +369,8 @@ nibble 2    : relay 1 权重
 
 每个权重为 `0..15`；0 表示本次执行不在该路径发 payload。至少一条路径必须非零。
 路径目录最多 13 条，因为当前 CCU task argument cache 最多容纳 1 direct + 12 relay。
+HCCL 同时以 15 paths 作为硬上限；再多会超出 64-bit policy 除 ABI nibble 外的编码空间，
+现在会在建链前直接报参数错误，而不会进入未定义位移或设备侧等待。
 
 默认性能约定是：
 
@@ -535,15 +535,11 @@ XN 1 = peer output
 XN 2 = peer token
 ```
 
-旧自定义 kernel 沿用了 route-probe 的私有 `OUTPUT=0、TOKEN=1` 布局，导致把 peer input 当输出、
-把 peer output 当 token，并卡在 `PreSync/Write/EventWait`。ABI 5 改为原生 `OUTPUT=1、TOKEN=2`。
-
-ABI 5 有卡运行仍卡在首次 warmup。进一步对比原生 AllToAll/MultiJetty 确认，所有已建
-Channel 都必须参与 pre/post sync，且 remote write 的 source/destination 必须使用该
-Channel 交换的 peer token。ABI 5 只对 channel 0 执行 post-sync，且 source 错用本地
-token。ABI 6 已对齐这两点，但仍错误沿用了 standalone route-probe 的完成位 `1<<5`；
-原生 AllToAll/MultiJetty 使用 `POST_SYNC_ID=3`。ABI 7 修正该通知映射；ABI 8/9 继续沿用该映射，
-当前运行脚本和 DeepEP C++ 会拒绝 HCCL ABI `< 9`。
+ABI 4..7 曾尝试使用新式原生 resource/CKE 布局；T560 缺少对应注册 ABI，因此这段实现没有
+继续沿用。ABI 8..10 的实际数据面是旧对象式 `hcomm::CcuKernel/CcuRep`：每个 Channel 使用
+变量槽 0/1 交换 output/token，notify 槽 0/1 完成地址交换，notify 槽 2 完成最终握手，mask
+均为 1。该协议已经由 standalone route-probe 的重复迭代验证。main thread 的 notify 数量为
+0，不影响这些 Channel 私有 notify。
 
 Native `CcuAlltoAllMesh1DMultiJetty` 仅作为 `CCU_SCHED` 入口与资源协议的参考；显式 relay
 仍采用“一条物理路径一个 Channel”，因为原生 MultiJetty 没有公开 `jetty -> EID/relay` 绑定接口。
@@ -570,7 +566,7 @@ grep -nE \
 [ExplicitMultipath] provisioned 3 channels (direct + 2 relays)
 [ExplicitMultipath] CalcRes ready ... paths[3]
 [ExplicitMultipath] KernelRun begin ...
-[ExplicitMultipathLegacy] phase=native_thread_ready ... notifyNum[3]
+[ExplicitMultipathLegacy] phase=native_thread_ready ... notifyNum[0]
 [ExplicitMultipathLegacy] phase=channel_acquire_done ...
 [ExplicitMultipathLegacy] phase=kernel_register_done ...
 [ExplicitMultipathLegacy] phase=kernel_launch_done ... status[0]
@@ -654,15 +650,16 @@ sed -n '1,300p' "${TRACE_OUT}"
 | 日志特征 | 结论 |
 |---|---|
 | `CCU_MS` + `GetTilingAccelerator ... not support` | 仍加载了旧 OPP/tiling 或 HCCL ABI `< 7`；重新执行第 4、5 节 |
-| ABI 4、warmup 后卡在 `torch.npu.synchronize()` | 旧 CCU kernel 使用错误的 `OUTPUT=0/TOKEN=1`；更新到 ABI 5 并重编 HCCL |
-| ABI 5、warmup 后仍卡在 `torch.npu.synchronize()` | 所有 Channel 未完成 pre/post sync，remote source token 也未按 Channel 绑定；更新到 ABI 6 |
-| ABI 6、warmup 后仍卡在 `torch.npu.synchronize()` | 完成通知仍使用 route-probe 的 bit 5，未对齐原生 AllToAll 的 bit 3；更新到 ABI 7 |
+| ABI 4..7、warmup 后卡在 `torch.npu.synchronize()` | 已废弃的新式 resource/CKE 集成路线；不要继续调槽位或 bit，更新到 ABI 10 旧对象式后端 |
 | ABI 8、两 rank 进入 warmup 后卡在 `torch.npu.synchronize()` | native main thread 先按 0 notify 创建，又被二次 Acquire；更新到 ABI 9 |
 | ABI 9、两 rank 的 `run_op()` 已返回但卡在 warmup `torch.npu.synchronize()` | `CalcRes` 错把 3 个 Channel notify 当作 main-thread notify；更新到 ABI 10 |
 | ABI 10 有 `native_thread_ready`、没有 `channel_acquire_done` | 卡在显式 Channel Acquire，检查 EID plan 与两 rank 的 ChannelDesc 对称性 |
 | ABI 10 有 `channel_acquire_done`、没有 `kernel_register_done` | 卡在旧对象 CCU 指令生成/注册 |
 | ABI 10 有 `kernel_register_done`、没有 `kernel_launch_done` | 卡在 host launch 提交或 thread/stream 绑定 |
 | ABI 10 有 `kernel_launch_done status[0]`、仍卡同步 | kernel 已提交，死锁位于地址/token 交换、Write event 或 completion notify |
+| `duplicate endpoint pair` | direct/relay 或两条 relay 的 EID pair 相同；修正 manifest，HCCL 不再带重复路径进入设备 |
+| `invalid or duplicate acquired Channel` | 不同描述符被 provider 合并为同一个 Channel；当前协议不能对同一 notify 槽等待两次，必须换 EID/path |
+| `fast launch has no prepared resource` | graph replay 的 `(comm, stream, plan_id, manifest 摘要)` 与首次执行不一致；不要在 communicator 生命周期内覆盖 manifest |
 | `selector MATCH ... executeConfig[6]` | 已正确进入 AllToAll 的 CCU_SCHED selector |
 | `exactly two ranks and one native direct channel are required` | `CalcChannelRequest...` 返回的原生 Channel 数量不符合当前 template 假设 |
 | `all channels in one launch must use the same local die` | relay plan 中本地 die 不一致 |
@@ -713,6 +710,29 @@ sed -n '1,240p' "${RUN_DIR}/plans/multipath_plans.json"
 如果已经出现 `selector MATCH` 而未出现 `CalcRes begin`，问题位于 selector 到 executor/template
 注册之间；如果出现 `CalcRes ready` 后失败，才进入 Channel 资源序列化或 CCU instruction 生成范围。
 不要再回退到 `HALF_ALLTOALLV + CCU_MS`。
+
+### 11.4 本版本的死锁防护与剩余边界
+
+HCCL 在进入 CCU kernel 前会执行以下 fail-fast 校验：
+
+- main thread handle 非零，且只复用原生 `TemplateResource.threads[0]`，不再对同一 stream 二次 Acquire；
+- `notifyNumOnMainThread=0`；output/token/completion 使用每个 Channel 自身的 notify 槽；
+- direct 与所有 relay 的 endpoint pair 必须互不重复；
+- native direct `ChannelDesc` 必须提供至少 3 个 Channel notify 槽，满足 output/token/completion 协议；
+- `HcclChannelAcquire` 返回的 handle 必须非零且互不重复，避免对同一 notify 槽等待两次；
+- path 数不能超过 policy word 可编码的 15 条；SGL runner 的产品上限仍为 13 条；
+- 一个 launch 内所有显式 relay 必须位于同一个本地 die，当前只接受 die0；
+- 缓存键包含 manifest 路径与内容摘要，不能让相同 `plan_id` 静默复用旧 Channel catalog；
+- 旧对象式 template 即使没有新式 `submitInfo` 也保存 engine context，使 graph replay 进入
+  `FastLaunch()` 而不是重复走资源创建。
+- 首次 `KernelRun` 的 HCCL input/output base offset 会随资源缓存；FastLaunch 只替换新 buffer
+  基址。若同一缓存键下 offset 变化则直接失败，避免重放从错误地址生成 token。
+
+仍需调用方保证：两个 rank 使用完全相同的 manifest 顺序和 `pathPolicy`，且在 communicator
+生命周期内不覆盖 manifest。动态 policy 要由控制器在两端原子更新；若两端使用不同权重，地址和
+completion 握手仍可能完成，但 AllToAll 数据布局不再有定义。当前还没有公开的旧对象 Channel
+release API，因此 Channel Acquire 后的失败应终止本轮进程再重试，不能在同一进程内反复恢复。
+communicator 销毁后同进程重建的缓存清理也仍是待验证项。
 
 ## 12. 常见故障
 

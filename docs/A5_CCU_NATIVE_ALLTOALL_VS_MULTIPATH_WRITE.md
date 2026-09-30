@@ -547,10 +547,13 @@ T560 无法执行的数据面后端：
        复用 TemplateResource.threads[0]
        HcclChannelAcquire
        HcclCcuKernelRegister / Finish
-       按 (comm, stream, plan_id) 缓存资源
+       拒绝重复 endpoint pair / 重复 Channel handle
+       按 (comm, stream, plan_id, manifest 内容摘要) 缓存资源
+       保存 HCCL input/output base offset
   -> HcclCcuKernelLaunch
   -> hcomm::CcuKernel / CcuRep
   -> direct/relay WriteNb 全部提交后统一 WaitEvent
+  -> executor 保存 zero-submitInfo engine context
   -> FastLaunch 复用同一资源并更新 buffer/policy task args
 ```
 
@@ -568,14 +571,21 @@ thread。ABI 9 的第一次有卡结果进一步证明两个 rank 都能完成 c
 `HcommCcuKernelRegisterStart/Register/End`。项目扩展版本提升为 ABI 10。
 
 当前尚不能宣称有卡完成。第一版主动限制 `localDie == 0`；资源缓存清理、失败恢复、标准算子首次
-执行、ACLGraph FastLaunch/replay 和 HCCN 物理路径仍需有卡验证。`CalcRes` 不向通用 allocator
+执行、ACLGraph FastLaunch/replay 和 HCCN 物理路径仍需有卡验证。当前已补上旧对象模板专用的
+zero-submitInfo engine context，使 replay 可以进入模板 `FastLaunch()`；但这一行为仍需有卡验证。
+`CalcRes` 不向通用 allocator
 提交 `ccuKernelInfos`，因为该 allocator 正是缺失新接口的调用方；旧对象资源在 `KernelRun` 首次
 执行时创建。这是对目标 T560 的兼容接入点，不应描述成已经完全等同于上游原生
 `TemplateResource` 生命周期。
 
-`plan_id` 和路径目录固定在一次 communicator/capture 生命周期内；图内 `pathPolicy` 仍可在
+`plan_id` 和路径目录固定在一次 communicator/capture 生命周期内；缓存键已经加入 manifest
+内容摘要，覆盖文件不会再静默复用旧 catalog，而会 fail-fast。图内 `pathPolicy` 仍可在
 replay 前改变已准备路径的启用状态与权重，但不能在 replay 中创建新 relay。下一步不是继续逆向
 MUE/UVS，而是先在有卡 T560 验证 ABI 10 的 zero-notify 旧对象资源生命周期与 FastLaunch。
+
+为避免错误计划演化为 device wait，当前 HCCL 还会在 launch 前拒绝：重复的 endpoint pair、
+空或重复的 acquired Channel handle，以及超过 15 条路径的 policy。SGL 产品接口保持更保守的
+1 direct + 12 relay 上限。两个 rank 仍必须使用同一 manifest 顺序和同一动态 policy。
 
 ## 10. 相关源码
 

@@ -79,7 +79,7 @@ HCCL CalcRes（标准 selector/template 资源规划）
     |
     v
 HCCL 原生资源层
-  - 根据 CalcRes.notifyNumOnMainThread=3 调用 HcclThreadAcquireWithStream
+  - 根据 CalcRes.notifyNumOnMainThread=0 调用 HcclThreadAcquireWithStream
   - 将 main thread 放入 TemplateResource.threads[0]
     |
     v
@@ -87,14 +87,18 @@ HCCL KernelRun（首次执行；T560 旧对象式后端）
   - 复用 TemplateResource.threads[0]，不二次 Acquire 同一 stream
   - HcclChannelAcquire(direct + relay descriptors)
   - HcclCcuKernelRegister / HcclCcuKernelRegisterFinish
-  - 按 (comm, stream, plan_id) 缓存 thread/channel/kernel
+  - 按 (comm, stream, plan_id, manifest 路径与内容摘要) 缓存 thread/channel/kernel
+  - 缓存首次 KernelRun 的 HCCL input/output base offset，FastLaunch 只替换新 buffer 基址
+  - 拒绝重复 endpoint pair、空 Channel handle 和重复 Channel handle
+  - 校验 native direct ChannelDesc 至少提供 3 个 Channel notify 槽
   - DecodePathPolicy(strideCount)
   - 按权重和 256-byte 对齐计算每条 path 的 offset/bytes
   - HcclCcuKernelLaunch
     |
     v
 HCCL FastLaunch（图重放）
-  - 查找同一 (comm, stream, plan_id) 的已准备资源
+  - executor 为旧对象式模板保存“0 个新式 submitInfo”的 engine context
+  - 查找同一 (comm, stream, plan_id, manifest 内容摘要) 的已准备资源
   - 用本次 buffer 和 policy 重新生成 task args
   - HcclCcuKernelLaunch
     |
@@ -230,11 +234,12 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
 
 ## 8. 生命周期与扩展性
 
-- communicator/首次 KernelRun：CalcRes 建立描述符目录和 3-notify main thread，旧对象后端首次执行时创建并缓存完整
+- communicator/首次 KernelRun：CalcRes 建立描述符目录和 zero-notify main thread，旧对象后端首次执行时创建并缓存完整
   direct/relay Channel 与 CCU kernel；
-- graph capture/replay：只传 policy 和 buffer 地址，复用 catalog；
+- graph capture/replay：executor 即使没有新式 `CcuKernelSubmitInfo`，也会为本模板保存 engine context；重放时只传
+  policy 和 buffer 地址，进入模板 `FastLaunch()` 并复用 catalog；
 - communicator 销毁：ABI 8..10 旧对象后端尚需在有卡环境验证缓存清理和异常恢复；当前缓存键为
-  `(comm, stream, plan_id)`，不能把进程内长期反复销毁/重建 communicator 视为已验证能力；
+  `(comm, stream, plan_id, manifest 内容摘要)`，仍不能把进程内长期反复销毁/重建 communicator 视为已验证能力；
 - 新增 relay：需要在下一次 communicator 初始化前更新 manifest；
 - 动态禁用 relay、切换子集、改变比例：只更新 `pathPolicy`；
 - 扩展到 4 ranks：应把当前“一对 rank 的 path catalog”提升为 peer-pair/path matrix，不能简单复用两 rank
@@ -258,11 +263,11 @@ HCCL `KernelRun` 和 `FastLaunch` 都调用同一个 `FillPathArgs`，避免首�
   `HCCL_E_NOT_SUPPORT (5)`，尚未进入 selector；
 - relay plan 本身完整，`src/dst/relay die` 与 EID 均已解析，不能用 plan 问题解释上述失败。
 
-ABI 4 已在有卡环境跨过资源分配，但因沿用 route-probe 的 0/1 resource index 卡在首次
-warmup completion。ABI 5 改用 HCCL 原生 1/2 output/token index；ABI 6 对齐
-原生 AllToAll/MultiJetty 的 Channel 生命周期和 per-channel token。ABI 6 有卡运行仍挂起，
-最终定位到 completion mask 沿用了 route-probe 的 `1<<5`，而原生 AllToAll 固定使用
-`POST_SYNC_ID=3`。ABI 7 已改为 `1<<3`。
+ABI 4..7 曾尝试把显式路径塞入新式 MC2/HCOMM resource 布局；该路线依赖 T560 未导出的
+`HcommCcuKernelRegister*` 接口，已被放弃。ABI 8 以后改为已被 standalone route-probe 验证的
+旧对象式 `hcomm::CcuKernel/CcuRep` 后端。当前 kernel 使用每个 Channel 的变量槽 0/1 和 notify
+槽 0/1/2、mask 1；这些编号只属于旧对象式 Channel 协议，不能与原生新式 kernel 的 CKE/bit
+编号混用。
 
 ABI 10 仍需有卡环境完成：
 
@@ -272,6 +277,12 @@ ABI 10 仍需有卡环境完成：
 4. 1/2/4/6 relay 性能和稳定性。
 5. communicator 销毁/重建后的缓存清理，以及失败路径中的资源回收；
 6. 第一版只支持 `localDie == 0`；die1 需要第二 stream 和 main/slave thread handshake。
+7. 两端必须读取相同 manifest、相同顺序和相同动态 policy；当前 runner 通过一个共享计划文件保证，
+   通用控制器仍需自行保证跨 rank 原子更新。
+8. 当前 HCCL 防护上限为 15 paths（64-bit policy 的高 4 bit 为 ABI，剩余 60 bit）；SGL API 继续
+   使用更保守的 1 direct + 12 relay 上限。
+9. graph replay 必须保持 HCCL buffer layout 不变；缓存命中但 input/output base offset 变化时直接
+   返回错误，避免用零 offset 或旧 offset 生成错误 token 后卡在 event wait。
 
 ## 10. 底层接口边界与替代架构
 
@@ -291,9 +302,9 @@ ABI 10 当前模板只依赖以下既有能力：
 | 旧对象 CCU primitive | `hcomm::CcuKernel`、`CcuRep`、`WriteNb`、`WaitEvent`、`NotifyRecord/Wait` | 否 |
 | TP/MUE/固件 | TPN、`route_addr_idx`、私有 path object | 未直接访问，也没有公开修改接口 |
 
-ABI 7 中的 `POST_SYNC_ID=3` 是 notify 内部的 mask bit，真正使用的 notify 槽是
-`POST_SYNC_CKE=1`。原生 Channel 的 `NORMAL_NOTIFY_NUM=3` 已覆盖该槽，因此 ABI 7 没有要求
-底层新增“第 4 个 notify”。
+原生新式 AllToAll 的 `POST_SYNC_ID/CKE` 只能用于理解原生 resource layout。当前 ABI 10 的
+旧对象式 kernel 不使用这些编号：它与已跑通的 route-probe 一致，使用 Channel notify 槽
+0/1/2 和 mask 1。`notifyNumOnMainThread=0` 也不代表没有 Channel notify；二者是不同资源域。
 
 ABI 7 曾依赖 HCCL 9.1 兼容层以 weak symbol + `dlsym` 解析新式 HCOMM CCU 接口；T560
 实测没有导出它们。ABI 8..10 不再让显式多路径 template 经过这条新接口，而是复用 route-probe
