@@ -273,10 +273,11 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 
 extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVersion()
 {
-    // Version 6 makes every route channel participate in the CCU post-sync so
-    // a prepared kernel can be launched repeatedly without reusing incomplete
-    // remote writes or stale completion state.
-    return 6;
+    // Version 7 additionally uses the native AllToAll notify layout: output
+    // and token occupy two bits in one pre-sync slot, while every route uses
+    // the native post-sync bit in a second slot.  This keeps repeated launches
+    // from accumulating independent notify-slot state.
+    return 7;
 }
 
 namespace {

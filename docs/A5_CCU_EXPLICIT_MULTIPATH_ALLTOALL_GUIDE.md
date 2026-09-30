@@ -37,7 +37,7 @@ GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能�
 host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
 原生 Ascend C 算子。
 
-ABI 要求：route runtime ABI >= 6，DeepEP ABI >= 9。
+ABI 要求：route runtime ABI >= 7，DeepEP ABI >= 9。
 
 ## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
@@ -54,7 +54,7 @@ git merge --ff-only "origin/${BRANCH}"
 git rev-parse --short HEAD
 git status --short
 
-# prepared-plan ABI6/DeepEP ABI9 的最低源码门禁
+# prepared-plan ABI7/DeepEP ABI9 的最低源码门禁
 git merge-base --is-ancestor fa86838 HEAD
 grep -n 'prepared-plan cases support' \
   scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh
@@ -87,13 +87,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-脚本会强制检查三个 prepared-plan 入口以及 ABI 6：
+脚本会强制检查三个 prepared-plan 入口以及 ABI 7：
 
 ```text
 HcclCcuUrmaExplicitMultipathPlanCreate
 HcclCcuUrmaExplicitMultipathPlanBindStream
 HcclCcuUrmaExplicitMultipathPlanExecuteV2
-A5CcuUrmaPreparedPlanAbiVersion() >= 6
+A5CcuUrmaPreparedPlanAbiVersion() >= 7
 ```
 
 也可以手工检查已安装文件：
@@ -112,7 +112,7 @@ lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("prepared-plan route ABI:", version())
-assert version() >= 6
+assert version() >= 7
 PY
 ```
 
@@ -195,7 +195,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 成功日志应包含：
 
 ```text
-Verified prepared-plan route runtime: ... (ABI=6)
+Verified prepared-plan route runtime: ... (ABI=7)
 Verified requested APIs: ... prepared=True; DeepEP ABI=9
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
@@ -342,7 +342,7 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 
 ## 9. 常见故障
 
-### 9.1 route runtime ABI 小于 6
+### 9.1 route runtime ABI 小于 7
 
 重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
 custom package installer 留下旧文件。
@@ -352,12 +352,35 @@ custom package installer 留下旧文件。
 先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。若 plan 建链成功，但第一次
 执行约 50% 不一致、重复 warmup 后变成 100% 不一致，说明旧 route runtime 只在第一条
 Channel 上做了 post-sync，其他 Channel 的远端写入和完成状态会泄漏到下一次 launch；这
-不是 EID、权重或“首轮预热不足”。安装 ABI 6 后，每条 route Channel 都会执行 completion
-record/wait，与原生 HCCL AllToAll/MultiJetty 的 post-sync 范围一致。
+不是 EID、权重或“首轮预热不足”。ABI 6 已让每条 route Channel 都执行 completion
+record/wait；ABI 7 进一步采用原生 HCCL AllToAll 的 notify 布局：output/token 共用一个
+pre-sync slot 的两个 bit，每条 Channel 使用第二个 slot 的 post-sync bit，避免重复 launch
+累积三个独立 notify slot 的状态。
 
 升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
-出现 `ABI=6`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+出现 `ABI=7`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
 实验。
+
+如果短序列通过而 100 次 warmup 失败，用下面的诊断模式定位第一轮错误；该选项每轮读取并
+检查整个输出，只用于正确性排查，不能用于性能计时：
+
+```bash
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
+  --direct-route 0 \
+  --cases direct_plus_relays \
+  --graph-backend none \
+  --bytes 4194304 \
+  --warmup 100 --iters 1 --repeats 1 \
+  --validate-every-iteration \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+失败时查看 `CASE_ITERATION_FAILURE` 的 `stage`、`iteration`、`mismatch_count` 和两段输出
+首元素。正式 profiling 命令不要带 `--validate-every-iteration`。
 
 ### 9.3 DeepEP ABI 小于 9
 

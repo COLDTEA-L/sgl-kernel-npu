@@ -282,7 +282,7 @@ route0、route2 的 `WriteNb` 都在第一个 `WaitEvent` 之前提交。这使�
 | 阶段 | 原生 HCCL | 多路径实现 | 原因 |
 |---|---|---|---|
 | 地址/token 发布 | 每个 peer channel 发布 | 每条 route channel 发布 | remote variable 属于 channel 资源 |
-| pre-sync wait | output/token bitmask 一次等待 | 同一 notify index，`mask=3` 一次等待 | 避免两个独立 wait |
+| pre-sync wait | output/token bitmask 一次等待 | 同一 notify index，`mask=3` 一次等待 | 与原生可重复通知布局一致 |
 | self copy | `GroupCopy`/内部 LocalCopy | `LocalCopyNb` | 使用公开 object API |
 | remote write | `ccu::Write` + event bit | `WriteNb` + CompletedEvent | API 层次不同，都是 CCU 单边写 |
 | 数据等待 | 共享 event bitmask | 每个 route 的 CompletedEvent | object API 未公开 event bitmask 聚合接口 |

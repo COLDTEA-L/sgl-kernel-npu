@@ -22,6 +22,7 @@ topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 profile=0
 profile_iters=20
 graph_backend=none
+validate_every_iteration=0
 replay_path_weights=""
 cases=native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay
 hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --profile) profile=1; shift ;;
         --profile-iters) profile_iters=$2; shift 2 ;;
         --graph-backend) graph_backend=$2; shift 2 ;;
+        --validate-every-iteration) validate_every_iteration=1; shift ;;
         --replay-path-weights) replay_path_weights=$2; shift 2 ;;
         --cases) cases=$2; shift 2 ;;
         --hccl-lib-dir) hccl_lib_dir=$2; shift 2 ;;
@@ -221,7 +223,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 6, f"prepared-plan ABI {value}, expected >= 6 (all-channel post-sync)"
+assert value >= 7, f"prepared-plan ABI {value}, expected >= 7 (native notify layout)"
 PY
     fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")
@@ -306,6 +308,10 @@ replay_args=()
 if [[ -n "${replay_path_weights}" ]]; then
     replay_args=(--replay-path-weights "${replay_path_weights}")
 fi
+diagnostic_args=()
+if (( validate_every_iteration )); then
+    diagnostic_args=(--validate-every-iteration)
+fi
 
 run_case() {
     local name=$1 round=$2
@@ -321,7 +327,7 @@ run_case() {
         A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
         "${test_script}" --bytes "${bytes}" --warmup "${warmup}" \
-        --iters "${iterations}" "${profile_args[@]}" "$@" \
+        --iters "${iterations}" "${profile_args[@]}" "${diagnostic_args[@]}" "$@" \
         >"${log}" 2>&1 || status=$?
     rm -f "${pg_init_file}"
     grep -q '^PASS:' "${log}" && result=PASS

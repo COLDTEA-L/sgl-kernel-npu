@@ -166,7 +166,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 6:
+            if plan_abi() < 7:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -242,6 +242,10 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--validate-every-iteration", action="store_true",
+        help="synchronize and validate every repeated call; diagnostic only",
+    )
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument("--profile-root", default="/home/l00934901/profiling")
     parser.add_argument(
@@ -483,11 +487,29 @@ def main():
             flush=True,
         )
 
-    def run_repeated(count):
-        for _ in range(count):
+    def run_repeated(count, stage):
+        for index in range(count):
             run_op()
             if complete_each_invocation:
                 torch.npu.synchronize()
+            if args.validate_every_iteration:
+                try:
+                    torch.testing.assert_close(recv, expected)
+                except AssertionError:
+                    mismatch_count = int(torch.count_nonzero(recv != expected).cpu().item())
+                    recv_heads = recv[:, 0].detach().cpu().tolist()
+                    expected_heads = expected[:, 0].detach().cpu().tolist()
+                    print(
+                        f"CASE_ITERATION_FAILURE rank={rank} stage={stage} "
+                        f"iteration={index + 1} mismatch_count={mismatch_count} "
+                        f"recv_heads={recv_heads} expected_heads={expected_heads}",
+                        flush=True,
+                    )
+                    raise
+                print(
+                    f"CASE_ITERATION_PASS rank={rank} stage={stage} iteration={index + 1}",
+                    flush=True,
+                )
 
     run_id = sanitize(
         f"{os.environ.get('TORCHELASTIC_RUN_ID', 'standalone')}_"
@@ -572,7 +594,7 @@ def main():
         print(f"CASE_GRAPH_REPLAY rank={rank} backend={args.compile_backend} PASS", flush=True)
 
     mark_phase("warmup")
-    run_repeated(args.warmup)
+    run_repeated(args.warmup, "warmup")
     torch.npu.synchronize()
     mark_phase("warmup_correctness")
     torch.testing.assert_close(recv, expected)
@@ -602,7 +624,7 @@ def main():
         mark_phase("timing")
     torch.npu.synchronize()
     begin = time.perf_counter()
-    run_repeated(args.iters)
+    run_repeated(args.iters, "measure")
     torch.npu.synchronize()
     average_us = (time.perf_counter() - begin) * 1e6 / args.iters
     if profiler is not None:

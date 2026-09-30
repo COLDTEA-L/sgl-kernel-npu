@@ -206,8 +206,8 @@ version = library.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 actual = version()
 print(f"Verified prepared-plan ABI: {actual} ({library_path})")
-if actual < 6:
-    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 6 (all-channel post-sync)")
+if actual < 7:
+    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 7 (native notify layout)")
 PY
 }
 verify_prepared_plan_abi "${built_library}"
