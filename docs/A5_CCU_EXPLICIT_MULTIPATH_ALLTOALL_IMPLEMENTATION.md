@@ -63,6 +63,16 @@ torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
 
 Meta kernel使 torch dispatcher/图前端能够推导输出形状与 dtype。
 
+DeepEP ABI 10 在直接 ACL/HCOMM 调用前使用 `getCurrentNPUStream().stream()`。
+torch_npu 的 `stream(false)` 只返回原始流，不能保证之前的 `fill/stack/add_` 已从
+host queue 提交；原始 ACL 调用可能抢先读取输入。`stream()` 清空 host 提交队列，
+让 tensor producer、D2D self-copy、CCU launch 按流顺序提交；它不等待 device 完成。
+这是 PyTorch bridge 的要求，单独 C++ probe 没有这层 torch_npu host queue。
+
+route ABI 10 的本地 slice 使用 D2D copy，peer slice 使用 RouteKernel 并发 WriteNb。
+两 rank 的地址映射为 `send[peer] -> remote_recv[rank]`、`send[rank] -> recv[rank]`。
+整行缺失只说明某个 slice 未得到预期值，不能单凭它认定硬件路径或 kernel 有故障。
+
 ## 3. plan 数据模型
 
 ### 3.1 不可变目录

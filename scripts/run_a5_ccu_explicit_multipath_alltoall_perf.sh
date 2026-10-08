@@ -262,9 +262,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 9:
+if version < 10:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 9; "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 10 (torch_npu queue ordering); "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "

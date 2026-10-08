@@ -150,7 +150,7 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        required_version = 9 if IMPLEMENTATION == "prepared" else 8
+        required_version = 10 if IMPLEMENTATION == "prepared" else 8
         if version < required_version:
             raise RuntimeError(
                 f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
@@ -244,7 +244,7 @@ def parse_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
         "--validate-every-iteration", action="store_true",
-        help="synchronize and validate every repeated call; diagnostic only",
+        help="change input, poison output, and validate every repeated call; diagnostic only",
     )
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument("--profile-root", default="/home/l00934901/profiling")
@@ -427,6 +427,24 @@ def main():
         for src in range(world_size)
     ])
 
+    def check_result():
+        try:
+            torch.testing.assert_close(recv, expected)
+        except AssertionError:
+            mismatch_by_row = torch.count_nonzero(
+                recv != expected, dim=1
+            ).detach().cpu().tolist()
+            print(
+                f"CASE_DATA_DIAGNOSTIC rank={rank} phase={CURRENT_PHASE} "
+                f"mismatch_by_row={mismatch_by_row} "
+                f"recv_heads={recv[:, 0].detach().cpu().tolist()} "
+                f"recv_tails={recv[:, -1].detach().cpu().tolist()} "
+                f"expected_heads={expected[:, 0].detach().cpu().tolist()} "
+                f"send_heads={send[:, 0].detach().cpu().tolist()}",
+                flush=True,
+            )
+            raise
+
     compiled_prepared_op = None
     acl_graph = None
     if args.compile_backend not in ("none", "aclgraph"):
@@ -489,12 +507,19 @@ def main():
 
     def run_repeated(count, stage):
         for index in range(count):
+            if args.validate_every_iteration:
+                # Leave these producers in the normal torch_npu host queue.
+                # The bridge must order its raw ACL/HCOMM launch after them.
+                # Fresh input and poisoned output also reject stale replay.
+                send.add_(17.0)
+                expected.add_(17.0)
+                recv.fill_(-999.0)
             run_op()
             if complete_each_invocation:
                 torch.npu.synchronize()
             if args.validate_every_iteration:
                 try:
-                    torch.testing.assert_close(recv, expected)
+                    check_result()
                 except AssertionError:
                     mismatch_count = int(torch.count_nonzero(recv != expected).cpu().item())
                     recv_heads = recv[:, 0].detach().cpu().tolist()
@@ -502,7 +527,8 @@ def main():
                     print(
                         f"CASE_ITERATION_FAILURE rank={rank} stage={stage} "
                         f"iteration={index + 1} mismatch_count={mismatch_count} "
-                        f"recv_heads={recv_heads} expected_heads={expected_heads}",
+                        f"recv_heads={recv_heads} expected_heads={expected_heads} "
+                        f"send_heads={send[:, 0].detach().cpu().tolist()}",
                         flush=True,
                     )
                     raise
@@ -536,7 +562,7 @@ def main():
                     send, plan_handle, explicit_weights
                 )
         torch.npu.synchronize()
-        torch.testing.assert_close(recv, expected)
+        check_result()
         file_barrier(sync_dir, "aclgraph_stream_warmup", rank, world_size)
 
         mark_phase("aclgraph_capture")
@@ -567,7 +593,7 @@ def main():
         mark_phase("aclgraph_replay")
         acl_graph.replay()
         torch.npu.synchronize()
-        torch.testing.assert_close(recv, expected)
+        check_result()
         file_barrier(sync_dir, "aclgraph_replay", rank, world_size)
         print(f"CASE_ACLGRAPH_REPLAY rank={rank} PASS", flush=True)
     elif compiled_prepared_op is not None:
@@ -576,7 +602,7 @@ def main():
         mark_phase(f"graph_first_execute_{args.compile_backend}")
         run_op()
         torch.npu.synchronize()
-        torch.testing.assert_close(recv, expected)
+        check_result()
         file_barrier(sync_dir, "graph_first_execute", rank, world_size)
         print(f"CASE_GRAPH_FIRST_EXECUTE rank={rank} backend={args.compile_backend} PASS", flush=True)
 
@@ -589,7 +615,7 @@ def main():
         mark_phase(f"graph_replay_{args.compile_backend}")
         run_op()
         torch.npu.synchronize()
-        torch.testing.assert_close(recv, expected)
+        check_result()
         file_barrier(sync_dir, "graph_replay", rank, world_size)
         print(f"CASE_GRAPH_REPLAY rank={rank} backend={args.compile_backend} PASS", flush=True)
 
@@ -597,7 +623,7 @@ def main():
     run_repeated(args.warmup, "warmup")
     torch.npu.synchronize()
     mark_phase("warmup_correctness")
-    torch.testing.assert_close(recv, expected)
+    check_result()
     file_barrier(sync_dir, "warmup_done", rank, world_size)
 
     if args.compile_backend == "aclgraph":
@@ -630,7 +656,7 @@ def main():
     if profiler is not None:
         profiler.stop()
         print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
-    torch.testing.assert_close(recv, expected)
+    check_result()
 
     (sync_dir / f"average.rank{rank}.json").write_text(json.dumps(average_us))
     file_barrier(sync_dir, "timing_results", rank, world_size)

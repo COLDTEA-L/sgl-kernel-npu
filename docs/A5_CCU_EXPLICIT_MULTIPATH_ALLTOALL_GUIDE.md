@@ -162,7 +162,7 @@ y = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
 )
 print("Meta:", y.device, tuple(y.shape), y.dtype)
 
-assert version() >= 9
+assert version() >= 10
 assert tuple(y.shape) == tuple(x.shape)
 PY
 ```
@@ -196,7 +196,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 
 ```text
 Verified prepared-plan route runtime: ... (ABI=10)
-Verified requested APIs: ... prepared=True; DeepEP ABI=9
+Verified requested APIs: ... prepared=True; DeepEP ABI=10
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
 PASS: implementation=prepared ...
@@ -349,12 +349,26 @@ custom package installer 留下旧文件。
 
 ### 9.2 warmup 正确性出现 50% 或 100% 不一致
 
-先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。如果建链成功但输出严格缺少
-row 0（rank0 最大差值为 1、rank1 最大差值为 2），说明问题不是某一条 relay，而是实验性
-AllToAll CCU graph 中组合的 `LocalCopyNb + WriteNb` 没有可靠提交目标 row 0。ABI 9 的
-`CompletedEvent` 容器修复并未改变这个结果，因此它不是本次故障的根因。
+先确认日志中的 direct/relay `PATH_CHANNEL` 都为 `state=0`。此前先出现缺 row 0，
+route ABI 10 后又出现缺 row 1。缺失整行只能定位数据范围，不能证明是某条 relay 或
+某个 CCU 指令坏了；此前据此归因组合 kernel 的结论过强。`CompletedEvent` 容器扩容
+以及替换 kernel 均未解决首次调用错误。
 
-ABI 10 不再让 prepared-plan 使用该实验性组合 graph。它恢复已经在显式多 relay Write
+这次源码检查发现 DeepEP bridge 在直接调用 ACL/HCOMM 前使用 `stream(false)`。
+torch_npu 中它只返回流指针，跳过 host task queue 清空；`fill/stack/add_` 可能尚未提交，
+通信就先读了输入。执行后 `torch.npu.synchronize()` 只能等待已提交工作，不能修复这种
+先读后写。DeepEP ABI 10 改用 `stream()`，先提交完之前的 torch_npu host 任务，再提交
+D2D 和 CCU launch；不增加每次 device synchronize。这个缺陷已从源码确认，它是否解释
+本次整行缺失仍须用下面的逐轮有卡实验确认。
+
+本次必须重新执行第 4 节编译安装 wheel，确认 **DeepEP ABI >= 10**。route runtime
+保持 ABI 10，若已经安装则不用重新编译 route package，也不用修改 HCCL。
+
+语义依据：[torch_npu NPUStream 源码](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp)
+中的 `NPUStream::stream(bool)` 和 `NPUStream::stream()`；同时已核对开发容器
+`libtorch_npu.so` 存在这两个重载。
+
+route ABI 10 不再让 prepared-plan 使用该实验性组合 graph。它恢复已经在显式多 relay Write
 实验中验证过的数据面：caller stream 上用 D2D copy 完成本地 slice，已验证的 `RouteKernel`
 只负责 peer slice，并把 peer slice 按权重拆给 direct/relay Channels。实验性组合 graph 仅保留
 在 legacy probe 入口中，不再服务 production prepared-plan。
@@ -364,7 +378,7 @@ ABI 7 曾照搬新版 primitive API 的 bitmask 布局，但 T560 object API 首
 因此不能使用该布局。
 
 升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
-出现 `ABI=10`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+出现 route `ABI=10`、`DeepEP ABI=10`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
 实验。
 
 如果短序列通过而 100 次 warmup 失败，用下面的诊断模式定位第一轮错误；该选项每轮读取并
@@ -378,17 +392,22 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
   --cases direct_plus_relays \
   --graph-backend none \
   --bytes 4194304 \
-  --warmup 100 --iters 1 --repeats 1 \
+  --warmup 4 --iters 2 --repeats 1 \
   --validate-every-iteration \
   --timeout-seconds 600 \
   --cann-root /usr/local/Ascend/cann-9.1.T560 \
   --output-root /home/l00934901/profiling
 ```
 
-失败时查看 `CASE_ITERATION_FAILURE` 的 `stage`、`iteration`、`mismatch_count` 和两段输出
-首元素。正式 profiling 命令不要带 `--validate-every-iteration`。
+该诊断每轮先把输入和期望值加 17，并把输出填为 -999，然后调用算子；Python 不在这些
+写入与算子之间加 synchronize，以检验 bridge 的提交顺序。每个 rank 应有六次
+`CASE_ITERATION_PASS`。失败时查看 `CASE_ITERATION_FAILURE` 的 `stage`、`iteration`、
+`mismatch_count`、`recv_heads`、`expected_heads` 和 `send_heads`。
+通过后可把 warmup 改为 100 再检验重复执行。正式 profiling 不带该诊断选项。
+即使未启用诊断选项，正确性失败也会打印 `CASE_DATA_DIAGNOSTIC`，包括每行错误数、
+输出首尾值、输入值和期望值，避免仅根据 assert 的最大差值推断实际输出。
 
-### 9.3 DeepEP ABI 小于 9
+### 9.3 DeepEP ABI 小于 10
 
 重新构建并 `--force-reinstall` wheel，然后用第 4 节确认实际加载路径。不要只看源码
 分支。

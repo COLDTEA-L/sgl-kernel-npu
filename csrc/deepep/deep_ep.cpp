@@ -23,7 +23,9 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
     // allocates and returns a fresh output instead of aliasing an out tensor.
     // Version 9 exposes prepared-plan ABI 5: explicit stream binding and
     // positive per-launch host path weights, without the MC2 device server.
-    return 9;
+    // Version 10 orders direct ACL/HCOMM submissions after torch_npu's host
+    // task queue. stream(false) can submit communication before tensor fills.
+    return 10;
 }
 
 namespace deep_ep {
@@ -399,7 +401,9 @@ torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
 
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
     auto recv_data = torch::empty({num_ranks, send_data.numel()}, send_data.options());
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaMultiRouteWrite()(send_data.data_ptr(), recv_data.data_ptr(),
                                            static_cast<uint64_t>(send_data.numel()),
                                            HCCL_DATA_TYPE_FP32, comm, stream));
@@ -419,7 +423,9 @@ torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
 
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaMultiRouteAllToAll()(send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32, comm, stream));
     return recv_data;
@@ -457,7 +463,9 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
         weights.push_back(static_cast<uint32_t>(weight));
     }
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathAllToAll()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -492,7 +500,9 @@ int64_t Buffer::prepare_ccu_urma_explicit_multipath_plan(
     }
 
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     uint64_t plan_handle = 0;
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanCreate()(
         comm, stream, plan_id.c_str(), relay_manifest.c_str(),
@@ -506,7 +516,9 @@ void Buffer::bind_ccu_urma_explicit_multipath_plan(int64_t plan_handle)
 {
     EP_HOST_ASSERT(num_ranks == 2 && plan_handle > 0);
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanBindStream()(
         static_cast<uint64_t>(plan_handle), comm, stream));
 }
@@ -549,7 +561,9 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
 
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -581,7 +595,9 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
     const std::vector<uint32_t> weights = NormalizePreparedPathWeights(path_weights);
 
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -607,7 +623,9 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
     EP_HOST_ASSERT(plan_handle > 0 && torch_npu::utils::is_npu(send_data));
     auto recv_data = torch::empty_like(send_data);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -633,7 +651,9 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
     const std::vector<uint32_t> weights = NormalizePreparedPathWeights(
         ToWeightVector(path_weights));
     auto recv_data = torch::empty_like(send_data);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -676,7 +696,9 @@ int64_t Buffer::prepare_ccu_hbm_command_worker(
         weights.push_back(static_cast<uint32_t>(weight));
     }
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     uint64_t workerHandle = 0;
     HCCL_CHECK(GetCcuUrmaCommandBlockWorkerCreate()(
         send_data.data_ptr(), recv_data.data_ptr(),
@@ -723,7 +745,9 @@ torch::Tensor Buffer::ccu_hbm_command_puncture(
 void Buffer::stop_ccu_hbm_command_worker(int64_t worker_handle)
 {
     EP_HOST_ASSERT(worker_handle > 0);
-    auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
+    // This orders tensor producers without waiting for device completion.
+    auto stream = c10_npu::getCurrentNPUStream().stream();
     HCCL_CHECK(GetCcuUrmaCommandBlockWorkerStop()(
         static_cast<uint64_t>(worker_handle), stream));
 }
