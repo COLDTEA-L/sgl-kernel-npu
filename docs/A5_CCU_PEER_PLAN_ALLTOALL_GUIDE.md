@@ -41,6 +41,27 @@ multi-die/grouped launch 调度，不能仅改变 `k` 或声称没有任何硬�
 
 ## 2. 拉取与构建
 
+如果本地指导文档差异阻止切分支，先运行以下代码块（备份 tracked 差异，保留
+untracked 文件；不需要在内网机器 push，不要恢复旧 stash）。括号中的 `set -e`
+只影响子 shell，避免失败时退出当前 Docker 交互 shell。每行末尾不要额外加反斜杠。
+
+```bash
+(
+set -e
+cd /home/l00934901/sgl-kernel-npu
+git stash push -m "backup-before-4rank-update-$(date +%Y%m%d_%H%M%S)"
+BRANCH=feature/a5-ccu-peer-plan-alltoall-4rank
+git fetch origin "${BRANCH}"
+git switch "${BRANCH}"
+git merge --ff-only "origin/${BRANCH}"
+git rev-parse HEAD
+git rev-parse "origin/${BRANCH}"
+git status --short
+)
+```
+
+两个提交号应相同。没有本地差异时也可以直接使用下面的拉取命令。
+
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 git fetch origin feature/a5-ccu-peer-plan-alltoall-4rank
@@ -63,6 +84,22 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
 若旧仓有未提交修改，先备份/stash，不要直接 reset 或删 untracked。
 构建脚本的 offline cann-cmake 与 UTF-8 源码预检保持原有行为。
 需要重新装 route package 和 wheel；**不需要重编 HCCL**。
+
+**2026-10-08 worker 入口修复只改 Python 测试与文档**：若第 3 节独立 peer-plan
+ABI 已通过，本次仅拉取更新即可，不需要重复编译/安装 route package 或 wheel。
+先做无需 NPU 的入口回归，再执行第 4 节：
+
+```bash
+python3 tests/python/deepep/test_a5_ccu_peer_entrypoint_cpu.py
+python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --help
+```
+
+应显示 3 个测试 `OK`，help 包含 `--manifest`、`--available-cards`、`--run-dir`、
+`--graph-backend`，不能显示旧两卡 benchmark 的 `--implementation`。
+
+若之前已经被迫退出 Docker，在宿主机使用 `docker exec -it sglang_yuanwen_old bash`
+重新进入（容器名按实际环境修改）。Git 报错不会主动停止容器；编译脚本用
+`bash scripts/...` 执行，不要 `source` 编译脚本或将带 `exit` 的恢复代码直接粘贴进交互 shell。
 
 ## 3. 验证新增 API（独立 ABI，不能只检查旧 ABI 11/12）
 
@@ -104,6 +141,32 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 
 不传 `--relay-map` 就是 direct-only，也不依赖 hccn EID 文件。
 逻辑 rank 与 `--devices` 的顺序对应，可使用其他四张卡或任意两张卡。
+
+### 4.1 `unrecognized arguments` / 错误进入旧两卡脚本
+
+若日志出现 `test_a5_ccu_urma_multiroute_all2all.py: error: unrecognized arguments:
+--manifest ... --available-cards ... --run-dir ... --graph-backend ...`，且最终 status=137，
+这不是四卡 Channel/CCU 失败。旧版 peer 测试导入了两卡 benchmark 的辅助函数；
+两卡 benchmark 在模块初始化时 `prepare_runtime()` 修改环境并执行
+`os.execvpe(..., __file__, ...)`，把四卡 worker 替换成了两卡入口。新参数因而被
+旧 parser 拒绝，分布式启动器随后未能正常结束，外层 timeout TERM/KILL。
+仅凭 137 不能断言 OOM，本次日志中明确出现了 timeout 的 Killed。
+
+修复版将 barrier/profiler 移到无启动副作用的 `a5_ccu_peer_test_support.py`，
+peer 入口先解析自己的参数再导入 NPU runtime，不再导入旧 benchmark。
+拉取后执行第 2 节入口回归，再重跑本节同一条 direct-only 命令即可。
+检查新日志中的阶段标记：
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_peer_plan_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -f "${RUN_DIR}/cases/peer_plan_r1.log"; then
+  grep -nE 'PEER_CASE_PHASE|PEER_CASE_FAILURE|RESULT_JSON|unrecognized arguments' "${RUN_DIR}/cases/peer_plan_r1.log"
+fi
+```
+
+至少应先看到 `import_runtime`，随后是 `communicator_init`、`prepare_plan`；
+只有进入这些阶段后才开始判读通信域/建链/数据面错误。四个 rank 都输出 correctness
+PASS 的 `RESULT_JSON` 才算此 case 完整通过。
 
 ## 5. 四卡显式 direct+1 relay
 

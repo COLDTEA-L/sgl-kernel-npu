@@ -7,11 +7,7 @@ import os
 from pathlib import Path
 import time
 
-import torch
-import torch.distributed as dist
-import torch_npu
-from deep_ep import Buffer
-from test_a5_ccu_urma_multiroute_all2all import file_barrier, make_profiler
+from a5_ccu_peer_test_support import file_barrier, make_profiler
 
 
 def main():
@@ -30,6 +26,15 @@ def main():
     rank, k = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     if k not in (2, 4):
         p.error("initial implementation supports 2 or 4 ranks")
+    # Parse this entry point's arguments before loading any NPU runtime. Never
+    # import an executable benchmark for helpers: its module initialization can
+    # execvpe its own __file__ and replace this four-rank worker with a two-rank CLI.
+    print(f"PEER_CASE_PHASE rank={rank} phase=import_runtime", flush=True)
+    import torch
+    import torch.distributed as dist
+    import torch_npu
+    from deep_ep import Buffer
+
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     sync = args.run_dir / "sync"
     def phase(name):
