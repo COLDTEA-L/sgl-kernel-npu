@@ -263,26 +263,70 @@ capture 和第一次校验 replay 都位于性能计时窗口之前。如果需�
 避免把未生效的策略更新误判为动态选路。权重 0 暂不开放，因为 T560 对零字节
 `WriteNb` 的 provider 行为没有可靠契约。
 
-## 7. relay 数量和性能矩阵
+## 7. 正式性能测试（完整执行命令）
 
 裸算子通信性能统一使用 `--graph-backend none`。这不会执行 ACLGraph capture，
 结果中会标记 `measurement_mode=prepared_eager`。每一次 prepared AllToAll 完成后才会
 进入下一次，避免把异步批量排队吞吐误当成单次通信延迟。
 
-`direct_plus_relays` 使用 `--relay-phys` 中的全部 relay，支持 1..12 张，不要求偶数：
+### 7.1 当前可用卡：2、3 通信，0、1 relay
+
+第 9.2 节正确性和第 6 节 ACLGraph 验证通过后，直接执行：
 
 ```bash
-# 1 条 relay
---relay-phys 0 --cases direct_plus_relays --graph-backend none
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
 
-# 3 条 relay
---relay-phys 0,1,4 --cases direct_plus_relays --graph-backend none
-
-# 固定性能矩阵别名
---relay-phys 4,5 --cases direct_plus_2relay --graph-backend none
---relay-phys 4,5,1,0 --cases direct_plus_4relay --graph-backend none
---relay-phys 4,5,1,0,6,7 --cases direct_plus_6relay --graph-backend none
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1 \
+  --direct-route 0 \
+  --cases direct_plus_relays \
+  --graph-backend none \
+  --bytes 4194304 \
+  --warmup 100 --iters 20 --repeats 3 \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
 ```
+
+本命令不做 graph capture，也不采 profiler。每个 repeat 在图外准备资源后，执行
+100 次独立且完成的 warmup，再计时 20 次独立且完成的调用；三轮各有一份结果。
+不要加 `--validate-every-iteration`，避免逐轮修改/读取 tensor 的诊断开销。
+若还要一起测已发现路径基线，将上述完整命令的 `--cases direct_plus_relays` 改成
+`--cases native0,native2,direct_plus_relays`，其他参数不变。
+`native0/native2` 是当前脚本的 HCCL-discovered candidate 对照（legacy multiroute 入口），
+不是硬件 route index，也不是 `dist.all_to_all` 原生 collective 基准。
+某个基线失败时保留失败日志，不把它作为性能样本。
+
+### 7.2 可用 relay 增多后的完整性能矩阵
+
+只有确认以下六张卡对应路径可使用时再运行，不要求当前立即执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
+  --src-phy 2 --dst-phy 3 \
+  --relay-phys 0,1,4,5,6,7 \
+  --direct-route 0 \
+  --cases native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay \
+  --graph-backend none \
+  --bytes 4194304 \
+  --warmup 100 --iters 20 --repeats 3 \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+固定别名按列表顺序取前 N 张：这里 2 relay 为 `0,1`，4 relay 为 `0,1,4,5`，
+6 relay 为 `0,1,4,5,6,7`。要换通信卡，修改 `--src-phy/--dst-phy`；relay 列表不能包含
+通信双方，拓扑/EID 会重新解析，不应沿用另一组卡的旧 manifest。
+任意数量请使用第 7.1 节的 `direct_plus_relays`，它使用 `--relay-phys` 的全部卡，
+支持 1..12 张、不要求偶数；例如将 relay 列表改为 `0` 或 `0,1,4` 即可。
 
 默认权重为：
 
@@ -291,6 +335,28 @@ direct : 每一条 relay = 2 : 1
 ```
 
 即两条 relay 为 `2,1,1`，不是 direct 与 relay 总量之比 `2:1`。
+
+### 7.3 查看结果
+
+脚本结束会自动生成性能报告，并打印精确 `Result directory`。如果使用上述 2、3 卡命令，
+可以自动取最新目录（不是 `YYYYMMDD_HHMMSS` 占位符）：
+
+```bash
+(
+  set -e
+  RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_explicit_multipath_2_3_* \
+    2>/dev/null | head -1)
+  test -n "${RUN_DIR}" && test -d "${RUN_DIR}"
+  echo "RUN_DIR=${RUN_DIR}"
+  column -s $'\t' -t "${RUN_DIR}/case_status.tsv"
+  sed -n '1,240p' "${RUN_DIR}/explicit_multipath_perf_report.md"
+)
+```
+
+有多个终端同时跑实验时，使用本次脚本打印的精确目录，不要依赖“最新目录”。
+报告的 `host_batch_avg_us` 包含 host 调用及完成同步开销；第 8 节 profiling 用于进一步
+查看 CCU 数据面执行时延。所有对照使用相同 `--bytes`，不能把更大 payload 的带宽当作
+更小 payload 的单次时延收益。
 
 ## 8. profiling
 
