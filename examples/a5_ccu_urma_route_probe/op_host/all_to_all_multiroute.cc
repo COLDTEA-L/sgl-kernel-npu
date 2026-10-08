@@ -3,6 +3,7 @@
 #include "command_block_worker_kernel.h"
 #include "route_kernel.h"
 #include "utils.h"
+#include "../common/path_layout.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
 #include <hcomm/hcomm_res.h>
@@ -11,6 +12,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -32,13 +35,14 @@ namespace {
 constexpr uint32_t MAX_EXPLICIT_PATHS = 13U;
 constexpr uint32_t THREAD_NOTIFY_INDEX = 0;
 constexpr uint32_t THREAD_NOTIFY_TIMEOUT = 1800;
-constexpr uint64_t PATH_ALIGNMENT = 256;
 
 struct PreparedPlan {
     HcclComm comm = nullptr;
     std::string planId;
     std::string fingerprint;
     std::string relayManifest;
+    std::string manifestContent;
+    int32_t deviceId = -1;
     uint32_t directRoute = 0;
     std::vector<uint32_t> weights;
     std::unordered_map<uintptr_t, RouteResources> resourcesByStream;
@@ -53,6 +57,7 @@ struct CommandWorker {
 
 std::mutex g_planMutex;
 std::mutex g_planBuildMutex;
+std::mutex g_submissionMutex;
 std::unordered_map<uint64_t, PreparedPlan> g_plans;
 std::unordered_map<std::string, uint64_t> g_planIds;
 std::atomic<uint64_t> g_nextPlanHandle{1U};
@@ -89,12 +94,29 @@ std::string MakePlanIdentity(HcclComm comm, const std::string &planId)
 }
 
 std::string MakePlanFingerprint(const char *relayManifest, uint32_t directRoute,
-                                const uint32_t *pathWeights, uint32_t pathCount)
+                                const uint32_t *pathWeights, uint32_t pathCount,
+                                const std::string &manifestContent)
 {
     std::ostringstream output;
     output << directRoute << ':' << relayManifest << ':';
     for (uint32_t i = 0; i < pathCount; ++i) output << pathWeights[i] << ',';
+    output << ":content=" << manifestContent.size() << ':' << manifestContent;
     return output.str();
+}
+
+bool ReadManifestContent(const std::string &path, std::string *content)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() <= 0 || file.tellg() > 65536) return false;
+    file.seekg(0);
+    content->assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return !file.bad();
+}
+
+bool OnPlanDevice(const PreparedPlan &plan)
+{
+    int32_t device = -1;
+    return aclrtGetDevice(&device) == ACL_SUCCESS && device == plan.deviceId;
 }
 
 HcclResult ValidatePlanArguments(HcclComm comm, aclrtStream stream,
@@ -148,47 +170,24 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
         return HCCL_E_INTERNAL;
     }
 
-    const uint64_t bytes = elementsPerPeer * sizeof(float);
-    const uint64_t totalBytes = bytes * resources.rankSize;
-    const uint32_t peer = 1U - resources.rank;
+    TwoRankPathLayout layout;
+    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout) ||
+        !DisjointBufferRanges(reinterpret_cast<uint64_t>(sendBuf),
+                              reinterpret_cast<uint64_t>(recvBuf), layout.totalBytes)) {
+        return HCCL_E_PARA;
+    }
+    const uint64_t bytes = layout.peerBytes;
+    const uint64_t totalBytes = layout.totalBytes;
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
 
-    uint64_t totalWeight = 0;
-    for (const uint32_t weight : launchWeights) {
-        if (weight == 0U) return HCCL_E_PARA;
-        totalWeight += weight;
-    }
-    std::vector<uint64_t> sourceOffsets;
-    std::vector<uint64_t> remoteOffsets;
-    std::vector<uint64_t> pathBytes;
-    uint64_t assigned = 0;
-    for (size_t i = 0; i < launchWeights.size(); ++i) {
-        uint64_t currentBytes = bytes - assigned;
-        if (i + 1 != launchWeights.size()) {
-            currentBytes = (bytes * launchWeights[i] / totalWeight) /
-                           PATH_ALIGNMENT * PATH_ALIGNMENT;
-        }
-        if (currentBytes == 0U) {
-            std::fprintf(stderr,
-                "[A5 CCU URMA] payload is too small for %zu positive paths "
-                "with 256-byte aligned chunks\n",
-                launchWeights.size());
-            return HCCL_E_PARA;
-        }
-        sourceOffsets.push_back(static_cast<uint64_t>(peer) * bytes + assigned);
-        remoteOffsets.push_back(static_cast<uint64_t>(resources.rank) * bytes + assigned);
-        pathBytes.push_back(currentBytes);
-        assigned += currentBytes;
-    }
-
     AllToAllMultiRouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
         inputToken, outputToken, static_cast<uint64_t>(resources.rank) * bytes,
         static_cast<uint64_t>(resources.rank) * bytes, bytes,
-        sourceOffsets, remoteOffsets, pathBytes);
+        layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
 
     HcclResult status = HCCL_SUCCESS;
     if (resources.routeThread != resources.mainThread) {
@@ -239,9 +238,15 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
         return HCCL_E_INTERNAL;
     }
 
-    const uint64_t bytes = elementsPerPeer * sizeof(float);
-    const uint64_t totalBytes = bytes * resources.rankSize;
-    const uint32_t peer = 1U - resources.rank;
+    TwoRankPathLayout layout;
+    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout) ||
+        !DisjointBufferRanges(reinterpret_cast<uint64_t>(sendBuf),
+                              reinterpret_cast<uint64_t>(recvBuf), layout.totalBytes)) {
+        std::fprintf(stderr, "[A5 CCU URMA] invalid size, chunks, or overlapping buffers\n");
+        return HCCL_E_PARA;
+    }
+    const uint64_t bytes = layout.peerBytes;
+    const uint64_t totalBytes = layout.totalBytes;
     auto *input = static_cast<unsigned char *>(sendBuf);
     auto *output = static_cast<unsigned char *>(recvBuf);
     const aclError copyStatus = aclrtMemcpyAsync(
@@ -259,35 +264,9 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
-    uint64_t totalWeight = 0;
-    for (const uint32_t weight : launchWeights) {
-        if (weight == 0U) return HCCL_E_PARA;
-        totalWeight += weight;
-    }
-
-    std::vector<uint64_t> sourceOffsets;
-    std::vector<uint64_t> remoteOffsets;
-    std::vector<uint64_t> pathBytes;
-    sourceOffsets.reserve(launchWeights.size());
-    remoteOffsets.reserve(launchWeights.size());
-    pathBytes.reserve(launchWeights.size());
-    uint64_t assigned = 0;
-    for (size_t i = 0; i < launchWeights.size(); ++i) {
-        uint64_t currentBytes = bytes - assigned;
-        if (i + 1 != launchWeights.size()) {
-            currentBytes = (bytes * launchWeights[i] / totalWeight) /
-                           PATH_ALIGNMENT * PATH_ALIGNMENT;
-        }
-        if (currentBytes == 0U) return HCCL_E_PARA;
-        sourceOffsets.push_back(static_cast<uint64_t>(peer) * bytes + assigned);
-        remoteOffsets.push_back(static_cast<uint64_t>(resources.rank) * bytes + assigned);
-        pathBytes.push_back(currentBytes);
-        assigned += currentBytes;
-    }
-
     RouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
-        inputToken, outputToken, sourceOffsets, remoteOffsets, pathBytes);
+        inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
 
     HcclResult status = HCCL_SUCCESS;
     if (resources.routeThread != resources.mainThread) {
@@ -373,7 +352,9 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // experimental combined AllToAll graph. ABI 10 makes prepared plans use
     // the proven RouteKernel for peer traffic and a stream-ordered D2D copy for
     // the self slice.
-    return 10;
+    // Version 11 validates complete layouts before enqueue and binds kernel
+    // signatures to actual Channels rather than ordinal numbers alone.
+    return 11;
 }
 
 namespace {
@@ -384,6 +365,7 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
     if (planHandle == 0U || stream == nullptr) return HCCL_E_PARA;
     const uintptr_t streamKey = reinterpret_cast<uintptr_t>(stream);
     HcclComm preparedComm = nullptr;
+    std::string manifestContent;
     RoutePlanRequest request;
     {
         std::lock_guard<std::mutex> lock(g_planMutex);
@@ -391,6 +373,7 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
         if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
         const PreparedPlan &prepared = found->second;
         if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
+        if (!OnPlanDevice(prepared)) return HCCL_E_PARA;
         const auto existing = prepared.resourcesByStream.find(streamKey);
         if (existing != prepared.resourcesByStream.end()) {
             if (boundResources != nullptr) *boundResources = existing->second;
@@ -402,6 +385,14 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
         request.relayManifest = prepared.relayManifest;
         request.weights = prepared.weights;
         request.planName = prepared.planId;
+        manifestContent = prepared.manifestContent;
+    }
+
+    std::string currentContent;
+    if (!ReadManifestContent(request.relayManifest, &currentContent) ||
+        currentContent != manifestContent) {
+        std::fprintf(stderr, "[A5 CCU URMA] prepared manifest changed; use a new plan_id\n");
+        return HCCL_E_PARA;
     }
 
     std::printf("PREPARED_MULTIPATH_STREAM phase=bind_begin handle=%lu stream=%p\n",
@@ -456,6 +447,7 @@ HcclResult LookupPreparedPlan(uint64_t planHandle, HcclComm comm,
     if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
     const PreparedPlan &prepared = found->second;
     if (comm != nullptr && prepared.comm != comm) return HCCL_E_PARA;
+    if (!OnPlanDevice(prepared)) return HCCL_E_PARA;
     const auto bound = prepared.resourcesByStream.find(streamKey);
     if (bound == prepared.resourcesByStream.end()) return HCCL_E_NOT_FOUND;
     *preparedComm = prepared.comm;
@@ -469,6 +461,9 @@ HcclResult ExecutePreparedPlan(void *sendBuf, void *recvBuf,
     aclrtStream stream, uint64_t planHandle, const uint32_t *launchWeights,
     uint32_t pathCount, bool useDefaultWeights)
 {
+    // Keep a single launch's main/slave notify sequence contiguous when host
+    // threads submit to the same execution stream. No device wait is added.
+    std::lock_guard<std::mutex> submitLock(g_submissionMutex);
     HcclComm preparedComm = nullptr;
     RouteResources resources;
     std::vector<uint32_t> defaultWeights;
@@ -514,24 +509,31 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
     uint64_t *planHandle)
 {
     if (planHandle == nullptr) return HCCL_E_PTR;
+    *planHandle = 0;
     HcclResult status = ValidatePlanArguments(
         comm, stream, planId, relayManifest, pathWeights, pathCount);
     if (status != HCCL_SUCCESS) return status;
 
+    int32_t deviceId = -1;
+    std::string manifestContent;
+    if (aclrtGetDevice(&deviceId) != ACL_SUCCESS ||
+        !ReadManifestContent(relayManifest, &manifestContent)) return HCCL_E_PARA;
+
     const std::string identity = MakePlanIdentity(comm, planId);
     const std::string fingerprint = MakePlanFingerprint(
-        relayManifest, directRoute, pathWeights, pathCount);
+        relayManifest, directRoute, pathWeights, pathCount, manifestContent);
     uint64_t handle = 0U;
+    bool inserted = false;
+    std::lock_guard<std::mutex> buildLock(g_planBuildMutex);
     {
         // Plan IDs are communicator-scoped, not stream-scoped.  Serialize
         // creation so two graph-compilation threads cannot leak duplicate
         // Channels/kernels for the same controller key.
-        std::lock_guard<std::mutex> buildLock(g_planBuildMutex);
         std::lock_guard<std::mutex> lock(g_planMutex);
         const auto existing = g_planIds.find(identity);
         if (existing != g_planIds.end()) {
             const PreparedPlan &installed = g_plans.at(existing->second);
-            if (installed.fingerprint != fingerprint) {
+            if (installed.fingerprint != fingerprint || installed.deviceId != deviceId) {
                 std::fprintf(stderr,
                     "[A5 CCU URMA] prepared plan id %s is immutable; use a new id for a new path set\n",
                     planId);
@@ -544,17 +546,27 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanCreate(
             prepared.planId = planId;
             prepared.fingerprint = fingerprint;
             prepared.relayManifest = relayManifest;
+            prepared.manifestContent = manifestContent;
+            prepared.deviceId = deviceId;
             prepared.directRoute = directRoute;
             prepared.weights.assign(pathWeights, pathWeights + pathCount);
             handle = g_nextPlanHandle.fetch_add(1U);
             if (handle == 0U) handle = g_nextPlanHandle.fetch_add(1U);
             g_plans.emplace(handle, prepared);
             g_planIds.emplace(identity, handle);
+            inserted = true;
         }
     }
     RouteResources resources;
-    status = BindPreparedPlanStream(handle, comm, stream, &resources);
-    if (status != HCCL_SUCCESS) return status;
+    status = BindPreparedPlanStreamLocked(handle, comm, stream, &resources);
+    if (status != HCCL_SUCCESS) {
+        if (inserted) {
+            std::lock_guard<std::mutex> lock(g_planMutex);
+            g_plans.erase(handle);
+            g_planIds.erase(identity);
+        }
+        return status;
+    }
     *planHandle = handle;
     std::printf("PREPARED_MULTIPATH_PLAN plan_id=%s handle=%lu rank=%u paths=%zu die=%u\n",
                 planId, static_cast<unsigned long>(handle), resources.rank,

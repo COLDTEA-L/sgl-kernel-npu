@@ -1120,6 +1120,11 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
                         rank, 1U - rank, i, uid, created.routeIndices[i],
                         static_cast<unsigned long>(created.channels[i]), channelStates[i]);
         }
+        if (explicitPlan && channelStates[i] != 0) {
+            std::fprintf(stderr, "[A5 CCU URMA] explicit channel %zu is not ready: state=%d\n",
+                         i, channelStates[i]);
+            return HCCL_E_RUNTIME;
+        }
     }
     std::fflush(stdout);
 

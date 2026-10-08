@@ -1,4 +1,5 @@
 #include "all_to_all_multiroute_kernel.h"
+#include "../common/path_layout.h"
 
 namespace a5_ccu_urma_probe {
 namespace {
@@ -30,11 +31,10 @@ hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() cons
     // Keep this signature in step with changes to the generated instruction
     // graph.  Otherwise HCOMM may reuse a kernel registered from an older
     // package in the same communicator.
-    signature.Append("A5CcuUrmaMultiRouteAllToAllV6");
-    signature.Append(static_cast<uint32_t>(serialized_ ? 1U : 0U));
-    for (const uint32_t routeIndex : routeIndices_) {
-        signature.Append(routeIndex);
-    }
+    signature.Append(MakePathKernelSignature(
+        serialized_ ? "A5CcuUrmaMultiRouteAllToAllSerialV7" :
+                      "A5CcuUrmaMultiRouteAllToAllConcurrentV7",
+        routeIndices_, channels));
     return signature;
 }
 
@@ -145,7 +145,10 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
 std::vector<uint64_t> AllToAllMultiRouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
 {
     const auto *taskArg = dynamic_cast<const AllToAllMultiRouteTaskArg *>(&arg);
-    if (taskArg == nullptr) {
+    if (taskArg == nullptr || taskArg->pathBytes.size() != channels_.size() ||
+        taskArg->sourceOffsets.size() != channels_.size() ||
+        taskArg->remoteOffsets.size() != channels_.size() ||
+        7 + 3 * channels_.size() > 48) {
         return {};
     }
     std::vector<uint64_t> args = {

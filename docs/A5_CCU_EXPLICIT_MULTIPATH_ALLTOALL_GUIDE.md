@@ -37,7 +37,9 @@ GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能�
 host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
 原生 Ascend C 算子。
 
-ABI 要求：route runtime ABI >= 10，DeepEP ABI >= 9。
+本次 ABI 要求：route runtime ABI >= 11，DeepEP ABI >= 11。必须重新执行第 3、4 节，
+安装 route package 和 wheel 两部分；不需要编译或替换系统 HCCL。
+当前 prepared 数据面仅支持两 rank、连续 FP32 tensor、互不重叠的输入/输出。
 
 ## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
@@ -54,8 +56,8 @@ git merge --ff-only "origin/${BRANCH}"
 git rev-parse --short HEAD
 git status --short
 
-# prepared-plan ABI9/DeepEP ABI9 的最低源码门禁
-git merge-base --is-ancestor fa86838 HEAD
+# 检查本次源码包含新的布局校验，不把旧提交号当成最新版本门禁
+test -f examples/a5_ccu_urma_route_probe/common/path_layout.h
 grep -n 'prepared-plan cases support' \
   scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh
 ```
@@ -87,13 +89,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-脚本会强制检查三个 prepared-plan 入口以及 route ABI 10：
+脚本会强制检查三个 prepared-plan 入口以及 route ABI 11：
 
 ```text
 HcclCcuUrmaExplicitMultipathPlanCreate
 HcclCcuUrmaExplicitMultipathPlanBindStream
 HcclCcuUrmaExplicitMultipathPlanExecuteV2
-A5CcuUrmaPreparedPlanAbiVersion() >= 10
+A5CcuUrmaPreparedPlanAbiVersion() >= 11
 ```
 
 也可以手工检查已安装文件：
@@ -112,7 +114,7 @@ lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("prepared-plan route ABI:", version())
-assert version() >= 10
+assert version() >= 11
 PY
 ```
 
@@ -162,7 +164,7 @@ y = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
 )
 print("Meta:", y.device, tuple(y.shape), y.dtype)
 
-assert version() >= 10
+assert version() >= 11
 assert tuple(y.shape) == tuple(x.shape)
 PY
 ```
@@ -195,8 +197,8 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 成功日志应包含：
 
 ```text
-Verified prepared-plan route runtime: ... (ABI=10)
-Verified requested APIs: ... prepared=True; DeepEP ABI=10
+Verified prepared-plan route runtime: ... (ABI=11)
+Verified requested APIs: ... prepared=True; DeepEP ABI=11
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
 PASS: implementation=prepared ...
@@ -342,7 +344,7 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 
 ## 9. 常见故障
 
-### 9.1 route runtime ABI 小于 10
+### 9.1 route runtime ABI 小于 11
 
 重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
 custom package installer 留下旧文件。
@@ -361,8 +363,8 @@ torch_npu 中它只返回流指针，跳过 host task queue 清空；`fill/stack
 D2D 和 CCU launch；不增加每次 device synchronize。这个缺陷已从源码确认，它是否解释
 本次整行缺失仍须用下面的逐轮有卡实验确认。
 
-本次必须重新执行第 4 节编译安装 wheel，确认 **DeepEP ABI >= 10**。route runtime
-保持 ABI 10，若已经安装则不用重新编译 route package，也不用修改 HCCL。
+本次进一步审查修复见第 9.7 节，必须重新执行第 3、4 节，确认 **route ABI >= 11、
+DeepEP ABI >= 11**；不用修改 HCCL。
 
 语义依据：[torch_npu NPUStream 源码](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp)
 中的 `NPUStream::stream(bool)` 和 `NPUStream::stream()`；同时已核对开发容器
@@ -378,7 +380,7 @@ ABI 7 曾照搬新版 primitive API 的 bitmask 布局，但 T560 object API 首
 因此不能使用该布局。
 
 升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
-出现 route `ABI=10`、`DeepEP ABI=10`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+出现 route `ABI=11`、`DeepEP ABI=11`、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
 实验。
 
 如果短序列通过而 100 次 warmup 失败，用下面的诊断模式定位第一轮错误；该选项每轮读取并
@@ -407,7 +409,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 即使未启用诊断选项，正确性失败也会打印 `CASE_DATA_DIAGNOSTIC`，包括每行错误数、
 输出首尾值、输入值和期望值，避免仅根据 assert 的最大差值推断实际输出。
 
-### 9.3 DeepEP ABI 小于 10
+### 9.3 DeepEP ABI 小于 11
 
 重新构建并 `--force-reinstall` wheel，然后用第 4 节确认实际加载路径。不要只看源码
 分支。
@@ -420,10 +422,45 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 ### 9.5 更改已有 plan_id 的路径目录
 
 plan `(communicator, plan_id)` 是不可变路径目录。更换 relay manifest 或路径数量必须用
-新的 `plan_id`；每次执行只允许改变同长度的正权重。
+新的 `plan_id`；每次执行只允许改变同长度的正权重。ABI 11 同时比对 manifest 内容，
+不再只比较文件路径。修改同名文件不能悄悄改变已存在的 plan；新 stream 绑定时也会检查。
 
 ### 9.6 资源释放
 
 当前公开 T560 接口没有提供完整、可证明安全的 Channel/thread/kernel 对称释放链。
 prepared plan 因此按 communicator/process 生命周期持有资源。不要循环创建大量一次性
-plan_id；每个稳定路径目录复用一个 plan。
+plan_id；每个稳定路径目录复用一个 plan。`CompletedEvent` 是注册 kernel 中复用的资源，
+不是每轮新申请再释放。没有实现 `PlanDestroy`，不能宣称每次调用后释放了全部 CCU 资源。
+通信域及其执行 stream 必须覆盖 plan 和 graph 的整个使用期，销毁前等待全部执行完成。
+
+### 9.7 本次全面审查修复与使用约束
+
+- kernel 缓存签名包含实际 Channel handles 和明确分隔符，避免只有 route ordinal 时
+  不同显式 relay 命中同一 kernel，或 `[1,23]` 与 `[12,3]` 拼接碰撞。
+- 权重分片使用 128-bit 中间乘积；先校验全部地址、长度、对齐及覆盖，再提交本地复制。
+  极小 payload 造成某路径零长度时会明确拒绝，不能先复制一半再报错。
+- bridge 选择 tensor 所在 device，拒绝跨 device 和输入/输出重叠；登记 allocator
+  `recordStream`，避免异步执行时 tensor 存储被过早回收。另一流生产的 tensor 仍须由
+  调用者执行 `execution_stream.wait_stream(producer_stream)`；生命周期登记不等于依赖同步。
+- ACLGraph 测试在 capture stream warmup 前等待输入生产流；没有增加逐次 device 同步。
+- plan 绑定 device，创建失败不留下可查到的半初始化 host plan；显式 Channel 非 ready
+  状态直接报错。底层部分创建失败是否全部释放，仍受第 9.6 节的接口限制。
+- host 提交锁防止单次主/从流 notify 序列被多 host 线程穿插；它**不保证不同 stream
+  的 device 执行互斥**。同一 plan/共享 Channel 的跨流并发未经验证，不应这样使用。
+  graph replay 期间不能同时在另一流用相同通信资源执行 eager 或另一张 graph。
+- 两端必须采用一致的路径顺序、权重和调用顺序；不能一个 rank 换 policy、另一个不换。
+  目前没有 autograd 实现；训练反向不能直接依赖本算子自动生成。
+
+开发 Docker 已完成 route/wheel 编译和安装检查，以及布局、溢出、地址重叠、签名、Meta
+测试。这些不是有卡正确性证明；升级后按第 9.2 节逐轮诊断通过，再执行第 6 节 capture/replay，
+最后采性能。
+
+可单独重复无卡回归（Python 使用已安装 ABI 11 wheel）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+g++ -std=c++14 -Wall -Wextra -Werror -I. \
+  tests/cpp/test_a5_multipath_layout.cpp -o /tmp/a5_multipath_layout_test
+/tmp/a5_multipath_layout_test
+python3 tests/python/deepep/test_a5_prepared_multipath_meta.py
+```

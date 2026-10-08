@@ -150,7 +150,7 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        required_version = 10 if IMPLEMENTATION == "prepared" else 8
+        required_version = 11 if IMPLEMENTATION == "prepared" else 8
         if version < required_version:
             raise RuntimeError(
                 f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
@@ -166,7 +166,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 10:
+            if plan_abi() < 11:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -552,6 +552,9 @@ def main():
         # creation already installed stream-bound HCOMM resources, so neither
         # capture nor replay may acquire a Channel or register a CCU kernel.
         mark_phase("aclgraph_stream_warmup")
+        # Inputs were produced on the caller stream. A new capture stream has
+        # no automatic dependency on those producers.
+        capture_stream.wait_stream(torch_npu.npu.current_stream())
         with torch_npu.npu.stream(capture_stream):
             if args.implementation == "standard":
                 recv = buffer.explicit_multipath_all2all_ccu(

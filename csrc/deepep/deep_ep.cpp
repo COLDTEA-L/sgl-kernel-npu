@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <vector>
 #include <ATen/record_function.h>
+#include <ATen/MemoryOverlap.h>
+#include <c10/core/DeviceGuard.h>
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
 #include <pybind11/functional.h>
 
 #include "hccl/hccl.h"
@@ -25,10 +28,25 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
     // positive per-launch host path weights, without the MC2 device server.
     // Version 10 orders direct ACL/HCOMM submissions after torch_npu's host
     // task queue. stream(false) can submit communication before tensor fills.
-    return 10;
+    // Version 11 validates tensor devices/aliasing and records allocator
+    // lifetimes for raw CCU work submitted on the execution stream.
+    return 11;
 }
 
 namespace deep_ep {
+namespace {
+aclrtStream OrderedCcuTensorStream(const torch::Tensor &send,
+                                  const torch::Tensor &recv)
+{
+    TORCH_CHECK(send.device() == recv.device(), "CCU send/recv must use the same NPU");
+    at::assert_no_overlap(send, recv);
+    const auto npuStream = c10_npu::getCurrentNPUStream();
+    const aclrtStream stream = npuStream.stream();
+    c10_npu::NPUCachingAllocator::recordStream(send.storage().data_ptr(), npuStream);
+    c10_npu::NPUCachingAllocator::recordStream(recv.storage().data_ptr(), npuStream);
+    return stream;
+}
+} // namespace
 constexpr int PADDING_SIZE = 1;
 constexpr size_t HCOMM_NAME_LEN = 128;
 constexpr int64_t NO_SCALES = 0;
@@ -391,6 +409,7 @@ torch::Tensor Buffer::explicit_multipath_all2all_ccu(
 
 torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     RECORD_FUNCTION("deep_ep::ccu_urma_multiroute_write", std::vector<c10::IValue>({send_data}));
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 1);
@@ -403,7 +422,7 @@ torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
     auto recv_data = torch::empty({num_ranks, send_data.numel()}, send_data.options());
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaMultiRouteWrite()(send_data.data_ptr(), recv_data.data_ptr(),
                                            static_cast<uint64_t>(send_data.numel()),
                                            HCCL_DATA_TYPE_FP32, comm, stream));
@@ -413,6 +432,7 @@ torch::Tensor Buffer::ccu_urma_multiroute_write(const torch::Tensor &send_data)
 torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send_data,
                                                        const torch::Tensor &recv_data)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     RECORD_FUNCTION("deep_ep::ccu_urma_multiroute_alltoall", std::vector<c10::IValue>({send_data, recv_data}));
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
@@ -425,7 +445,7 @@ torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaMultiRouteAllToAll()(send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32, comm, stream));
     return recv_data;
@@ -442,6 +462,7 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     const std::string &relay_manifest, int64_t direct_route,
     const std::vector<int64_t> &path_weights)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     RECORD_FUNCTION("deep_ep::ccu_urma_explicit_multipath_alltoall",
                     std::vector<c10::IValue>({send_data, recv_data}));
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
@@ -465,7 +486,7 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathAllToAll()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -550,6 +571,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     const torch::Tensor &send_data, const torch::Tensor &recv_data,
     int64_t plan_handle)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     RECORD_FUNCTION("deep_ep::ccu_urma_prepared_multipath_alltoall",
                     std::vector<c10::IValue>({send_data, recv_data}));
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
@@ -563,7 +585,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -583,6 +605,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
     const torch::Tensor &send_data, const torch::Tensor &recv_data,
     int64_t plan_handle, const std::vector<int64_t> &path_weights)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     RECORD_FUNCTION("deep_ep::ccu_urma_prepared_multipath_alltoall_policy",
                     std::vector<c10::IValue>({send_data, recv_data}));
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
@@ -597,7 +620,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
     HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -618,6 +641,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy(
 torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     const torch::Tensor &send_data, int64_t plan_handle)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
@@ -625,7 +649,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     auto recv_data = torch::empty_like(send_data);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -637,6 +661,8 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
     const torch::Tensor &send_data, int64_t plan_handle)
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
+    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0 &&
+                   send_data.scalar_type() == at::kFloat);
     return torch::empty_like(send_data);
 }
 
@@ -644,6 +670,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
     const torch::Tensor &send_data, int64_t plan_handle,
     const c10::List<int64_t> &path_weights)
 {
+    c10::DeviceGuard deviceGuard(send_data.device());
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
@@ -653,7 +680,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
     auto recv_data = torch::empty_like(send_data);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
     // This orders tensor producers without waiting for device completion.
-    auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
         static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
@@ -668,6 +695,9 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
     EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 13);
+    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0 &&
+                   send_data.scalar_type() == at::kFloat);
+    NormalizePreparedPathWeights(ToWeightVector(path_weights));
     return torch::empty_like(send_data);
 }
 

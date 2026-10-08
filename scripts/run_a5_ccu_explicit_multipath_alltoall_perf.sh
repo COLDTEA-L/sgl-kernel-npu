@@ -223,7 +223,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 10, f"prepared-plan ABI {value}, expected >= 10 (prepared RouteKernel data plane)"
+assert value >= 11, f"prepared-plan ABI {value}, expected >= 11 (validated layout and Channel-bound kernel)"
 PY
     fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")
@@ -262,9 +262,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 10:
+if version < 11:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 10 (torch_npu queue ordering); "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 11 (stream ordering and tensor lifetime); "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "

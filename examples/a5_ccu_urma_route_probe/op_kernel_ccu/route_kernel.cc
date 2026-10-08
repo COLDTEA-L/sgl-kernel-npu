@@ -1,4 +1,5 @@
 #include "route_kernel.h"
+#include "../common/path_layout.h"
 
 namespace a5_ccu_urma_probe {
 namespace {
@@ -29,10 +30,7 @@ RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
 hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append("A5CcuUrmaMultiRouteV1");
-    for (const uint32_t routeIndex : routeIndices_) {
-        signature.Append(routeIndex);
-    }
+    signature.Append(MakePathKernelSignature("A5CcuUrmaMultiRouteV2", routeIndices_, channels));
     return signature;
 }
 
@@ -111,7 +109,10 @@ HcclResult RouteKernel::Algorithm()
 std::vector<uint64_t> RouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
 {
     const auto *taskArg = dynamic_cast<const RouteTaskArg *>(&arg);
-    if (taskArg == nullptr) {
+    if (taskArg == nullptr || taskArg->pathBytes.size() != channels_.size() ||
+        taskArg->sourceOffsets.size() != channels_.size() ||
+        taskArg->remoteOffsets.size() != channels_.size() ||
+        4 + 3 * channels_.size() > 48) {
         return {};
     }
     std::vector<uint64_t> args = {taskArg->inputAddr, taskArg->outputAddr,
