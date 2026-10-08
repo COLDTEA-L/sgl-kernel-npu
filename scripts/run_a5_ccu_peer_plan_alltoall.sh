@@ -94,4 +94,11 @@ for ((r=1; r<=repeats; r++)); do
 done
 python3 "${repo}/scripts/analyze_a5_ccu_peer_plan.py" --run-dir "$run_dir"
 sed -n '1,180p' "${run_dir}/peer_plan_report.md"
+if ! python3 - "${run_dir}/peer_plan_summary.json" <<'PY'
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1]))['complete'] else 1)
+PY
+then
+    failed=1
+fi
 exit "$failed"
