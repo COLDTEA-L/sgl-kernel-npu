@@ -174,6 +174,9 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout) ||
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(sendBuf),
                               reinterpret_cast<uint64_t>(recvBuf), layout.totalBytes)) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA] invalid alltoall layout: rank=%u paths=%zu elements_per_peer=%lu\n",
+            resources.rank, launchWeights.size(), static_cast<unsigned long>(elementsPerPeer));
         return HCCL_E_PARA;
     }
     const uint64_t bytes = layout.peerBytes;
@@ -354,7 +357,9 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // the self slice.
     // Version 11 validates complete layouts before enqueue and binds kernel
     // signatures to actual Channels rather than ordinal numbers alone.
-    return 11;
+    // Version 12 preserves single-candidate legacy baselines. The common
+    // layout validator accepts one path; prepared-plan APIs still require >=2.
+    return 12;
 }
 
 namespace {

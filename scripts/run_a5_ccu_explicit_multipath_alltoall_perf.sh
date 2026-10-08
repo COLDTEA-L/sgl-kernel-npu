@@ -215,7 +215,10 @@ if (( need_legacy || need_prepared )); then
                 exit 2
             }
         done
-        ROUTE_PROBE_LIB="${route_probe_lib}" python3 - <<'PY'
+    fi
+    # Single-candidate baselines also use the common layout validator. Reject
+    # ABI 11 before launching workers, not only when a prepared case is chosen.
+    ROUTE_PROBE_LIB="${route_probe_lib}" python3 - <<'PY'
 import ctypes
 import os
 lib = ctypes.CDLL(os.environ["ROUTE_PROBE_LIB"], mode=ctypes.RTLD_GLOBAL)
@@ -223,9 +226,8 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 11, f"prepared-plan ABI {value}, expected >= 11 (validated layout and Channel-bound kernel)"
+assert value >= 12, f"route runtime ABI {value}, expected >= 12 (single-candidate layout regression fixed)"
 PY
-    fi
     route_probe_lib=$(readlink -f "${route_probe_lib}")
     export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"
     export LD_LIBRARY_PATH="$(dirname "${route_probe_lib}"):${LD_LIBRARY_PATH}"

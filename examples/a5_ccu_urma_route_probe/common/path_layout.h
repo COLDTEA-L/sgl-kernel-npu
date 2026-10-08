@@ -21,13 +21,14 @@ struct TwoRankPathLayout {
     std::vector<uint64_t> pathBytes;
 };
 
-// Pure preflight: validate the whole layout before enqueuing any device work.
+// Pure preflight shared by single-candidate baselines and prepared multipath.
+// The prepared-plan API enforces its own >= 2 path contract before calling us.
 inline bool BuildTwoRankPathLayout(uint64_t elementsPerPeer, uint32_t rank,
     const std::vector<uint32_t> &weights, TwoRankPathLayout *result)
 {
     if (result == nullptr || rank >= 2 || elementsPerPeer == 0 ||
         elementsPerPeer > std::numeric_limits<uint64_t>::max() / 8 ||
-        weights.size() < 2 || weights.size() > PREPARED_MAX_PATHS) return false;
+        weights.empty() || weights.size() > PREPARED_MAX_PATHS) return false;
     uint64_t totalWeight = 0;
     for (uint32_t weight : weights) {
         if (weight == 0) return false;

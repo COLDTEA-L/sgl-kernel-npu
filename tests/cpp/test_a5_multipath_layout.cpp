@@ -24,6 +24,9 @@ static void CheckCoverage(uint64_t elements, uint32_t rank,
 int main()
 {
     for (uint32_t rank : {0U, 1U}) {
+        CheckCoverage(1048576, rank, {1}); // native0/native2: one candidate
+        CheckCoverage(1, rank, {1}); // single path has no aligned split
+        CheckCoverage(1048577, rank, {UINT32_MAX});
         for (size_t relays = 1; relays <= 12; ++relays) {
             std::vector<uint32_t> weights(relays + 1, 1);
             weights[0] = 2;
@@ -33,6 +36,7 @@ int main()
         CheckCoverage(1ULL << 33, rank, {UINT32_MAX, UINT32_MAX}); // overflowed old product
     }
     TwoRankPathLayout layout;
+    assert(!BuildTwoRankPathLayout(1024, 0, {}, &layout));
     assert(!BuildTwoRankPathLayout(1, 0, {2, 1}, &layout));
     assert(!BuildTwoRankPathLayout(1024, 0, {0, 1}, &layout));
     assert(!BuildTwoRankPathLayout(UINT64_MAX, 0, {2, 1}, &layout));

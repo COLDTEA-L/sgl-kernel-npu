@@ -166,10 +166,20 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 11:
+            if plan_abi() < 12:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
+    if IMPLEMENTATION == "multiroute":
+        route_extension = ctypes.CDLL(str(ROUTE_LIB))
+        route_abi = route_extension.A5CcuUrmaPreparedPlanAbiVersion
+        route_abi.restype = ctypes.c_int
+        if route_abi() < 12:
+            raise RuntimeError(
+                f"legacy baseline requires route ABI >= 12 (single-path layout fix): {ROUTE_LIB}"
+            )
+        print(f"CASE_ROUTE_RUNTIME_ABI rank={os.environ.get('RANK', 'NA')} "
+              f"version={route_abi()} route_library={ROUTE_LIB}", flush=True)
 
 
 def file_barrier(directory, tag, rank, world_size, timeout=180):

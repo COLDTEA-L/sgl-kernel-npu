@@ -69,7 +69,7 @@ host queue 提交；原始 ACL 调用可能抢先读取输入。`stream()` 清�
 让 tensor producer、D2D self-copy、CCU launch 按流顺序提交；它不等待 device 完成。
 这是 PyTorch bridge 的要求，单独 C++ probe 没有这层 torch_npu host queue。
 
-本次 route/DeepEP ABI 均为 11，保留上述提交顺序修复。bridge 增加 tensor DeviceGuard、
+当前 route ABI 为 12、DeepEP ABI 为 11，保留上述提交顺序修复。bridge 增加 tensor DeviceGuard、
 同 device/不重叠检查和 caching allocator `recordStream`。后者保证异步访问期间的存储
 生命周期，不代替生产流与执行流的依赖；跨流输入需要调用者先 `wait_stream`。
 
@@ -218,6 +218,10 @@ V2 允许同一个 plan 在 eager 模式下使用另一组同长度正权重，�
 权重乘积使用 `__uint128_t`。注册签名包含实际 Channels 和带分隔符的 ordinals，不能仅
 用 route 编号决定 kernel 身份；运行时权重/地址仍是 task 参数，不触发重新注册。
 
+route ABI 12 的公共布局函数允许单路径，用于 native0/native2 候选基线；prepared-plan
+入口仍单独要求至少两条路径。ABI 11 把公共函数误设为最少两条，导致单路径 baseline
+在注册成功后、launch 前返回参数错误。此修复不改变路径、权重分配或 prepared 数据面。
+
 ## 7. ACLGraph 语义
 
 正确顺序：
@@ -281,7 +285,7 @@ device synchronize 超时。HBM mailbox 常驻 worker 又缺少可靠 AIV->CCU d
 
 `tests/cpp/test_a5_multipath_layout.cpp` 覆盖两 rank、1..12 relay、余数、乘积溢出、
 错误 policy、buffer 重叠和缓存签名碰撞。开发 Docker 编译 route package/wheel、验证
-ABI 11 和 Meta/fullgraph capture。它们不证明 T560 有卡完成同步正确；必须再运行操作
+route ABI 12 / DeepEP ABI 11 和 Meta/fullgraph capture。它们不证明 T560 有卡完成同步正确；必须再运行操作
 指南第 9.2 节逐轮数据诊断和第 6 节真实 ACLGraph replay。
 Python 无卡回归入口为 `tests/python/deepep/test_a5_prepared_multipath_meta.py`。
 
