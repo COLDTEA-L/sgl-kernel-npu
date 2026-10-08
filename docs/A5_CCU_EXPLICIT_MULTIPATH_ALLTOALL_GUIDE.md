@@ -361,6 +361,8 @@ direct : 每一条 relay = 2 : 1
 
 ## 8. profiling
 
+### 8.1 显式多路径算子
+
 只采显式多路径 case：
 
 ```bash
@@ -381,7 +383,7 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 `msprof`/MindStudio 产物位于本次 `RUN_DIR/profiling`。先用普通单 case 验证正确性，
 再采 profiling，避免把建链失败误判为 profiler 问题。
 
-profiling harness 会在每次 prepared-plan 调用后执行一次 NPU synchronize，并打印：
+本节的 prepared-plan profiling harness 会在每次调用后执行一次 NPU synchronize，并打印：
 
 ```text
 CASE_LAUNCH_COMPLETION ... mode=complete_each_prepared_invocation
@@ -408,6 +410,99 @@ AllToAll 调用，不会把单次 AllToAll 内的 direct/relay 路径串行化�
 如果日志在 profiler 启动前就于 `warmup_correctness` 报 100% 数据不一致，且没有上述
 `CASE_LAUNCH_COMPLETION`，说明测试脚本仍是旧版本；这不是 `msprof` 初始化错误。先拉取包含
 该门禁的最新分支，再重新运行第 8 节。
+
+### 8.2 原生 HCCL CCU AllToAll baseline
+
+真正的原生 baseline 使用测试 Python 的 `--implementation native`：
+
+```text
+dist.all_to_all_single(recv, send)
+  -> torch_npu ProcessGroupHCCL
+  -> 系统 HCCL AllToAll 系列接口
+  -> 原生通信算法和 CCU 数据面
+```
+
+它不调用 DeepEP prepared-plan，也不调用我们的 Channel/WriteNb 组合入口。
+第 7 节的 `native0/native2` 是 legacy discovered-candidate 对照，**不是这个原生
+collective baseline**。原生 HCCL 自行选择算法/路径，下面命令不强制 route0 或 route2。
+
+不需要为本 baseline 编译自定义算子、安装 route package 或安装 DeepEP wheel；需要
+当前环境正常的 torch、torch_npu 和系统 CANN/HCCL。若第 8.1 节已经可以运行，直接执行：
+
+```bash
+(
+set -e -o pipefail
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
+
+export ASCEND_RT_VISIBLE_DEVICES=2,3
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export LD_LIBRARY_PATH="/usr/local/Ascend/cann-9.1.T560/lib64:${LD_LIBRARY_PATH:-}"
+export PYTHONUNBUFFERED=1
+
+PROF_ROOT="/home/l00934901/profiling/native_hccl_ccu_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${PROF_ROOT}"
+echo "Native baseline profiling root: ${PROF_ROOT}"
+
+timeout --signal=TERM --kill-after=5 600 \
+python3 -m torch.distributed.run \
+  --standalone --nproc-per-node=2 \
+  tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+  --implementation native \
+  --compile-backend none \
+  --bytes 4194304 \
+  --warmup 100 --iters 20 \
+  --profile --profile-iters 20 \
+  --profile-root "${PROF_ROOT}" \
+  2>&1 | tee "${PROF_ROOT}/run.log"
+
+echo "Completed native baseline: ${PROF_ROOT}"
+)
+```
+
+先等之前使用 2、3 卡的测试退出，不要在同一对卡上同时运行 baseline 和多路径测试。
+更换通信卡时修改 `ASCEND_RT_VISIBLE_DEVICES`，仍保持两 rank。数据量与多路径相同：
+FP32，每个 peer 的 chunk 为 4 MiB，两 rank 的 send/recv tensor 各含两个 chunk。
+
+本命令请求 `CCU_SCHED` 模式。最终是否使用 CCU，需要从 HCCL 算法日志或 profiling
+任务确认，不能只看到环境变量就认定成功；若回退到其他后端，单独标明该结果，不能当作
+“原生 CCU”对照。关于模式含义参见
+[HCCL_OP_EXPANSION_MODE 官方说明](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/API/hcclug/hcclenvref_07_0009.html)。
+
+### 8.3 baseline 产物和比较口径
+
+第 8.2 节产物结构为：
+
+```text
+native_hccl_ccu_<时间>/
+├── run.log
+└── a5_ccu_alltoall_native_<运行ID>/
+    ├── rank0/…_ascend_pt/
+    └── rank1/…_ascend_pt/
+```
+
+该命令直接调用 Python harness，不会生成矩阵脚本的 `case_status.tsv` 或
+`explicit_multipath_perf_report.md`。运行结果和 `RESULT_JSON` 在 `run.log`，MindStudio
+数据在两个 rank 的 `_ascend_pt` 目录。只有一个 baseline 正在运行时可这样定位：
+
+```bash
+(
+set -e
+BASELINE_DIR=$(ls -dt /home/l00934901/profiling/native_hccl_ccu_* 2>/dev/null | head -1)
+test -n "${BASELINE_DIR}" && test -d "${BASELINE_DIR}"
+echo "BASELINE_DIR=${BASELINE_DIR}"
+grep -nE 'CASE_PHASE.*(warmup|profiling|complete)|CASE_FAILURE|PASS:|RESULT_JSON|profiling=' \
+  "${BASELINE_DIR}/run.log" || true
+find "${BASELINE_DIR}" -type d -name '*_ascend_pt' -print
+)
+```
+
+当前 native 分支在一组调用后统一同步，prepared 分支每次调用后同步。因此两者
+`host_batch_avg_us` **不能直接用于公平的单次端到端延迟比较**。本节首先比较 profiling
+中相同 payload 的完整通信执行区间；不要拿原生算法的一条子任务与我们整个通信区间比较。
+若需要公平的 host 端到端 baseline，还需统一两种实现的逐次完成/同步口径。
+建链、warmup 和 profiler 导出时间都不作为稳态数据面时延。
 
 ## 9. 常见故障
 
