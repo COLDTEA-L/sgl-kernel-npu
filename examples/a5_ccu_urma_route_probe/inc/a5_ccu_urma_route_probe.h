@@ -67,6 +67,16 @@ HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
  * stream binding and per-launch host path weights. */
 int A5CcuUrmaPreparedPlanAbiVersion(void);
 
+/** Independent peer-plan ABI: complete canonical peer manifest, 2/4 ranks,
+ * direct-only or explicit communicator-external relay paths. */
+int A5CcuPeerPlanAbiVersion(void);
+HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle);
+HcclResult HcclCcuUrmaPeerPlanBindStream(uint64_t handle, HcclComm comm, aclrtStream stream);
+HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv, uint64_t elementsPerPeer, uint32_t rankSize,
+    HcclDataType dtype, HcclComm comm, aclrtStream stream, uint64_t handle,
+    const uint32_t *policy, uint32_t policyCount);
+
 /**
  * Build and register all control-plane resources for one explicit multipath
  * plan. This call performs CommLink construction, HcclChannelAcquire and CCU

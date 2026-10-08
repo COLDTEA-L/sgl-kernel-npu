@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "../common/peer_plan.h"
 
 namespace a5_ccu_urma_probe {
 
@@ -32,6 +33,14 @@ struct RouteResources {
     uint32_t rankSize = 0;
     uint32_t dieId = 0;
 };
+
+struct PeerPlanResources {
+    RouteResources route;
+    std::vector<uint32_t> peers;
+};
+
+HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources);
 
 // Normalized two-rank control-plane request used by the production-facing
 // explicit multipath API.  The discovered route is always channel 0 and the

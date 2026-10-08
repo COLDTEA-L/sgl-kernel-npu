@@ -549,6 +549,21 @@ class Buffer:
             send_data, recv_data, relay_manifest, direct_route, path_weights
         )
 
+    def prepare_ccu_urma_peer_plan(self, plan_id, manifest, available_cards=8):
+        """Graph-out preparation for explicit 2/4-rank peer plans; no auto relay allocation."""
+        return self.runtime.prepare_ccu_urma_peer_plan(plan_id, manifest, available_cards)
+
+    def bind_ccu_urma_peer_plan(self, handle):
+        """Bind execution/capture stream before invoking the graph-visible operator."""
+        return self.runtime.bind_ccu_urma_peer_plan(handle)
+
+    def ccu_urma_peer_plan_alltoall(self, send, handle, path_weights=()):
+        """FP32 [rank_count, elements_per_peer]; output rows indexed by source rank."""
+        return torch.ops.deep_ep.ccu_urma_peer_plan_alltoall(send, handle, list(path_weights))
+
+    def ccu_urma_peer_plan_alltoall_out(self, send, recv, handle, path_weights=()):
+        return self.runtime.ccu_urma_peer_plan_alltoall_out(send, recv, handle, list(path_weights))
+
     def prepare_ccu_urma_explicit_multipath_plan(
         self,
         plan_id: str,

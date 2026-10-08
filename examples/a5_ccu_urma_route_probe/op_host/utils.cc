@@ -356,7 +356,8 @@ HcclResult EnumeratePaths(HcclComm comm, uint32_t rank, uint32_t peer,
 HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
                        uint32_t routeIndex, HcclChannelDesc *desc,
                        uint32_t *dieId, std::string *pathUid,
-                       bool rebuildPublicFields = false)
+                       bool rebuildPublicFields = false,
+                       bool useSyntheticEnvironment = true)
 {
     if (desc == nullptr || dieId == nullptr) {
         return HCCL_E_PTR;
@@ -415,8 +416,10 @@ HcclResult SelectRoute(HcclComm comm, uint32_t rank, uint32_t peer,
         desc->localEndpoint = selectedLink.srcEndpointDesc;
         desc->remoteEndpoint = selectedLink.dstEndpointDesc;
     }
-    status = ApplySyntheticEidPair(comm, rank, peer, desc, dieId, pathUid);
-    if (status != HCCL_SUCCESS) return status;
+    if (useSyntheticEnvironment) {
+        status = ApplySyntheticEidPair(comm, rank, peer, desc, dieId, pathUid);
+        if (status != HCCL_SUCCESS) return status;
+    }
     TraceSelectedLink(rank, peer, selected, *desc);
 
     std::printf("[A5 CCU URMA][rank=%u peer=%u] prepared route=%u layer=%u link=%u "
@@ -1208,6 +1211,106 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     g_cache.routeKey = routeKey;
     g_cache.resources = created;
     *resources = created;
+    return HCCL_SUCCESS;
+}
+
+HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources)
+{
+    if (!comm || !stream || !resources) return HCCL_E_PTR;
+    PeerPlanResources result;
+    auto &r = result.route;
+    HcclResult status = HcclGetRankId(comm, &r.rank);
+    if (status != HCCL_SUCCESS) return status;
+    status = HcclGetRankSize(comm, &r.rankSize);
+    if (status != HCCL_SUCCESS) return status;
+    std::vector<HcclChannelDesc> descs;
+    bool haveDie = false;
+    for (uint32_t peer = 0; peer < r.rankSize; ++peer) {
+        if (peer == r.rank) continue;
+        for (size_t i = 0; i < specs.size(); ++i) {
+            const auto &p = specs[i];
+            if (!((p.srcRank == r.rank && p.dstRank == peer) ||
+                  (p.dstRank == r.rank && p.srcRank == peer))) continue;
+            std::vector<PathCandidate> candidates;
+            status = EnumeratePaths(comm, r.rank, peer, &candidates);
+            if (status != HCCL_SUCCESS) return status;
+            if (p.directRoute >= candidates.size() || candidates[p.directRoute].link.linkAttr.hop != 1) {
+                std::fprintf(stderr, "PEER_PLAN_INVALID rank=%u peer=%u base must be a direct CommLink\n", r.rank, peer);
+                return HCCL_E_PARA;
+            }
+            HcclChannelDesc desc{};
+            uint32_t die = 0;
+            std::string uid;
+            status = SelectRoute(comm, r.rank, peer, p.directRoute, &desc, &die, &uid, false, false);
+            if (status != HCCL_SUCCESS) return status;
+            const bool forward = r.rank == p.srcRank;
+            if (desc.localEndpoint.loc.device.devPhyId != (forward ? p.srcPhy : p.dstPhy) ||
+                desc.remoteEndpoint.loc.device.devPhyId != (forward ? p.dstPhy : p.srcPhy)) {
+                std::fprintf(stderr, "PEER_PLAN_INVALID physical device mapping differs from communicator\n");
+                return HCCL_E_PARA;
+            }
+            if (p.relay) {
+                uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
+                status = ParseEidText("src_eid", p.srcEid.c_str(), src);
+                if (status != HCCL_SUCCESS) return status;
+                status = ParseEidText("dst_eid", p.dstEid.c_str(), dst);
+                if (status != HCCL_SUCCESS) return status;
+                std::copy(forward ? src : dst, (forward ? src : dst) + EID_BYTE_NUM,
+                          desc.localEndpoint.commAddr.eid);
+                std::copy(forward ? dst : src, (forward ? dst : src) + EID_BYTE_NUM,
+                          desc.remoteEndpoint.commAddr.eid);
+                die = forward ? p.srcDie : p.dstDie;
+                uid = "relay" + std::to_string(p.relayPhy) + "-" +
+                    CommAddrToString(desc.localEndpoint.commAddr) + "-" +
+                    CommAddrToString(desc.remoteEndpoint.commAddr);
+            }
+            if (haveDie && die != r.dieId) {
+                std::fprintf(stderr, "PEER_PLAN_INVALID mixed local IO dies require a future multi-die scheduler\n");
+                return HCCL_E_PARA;
+            }
+            haveDie = true; r.dieId = die;
+            descs.push_back(desc); result.peers.push_back(peer);
+            r.weights.push_back(p.weight); r.routeIndices.push_back(static_cast<uint32_t>(i));
+            r.pathUids.push_back(uid);
+            std::printf("PEER_PATH_DESC rank=%u peer=%u kind=%s relay_phy=%u weight=%u die=%u local=%s remote=%s\n",
+                r.rank, peer, p.relay ? "relay" : "direct", p.relayPhy, p.weight, die,
+                CommAddrToString(desc.localEndpoint.commAddr).c_str(),
+                CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
+        }
+    }
+    if (descs.empty() || 4 + 3 * descs.size() > 48) return HCCL_E_PARA;
+    std::fflush(stdout);
+    // Thread resources must exist before ChannelAcquire on every rank.
+    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread);
+    if (status != HCCL_SUCCESS) return status;
+    r.routeThread = r.mainThread;
+    if (r.dieId == 1) {
+        if (aclrtCreateStream(&r.slaveStream) != ACL_SUCCESS) return HCCL_E_RUNTIME;
+        status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, r.slaveStream, THREAD_NOTIFY_NUM, &r.routeThread);
+        if (status != HCCL_SUCCESS) return status;
+    }
+    r.channels.resize(descs.size());
+    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, descs.data(), static_cast<uint32_t>(descs.size()), r.channels.data());
+    std::printf("PEER_PLAN_ACQUIRE rank=%u channels=%zu status=%d\n", r.rank, descs.size(), status);
+    std::fflush(stdout);
+    if (status != HCCL_SUCCESS) return status;
+    std::vector<int32_t> states(descs.size(), -1);
+    if (HcommChannelGetStatus(r.channels.data(), static_cast<uint32_t>(states.size()), states.data()) != 0)
+        return HCCL_E_RUNTIME;
+    std::set<ChannelHandle> handles;
+    for (size_t i = 0; i < states.size(); ++i) {
+        std::printf("PEER_PATH_CHANNEL rank=%u peer=%u index=%zu weight=%u state=%d handle=%lu\n",
+            r.rank, result.peers[i], i, r.weights[i], states[i], static_cast<unsigned long>(r.channels[i]));
+        if (states[i] != 0 || !handles.insert(r.channels[i]).second) return HCCL_E_RUNTIME;
+    }
+    RouteKernelArg arg(r.channels, r.routeIndices);
+    hcomm::KernelCreator creator = CreateRouteKernel;
+    status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
+    if (status != HCCL_SUCCESS) return status;
+    status = HcclCcuKernelRegisterFinish(comm);
+    if (status != HCCL_SUCCESS) return status;
+    *resources = result;
     return HCCL_SUCCESS;
 }
 

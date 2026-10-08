@@ -15,6 +15,11 @@
 
 namespace deep_ep {
 
+torch::Tensor ccu_urma_peer_plan_alltoall_op(const torch::Tensor &, int64_t,
+    const c10::List<int64_t> &);
+torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &, int64_t,
+    const c10::List<int64_t> &);
+
 torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     const torch::Tensor &send_data, int64_t plan_handle);
 
@@ -30,6 +35,11 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
     const c10::List<int64_t> &path_weights);
 
 struct Buffer {
+    int64_t prepare_ccu_urma_peer_plan(const std::string &plan_id,
+        const std::string &manifest, int64_t available_cards);
+    void bind_ccu_urma_peer_plan(int64_t handle);
+    torch::Tensor ccu_urma_peer_plan_alltoall_out(const torch::Tensor &send,
+        const torch::Tensor &recv, int64_t handle, const std::vector<int64_t> &weights);
     int64_t rank, rdma_rank, nvl_rank;
     int64_t num_ranks, num_rdma_ranks, num_nvl_ranks;
     op::SocVersion soc_version;

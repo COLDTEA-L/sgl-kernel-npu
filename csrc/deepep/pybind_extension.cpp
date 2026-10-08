@@ -17,6 +17,7 @@ namespace py = pybind11;
 
 TORCH_LIBRARY_FRAGMENT(deep_ep, m)
 {
+    m.def("ccu_urma_peer_plan_alltoall(Tensor send_data, int plan_handle, int[] path_weights=[]) -> Tensor");
     m.def(
         "ccu_urma_prepared_multipath_alltoall(Tensor send_data, int plan_handle) -> Tensor");
     m.def(
@@ -25,6 +26,7 @@ TORCH_LIBRARY_FRAGMENT(deep_ep, m)
 
 TORCH_LIBRARY_IMPL(deep_ep, PrivateUse1, m)
 {
+    m.impl("ccu_urma_peer_plan_alltoall", TORCH_FN(deep_ep::ccu_urma_peer_plan_alltoall_op));
     m.impl("ccu_urma_prepared_multipath_alltoall",
            TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_op));
     m.impl("ccu_urma_prepared_multipath_alltoall_policy",
@@ -33,6 +35,7 @@ TORCH_LIBRARY_IMPL(deep_ep, PrivateUse1, m)
 
 TORCH_LIBRARY_IMPL(deep_ep, Meta, m)
 {
+    m.impl("ccu_urma_peer_plan_alltoall", TORCH_FN(deep_ep::ccu_urma_peer_plan_alltoall_meta));
     m.impl("ccu_urma_prepared_multipath_alltoall",
            TORCH_FN(deep_ep::ccu_urma_prepared_multipath_alltoall_meta));
     m.impl("ccu_urma_prepared_multipath_alltoall_policy",
@@ -55,6 +58,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, std::string>())
+        .def("prepare_ccu_urma_peer_plan", &deep_ep::Buffer::prepare_ccu_urma_peer_plan,
+             py::arg("plan_id"), py::arg("manifest"), py::arg("available_cards") = 8)
+        .def("bind_ccu_urma_peer_plan", &deep_ep::Buffer::bind_ccu_urma_peer_plan, py::arg("handle"))
+        .def("ccu_urma_peer_plan_alltoall_out", &deep_ep::Buffer::ccu_urma_peer_plan_alltoall_out,
+             py::arg("send"), py::arg("recv"), py::arg("handle"),
+             py::arg("weights") = std::vector<int64_t>{})
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)

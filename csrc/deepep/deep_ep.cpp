@@ -701,6 +701,109 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
     return torch::empty_like(send_data);
 }
 
+extern "C" __attribute__((visibility("default"))) int A5DeepEpPeerPlanAbiVersion() { return 1; }
+
+namespace {
+void *PeerPlanSymbol(const char *name)
+{
+    static void *library = []() {
+        const char *path = std::getenv("A5_CCU_ROUTE_PROBE_LIB");
+        void *handle = dlopen(path && *path ? path : "liba5_ccu_urma_route_probe.so", RTLD_NOW | RTLD_LOCAL);
+        EP_HOST_ASSERT_S(handle, "peer-plan runtime load failed: ", dlerror());
+        return handle;
+    }();
+    void *symbol = dlsym(library, name);
+    EP_HOST_ASSERT_S(symbol, "missing peer-plan symbol ", name, "; rebuild route probe");
+    return symbol;
+}
+using PeerCreate = HcclResult (*)(HcclComm, aclrtStream, const char *, const char *, uint32_t, uint64_t *);
+using PeerBind = HcclResult (*)(uint64_t, HcclComm, aclrtStream);
+using PeerExecute = HcclResult (*)(void *, void *, uint64_t, uint32_t, HcclDataType,
+    HcclComm, aclrtStream, uint64_t, const uint32_t *, uint32_t);
+
+std::vector<uint32_t> PeerWeights(const std::vector<int64_t> &values)
+{
+    EP_HOST_ASSERT(values.size() <= 14);
+    std::vector<uint32_t> result;
+    for (auto weight : values) {
+        EP_HOST_ASSERT(weight > 0 && weight <= static_cast<int64_t>(UINT32_MAX));
+        result.push_back(static_cast<uint32_t>(weight));
+    }
+    return result;
+}
+void PeerTensorCheck(const torch::Tensor &send, int64_t handle)
+{
+    EP_HOST_ASSERT(handle > 0 && send.dim() == 2 && (send.sym_size(0) == 2 || send.sym_size(0) == 4));
+    EP_HOST_ASSERT(send.is_contiguous() && send.sym_numel() > 0 && send.scalar_type() == at::kFloat);
+}
+void PeerLaunch(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
+    HcclComm comm, const std::vector<int64_t> &policy)
+{
+    PeerTensorCheck(send, handle);
+    EP_HOST_ASSERT(recv.sizes() == send.sizes() && recv.is_contiguous() && recv.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(recv.device() == send.device() && torch_npu::utils::is_npu(send));
+    const auto weights = PeerWeights(policy);
+    auto stream = OrderedCcuTensorStream(send, recv);
+    static auto execute = reinterpret_cast<PeerExecute>(PeerPlanSymbol("HcclCcuUrmaPeerPlanExecute"));
+    HCCL_CHECK(execute(send.data_ptr(), recv.data_ptr(), static_cast<uint64_t>(send.size(1)),
+        static_cast<uint32_t>(send.size(0)), HCCL_DATA_TYPE_FP32, comm, stream,
+        static_cast<uint64_t>(handle), weights.data(), static_cast<uint32_t>(weights.size())));
+}
+} // namespace
+
+int64_t Buffer::prepare_ccu_urma_peer_plan(const std::string &plan_id,
+    const std::string &manifest, int64_t available_cards)
+{
+    EP_HOST_ASSERT((num_ranks == 2 || num_ranks == 4) && !plan_id.empty() && !manifest.empty());
+    EP_HOST_ASSERT(available_cards >= num_ranks && available_cards <= UINT32_MAX);
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream();
+    uint64_t handle = 0;
+    static auto create = reinterpret_cast<PeerCreate>(PeerPlanSymbol("HcclCcuUrmaPeerPlanCreate"));
+    HCCL_CHECK(create(comm, stream, plan_id.c_str(), manifest.c_str(),
+        static_cast<uint32_t>(available_cards), &handle));
+    EP_HOST_ASSERT(handle > 0);
+    return static_cast<int64_t>(handle);
+}
+
+void Buffer::bind_ccu_urma_peer_plan(int64_t handle)
+{
+    EP_HOST_ASSERT(handle > 0 && (num_ranks == 2 || num_ranks == 4));
+    HcclComm comm = ResolveComm(moe_all_to_all_group_name, ep_comm);
+    auto stream = c10_npu::getCurrentNPUStream().stream();
+    static auto bind = reinterpret_cast<PeerBind>(PeerPlanSymbol("HcclCcuUrmaPeerPlanBindStream"));
+    HCCL_CHECK(bind(static_cast<uint64_t>(handle), comm, stream));
+}
+
+torch::Tensor Buffer::ccu_urma_peer_plan_alltoall_out(const torch::Tensor &send,
+    const torch::Tensor &recv, int64_t handle, const std::vector<int64_t> &weights)
+{
+    c10::DeviceGuard peerDeviceGuard(send.device());
+    EP_HOST_ASSERT(send.dim() == 2 && send.size(0) == num_ranks);
+    RECORD_FUNCTION("deep_ep::ccu_urma_peer_plan_alltoall", std::vector<c10::IValue>({send, recv}));
+    PeerLaunch(send, recv, handle, ResolveComm(moe_all_to_all_group_name, ep_comm), weights);
+    return recv;
+}
+
+torch::Tensor ccu_urma_peer_plan_alltoall_op(const torch::Tensor &send, int64_t handle,
+    const c10::List<int64_t> &weights)
+{
+    c10::DeviceGuard peerDeviceGuard(send.device());
+    PeerTensorCheck(send, handle);
+    auto recv = torch::empty_like(send);
+    RECORD_FUNCTION("deep_ep::ccu_urma_peer_plan_alltoall", std::vector<c10::IValue>({send, recv}));
+    PeerLaunch(send, recv, handle, nullptr, ToWeightVector(weights));
+    return recv;
+}
+
+torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &send, int64_t handle,
+    const c10::List<int64_t> &weights)
+{
+    PeerTensorCheck(send, handle);
+    PeerWeights(ToWeightVector(weights));
+    return torch::empty_like(send);
+}
+
 int64_t Buffer::prepare_ccu_hbm_command_worker(
     const torch::Tensor &send_data, const torch::Tensor &recv_data,
     const torch::Tensor &command_block, const std::string &plan_id,

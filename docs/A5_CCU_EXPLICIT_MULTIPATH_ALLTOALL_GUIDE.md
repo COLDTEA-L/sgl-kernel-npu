@@ -1,5 +1,11 @@
 # A5 CCU+URMA prepared-plan 显式多路径 AllToAll 操作指南
 
+两卡实现的逻辑、调用链、参数及 API 见
+[两卡 prepared-plan 设计](A5_CCU_TWO_RANK_PREPARED_PLAN_DESIGN.md)。
+新增两卡/四卡、显式 peer relay 分配及 direct-only 接口见
+[peer-plan 两卡/四卡指南](A5_CCU_PEER_PLAN_ALLTOALL_GUIDE.md)，其独立 ABI 为 1。
+本文件保留原两卡 API 的实验步骤，四卡不要直接沿用原 WORLD_SIZE=2 脚本。
+
 ## 1. 当前实现和边界
 
 当前可运行主线不再修改 `libhccl.so`，也不再让标准 Ascend C AIV kernel 进入
