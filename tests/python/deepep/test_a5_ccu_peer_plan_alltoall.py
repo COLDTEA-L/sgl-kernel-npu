@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Hardware correctness/performance test for explicit 2/4-rank peer plans."""
 import argparse
+import atexit
 from datetime import timedelta
+import faulthandler
 import json
 import os
 from pathlib import Path
 import time
 
 from a5_ccu_peer_test_support import file_barrier, make_profiler
+
+
+def phase(name):
+    print(f"PEER_CASE_PHASE rank={os.environ.get('RANK', 'NA')} phase={name}", flush=True)
 
 
 def main():
@@ -26,6 +32,8 @@ def main():
     rank, k = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     if k not in (2, 4):
         p.error("initial implementation supports 2 or 4 ranks")
+    # This marker does not imply native/static destructors have finished.
+    atexit.register(lambda: phase("python_atexit"))
     # Parse this entry point's arguments before loading any NPU runtime. Never
     # import an executable benchmark for helpers: its module initialization can
     # execvpe its own __file__ and replace this four-rank worker with a two-rank CLI.
@@ -37,8 +45,6 @@ def main():
 
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     sync = args.run_dir / "sync"
-    def phase(name):
-        print(f"PEER_CASE_PHASE rank={rank} phase={name}", flush=True)
     def barrier(tag):
         file_barrier(sync, tag, rank, k)
     phase("communicator_init")
@@ -123,15 +129,28 @@ def main():
         bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, warmup=args.warmup,
         iterations=args.iters, graph_backend=args.graph_backend, host_call_us=samples,
         host_avg_us=sum(samples)/len(samples), manifest=str(args.manifest))), flush=True)
-    # Keep Buffer/plan/communicator alive through all asynchronous work and profiling.
+    # All rank results have been recorded, but cleanup is a separate obligation.
+    # Capture Python stacks instead of masking cleanup hangs with os._exit().
+    cleanup_watchdog = int(os.environ.get("A5_CCU_PEER_CLEANUP_WATCHDOG_SECONDS", "30"))
+    faulthandler.enable(all_threads=True)
+    if cleanup_watchdog > 0:
+        faulthandler.dump_traceback_later(cleanup_watchdog, repeat=True)
+    phase("final_synchronize_begin")
     torch.npu.synchronize()
+    phase("final_synchronize_done")
+    phase("reported_barrier_begin")
     barrier("reported")
+    phase("reported_barrier_done")
+    phase("destroy_process_group_begin")
     dist.destroy_process_group()
+    phase("destroy_process_group_done")
+    phase("main_return_begin")
 
 
 if __name__ == "__main__":
     try:
         main()
+        phase("main_return_done")
     except Exception as exc:
         print(f"PEER_CASE_FAILURE rank={os.environ.get('RANK')} error={type(exc).__name__}:{exc}", flush=True)
         raise

@@ -166,7 +166,58 @@ fi
 
 至少应先看到 `import_runtime`，随后是 `communicator_init`、`prepare_plan`；
 只有进入这些阶段后才开始判读通信域/建链/数据面错误。四个 rank 都输出 correctness
-PASS 的 `RESULT_JSON` 才算此 case 完整通过。
+PASS 的 `RESULT_JSON` 且进程正常退出 status=0，才算此 case 完整通过。
+
+### 4.2 四个 rank 都已 PASS，但 status=137：退出阶段诊断
+
+2026-10-08 的四卡 direct-only 日志已观察到所有 rank 的 Channel Acquire 成功、
+Channel state=0、plan bound，随后三次 changed-payload 检查及正式执行完成，
+四个 rank 均输出 correctness=PASS。这证明该次四卡 direct 数据面通过了测试，
+但外层 timeout 最终杀掉进程，不能算完整运行通过，更不能定位为 relay 失败。
+
+原版 RESULT_JSON 后还有最后一次 NPU synchronize、文件 barrier、
+`dist.destroy_process_group()`、局部对象析构及 Python/native 退出。旧日志没有
+这些位置的标记，不能直接断言哪个 API 死锁。更新只增加诊断和分析，不声称已修复退出。
+不要通过 `os._exit(0)` 绕过清理来把结果伪装为正常 PASS。
+
+本次修改仅 Python/报告，无需重编算子或重装 wheel。推送并拉取后，重跑第 4 节
+同一命令；可保留 timeout=600。结果输出后若清理卡住，默认每 30 秒打印 Python
+线程堆栈到 case log。只打印堆栈，不修改路由、驱动或共享硬件配置：
+
+```bash
+export A5_CCU_PEER_CLEANUP_WATCHDOG_SECONDS=30
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+```
+
+可在第二个终端读取日志，不必等满十分钟再看：
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_peer_plan_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -f "${RUN_DIR}/cases/peer_plan_r1.log"; then
+  LOG="${RUN_DIR}/cases/peer_plan_r1.log"
+  grep -nE 'RESULT_JSON|PEER_CASE_PHASE|PEER_CASE_FAILURE|Timeout|destroy_process_group' "${LOG}"
+  tail -n 160 "${LOG}"
+fi
+```
+
+每 rank 最后一个 begin/done 标记界定位置：
+
+| 最后阶段 | 当前收敛范围 |
+|---|---|
+| `final_synchronize_begin` 无 done | 最终 NPU stream 同步 |
+| `reported_barrier_begin` 无 done | 文件 barrier；检查哪个 rank 没到达 |
+| `destroy_process_group_begin` 无 done | ProcessGroupHCCL 销毁/底层等待 |
+| `main_return_begin` 无 done | main 局部对象释放 |
+| `main_return_done` / `python_atexit` | Python 退出或 native/static 资源析构；需结合堆栈 |
+
+`python_atexit` 只说明这个 Python 回调已执行，不代表所有底层析构完成。
+如果全部 RESULT_JSON 已通过而退出仍失败，新报告保留 data correctness=PASS，
+lifecycle=`FAILED_OR_INTERRUPTED_AFTER_DATA_PASS`，complete=False；计时仅供诊断，
+不纳入有效性能样本。历史日志也可以重新运行第 8 节分析命令重新分类。
 
 ## 5. 四卡显式 direct+1 relay
 
