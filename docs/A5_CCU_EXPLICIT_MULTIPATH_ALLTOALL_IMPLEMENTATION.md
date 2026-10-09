@@ -222,6 +222,88 @@ route ABI 12 的公共布局函数允许单路径，用于 native0/native2 候�
 入口仍单独要求至少两条路径。ABI 11 把公共函数误设为最少两条，导致单路径 baseline
 在注册成功后、launch 前返回参数错误。此修复不改变路径、权重分配或 prepared 数据面。
 
+### 6.1 路径切片、CCU 搬运、WQE 与网络分包（2026-10-09 核实）
+
+这四个层次不能混为一谈：
+
+```text
+一个远端 peer 的数据
+  -> 按路径权重切出连续数据块（算子控制）
+  -> 每条路径生成 WriteNb 搬运操作（CCU kernel 控制）
+  -> CCU/底层生成传输任务与 WQE（当前未完整解码）
+  -> 协议/硬件拆分为线上报文（当前未确认分段粒度）
+```
+
+**当前不是在算子里每 4 KiB 手工组一个 WQE。** 两卡版本的
+`common/path_layout.h::BuildTwoRankPathLayout` 按权重计算 `pathBytes`；非末片向下
+按 256 字节对齐，末片接收余数，保证所有路径合计覆盖完整 peer slice。
+四卡兼容分支的 `common/peer_plan.h::BuildPeerPathLayout` 对每个远端 peer 分别做
+相同切片，不把所有 peer 的数据混成一个切片池。
+
+例如，一个 peer 的数据为 4 MiB，direct 与两条 relay 权重为 `[2,1,1]`：
+
+| 路径 | 数据量 | 算子生成的逻辑搬运 |
+|---|---:|---|
+| direct | 2 MiB | WriteNb(channel_direct, ..., 2 MiB, event) |
+| relay0 | 1 MiB | WriteNb(channel_relay0, ..., 1 MiB, event) |
+| relay1 | 1 MiB | WriteNb(channel_relay1, ..., 1 MiB, event) |
+
+`op_kernel_ccu/route_kernel.cc::Algorithm` 对每个 Channel 生成一次大块 `WriteNb`，
+再统一 `WaitEvent`；`all_to_all_multiroute_kernel.cc` 的并发分支同样先生成全部远端
+路径的 WriteNb 再等待。这里的 C++ 循环是在注册阶段构建 CCU 指令表示，执行阶段
+由 CCU 运行，并不是 host 每次执行都循环调用普通 `urma_post_send`。
+不能据此推导“一次 WriteNb = 一个 WQE = 一个网络包”。
+
+### 6.2 当前使用 CTP，但不能推导 WriteNb 只能写 4 KiB
+
+本实现 `op_host/utils.cc::SelectRoute` 明确筛选 `COMM_PROTOCOL_UBC_CTP`，显式 relay
+Channel 使用对应 CTP 模板。内存到内存调用使用
+`WriteNb(ChannelHandle, RemoteAddr, LocalAddr, Variable len, CompletedEvent)`，
+不是以内部 `CcuBuf` 为源的另一种重载。
+
+已核实的事实：
+
+- 本实现直接传入 MiB 级 `pathBytes`，没有按 4096 字节循环调用 WriteNb；已有有卡
+  实验完成了这些大块搬运和数据正确性检查。
+- 开发容器的 `ccu_microcode_v1.h` 定义 `CCU_MS_SIZE = 4096`，这是 CCU 内部 MS
+  缓冲区粒度，不能当作上述内存到内存 WriteNb 的长度上限，也不能当作 CTP MTU。
+- HCCL 源码 `src/ops/op_common/inc/alg_param.h` 定义
+  `UB_MAX_DATA_SIZE = 256 * 1024 * 1024`。这是该源码版本的传输大小常量，说明
+  HCCL 不将所有 UB 搬运统一限制为 4 KiB；不将它直接宣称为 T560 每一种 WriteNb
+  或硬件配置的实测最大值。
+- 开发容器 CANN 9.1.0-beta.1 的 HCOMM 反汇编显示：内存到内存 WriteNb 构建
+  `CcuRepWrite`，其 Translate 生成带长度寄存器的 `TransLocMemToRmtMemInstr`，
+  未看到该软件层按 4 KiB循环。**该库不是有卡机器的 T560**，结论仅限所检查版本，
+  且不覆盖硬件内部的 WQE/报文切分。
+
+因此，当前准确结论为：**应用层一次 WriteNb 可以描述大块搬运；底层是否按
+4 KiB 分段、一个大块产生多少 WQE、CTP 报文最大载荷分别是多少，尚未确认。**
+验证这些问题需要匹配 T560 的 CCU/UDMA/固件实现或权威协议资料；不能用
+GET_TP_LIST、Channel 数量或 WriteNb 次数代替分包证据。
+
+### 6.3 原生 HCCL CCU 与 URMA/CTP 的关系
+
+| 名称 | 所在层次 |
+|---|---|
+| HCCL AllToAll | collective 算法、资源管理和执行入口 |
+| CCU | 执行通信搬运与同步操作的硬件引擎 |
+| URMA | 通信资源及操作接口体系 |
+| CTP | 底层传输类型之一 |
+
+检查 HCCL 的 `src/ops/op_common/executor/channel/channel.cc::GetProtocolByEngine`，
+在 `CANN_VERSION_NUM >= 9.1.0` 分支，`COMM_ENGINE_CCU` 允许
+`COMM_PROTOCOL_UBC_CTP` 和 `COMM_PROTOCOL_UBC_TP`。native multi-jetty AllToAll
+还会按 jetty 数及对齐要求计算 slice，再调用 CCU Write，并不是在算法层统一按
+4 KiB循环写。
+
+所以，本算子可明确描述为“CCU 执行 + UBC_CTP Channel”；**不能把所有原生
+HCCL CCU 算子都等同于单一 URMA CTP 协议**。具体 baseline 的协议仍需核对其
+实际选中 CommLink/Channel 及版本，不能只凭 profiling 的 `Ccu` 任务名判断。
+
+参考官方源码：
+[Channel 协议选择](https://gitcode.com/cann/hccl/blob/master/src/ops/op_common/executor/channel/channel.cc)、
+[UB 传输大小常量](https://gitcode.com/cann/hccl/blob/master/src/ops/op_common/inc/alg_param.h)。
+
 ## 7. ACLGraph 语义
 
 正确顺序：
