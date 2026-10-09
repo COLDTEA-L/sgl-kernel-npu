@@ -8,10 +8,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
 from prepare_a5_ccu_peer_plan import build_rows, validate_policy
-from analyze_a5_ccu_peer_plan import analyze
+from analyze_a5_ccu_peer_plan import analyze, valid_result
 
 
 class PeerPlanTests(unittest.TestCase):
+    def test_malformed_timing_results_fail_closed(self):
+        valid = dict(rank=0, ranks=4, correctness="PASS", host_call_us=[10], iterations=1, host_avg_us=10)
+        self.assertTrue(valid_result(valid, 4))
+        for changes in (dict(rank=[]), dict(host_call_us=[float("nan")]),
+                        dict(host_call_us="10"), dict(host_call_us=[-1]),
+                        dict(host_avg_us=99), dict(iterations=True)):
+            self.assertFalse(valid_result(dict(valid, **changes), 4))
     def test_direct(self):
         for devices in ([2, 3], [0, 1, 2, 3], [3, 2, 1, 0]):
             rows, data = build_rows(devices, list(range(8)), {}, [], [])

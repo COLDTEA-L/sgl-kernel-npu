@@ -7,10 +7,11 @@ import faulthandler
 import json
 import os
 import re
-import site
 import sys
 import time
 from pathlib import Path
+from a5_ccu_test_runtime import prepare_runtime as shared_prepare_runtime
+from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
 
 os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
 CURRENT_PHASE = "module_import"
@@ -57,60 +58,8 @@ def encode_path_policy(weights):
     return word
 
 
-def prepend_env_path(name, path):
-    items = [item for item in os.environ.get(name, "").split(":") if item]
-    os.environ[name] = ":".join([path, *(item for item in items if item != path)])
-
-
 def prepare_runtime(require_route_library=True):
-    root = Path(__file__).resolve().parents[3]
-    # Prefer the force-installed wheel that the launcher validated.  Keep the
-    # source-tree extension only as a development fallback; choosing it first
-    # can silently mix a stale local .so with a new installed operator package.
-    packages = [Path(path) / "deep_ep" for path in site.getsitepackages()]
-    packages.append(root / "python" / "deep_ep" / "deep_ep")
-    candidates = []
-    if os.environ.get("A5_CCU_ROUTE_PROBE_LIB"):
-        candidates.append(Path(os.environ["A5_CCU_ROUTE_PROBE_LIB"]))
-    if os.environ.get("ASCEND_HOME_PATH"):
-        candidates.append(Path(os.environ["ASCEND_HOME_PATH"]) /
-                          "opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so")
-    candidates.append(Path("/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/"
-                           "liba5_ccu_urma_route_probe.so"))
-    route_lib = next((path.resolve() for path in candidates if path.is_file()), None)
-    if require_route_library and route_lib is None:
-        raise RuntimeError("route library not found; rebuild and install the latest probe package")
-
-    for package in packages:
-        extensions = sorted(package.glob("deep_ep_cpp*.so"))
-        if not extensions:
-            continue
-        changed = False
-        if route_lib is not None:
-            changed = os.environ.get("A5_CCU_ROUTE_PROBE_LIB") != str(route_lib)
-            os.environ["A5_CCU_ROUTE_PROBE_LIB"] = str(route_lib)
-        old_ld = os.environ.get("LD_LIBRARY_PATH", "")
-        vendor_root = package / "vendors" / "hwcomputing"
-        vendor_lib = vendor_root / "op_api" / "lib"
-        if vendor_root.is_dir():
-            old_opp = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
-            prepend_env_path("ASCEND_CUSTOM_OPP_PATH", str(vendor_root))
-            changed |= old_opp != os.environ["ASCEND_CUSTOM_OPP_PATH"]
-        if vendor_lib.is_dir():
-            prepend_env_path("LD_LIBRARY_PATH", str(vendor_lib))
-        if route_lib is not None:
-            prepend_env_path("LD_LIBRARY_PATH", str(route_lib.parent))
-        changed |= old_ld != os.environ["LD_LIBRARY_PATH"]
-        if changed and os.environ.get("_A5_CCU_A2A_REEXEC") != "1":
-            env = os.environ.copy()
-            env["_A5_CCU_A2A_REEXEC"] = "1"
-            os.execvpe(sys.executable,
-                       [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env)
-        if route_lib is not None:
-            ctypes.CDLL(str(route_lib), mode=ctypes.RTLD_GLOBAL)
-        sys.path.insert(0, str(package.parent))
-        return extensions[0], route_lib
-    raise RuntimeError("deep_ep_cpp not found; rebuild and install the latest DeepEP wheel")
+    return shared_prepare_runtime(__file__, require_route_library)
 
 
 def requested_implementation():
@@ -180,48 +129,6 @@ if IMPLEMENTATION != "native":
             )
         print(f"CASE_ROUTE_RUNTIME_ABI rank={os.environ.get('RANK', 'NA')} "
               f"version={route_abi()} route_library={ROUTE_LIB}", flush=True)
-
-
-def file_barrier(directory, tag, rank, world_size, timeout=180):
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{tag}.rank{rank}").touch()
-    deadline = time.monotonic() + timeout
-    expected = [directory / f"{tag}.rank{item}" for item in range(world_size)]
-    while not all(path.exists() for path in expected):
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"file barrier {tag} timed out")
-        time.sleep(0.01)
-
-
-def make_profiler(output_dir, rank):
-    output_dir = output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if not os.access(output_dir, os.W_OK):
-        raise RuntimeError(f"profiling directory is not writable: {output_dir}")
-    export_types = [torch_npu.profiler.ExportType.Text]
-    if hasattr(torch_npu.profiler.ExportType, "Db"):
-        export_types.append(torch_npu.profiler.ExportType.Db)
-    kwargs = dict(
-        export_type=export_types,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        l2_cache=False,
-        op_attr=False,
-        data_simplification=False,
-        record_op_args=False,
-    )
-    try:
-        config = torch_npu.profiler._ExperimentalConfig(mstx=False, **kwargs)
-    except TypeError:
-        config = torch_npu.profiler._ExperimentalConfig(msprof_tx=False, **kwargs)
-    return torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-            str(output_dir), worker_name=f"rank{rank}"),
-        record_shapes=True,
-        experimental_config=config,
-    )
 
 
 def parse_args():
@@ -661,14 +568,17 @@ def main():
         profiler.start()
     else:
         mark_phase("timing")
-    torch.npu.synchronize()
-    begin = time.perf_counter()
-    run_repeated(args.iters, "measure")
-    torch.npu.synchronize()
-    average_us = (time.perf_counter() - begin) * 1e6 / args.iters
-    if profiler is not None:
-        profiler.stop()
-        print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
+    try:
+        torch.npu.synchronize()
+        start_lateness_us = measurement_start(sync_dir, rank, world_size)
+        begin = time.perf_counter()
+        run_repeated(args.iters, "measure")
+        torch.npu.synchronize()
+        average_us = (time.perf_counter() - begin) * 1e6 / args.iters
+    finally:
+        if profiler is not None:
+            profiler.stop()
+            print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
     check_result()
 
     (sync_dir / f"average.rank{rank}.json").write_text(json.dumps(average_us))
@@ -694,6 +604,7 @@ def main():
             "relay_manifest": relay_manifest,
             "compile_backend": args.compile_backend,
             "measurement_mode": measurement_mode,
+            "measurement_start_lateness_us": start_lateness_us,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "

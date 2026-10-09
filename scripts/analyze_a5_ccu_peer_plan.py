@@ -8,6 +8,20 @@ import statistics
 from pathlib import Path
 
 
+def valid_result(result, k):
+    def numeric(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool) and
+                math.isfinite(value) and value >= 0)
+    rank, count = result.get("rank"), result.get("iterations")
+    samples = result.get("host_call_us")
+    return (isinstance(rank, int) and not isinstance(rank, bool) and 0 <= rank < k and
+            result.get("ranks") == k and result.get("correctness") == "PASS" and
+            isinstance(count, int) and not isinstance(count, bool) and count > 0 and
+            isinstance(samples, list) and len(samples) == count and
+            all(numeric(value) for value in samples) and numeric(result.get("host_avg_us")) and
+            math.isclose(result["host_avg_us"], sum(samples) / count, rel_tol=1e-6, abs_tol=1e-6))
+
+
 def analyze(root):
     plan = json.loads((root / "plans/peer_plan.json").read_text())
     k = len(plan["devices"])
@@ -36,11 +50,8 @@ def analyze(root):
         status_file = log.with_suffix(".status")
         status = status_file.read_text().strip() if status_file.exists() else "INTERRUPTED"
         data_valid = (len(results) == k and
-                 {r.get("rank") for r in results} == set(range(k)) and
-                 all(r.get("correctness") == "PASS" and r.get("ranks") == k and
-                     r.get("host_call_us") and len(r["host_call_us"]) == r.get("iterations") and
-                     isinstance(r.get("host_avg_us"), (int, float)) and math.isfinite(r["host_avg_us"])
-                     for r in results))
+                 all(valid_result(r, k) for r in results) and
+                 {r.get("rank") for r in results} == set(range(k)))
         valid = status == "0" and data_valid
         complete &= valid
         rows.append(dict(case=log.stem, status=status,

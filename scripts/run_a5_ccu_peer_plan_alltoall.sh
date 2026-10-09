@@ -44,22 +44,14 @@ for value in "$bytes" "$iterations" "$repeats" "$timeout_seconds"; do
 done
 [[ "$warmup" =~ ^[0-9]+$ ]] || exit 2
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
+source "${repo}/scripts/a5_ccu_test_env.sh"
+a5_ccu_prepare_test_env "$cann_root" "$repo"
 export A5_CCU_ROUTE_PROBE_LIB=${A5_CCU_ROUTE_PROBE_LIB:-${cann_root}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so}
 export LD_LIBRARY_PATH="${cann_root}/lib64:${cann_root}/opp/vendors/cust/lib64:${LD_LIBRARY_PATH:-}"
-unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_CCU_SYNTHETIC_SRC_EID A5_CCU_SYNTHETIC_DST_EID
-python3 - <<'PY'
-import ctypes, os
-from pathlib import Path
-import deep_ep.deep_ep_cpp as ext
-from deep_ep import Buffer
-route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'], mode=ctypes.RTLD_GLOBAL)
-deep = ctypes.CDLL(str(Path(ext.__file__).resolve()))
-for lib, name in ((route, 'A5CcuPeerPlanAbiVersion'), (deep, 'A5DeepEpPeerPlanAbiVersion')):
-    fn = getattr(lib, name); fn.restype = ctypes.c_int
-    assert fn() >= 1, f'rebuild new peer-plan ABI: {name}'
-assert hasattr(Buffer, 'prepare_ccu_urma_peer_plan')
-print('Verified independent peer-plan ABI 1 (route + DeepEP)', flush=True)
-PY
+unset A5_CCU_SYNTHETIC_SRC_EID A5_CCU_SYNTHETIC_DST_EID A5_CCU_SYNTHETIC_ROUTE_MANIFEST
+unset A5_CCU_ROUTE_INDEX A5_CCU_ROUTE_INDICES A5_CCU_PATH_UIDS A5_CCU_PATH_WEIGHTS A5_CCU_ROUTE_SCHEDULE
+timeout --signal=TERM --kill-after=5 180 \
+    python3 "${repo}/tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py" --runtime-check
 mkdir -p "${output_root}"
 run_dir=$(mktemp -d "${output_root}/a5_ccu_peer_plan_${devices//,/_}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "${run_dir}/cases"

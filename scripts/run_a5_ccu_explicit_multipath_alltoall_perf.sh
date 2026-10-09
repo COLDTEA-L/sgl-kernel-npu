@@ -150,10 +150,8 @@ elif [[ -n "${relay_phys}" ]]; then
 fi
 
 cd "${repo_root}"
-source "${cann_root}/set_env.sh"
-set +u
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-set -u
+source "${repo_root}/scripts/a5_ccu_test_env.sh"
+a5_ccu_prepare_test_env "${cann_root}" "${repo_root}"
 # Save the unmodified tool environment before prepending the experimental
 # HCCL runtime.  Triton's Ascend backend spawns npu-smi while torch_npu is
 # imported, and npu-smi must not inherit the worker's private libhccl preload.

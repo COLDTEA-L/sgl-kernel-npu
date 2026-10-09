@@ -13,7 +13,32 @@ def file_barrier(directory, tag, rank, world_size, timeout=180):
     while not all(path.exists() for path in expected):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"file barrier {tag} rank={rank}/{world_size} timed out")
-        time.sleep(0.01)
+        time.sleep(0.001)
+
+
+def measurement_start(directory, rank, world_size, lead_seconds=0.05):
+    """One-host start rendezvous outside timing; avoid a 10ms first-call skew.
+
+    This improves host start alignment, not cycle-level hardware synchrony.
+    Return scheduling lateness so first-call outliers remain diagnosable.
+    """
+    directory = Path(directory)
+    file_barrier(directory, "measurement_ready", rank, world_size)
+    release = directory / "measurement_start_ns"
+    if rank == 0:
+        temp = directory / "measurement_start_ns.tmp"
+        temp.write_text(str(time.monotonic_ns() + int(lead_seconds * 1e9)))
+        temp.replace(release)
+    deadline = time.monotonic() + 180
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("measurement start rendezvous timed out")
+        time.sleep(0.001)
+    target = int(release.read_text())
+    remaining = target - time.monotonic_ns()
+    if remaining > 0:
+        time.sleep(remaining / 1e9)
+    return max(0, time.monotonic_ns() - target) / 1000
 
 
 def make_profiler(output_dir, rank):

@@ -1,5 +1,6 @@
 """No-card regression tests for worker entry-point isolation and barriers."""
 import concurrent.futures
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,23 @@ from a5_ccu_peer_test_support import file_barrier
 
 
 class PeerEntrypointTest(unittest.TestCase):
+    def test_worker_preloads_before_torch_and_prepares_capture_stream_once(self):
+        tree = ast.parse(Path(__file__).with_name("test_a5_ccu_peer_plan_alltoall.py").read_text())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
+        preload = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == "prepare_runtime")
+        torch_import = next(node for node in ast.walk(main) if isinstance(node, ast.Import) and
+                            any(alias.name == "torch" for alias in node.names))
+        self.assertLess(preload.lineno, torch_import.lineno)
+        prepare = [node for node in calls if isinstance(node.func, ast.Attribute) and
+                   node.func.attr == "prepare_ccu_urma_peer_plan"]
+        self.assertEqual(len(prepare), 1)
+        stream = next(node for node in main.body if isinstance(node, ast.Assign) and
+                      any(isinstance(target, ast.Name) and target.id == "capture_stream" for target in node.targets))
+        self.assertLess(stream.lineno, prepare[0].lineno)
+        self.assertTrue(any(isinstance(node, ast.With) and
+                           any(child is prepare[0] for child in ast.walk(node)) for node in main.body))
+
     def test_import_has_no_runtime_or_legacy_benchmark_side_effects(self):
         code = (
             "import sys; import test_a5_ccu_peer_plan_alltoall; "

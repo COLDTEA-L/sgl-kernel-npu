@@ -85,16 +85,17 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
 构建脚本的 offline cann-cmake 与 UTF-8 源码预检保持原有行为。
 需要重新装 route package 和 wheel；**不需要重编 HCCL**。
 
-**2026-10-08 worker 入口修复只改 Python 测试与文档**：若第 3 节独立 peer-plan
+**2026-10-09 测试统一更新仅修改 Python、shell 与文档**：若第 3 节独立 peer-plan
 ABI 已通过，本次仅拉取更新即可，不需要重复编译/安装 route package 或 wheel。
 先做无需 NPU 的入口回归，再执行第 4 节：
 
 ```bash
 python3 tests/python/deepep/test_a5_ccu_peer_entrypoint_cpu.py
+python3 tests/python/deepep/test_a5_ccu_test_runtime_cpu.py
 python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --help
 ```
 
-应显示 3 个测试 `OK`，help 包含 `--manifest`、`--available-cards`、`--run-dir`、
+两个测试文件均应显示 `OK`，help 包含 `--manifest`、`--available-cards`、`--run-dir`、
 `--graph-backend`，不能显示旧两卡 benchmark 的 `--implementation`。
 
 若之前已经被迫退出 Docker，在宿主机使用 `docker exec -it sglang_yuanwen_old bash`
@@ -105,14 +106,20 @@ python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --help
 
 ```bash
 export A5_CCU_ROUTE_PROBE_LIB=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
+source scripts/a5_ccu_test_env.sh
+a5_ccu_prepare_test_env /usr/local/Ascend/cann-9.1.T560 "${PWD}"
+# 和正式 worker 完全相同的加载/ABI 预检；不初始化卡、不创建通信域。
+timeout --signal=TERM --kill-after=5 180 \
+  python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
 python3 - <<'PY'
 import ctypes, os
 from pathlib import Path
+# 与正式 worker 一样，先全局加载 route library，再导入 torch。
+route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'], mode=ctypes.RTLD_GLOBAL)
 import torch
 import deep_ep.deep_ep_cpp as ext
 from deep_ep import Buffer
 
-route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'], mode=ctypes.RTLD_GLOBAL)
 deep = ctypes.CDLL(str(Path(ext.__file__).resolve()))
 for library, name in [(route, 'A5CcuPeerPlanAbiVersion'), (deep, 'A5DeepEpPeerPlanAbiVersion')]:
     fn = getattr(library, name); fn.restype = ctypes.c_int
@@ -164,7 +171,8 @@ if test -n "${RUN_DIR}" && test -f "${RUN_DIR}/cases/peer_plan_r1.log"; then
 fi
 ```
 
-至少应先看到 `import_runtime`，随后是 `communicator_init`、`prepare_plan`；
+至少应先看到 `runtime_bootstrap`、`CASE_TEST_RUNTIME`、`import_runtime`，随后是
+`PEER_RUNTIME_VERIFIED`、`communicator_init`、`prepare_plan`；
 只有进入这些阶段后才开始判读通信域/建链/数据面错误。四个 rank 都输出 correctness
 PASS 的 `RESULT_JSON` 且进程正常退出 status=0，才算此 case 完整通过。
 
@@ -177,12 +185,14 @@ Channel state=0、plan bound，随后三次 changed-payload 检查及正式执�
 
 原版 RESULT_JSON 后还有最后一次 NPU synchronize、文件 barrier、
 `dist.destroy_process_group()`、局部对象析构及 Python/native 退出。旧日志没有
-这些位置的标记，不能直接断言哪个 API 死锁。更新只增加诊断和分析，不声称已修复退出。
+这些位置的标记，不能直接断言哪个 API 死锁。统一环境后仍需有卡复测，不能声称已修复退出。
 不要通过 `os._exit(0)` 绕过清理来把结果伪装为正常 PASS。
 
 本次修改仅 Python/报告，无需重编算子或重装 wheel。推送并拉取后，重跑第 4 节
-同一命令；可保留 timeout=600。结果输出后若清理卡住，默认每 30 秒打印 Python
-线程堆栈到 case log。只打印堆栈，不修改路由、驱动或共享硬件配置：
+同一命令；可保留 timeout=600。最后 synchronize/barrier/ProcessGroup 清理期间若卡住，
+默认每 30 秒打印 Python 线程堆栈；正常清理完成后取消 watchdog，输出
+`cleanup_watchdog_cancelled`。随后 native/interpreter 退出由第 4.3 节的外部观察器负责，
+不留下持续运行的 Python watchdog。只打印堆栈，不修改路由、驱动或共享硬件配置：
 
 ```bash
 export A5_CCU_PEER_CLEANUP_WATCHDOG_SECONDS=30
@@ -278,10 +288,34 @@ fi
 HCOMM destructor。`UNAVAILABLE`/`Operation not permitted` 是观测权限缺口，不代表
 数据面失败。若没有 native 栈，保留这个边界，不要继续猜测 TP/路由参数导致退出。
 
+### 4.4 两卡与四卡共用环境准备，不再维护两套初始化环境
+
+旧两卡与新 peer-plan launcher 均调用 `scripts/a5_ccu_test_env.sh`：source 相同 CANN，
+设置 `CCU_SCHED`，保留用户配置的 `HCCL_BUFFSIZE`（未配置时沿用两卡默认 2300），
+清除旧 tracer/调试环境。vendor 路径从当前 checkout 推导，不 source 含开发服务器绝对路径
+的生成脚本。worker 均使用 `tests/python/deepep/a5_ccu_test_runtime.py`，优先安装的 wheel，
+在导入 Torch **之前**以 `RTLD_GLOBAL` 加载 route library，并输出实际 .so 路径。
+需要刷新动态加载路径时只 re-exec 当前 worker，自身参数保持不变，不跳转到另一测试入口。
+
+这是对旧两卡已验证加载顺序的对齐，不能据此推断 native 退出卡顿一定由加载顺序造成。
+通信域仍由 `dist.init_process_group("hccl")` 创建、Buffer 持有；两卡/四卡只有 rank 数、
+peer-plan/旧 prepared-plan API 和路径计划不同，不需要另一个 HCCL 环境或 patched libhccl。
+launcher 的预检也直接调用正式 worker 的 `--runtime-check`，避免预检成功但 worker 加载另一套库。
+
+图模式直接在 capture stream 准备 plan，数据校验与图外 warmup 也使用该 stream。
+不再先在默认 stream 建一套资源，再在 capture stream 重建一套。
+进入 capture 前的 bind 是对同一 stream 的幂等检查，不是第二次创建 Channels。
+当前没有独立 plan/Channel Destroy API，不能靠无限新建 stream 或 plan 规避资源问题。
+
+这次还加强了校验：发送数据含 source/destination 和分片内位置；接收缓冲区预填无效值，
+三次变化输入及 warmup 后都核对完整输出，避免常数填充掩盖分片重叠/缺失或旧结果。
+重跑第 4 节 direct-only；只有所有 rank 数据 PASS **且 status=0** 后，再运行 relay/graph/profiling。
+
 ## 5. 四卡显式 direct+1 relay
 
 下面文件已随仓提供，可自行编辑卡对/relay/plane；key 为升序**物理**卡对，
-不是逻辑 rank。省略的卡对只走 direct。每张卡必须使用三张互不相同的外部 relay。
+不是逻辑 rank。省略的卡对只走 direct。若三个 peer 均配置 relay，则每张卡使用三张
+互不相同的外部 relay；也允许只为部分 peer 配置 relay。
 
 ```bash
 cat docs/topology/a5_peer_plan_4rank_example.json
@@ -327,6 +361,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 性能使用初始化一次、100 次独立 warmup、20 次独立执行；只给正式 20 次开 profiler。
 每次执行后 synchronize，不含资源准备、warmup 或 capture。正式 warmup 前还有三次
 变化 payload 的正确性检查，它们不计时；统计整段 HCCN 数据量时需要计入这些额外调用。
+测量或起跑 rendezvous 抛出异常时也通过 finally 停止已启动的 profiler，不继续生成 PASS。
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
@@ -340,6 +375,13 @@ prof 在结果目录的 `r1/profiling/rank0/` 到 `rank3/`，每个 repeat 独�
 报告中的 host-call us 含提交与同步开销；MindStudio CCU task 时长才是 device timing。
 不把 host timing 除 payload 当作 link bandwidth。
 
+两卡/四卡共用文件 rendezvous，所有 rank 在 profiler 启动后、计时前等待同一个
+单机 monotonic 时间点；减少旧 10 ms 文件轮询造成的首调用等待。此等待不计入样本，
+`measurement_start_lateness_us` 记录 host 调度迟到量。它不是硬件时钟同步，也不保证
+所有 rank 周期级同时发起；首样本若仍较慢，应检查调度迟到和 profiler，而非直接推断路径瓶颈。
+此对齐只适用于当前一机测试，多机需另做时钟/同步设计。host 每次计时仍包含该调用等待
+其他 rank 的时间；平均值与 device-only profiling 必须分别报告。
+
 单独验证新接口 graph capture/replay：
 
 ```bash
@@ -352,7 +394,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 ```
 
 新四卡图支持仍需此有卡测试确认；旧两卡 capture PASS 不自动等于四卡 PASS。
-capture stream 的 bind/warmup 在 capture 外进行，replay 修改输入验证非旧输出。
+capture stream 的 prepare/bind/warmup 在 capture 外进行，replay 修改输入验证非旧输出。
 每个 plan 的执行须串行使用；不能在多 stream 同时使用共享 Channel 的 notify 槽。
 
 ## 8. 结果检查、中断后分析、物理转发确认
@@ -367,7 +409,8 @@ grep -HnE 'PEER_CASE_PHASE|PEER_PATH_DESC|PEER_PATH_CHANNEL|PEER_PLAN_BOUND|PEER
   "${RUN_DIR}"/cases/*.log
 ```
 
-分析必须看到所有 k 个 rank 的 RESULT_JSON 和 status=0 才算正确性 PASS。
+分析要求所有 k 个 rank 的完整、唯一 RESULT_JSON，采样数量匹配 iterations、时间为有限
+非负值且平均值与样本一致。数据 PASS 与退出 lifecycle 分开；status=0 才算 complete。
 Ctrl-C 中断时，无 status 文件的 case 标记 INTERRUPTED，已有完整 case 仍可分析。
 
 `plans/peer_plan.json` 的 `relay_edges` 保存 src/dst/relay 真实 die/port、拓扑边及完整 EID。
@@ -430,8 +473,23 @@ c++ -std=c++14 -Wall -Wextra -Werror \
   tests/python/deepep/test_a5_ccu_peer_layout.cpp -o /tmp/a5_peer_layout_test
 /tmp/a5_peer_layout_test
 python3 tests/python/deepep/test_a5_ccu_peer_plan_cpu.py
+python3 tests/python/deepep/test_a5_ccu_peer_entrypoint_cpu.py
+python3 tests/python/deepep/test_a5_ccu_test_runtime_cpu.py
+python3 tests/python/deepep/test_a5_ccu_peer_shutdown_cpu.py
 python3 tests/python/deepep/test_a5_ccu_peer_meta.py
 ```
 
 开发容器已验证旧对象式 CCU runtime 与 DeepEP 编译、布局和 policy 校验、Meta/fullgraph
 形状检查；没有 NPU 的容器无法证明四卡 Acquire、实际转发或 graph replay。
+
+2026-10-09 在 `cam_lyw_dev_91` 的 `cam_py311_pt28` Python 环境通过了入口、共享
+bootstrap/rendezvous、计划/报告、退出观察器 CPU 回归，以及两卡/四卡 Meta/fullgraph
+和 C++ 分片布局回归。真实动态加载预检使用该容器之前编译的
+`/tmp/a5-peer-plan-install/lib/liba5_ccu_urma_route_probe.so`（peer ABI=1）及安装的 wheel，
+两卡 prepared 入口亦可正常加载。这不是有卡传输测试。
+容器 CANN 默认安装位置仍是旧 route package，预检能正确拒绝缺失 peer ABI 的库；
+没有为了这次 Python 修改覆盖安装包。用户机器第 3 节 peer ABI 已通过则不用重新安装。
+
+若预检报 `No module named torch`，先核对 `command -v python3` 与
+`python3 -c 'import sys, torch; print(sys.executable, torch.__version__)'`，使用已经安装
+Torch/torch_npu/DeepEP 的 Python 环境；不应通过更换 HCCL、驱动或源代码来修解释器环境。
