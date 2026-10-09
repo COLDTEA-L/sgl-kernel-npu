@@ -12,6 +12,7 @@ repeats=1
 timeout_seconds=600
 graph=none
 profile=0
+shutdown_native=0
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 output_root=/home/l00934901/profiling
 topology="${repo}/docs/topology/a5_hccn_device_topology_raw.txt"
@@ -29,11 +30,12 @@ while (($#)); do
         --timeout-seconds) timeout_seconds=$2; shift 2;;
         --graph-backend) graph=$2; shift 2;;
         --profile) profile=1; shift;;
+        --shutdown-native-backtrace) shutdown_native=1; shift;;
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
-        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph'; exit 0;;
+        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]'; exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
@@ -79,6 +81,12 @@ failed=0
 for ((r=1; r<=repeats; r++)); do
     case_dir="${run_dir}/r${r}"; mkdir -p "$case_dir"
     log="${run_dir}/cases/peer_plan_r${r}.log"
+    shutdown_args=(); ((shutdown_native == 0)) || shutdown_args=(--native-backtrace)
+    python3 "${repo}/scripts/watch_a5_ccu_peer_shutdown.py" \
+        --case-dir "$case_dir" --log "$log" --ranks "$k" --owner-pid "$$" \
+        --max-seconds "$((timeout_seconds + 20))" "${shutdown_args[@]}" \
+        > "${case_dir}/shutdown_monitor.log" 2>&1 &
+    monitor_pid=$!
     set +e
     timeout --signal=TERM --kill-after=5 "$timeout_seconds" \
         python3 -m torch.distributed.run --standalone --nproc-per-node="$k" \
@@ -89,6 +97,9 @@ for ((r=1; r<=repeats; r++)); do
     rc=$?
     set -e
     printf '%s\n' "$rc" > "${run_dir}/cases/peer_plan_r${r}.status"
+    # Observer exits when status appears; if collecting stacks, allow its bounded
+    # capture to finish. It never signals the test or touches shared hardware.
+    wait "$monitor_pid" || true
     echo "peer_plan_r${r}: status=${rc}"
     if ((rc != 0)); then tail -n 60 "$log"; failed=1; break; fi
 done

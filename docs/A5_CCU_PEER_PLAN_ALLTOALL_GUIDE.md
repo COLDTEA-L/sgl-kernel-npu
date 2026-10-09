@@ -219,6 +219,65 @@ fi
 lifecycle=`FAILED_OR_INTERRUPTED_AFTER_DATA_PASS`，complete=False；计时仅供诊断，
 不纳入有效性能样本。历史日志也可以重新运行第 8 节分析命令重新分类。
 
+### 4.3 `main_return_done` 和 `python_atexit` 都出现但仍超时
+
+最新四卡 direct-only 实验已在全部 rank 上观察到 final synchronize、reported barrier、
+destroy_process_group、main return 均完成，且均输出 python_atexit。此前怀疑的
+`dist.destroy_process_group()` 内部等待已排除。当前范围是 Python 后续退出/native
+清理、进程退出中的驱动等待，或 rank 已退出但 torchrun 启动器未收尾；不能据此
+断言 HCCL 模块某个析构函数，也不能把“atexit 回调执行”当作进程已经退出。
+
+更新版 runner 在每个 repeat 启动一个独立观察器。四个 rank 全部报告数据 PASS
+后仍未退出超过 30 秒，自动在 `r1/shutdown_trace/` 保存三次 /proc 快照，识别
+本次 case 的 rank/启动器/timeout 进程。匹配依据是完整测试脚本名和精确 `--run-dir`
+参数，不扫描或 attach 其他用户的 Python 作业。默认只是只读采集。
+阶段标记还增加了 PID，便于对应 rank。
+
+若容器已经有 gdb，推荐本次额外加 `--shutdown-native-backtrace`。GDB 在测量完成后
+短暂停顿本次匹配进程并逐个采集调用栈；没有 gdb 或 ptrace 权限时记录不可用，
+不安装工具，不修改宿主机 ptrace 配置，不重启容器或驱动。
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --shutdown-native-backtrace \
+  --output-root /home/l00934901/profiling
+```
+
+不加这个新参数也会生成只读 /proc 快照。无需重编算子或安装 wheel。
+先验证观察器回归可在无卡机器执行：
+
+```bash
+python3 tests/python/deepep/test_a5_ccu_peer_shutdown_cpu.py
+```
+
+在第二个终端或运行结束后检查：
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_peer_plan_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -d "${RUN_DIR}/r1"; then
+  cat "${RUN_DIR}/r1/shutdown_monitor.log"
+  TRACE_DIR="${RUN_DIR}/r1/shutdown_trace"
+  if test -d "${TRACE_DIR}"; then
+    cat "${TRACE_DIR}/scope.json"
+    sed -n '1,220p' "${TRACE_DIR}/proc_snapshot0.json"
+    for file in "${TRACE_DIR}"/native_pid*.txt; do
+      test -f "${file}" || continue
+      echo "===== ${file} ====="
+      sed -n '1,220p' "${file}"
+    done
+  fi
+fi
+```
+
+优先提供 `scope.json` 和 `native_pid*.txt`。若 rank 进程都不在而只剩 torchrun，
+转查 elastic/launcher 清理；若 rank 仍在，按用户态栈查实际阻塞函数。
+`futex`/`do_wait` 只说明锁/条件变量或子进程等待，不能从 /proc wchan 直接命名
+HCOMM destructor。`UNAVAILABLE`/`Operation not permitted` 是观测权限缺口，不代表
+数据面失败。若没有 native 栈，保留这个边界，不要继续猜测 TP/路由参数导致退出。
+
 ## 5. 四卡显式 direct+1 relay
 
 下面文件已随仓提供，可自行编辑卡对/relay/plane；key 为升序**物理**卡对，

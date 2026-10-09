@@ -67,6 +67,12 @@ def analyze(root):
     report.extend(["", "## Last observed lifecycle phase per rank", ""])
     for row in rows:
         report.append(f"- {row['case']}: `{row['last_phase_by_rank']}`")
+    report.extend(["", "## Shutdown observer outputs", ""])
+    for scope_file in sorted(root.glob("r*/shutdown_trace/scope.json")):
+        scope = json.loads(scope_file.read_text())
+        pids = [process["pid"] for process in scope.get("processes", [])]
+        report.append(f"- `{scope_file.relative_to(root)}`: still-matching process PIDs `{pids}`; "
+                      "see proc snapshots and optional native_pid*.txt. Kernel waits alone do not identify a user-space destructor.")
     times = [r["slowest_rank_host_avg_us"] for r in rows if r["lifecycle"] == "PASS"]
     if times:
         report.extend(["", f"Median across valid repeats: {statistics.median(times):.3f} us."])

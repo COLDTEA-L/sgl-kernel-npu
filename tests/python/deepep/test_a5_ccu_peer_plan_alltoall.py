@@ -13,7 +13,7 @@ from a5_ccu_peer_test_support import file_barrier, make_profiler
 
 
 def phase(name):
-    print(f"PEER_CASE_PHASE rank={os.environ.get('RANK', 'NA')} phase={name}", flush=True)
+    print(f"PEER_CASE_PHASE rank={os.environ.get('RANK', 'NA')} pid={os.getpid()} phase={name}", flush=True)
 
 
 def main():
