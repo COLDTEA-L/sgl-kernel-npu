@@ -397,6 +397,91 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 capture stream 的 prepare/bind/warmup 在 capture 外进行，replay 修改输入验证非旧输出。
 每个 plan 的执行须串行使用；不能在多 stream 同时使用共享 Channel 的 notify 槽。
 
+### 7.1 四卡原生 HCCL AllToAll baseline（不是自定义 direct-only）
+
+使用新增 `scripts/run_a5_ccu_native_alltoall_baseline.sh`。实际调用是
+`dist.all_to_all_single(recv, send)`，由系统 HCCL 自己选择算法与路径。
+**第 4 节的 direct-only 仍是我们的 peer-plan 算子，不能当作原生 baseline。**
+这里不选择 CommLink candidate0/2，也不合成 EID、创建自定义 plan、加载 route .so，
+不要求安装 DeepEP wheel或 patched libhccl。不要加旧两卡实验的 `--route-index`。
+原生 HCCL 内部可能使用多路径，因此此 baseline 不意味着强制纯 direct。
+
+本次只新增 Python/shell/分析脚本及文档，已有四卡环境**拉取即可，无需重新编译安装**。
+设备必须和自定义算子对比实验一致；下面用通信卡0、1、2、3，没有 relay rank 进程。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+# 可先做不依赖 NPU 的脚本回归。
+python3 tests/python/deepep/test_a5_ccu_native_baseline_cpu.py
+
+# 快速正确性与退出检查；先通过，再采性能。
+bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
+  --devices 0,1,2,3 \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+
+# 正式 baseline，带 MindStudio 可查看的 profiling。
+bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
+  --devices 0,1,2,3 \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 3 --profile \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+```
+
+可改 `--devices` 为其他四张可用卡或两张卡，顺序决定逻辑 rank。
+脚本与 peer-plan 复用 CANN 环境准备、文件 barrier、测量起跑 rendezvous和 profiler helper；
+区别是 baseline 不调用 `Buffer.prepare/bind`，而是原生 AllToAll 自己准备通信资源。
+`HCCL_OP_EXPANSION_MODE=CCU_SCHED` 是请求原生 CCU 调度，最终实际实现要在 profiling
+中确认，不能仅凭这个环境变量声称所有通信任务都是 CCU。
+
+每 rank 的 send/recv 都为 `[4,1048576]` FP32，即 **16 MiB tensor**；每个目的 rank
+分片 **4 MiB**，其中 self 4 MiB，网络发送给另外三卡共 **12 MiB/rank**。
+数据模式和 peer-plan 一致。三次变化输入的正确性检查、首次资源创建、100次 warmup
+均不计时；正式20次每次 AllToAll 后 synchronize，再执行下一次。不强制 graph capture。
+
+结果目录如下，每个 repeat 启动一套新的四 rank 进程：
+
+```text
+a5_ccu_native_alltoall_0_1_2_3_<time>.<suffix>/
+├── run_settings.json                  # 数据量、版本环境、HCCL配置
+├── cases/native_alltoall_r1.log
+├── cases/native_alltoall_r1.status
+├── r1/results/rank0.json ... rank3.json
+├── r1/profiling/rank0/..._ascend_pt/    # --profile时生成，rank1..3同样
+├── r2/ ...
+├── native_alltoall_results.tsv
+├── native_alltoall_summary.json
+└── native_alltoall_report.md
+```
+
+分析文档自动生成。也可中断后手动分析；未跑的 repeat 标记不完整，已完成 repeat 的
+样本仍保留。每 rank 结果独立、原子写 JSON，避免多进程终端输出拼接导致漏分析。
+
+```bash
+(
+set -e
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_native_alltoall_* 2>/dev/null | head -1)
+test -n "${RUN_DIR}" && test -d "${RUN_DIR}"
+echo "RUN_DIR=${RUN_DIR}"
+python3 scripts/analyze_a5_ccu_native_alltoall.py --run-dir "${RUN_DIR}"
+column -s $'\t' -t "${RUN_DIR}/native_alltoall_results.tsv"
+sed -n '1,240p' "${RUN_DIR}/native_alltoall_report.md"
+grep -HnE 'NATIVE_CASE_PHASE|NATIVE_CASE_FAILURE|NATIVE_RUNTIME|RESULT_JSON' "${RUN_DIR}"/cases/*.log
+find "${RUN_DIR}" -type d -name '*_ascend_pt' -print
+)
+```
+
+将对应 `r*/profiling/rank*/..._ascend_pt/` 导入 MindStudio。baseline 和自定义 peer-plan
+要用**相同卡组、每 peer 数据量、warmup、iterations、是否开启 profiler**进行比较。
+host统计按每轮最慢 rank 的平均耗时汇总；它包含提交与同步，不等于设备CCU时长。
+比较设备性能时查看正式执行的 CCU task，若一个 AllToAll 展开成多个任务，需看完整
+调用的相关通信任务跨度，不能只挑最快的一条。profiling中的无效 size/rank字段不能用于
+反推带宽。所有 rank 数据正确且进程 status=0，才计为完整 baseline。
+
 ## 8. 结果检查、中断后分析、物理转发确认
 
 ```bash
