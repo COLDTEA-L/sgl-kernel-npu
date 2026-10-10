@@ -1,11 +1,62 @@
 """Shared two-/four-rank runtime bootstrap, with no import-time side effects."""
 import ctypes
+import importlib
+import importlib.util
 import os
 from pathlib import Path
 import site
 import sys
 
 _LOADED_LIBRARIES = []
+
+
+def import_deep_ep(extension_path):
+    """Load the selected binary once under both historical import names.
+
+    Call after importing torch/torch_npu. Older wheels use a top-level
+    ``deep_ep_cpp`` import even though the binary lives inside ``deep_ep``.
+    Do not add the package directory to sys.path or load a second binary.
+    Missing binary dependencies must remain visible, not trigger a fallback.
+    """
+    if "torch" not in sys.modules:
+        raise RuntimeError("import torch before import_deep_ep")
+    extension_path = Path(extension_path).resolve(strict=True)
+    names = ("deep_ep_cpp", "deep_ep.deep_ep_cpp")
+    loaded = [sys.modules[name] for name in names if name in sys.modules]
+    package = sys.modules.get("deep_ep")
+    if package is not None and Path(package.__file__).resolve().parent != extension_path.parent:
+        raise RuntimeError("already imported deep_ep package differs from selected extension")
+    if loaded and any(module is not loaded[0] for module in loaded):
+        raise RuntimeError("deep_ep_cpp aliases refer to different loaded modules")
+    if loaded:
+        extension = loaded[0]
+        if Path(extension.__file__).resolve() != extension_path:
+            raise RuntimeError("already imported deep_ep_cpp differs from selected extension")
+    else:
+        spec = importlib.util.spec_from_file_location("deep_ep_cpp", extension_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load DeepEP extension: {extension_path}")
+        extension = importlib.util.module_from_spec(spec)
+    inserted = [name for name in names if name not in sys.modules]
+    for name in inserted:
+        sys.modules[name] = extension
+    try:
+        if not loaded:
+            spec.loader.exec_module(extension)
+        package = importlib.import_module("deep_ep")
+        if Path(package.__file__).resolve().parent != extension_path.parent:
+            raise RuntimeError("imported deep_ep package differs from selected extension")
+        if getattr(package, "deep_ep_cpp", extension) is not extension:
+            raise RuntimeError("deep_ep package refers to a different extension")
+        package.deep_ep_cpp = extension
+    except BaseException:
+        for name in inserted:
+            if sys.modules.get(name) is extension:
+                del sys.modules[name]
+        raise
+    print(f"CASE_TEST_EXTENSION path={extension_path} "
+          "aliases=deep_ep_cpp,deep_ep.deep_ep_cpp", flush=True)
+    return package, extension
 
 
 def prepend_env_path(name, path):

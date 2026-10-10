@@ -4,6 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -13,6 +14,57 @@ from a5_ccu_test_runtime import prepare_runtime
 
 
 class RuntimeSetupTests(unittest.TestCase):
+    def run_import_fixture(self, initializer, extension_code="Config = object()\n", setup="", check=""):
+        # Exercise real Python import behavior in an isolated interpreter,
+        # using a tiny Python stand-in for the NPU extension, not a fake .so.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "deep_ep"; package.mkdir()
+            (package / "__init__.py").write_text(initializer)
+            extension = package / "deep_ep_cpp.py"
+            extension.write_text(extension_code)
+            code = (
+                "import sys, types, importlib\n"
+                f"sys.path.insert(0, {str(root)!r})\n"
+                "from a5_ccu_test_runtime import import_deep_ep\n"
+                "sys.modules['torch'] = types.ModuleType('torch')\n"
+                + setup + "\n"
+                f"package, ext = import_deep_ep({str(extension)!r})\n"
+                "assert sys.modules['deep_ep_cpp'] is ext\n"
+                "assert sys.modules['deep_ep.deep_ep_cpp'] is ext\n"
+                "assert importlib.import_module('deep_ep.deep_ep_cpp') is ext\n"
+                "assert package.Config is ext.Config\n"
+                + check + "\n"
+            )
+            return subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent,
+                                  text=True, capture_output=True, timeout=10)
+
+    def test_old_wheel_top_level_import_with_binary_inside_package(self):
+        result = self.run_import_fixture("from deep_ep_cpp import Config\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CASE_TEST_EXTENSION", result.stdout)
+
+    def test_current_wheel_relative_import_uses_the_same_module(self):
+        result = self.run_import_fixture("from . import deep_ep_cpp\nConfig = deep_ep_cpp.Config\n",
+            extension_code="import builtins\nbuiltins._deep_ep_loads = getattr(builtins, '_deep_ep_loads', 0) + 1\nConfig = object()\n",
+            check="import builtins\nassert builtins._deep_ep_loads == 1\n"
+                  "import_deep_ep(ext.__file__)\nassert builtins._deep_ep_loads == 1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_conflicting_preloaded_extension_is_rejected(self):
+        result = self.run_import_fixture("from deep_ep_cpp import Config\n",
+            setup="wrong = types.ModuleType('deep_ep_cpp')\nwrong.__file__ = '/tmp/wrong_deep_ep_cpp.so'\n"
+                  "sys.modules['deep_ep_cpp'] = wrong")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already imported deep_ep_cpp differs", result.stderr)
+
+    def test_extension_dependency_error_is_not_hidden_by_an_import_fallback(self):
+        result = self.run_import_fixture("from deep_ep_cpp import Config\n",
+            extension_code="raise ImportError('lib_required_dependency.so missing')\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lib_required_dependency.so missing", result.stderr)
+        self.assertNotIn("No module named 'deep_ep_cpp'", result.stderr)
+
     def test_reexec_targets_caller_and_preserves_peer_arguments(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

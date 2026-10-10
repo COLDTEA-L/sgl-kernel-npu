@@ -112,13 +112,22 @@ a5_ccu_prepare_test_env /usr/local/Ascend/cann-9.1.T560 "${PWD}"
 timeout --signal=TERM --kill-after=5 180 \
   python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
 python3 - <<'PY'
-import ctypes, os
+import ctypes, os, sys, importlib.util
 from pathlib import Path
 # 与正式 worker 一样，先全局加载 route library，再导入 torch。
 route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'], mode=ctypes.RTLD_GLOBAL)
 import torch
-import deep_ep.deep_ep_cpp as ext
-from deep_ep import Buffer
+import torch_npu
+sys.path.insert(0, str(Path('tests/python/deepep').resolve()))
+from a5_ccu_test_runtime import import_deep_ep
+package_spec = importlib.util.find_spec('deep_ep')
+if package_spec is None or package_spec.origin is None:
+    raise RuntimeError('deep_ep package not found in this Python environment')
+extension = next(Path(package_spec.origin).parent.glob('deep_ep_cpp*.so'), None)
+if extension is None:
+    raise RuntimeError('deep_ep_cpp binary not found in the selected package')
+package, ext = import_deep_ep(extension)
+Buffer = package.Buffer
 
 deep = ctypes.CDLL(str(Path(ext.__file__).resolve()))
 for library, name in [(route, 'A5CcuPeerPlanAbiVersion'), (deep, 'A5DeepEpPeerPlanAbiVersion')]:
@@ -132,6 +141,43 @@ for k in (2, 4):
 print('peer-plan Meta PASS; not a hardware correctness test')
 PY
 ```
+
+### 3.1 `.so` 存在但 `No module named 'deep_ep_cpp'`
+
+若 `CASE_TEST_RUNTIME` 已打印 `.../site-packages/deep_ep/deep_ep_cpp*.so`，
+但 `deep_ep/__init__.py` 在 `from deep_ep_cpp import Config` 失败，说明旧 wheel
+入口按顶层名称导入，而二进制实际放在包内。这发生在 `import_runtime` 阶段，
+尚未初始化通信域/Acquire Channel；不是 batch 模式或 CCU 数据面失败。
+
+测试入口现在在导入 Torch/Torch-NPU 后，按 bootstrap 选定的绝对路径加载一次
+扩展，将 `deep_ep_cpp` 和 `deep_ep.deep_ep_cpp` 指向同一模块，再导入 DeepEP。
+同时兼容旧入口和新版相对导入，拒绝已经加载的不同扩展，不会吞掉缺少依赖
+`.so` 的真实错误。后续独立 peer-plan ABI/API 检查仍保留；名称兼容不等于旧
+二进制自动具备新版 API。
+
+本次修复仅测试加载代码与文档，**不需要重新编译算子、安装 wheel 或编译 HCCL**。
+拉取本分支更新后，在当前 Docker/Python 中执行（不初始化 NPU）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD
+python3 tests/python/deepep/test_a5_ccu_test_runtime_cpu.py
+source scripts/a5_ccu_test_env.sh
+a5_ccu_prepare_test_env /usr/local/Ascend/cann-9.1.T560 "${PWD}"
+timeout --signal=TERM --kill-after=5 180 \
+  python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
+```
+
+应看到 `CASE_TEST_EXTENSION ... aliases=deep_ep_cpp,deep_ep.deep_ep_cpp` 和
+`PEER_RUNTIME_VERIFIED`。CPU 测试覆盖新旧 Python 包入口的导入，不代表有卡
+二进制依赖或数据面通过。若预检仍失败，保留完整 traceback，先处理该错误，
+不要通过重复全量编译掩盖安装来源问题。
+
+若已经重编/重装，第 2 节命令会更新自定义 route 库和当前 Python 的 DeepEP 包，
+不会加载新 ko 或修改 UB 路由表；`pip --no-deps` 不要求重装 Torch 依赖。
+这些安装路径若是共享挂载，其他容器/宿主机也可能看到文件变化，因此不能
+把安装当成完全不改变环境。不要在仍有测试进程使用这些库时覆盖安装。
 
 ## 4. 先测四卡 direct-only
 

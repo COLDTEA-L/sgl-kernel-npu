@@ -13,7 +13,7 @@ import time
 
 from a5_ccu_peer_test_support import (file_barrier, make_profiler, measurement_start,
     warmup_calls, measure_calls, validate_queued_calls, write_rank_result)
-from a5_ccu_test_runtime import prepare_runtime
+from a5_ccu_test_runtime import prepare_runtime, import_deep_ep
 
 
 def phase(name):
@@ -57,8 +57,8 @@ def main():
     import torch
     import torch.distributed as dist
     import torch_npu
-    from deep_ep import Buffer
-    import deep_ep.deep_ep_cpp as ext
+    deep_ep, ext = import_deep_ep(extension_path)
+    Buffer = deep_ep.Buffer
 
     if Path(ext.__file__).resolve() != extension_path:
         raise RuntimeError(f"worker extension differs from bootstrap: {ext.__file__} != {extension_path}")
