@@ -11,6 +11,7 @@ iterations=20
 repeats=1
 timeout_seconds=600
 graph=none
+sync_mode=per-call
 profile=0
 shutdown_native=0
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
@@ -29,13 +30,15 @@ while (($#)); do
         --repeats) repeats=$2; shift 2;;
         --timeout-seconds) timeout_seconds=$2; shift 2;;
         --graph-backend) graph=$2; shift 2;;
+        --sync-mode) sync_mode=$2; shift 2;;
         --profile) profile=1; shift;;
         --shutdown-native-backtrace) shutdown_native=1; shift;;
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
-        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]'; exit 0;;
+        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
+            echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).'; exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
@@ -44,6 +47,8 @@ for value in "$bytes" "$iterations" "$repeats" "$timeout_seconds"; do
 done
 [[ "$warmup" =~ ^[0-9]+$ ]] || exit 2
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
+[[ "$sync_mode" == per-call || "$sync_mode" == batch ]] || { echo 'invalid --sync-mode' >&2; exit 2; }
+[[ "$sync_mode" != batch || "$graph" == none ]] || { echo 'batch requires --graph-backend none' >&2; exit 2; }
 source "${repo}/scripts/a5_ccu_test_env.sh"
 a5_ccu_prepare_test_env "$cann_root" "$repo"
 export A5_CCU_ROUTE_PROBE_LIB=${A5_CCU_ROUTE_PROBE_LIB:-${cann_root}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so}
@@ -55,9 +60,11 @@ timeout --signal=TERM --kill-after=5 180 \
 mkdir -p "${output_root}"
 run_dir=$(mktemp -d "${output_root}/a5_ccu_peer_plan_${devices//,/_}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "${run_dir}/cases"
-python3 - "$run_dir" "$repeats" <<'PY'
+python3 - "$run_dir" "$repeats" "$sync_mode" "$bytes" "$warmup" "$iterations" "$graph" <<'PY'
 import json, pathlib, sys
-(pathlib.Path(sys.argv[1]) / 'run_settings.json').write_text(json.dumps({'repeats': int(sys.argv[2])}) + '\n')
+(pathlib.Path(sys.argv[1]) / 'run_settings.json').write_text(json.dumps(dict(
+    repeats=int(sys.argv[2]), sync_mode=sys.argv[3], bytes_per_peer=int(sys.argv[4]),
+    warmup=int(sys.argv[5]), iterations=int(sys.argv[6]), graph_backend=sys.argv[7])) + '\n')
 PY
 echo "Result directory: ${run_dir}"
 plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
@@ -85,7 +92,7 @@ for ((r=1; r<=repeats; r++)); do
         "${repo}/tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py" \
         --manifest "${run_dir}/plans/peer_plan.tsv" --available-cards "$n" \
         --bytes "$bytes" --warmup "$warmup" --iters "$iterations" \
-        --run-dir "$case_dir" --graph-backend "$graph" "${profile_args[@]}" > "$log" 2>&1
+        --run-dir "$case_dir" --graph-backend "$graph" --sync-mode "$sync_mode" "${profile_args[@]}" > "$log" 2>&1
     rc=$?
     set -e
     printf '%s\n' "$rc" > "${run_dir}/cases/peer_plan_r${r}.status"

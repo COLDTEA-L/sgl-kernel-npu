@@ -108,7 +108,7 @@ def native_backtrace(target, output):
             file.write("\nGDB_TIME_BUDGET_EXCEEDED; do not infer a native root cause from incomplete output\n")
 
 
-def log_state(log, k):
+def log_state(log, k, case_dir=None):
     results, phases = {}, {}
     # Logs in this short test are normally small; bound reads for a stalled run.
     for line in read(log, 16 * 1024 * 1024).splitlines():
@@ -123,6 +123,15 @@ def log_state(log, k):
             fields = dict(p.split("=", 1) for p in line.split()[1:] if "=" in p)
             if "rank" in fields and "phase" in fields:
                 phases[fields["rank"]] = fields["phase"]
+    if case_dir is not None and (Path(case_dir) / "results").is_dir():
+        results = {}
+        for rank in range(k):
+            try:
+                item = json.loads((Path(case_dir) / "results" / f"rank{rank}.json").read_text())
+                if item.get("rank") == rank and item.get("ranks") == k and item.get("correctness") == "PASS":
+                    results[rank] = item
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
     return set(results) == set(range(k)), phases
 
 
@@ -133,7 +142,7 @@ def watch(case_dir, log, k, owner_pid, grace, max_seconds, native=False):
     while time.monotonic() < deadline:
         if status.exists() or not Path(f"/proc/{owner_pid}").exists():
             return
-        complete, phases = log_state(log, k)
+        complete, phases = log_state(log, k, case_dir)
         if complete:
             if first_report is None:
                 first_report = time.monotonic()

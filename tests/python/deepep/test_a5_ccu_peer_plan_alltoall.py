@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 import time
 
-from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
+from a5_ccu_peer_test_support import (file_barrier, make_profiler, measurement_start,
+    warmup_calls, measure_calls, validate_queued_calls, write_rank_result)
 from a5_ccu_test_runtime import prepare_runtime
 
 
@@ -26,6 +27,8 @@ def main():
     p.add_argument("--bytes", type=int, default=4194304, help="bytes per destination, including self")
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--sync-mode", choices=("per-call", "batch"), default="per-call",
+                   help="batch is opt-in and requires queued changed-payload validation")
     p.add_argument("--run-dir", type=Path)
     p.add_argument("--runtime-check", action="store_true", help="check worker runtime/ABI without initializing devices or communicator")
     p.add_argument("--graph-backend", choices=("none", "aclgraph"), default="none")
@@ -33,6 +36,8 @@ def main():
     args = p.parse_args()
     if args.bytes <= 0 or args.bytes % 4 or args.warmup < 0 or args.iters < 1:
         p.error("positive FP32-aligned byte count and iterations required")
+    if args.sync_mode == "batch" and args.graph_backend != "none":
+        p.error("batch validation currently requires --graph-backend none; validate graph separately in per-call mode")
     if not args.runtime_check:
         if args.manifest is None or args.run_dir is None:
             p.error("--manifest and --run-dir are required for a hardware run")
@@ -127,6 +132,36 @@ def main():
     launch = eager
     epoch = 2
     graph_output = recv
+    batch_validation = dict(status="NOT_REQUESTED", rounds=0, calls_per_round=0)
+    if args.sync_mode == "batch":
+        phase("batch_validation_begin")
+        queued_count = min(max(args.iters, 2), 20)
+        # Keep native/current stream fixed. Torch producers and snapshots must
+        # be ordered around the raw CCU launch by the existing bridge/runtime.
+        # Reuse send/recv exactly as timing does, but vary inputs and poison
+        # output each call so a stale or missing execution cannot pass.
+        for round_index in range(2):
+            deltas = [100 * (round_index + 1) + i + 1 for i in range(queued_count)]
+            inputs = [send + delta for delta in deltas]
+            snapshots = [torch.empty_like(recv) for _ in deltas]
+            torch.npu.synchronize()
+            barrier(f"batch_validation_{round_index}_begin")
+            def prepare(index):
+                send.copy_(inputs[index])
+                recv.fill_(-999)
+            def snapshot(index):
+                snapshots[index].copy_(recv)
+            def check_snapshot(index):
+                check(snapshots[index], epoch + deltas[index])
+            validate_queued_calls(prepare, eager, snapshot, torch.npu.synchronize,
+                                  check_snapshot, queued_count)
+            epoch += deltas[-1]
+            check(recv, epoch)
+            barrier(f"batch_validation_{round_index}_passed")
+            del inputs, snapshots
+        batch_validation = dict(status="PASS", rounds=2, calls_per_round=queued_count)
+        print(f"PEER_BATCH_VALIDATION rank={rank} PASS rounds=2 calls_per_round={queued_count} "
+              "changed_input=1 poisoned_output=1 every_snapshot_checked=1", flush=True)
     if args.graph_backend == "aclgraph":
         phase("bind_capture_stream")
         capture_stream.wait_stream(torch.npu.current_stream())
@@ -152,34 +187,32 @@ def main():
         print(f"PEER_GRAPH_CAPTURE_REPLAY rank={rank} PASS", flush=True)
         launch = graph.replay
     phase("warmup")
-    for _ in range(args.warmup):
-        launch()
-        torch.npu.synchronize()  # independent completed calls, not a queued batch
+    warmup_calls(launch, torch.npu.synchronize, args.warmup, args.sync_mode)
     check(graph_output, epoch)
     barrier("warmup_done")
     profiler = make_profiler(args.run_dir / "profiling" / f"rank{rank}", rank) if args.profile else None
     if profiler:
         profiler.start()
-    samples = []
     try:
+        torch.npu.synchronize()  # align the profiler-start boundary with native baseline
         phase("measurement_rendezvous")
         start_lateness_us = measurement_start(sync, rank, k)
         phase("measure")
-        for _ in range(args.iters):
-            start = time.perf_counter_ns()
-            launch()
-            torch.npu.synchronize()
-            samples.append((time.perf_counter_ns() - start) / 1000)
+        print(f"PEER_MEASUREMENT rank={rank} sync_mode={args.sync_mode} "
+              f"calls={args.iters} warmup_in_profile=0", flush=True)
+        timing = measure_calls(launch, torch.npu.synchronize, args.iters, args.sync_mode)
     finally:
         if profiler:
             profiler.stop()
     check(graph_output, epoch)
     barrier("measured")
-    print("RESULT_JSON " + json.dumps(dict(rank=rank, ranks=k, correctness="PASS",
+    result = dict(rank=rank, ranks=k, correctness="PASS",
         bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, warmup=args.warmup,
-        iterations=args.iters, graph_backend=args.graph_backend, host_call_us=samples,
-        host_avg_us=sum(samples)/len(samples), measurement_start_lateness_us=start_lateness_us,
-        manifest=str(args.manifest))), flush=True)
+        iterations=args.iters, graph_backend=args.graph_backend, **timing,
+        batch_validation=batch_validation, measurement_start_lateness_us=start_lateness_us,
+        manifest=str(args.manifest))
+    write_rank_result(args.run_dir, rank, result)
+    print("RESULT_JSON " + json.dumps(result), flush=True)
     # All rank results have been recorded, but cleanup is a separate obligation.
     # Native shutdown monitoring is external; cancel this Python watchdog
     # after normal cleanup just as the validated two-rank harness does.

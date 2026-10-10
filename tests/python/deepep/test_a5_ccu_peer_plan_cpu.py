@@ -27,6 +27,33 @@ class PeerPlanTests(unittest.TestCase):
             self.assertEqual(data["channels_per_rank"], [k - 1] * k)
             self.assertEqual(data["relay_limit_per_peer"], 6 if k == 2 else 1)
 
+    def test_batch_analysis_requires_gate_and_atomic_rank_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / "plans").mkdir(); (root / "cases").mkdir()
+            (root / "plans/peer_plan.json").write_text(json.dumps(dict(devices=[0, 1, 2, 3], relay_limit_per_peer=1)))
+            (root / "run_settings.json").write_text(json.dumps(dict(repeats=1, sync_mode="batch", iterations=2)))
+            (root / "cases/peer_plan_r1.status").write_text("0")
+            (root / "cases/peer_plan_r1.log").write_text("RESULT_JSON {RESULT_JSON {broken\n")
+            result_dir = root / "r1/results"; result_dir.mkdir(parents=True)
+            for rank in range(4):
+                item = dict(rank=rank, ranks=4, correctness="PASS", iterations=2, sync_mode="batch",
+                    host_call_us=[], host_avg_us=10, host_batch_total_us=20,
+                    batch_validation=dict(status="PASS", rounds=2, calls_per_round=2))
+                (result_dir / f"rank{rank}.json").write_text(json.dumps(item))
+            self.assertTrue(analyze(root)["complete"])
+            item.pop("batch_validation")
+            self.assertFalse(valid_result(item, 4))
+            (result_dir / "rank3.json").write_text(json.dumps(item))
+            self.assertFalse(analyze(root)["complete"])
+            item["batch_validation"] = dict(status="PASS", rounds=2, calls_per_round=2)
+            item["host_batch_total_us"] = 21
+            self.assertFalse(valid_result(item, 4))
+            item["host_batch_total_us"] = 20
+            (result_dir / "rank3.json").write_text(json.dumps(item))
+            settings = dict(repeats=1, sync_mode="per-call", iterations=2)
+            (root / "run_settings.json").write_text(json.dumps(settings))
+            self.assertFalse(analyze(root)["complete"])
+
     def test_policy(self):
         valid = {"0,1": [4], "2,3": [4], "0,2": [5], "1,3": [5], "0,3": [6], "1,2": [6]}
         validate_policy([0, 1, 2, 3], list(range(8)), valid)

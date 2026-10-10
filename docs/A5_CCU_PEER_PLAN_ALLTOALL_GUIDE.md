@@ -367,7 +367,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
   --devices 0,1,2,3 \
   --relay-map docs/topology/a5_peer_plan_4rank_example.json \
-  --bytes 4194304 --warmup 100 --iters 20 --repeats 3 --profile \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
   --output-root /home/l00934901/profiling
 ```
 
@@ -396,6 +396,64 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 新四卡图支持仍需此有卡测试确认；旧两卡 capture PASS 不自动等于四卡 PASS。
 capture stream 的 prepare/bind/warmup 在 capture 外进行，replay 修改输入验证非旧输出。
 每个 plan 的执行须串行使用；不能在多 stream 同时使用共享 Channel 的 notify 槽。
+
+### 7.0 多路径 batch 验证与性能复测（新增，显式开启）
+
+第7节旧命令默认 `--sync-mode per-call`，每次调用完成后才重新下发下一次。
+这可能把四个rank的host提交错位放大为CCU内部等待，warmup100次也不能排除。
+CCU时长包含地址/token通知、WriteNb完成和peer完成通知的等待，并非纯搬运时间。
+现在增加 `--sync-mode batch`，用于与第7.1节原生batch基线采用相同显式同步口径。
+batch仍是验证模式，不声称已经在所有尺寸、权重、流或设备上证明可连续排队。
+
+**先自动做安全门槛，再采性能。** batch每次运行先做两轮图外排队校验，每轮
+`min(max(iters,2),20)`次：复用同一send/recv，每次输入不同、接收缓冲区被清空；
+在同一执行stream上排入生产数据、CCU调用、该次输出的独立snapshot拷贝。
+仅在该轮末尾同步，然后逐一精确校验全部snapshot和最终输出，而非只看最后一次。
+这用于检测生产者/CCU/消费者顺序、丢失调用、旧输出和通知复用问题。
+每一轮全部rank校验通过才进入下一阶段；失败时不进入warmup或profiler，不生成性能PASS。
+校验需要额外HBM（四卡4MiB/peer、20次时输入与snapshot合计约640MiB/rank）；
+这些校验调用不计时、不采profiling，但统计覆盖整个进程的HCCN流量时必须计入。
+
+```bash
+# 可先执行CPU回归，无需NPU。
+python3 tests/python/deepep/test_a5_ccu_peer_entrypoint_cpu.py
+python3 tests/python/deepep/test_a5_ccu_peer_plan_cpu.py
+
+# 多路径batch：自动校验 -> warmup100 -> 正式20；只采正式20，跑一轮。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --output-root /home/l00934901/profiling
+```
+
+两卡采用同一入口，将设备改为`2,3`、map改为第6节的两卡map即可。
+warmup连续提交后同步一次，所有rank预热完成后开启profiler；正式计时前做一次
+设备同步和起跑rendezvous，正式20次连续提交，最后同步确认完成后停止profiler。
+batch host均值是整批耗时/20，不伪造逐次host延迟；设备单次时长仍看MindStudio。
+与原生比较必须保持相同卡组、per-peer字节、warmup、iters、profiler和sync-mode。
+批量提交仍可能受host供给、peer等待和链路争用影响，不承诺消除所有波动。
+
+```bash
+(
+set -e
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_peer_plan_* 2>/dev/null | head -1)
+test -n "${RUN_DIR}" && test -d "${RUN_DIR}"
+echo "RUN_DIR=${RUN_DIR}"
+grep -HnE 'PEER_BATCH_VALIDATION|PEER_MEASUREMENT|PEER_CASE_FAILURE' "${RUN_DIR}"/cases/*.log
+python3 scripts/analyze_a5_ccu_peer_plan.py --run-dir "${RUN_DIR}"
+sed -n '1,200p' "${RUN_DIR}/peer_plan_report.md"
+find "${RUN_DIR}" -path '*/results/rank*.json' -o -type d -name '*_ascend_pt'
+)
+```
+
+应看到全部rank `PEER_BATCH_VALIDATION ... PASS`、`sync_mode=batch`和完整数据/退出PASS。
+新结果保存为`r*/results/rank*.json`，分析和退出观察器以独立文件为准，避免stdout交错漏判；
+仍兼容旧stdout-only结果。分析器拒绝缺少batch门槛记录、模式不一致或错误的批均值。
+需要A/B对照时把`--sync-mode batch`改为`per-call`，其余参数保持不变。
+batch目前不与aclgraph组合；图capture/replay继续使用per-call单独验证。
+只修改Python/shell/分析脚本和文档，无HCCL或CCU二进制改动，**拉取即可，不用重新编译安装**。
 
 ### 7.1 四卡原生 HCCL AllToAll baseline（不是自定义 direct-only）
 
@@ -459,7 +517,7 @@ profiling可能包含测量阶段的同步/运行时任务；“20次”指20次
 后者每次调用后同步，可能把重新下发的rank错位放大成CCU内部的peer等待；
 仅增加warmup不能排除这种等待。默认batch模式测的是连续调用的稳态性能。
 
-此改动**仅限原生baseline**；自定义peer-plan仍逐次完成，避免跨调用复用通知和输出的风险。
+原生默认batch；自定义peer-plan默认仍逐次完成，也可按第7.0节显式开启有门槛检查的batch。
 没有修改HCCL、Channel、EID或多路径CCU kernel。拉取脚本更新即可，无需编译安装。
 
 结果目录如下，当前命令只启动一轮四 rank 进程：

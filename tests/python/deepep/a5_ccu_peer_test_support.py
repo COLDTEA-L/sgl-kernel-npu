@@ -1,7 +1,58 @@
 """Import-safe peer-plan test helpers: no CLI, runtime initialization or re-exec."""
 import os
+import json
 from pathlib import Path
 import time
+
+
+def warmup_calls(launch, synchronize, count, sync_mode):
+    for _ in range(count):
+        launch()
+        if sync_mode == "per-call":
+            synchronize()
+    synchronize()
+
+
+def measure_calls(launch, synchronize, count, sync_mode, clock=time.perf_counter_ns):
+    if sync_mode == "batch":
+        start = clock()
+        for _ in range(count):
+            launch()
+        synchronize()
+        total_us = (clock() - start) / 1000
+        return dict(sync_mode=sync_mode, host_call_us=[], host_batch_total_us=total_us,
+                    host_avg_us=total_us / count)
+    samples = []
+    for _ in range(count):
+        start = clock()
+        launch()
+        synchronize()
+        samples.append((clock() - start) / 1000)
+    return dict(sync_mode=sync_mode, host_call_us=samples, host_avg_us=sum(samples) / count)
+
+
+def validate_queued_calls(prepare, launch, snapshot, synchronize, check, count):
+    """Exercise producers, repeated output reuse and per-call snapshots on one stream.
+
+    No host synchronization/check inside submission; validate EVERY snapshot
+    after the batch completes, not merely the final receive buffer.
+    """
+    for index in range(count):
+        prepare(index)
+        launch()
+        snapshot(index)
+    synchronize()
+    for index in range(count):
+        check(index)
+
+
+def write_rank_result(run_dir, rank, result):
+    directory = Path(run_dir) / "results"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"rank{rank}.json"
+    temp = target.with_suffix(f".pid{os.getpid()}.tmp")
+    temp.write_text(json.dumps(result, indent=2) + "\n")
+    temp.replace(target)
 
 
 def file_barrier(directory, tag, rank, world_size, timeout=180):
