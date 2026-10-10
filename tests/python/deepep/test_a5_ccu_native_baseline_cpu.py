@@ -76,7 +76,7 @@ class NativeBaselineTest(unittest.TestCase):
             cwd=script.parent, text=True, capture_output=True, timeout=10)
         self.assertEqual(process.returncode, 0, process.stderr)
 
-    def test_native_api_and_independent_calls(self):
+    def test_native_api_and_no_custom_runtime(self):
         script = Path(__file__).with_name("test_a5_ccu_native_alltoall.py")
         tree = ast.parse(script.read_text())
         main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -85,12 +85,40 @@ class NativeBaselineTest(unittest.TestCase):
         self.assertEqual(ast.unparse(launch.body[0]), "dist.all_to_all_single(recv, send)")
         imports = [alias.name for node in ast.walk(main) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names]
         self.assertFalse(any("deep_ep" in name for name in imports))
-        loops = [node for node in ast.walk(main) if isinstance(node, ast.For)
-                 and ast.unparse(node.iter) in ("range(args.warmup)", "range(args.iters)")]
-        self.assertEqual(len(loops), 2)
-        for loop in loops:
-            calls = [ast.unparse(node.value) for node in loop.body if isinstance(node, ast.Expr)]
-            self.assertLess(calls.index("launch()"), calls.index("torch.npu.synchronize()"))
+
+    def test_batch_and_per_call_execution_order(self):
+        import test_a5_ccu_native_alltoall as benchmark
+        for mode in ("batch", "per-call"):
+            events = []
+            launch = lambda: events.append("launch")
+            sync = lambda: events.append("sync")
+            benchmark.warmup_calls(launch, sync, 3, mode)
+            expected = ["launch"] * 3 + ["sync"] if mode == "batch" else ["launch", "sync"] * 3 + ["sync"]
+            self.assertEqual(events, expected)
+            events.clear()
+            ticks = iter([0, 120000] if mode == "batch" else [0, 50000, 60000, 130000])
+            timing = benchmark.measure_calls(launch, sync, 2, mode, lambda: next(ticks))
+            expected = ["launch", "launch", "sync"] if mode == "batch" else ["launch", "sync"] * 2
+            self.assertEqual(events, expected)
+            self.assertEqual(timing["host_avg_us"], 60)
+            self.assertEqual(timing["host_call_us"], [] if mode == "batch" else [50, 70])
+
+    def test_batch_results_and_mode_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); self.seed(root)
+            settings_path = root / "run_settings.json"
+            settings = json.loads(settings_path.read_text()); settings["sync_mode"] = "batch"
+            settings_path.write_text(json.dumps(settings))
+            for rank in range(4):
+                item = result(rank)
+                item.update(sync_mode="batch", host_call_us=[], host_batch_total_us=2 * item["host_avg_us"])
+                (root / f"r1/results/rank{rank}.json").write_text(json.dumps(item))
+            self.assertTrue(analysis.analyze(root)["complete"])
+            item["host_batch_total_us"] += 10
+            self.assertFalse(analysis.valid_result(item, 3, settings))
+            item["host_batch_total_us"] -= 10
+            settings["sync_mode"] = "per-call"
+            self.assertFalse(analysis.valid_result(item, 3, settings))
 
     def test_defaults_and_measured_only_profiler_window(self):
         script = Path(__file__).with_name("test_a5_ccu_native_alltoall.py")
@@ -104,15 +132,18 @@ class NativeBaselineTest(unittest.TestCase):
                 for kw in node.keywords:
                     if kw.arg == "default" and isinstance(kw.value, ast.Constant):
                         defaults[node.args[0].value] = kw.value.value
-        self.assertEqual(defaults["--warmup"], 500)
+        self.assertEqual(defaults["--warmup"], 100)
         self.assertEqual(defaults["--iters"], 20)
+        self.assertEqual(defaults["--sync-mode"], "batch")
         runner = (ROOT / "scripts/run_a5_ccu_native_alltoall_baseline.sh").read_text()
-        self.assertIn("\nwarmup=500\n", runner)
+        self.assertIn("\nwarmup=100\n", runner)
         self.assertIn("\niterations=20\n", runner)
         self.assertIn("\nrepeats=1\n", runner)
+        self.assertIn("\nsync_mode=batch\n", runner)
+        self.assertIn('--sync-mode "$sync_mode"', runner)
         self.assertLess(source.index('barrier("warmup_done")'), source.index("profiler.start()"))
-        self.assertLess(source.index("profiler.start()"), source.index("range(args.iters)"))
-        self.assertLess(source.index("range(args.iters)"), source.index("profiler.stop()"))
+        self.assertLess(source.index("profiler.start()"), source.index("timing = measure_calls("))
+        self.assertLess(source.index("timing = measure_calls("), source.index("profiler.stop()"))
 
 
 if __name__ == "__main__":

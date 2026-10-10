@@ -14,6 +14,21 @@ def valid_result(result, rank, settings):
                 and math.isfinite(value) and value >= 0)
     k, count = len(settings["devices"]), settings["iterations"]
     samples = result.get("host_call_us")
+    mode = result.get("sync_mode", "per-call")
+    if mode != settings.get("sync_mode", "per-call"):
+        return False
+    if mode == "batch":
+        timing_valid = (samples == [] and number(result.get("host_batch_total_us"))
+            and number(result.get("host_avg_us"))
+            and math.isclose(result["host_avg_us"], result["host_batch_total_us"] / count,
+                             rel_tol=1e-6, abs_tol=1e-6))
+    elif mode == "per-call":
+        timing_valid = (isinstance(samples, list) and len(samples) == count
+            and all(number(x) for x in samples) and number(result.get("host_avg_us"))
+            and math.isclose(result["host_avg_us"], sum(samples) / count,
+                             rel_tol=1e-6, abs_tol=1e-6))
+    else:
+        return False
     return (type(result.get("rank")) is int and result["rank"] == rank
         and type(result.get("ranks")) is int and result["ranks"] == k
         and result.get("implementation") == "native_hccl"
@@ -22,10 +37,7 @@ def valid_result(result, rank, settings):
         and result.get("bytes_per_peer") == settings["bytes_per_peer"]
         and result.get("tensor_bytes") == k * settings["bytes_per_peer"]
         and result.get("warmup") == settings["warmup"]
-        and result.get("iterations") == count and isinstance(samples, list)
-        and len(samples) == count and all(number(x) for x in samples)
-        and number(result.get("host_avg_us"))
-        and math.isclose(result["host_avg_us"], sum(samples) / count, rel_tol=1e-6, abs_tol=1e-6))
+        and result.get("iterations") == count and timing_valid)
 
 
 def analyze(root):
@@ -56,6 +68,7 @@ def analyze(root):
     complete = bool(rows) and all(row["lifecycle"] == "PASS" for row in rows)
     valid_times = [row["slowest_rank_host_avg_us"] for row in rows if row["lifecycle"] == "PASS"]
     summary = dict(complete=complete, implementation="native_hccl", devices=settings["devices"],
+        sync_mode=settings.get("sync_mode", "per-call"),
         bytes_per_peer=settings["bytes_per_peer"], tensor_bytes=k * settings["bytes_per_peer"],
         network_send_bytes=(k - 1) * settings["bytes_per_peer"], cases=rows,
         median_slowest_rank_host_us=statistics.median(valid_times) if valid_times else None)
@@ -69,6 +82,7 @@ def analyze(root):
         f"- per peer: `{settings['bytes_per_peer']}` bytes; tensor: `{summary['tensor_bytes']}` bytes per rank.",
         f"- network send payload: `{summary['network_send_bytes']}` bytes per rank, excluding self.",
         f"- warmup: `{settings['warmup']}`; measured calls: `{settings['iterations']}`; graph: `none`.",
+        f"- synchronization mode: `{summary['sync_mode']}`; batch means one final device synchronization.",
         "", "| case | status | correctness | lifecycle | invalid/missing ranks | slowest-rank host us |",
         "|---|---|---|---|---|---:|"]
     for row in rows:
@@ -76,9 +90,10 @@ def analyze(root):
     report.extend(["", f"Median across complete repeats: `{summary['median_slowest_rank_host_us']}` us.",
         "", "## Interpretation", "",
         "Host timing includes submission and synchronization, not initialization, first-call resource creation or warmup.",
+        "In batch mode, host us is total batch time / call count, not an individual-call latency sample. Inspect CCU tasks for individual device durations.",
         "CCU_SCHED requests the native CCU scheduler; check profiling to confirm the actual device implementation.",
         "Native HCCL chooses its own paths. This baseline is not a forced direct-only path, candidate0 or candidate2.",
-        "Use the same cards, per-peer bytes, warmup/iterations and profiling setting when comparing with peer-plan.",
+        "Use the same cards, per-peer bytes, warmup/iterations, synchronization mode and profiling setting for comparisons. Peer-plan currently completes each invocation; do not silently remove that safety boundary.",
         "Host call timing is not CCU task timing or link bandwidth; use MindStudio device tasks for that comparison.",
         "Only all-rank correctness PASS and exit status 0 qualify as a complete repeat.",
         "Rank-local atomic JSON files are authoritative; interleaved terminal output is not parsed as data.",

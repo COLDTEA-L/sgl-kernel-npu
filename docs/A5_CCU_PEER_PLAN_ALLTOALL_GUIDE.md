@@ -424,11 +424,12 @@ bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
   --timeout-seconds 600 \
   --output-root /home/l00934901/profiling
 
-# 正式 baseline：只跑一轮，500次warmup + 20次正式执行。
-# profiler仅在warmup结束后开启，只采正式20次，不采前500次。
+# 正式 baseline：只跑一轮，100次warmup + 20次正式执行。
+# batch模式连续提交，最后同步一次；profiler只采正式20次，不采warmup。
 bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
   --devices 0,1,2,3 \
-  --bytes 4194304 --warmup 500 --iters 20 --repeats 1 --profile \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --sync-mode batch \
   --timeout-seconds 600 \
   --output-root /home/l00934901/profiling
 ```
@@ -441,13 +442,25 @@ bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
 
 每 rank 的 send/recv 都为 `[4,1048576]` FP32，即 **16 MiB tensor**；每个目的 rank
 分片 **4 MiB**，其中 self 4 MiB，网络发送给另外三卡共 **12 MiB/rank**。
-数据模式和 peer-plan 一致。三次变化输入的正确性检查、首次资源创建、500次 warmup
-均不计时、不开 profiler；全部 rank 完成 warmup 后才开启 profiler，正式20次每次
-AllToAll 后 synchronize，再执行下一次，测量循环结束后关闭 profiler。
-因此一轮包含500次独立预热和20次独立正式调用（另有3次图外正确性检查）。
+数据模式和 peer-plan 一致。三次变化输入的正确性检查、首次资源创建、100次 warmup
+均不计时、不开 profiler。默认 `--sync-mode batch`：连续提交100次 warmup 后同步；
+全部 rank 完成预热后开启 profiler，计时前先同步并做起跑 rendezvous；连续提交正式20次
+AllToAll，最后同步一次，确认完成后关闭 profiler。循环中不打印、不做数据校验，
+校验在 profiler 关闭后完成。总计100次预热与20次正式调用（另有3次图外正确性检查）。
+脚本去掉的是显式逐次设备同步；`dist.all_to_all_single` 本身仍遵循目标后端的等待语义，
+不保证底层一定形成多个同时在途的任务，也不保证完全消除host提交或peer等待波动。
 profiling可能包含测量阶段的同步/运行时任务；“20次”指20次AllToAll调用，
 不保证只出现20个CCU任务，因为一次AllToAll可能展开为多个任务。不强制 graph capture。
-脚本默认值同步为 `--warmup 500 --iters 20 --repeats 1`；无需连续运行三轮。
+脚本默认值为 `--warmup 100 --iters 20 --repeats 1 --sync-mode batch`；无需连续运行三轮。
+
+**两卡与四卡必须采用同一同步口径。** 两卡复测只需将上面命令改为 `--devices 2,3`。
+此前旧两卡 native 测试没有逐次显式同步，新四卡版本却逐次同步，二者不能直接比较。
+需要因果对照时，仅将 `--sync-mode batch` 改为 `--sync-mode per-call`，其他参数不变。
+后者每次调用后同步，可能把重新下发的rank错位放大成CCU内部的peer等待；
+仅增加warmup不能排除这种等待。默认batch模式测的是连续调用的稳态性能。
+
+此改动**仅限原生baseline**；自定义peer-plan仍逐次完成，避免跨调用复用通知和输出的风险。
+没有修改HCCL、Channel、EID或多路径CCU kernel。拉取脚本更新即可，无需编译安装。
 
 结果目录如下，当前命令只启动一轮四 rank 进程：
 
@@ -481,7 +494,7 @@ find "${RUN_DIR}" -type d -name '*_ascend_pt' -print
 ```
 
 将对应 `r*/profiling/rank*/..._ascend_pt/` 导入 MindStudio。baseline 和自定义 peer-plan
-要用**相同卡组、每 peer 数据量、warmup、iterations、是否开启 profiler**进行比较。
+要用**相同卡组、每 peer 数据量、warmup、iterations、同步模式、是否开启 profiler**进行比较。
 host统计按每轮最慢 rank 的平均耗时汇总；它包含提交与同步，不等于设备CCU时长。
 比较设备性能时查看正式执行的 CCU task，若一个 AllToAll 展开成多个任务，需看完整
 调用的相关通信任务跨度，不能只挑最快的一条。profiling中的无效 size/rank字段不能用于

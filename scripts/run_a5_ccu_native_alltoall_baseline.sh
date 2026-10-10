@@ -4,9 +4,10 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 devices=0,1,2,3
 bytes=4194304
-warmup=500
+warmup=100
 iterations=20
 repeats=1
+sync_mode=batch
 timeout_seconds=600
 profile=0
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
@@ -17,19 +18,22 @@ while (($#)); do
         --bytes) bytes=$2; shift 2;;
         --warmup) warmup=$2; shift 2;;
         --iters) iterations=$2; shift 2;;
+        --sync-mode) sync_mode=$2; shift 2;;
         --repeats) repeats=$2; shift 2;;
         --timeout-seconds) timeout_seconds=$2; shift 2;;
         --profile) profile=1; shift;;
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --help)
-            echo 'Native dist.all_to_all_single baseline. --devices 0,1,2,3 --bytes BYTES_PER_PEER --warmup 500 --iters 20 --repeats 1 [--profile]'
+            echo 'Native dist.all_to_all_single baseline. --devices 0,1,2,3 --bytes BYTES_PER_PEER --warmup 100 --iters 20 --repeats 1 [--profile]'
+            echo '--sync-mode batch (default): submit all calls then synchronize; per-call: synchronize each call for diagnosis.'
             echo 'Profiling covers measured iterations only, after all warmup calls complete.'
             echo 'No DeepEP/route package, relay-map, candidate index or graph capture required.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
+[[ "$sync_mode" == batch || "$sync_mode" == per-call ]] || { echo 'invalid --sync-mode: expected batch or per-call' >&2; exit 2; }
 for value in "$bytes" "$iterations" "$repeats" "$timeout_seconds"; do
     [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || { echo 'positive numeric argument required' >&2; exit 2; }
 done
@@ -59,13 +63,13 @@ export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 mkdir -p "$output_root"
 run_dir=$(mktemp -d "${output_root}/a5_ccu_native_alltoall_${devices//,/_}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "${run_dir}/cases"
-python3 - "$run_dir" "$devices" "$bytes" "$warmup" "$iterations" "$repeats" "$profile" "$cann_root" <<'PY'
+python3 - "$run_dir" "$devices" "$bytes" "$warmup" "$iterations" "$repeats" "$profile" "$cann_root" "$sync_mode" <<'PY'
 import json, os, pathlib, sys
-root, cards, size, warmup, iterations, repeats, profile, cann = sys.argv[1:]
+root, cards, size, warmup, iterations, repeats, profile, cann, sync_mode = sys.argv[1:]
 settings = dict(implementation='native_hccl', api='dist.all_to_all_single',
     devices=list(map(int, cards.split(','))), bytes_per_peer=int(size),
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
-    profile=bool(int(profile)), cann_root=cann,
+    profile=bool(int(profile)), cann_root=cann, sync_mode=sync_mode,
     environment={key: os.environ.get(key) for key in
                  ('HCCL_OP_EXPANSION_MODE', 'HCCL_ALGO', 'HCCL_BUFFSIZE', 'LD_LIBRARY_PATH')})
 (pathlib.Path(root) / 'run_settings.json').write_text(json.dumps(settings, indent=2) + '\n')
@@ -81,7 +85,7 @@ for ((r=1; r<=repeats; r++)); do
         python3 -m torch.distributed.run --standalone --nproc-per-node="$k" \
         "${repo}/tests/python/deepep/test_a5_ccu_native_alltoall.py" \
         --bytes "$bytes" --warmup "$warmup" --iters "$iterations" \
-        --run-dir "$case_dir" "${profile_args[@]}" > "$log" 2>&1
+        --run-dir "$case_dir" --sync-mode "$sync_mode" "${profile_args[@]}" > "$log" 2>&1
     rc=$?
     set -e
     printf '%s\n' "$rc" > "${run_dir}/cases/native_alltoall_r${r}.status"

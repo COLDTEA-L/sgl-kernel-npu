@@ -30,11 +30,41 @@ def write_rank_result(run_dir, rank, result):
     temp.replace(target)
 
 
+def warmup_calls(launch, synchronize, count, sync_mode):
+    for _ in range(count):
+        launch()
+        if sync_mode == "per-call":
+            synchronize()
+    synchronize()
+
+
+def measure_calls(launch, synchronize, count, sync_mode, clock=time.perf_counter_ns):
+    """Batch averages are not fabricated individual-call latency samples."""
+    if sync_mode == "batch":
+        start = clock()
+        for _ in range(count):
+            launch()
+        synchronize()
+        total_us = (clock() - start) / 1000
+        return dict(sync_mode=sync_mode, host_call_us=[],
+                    host_batch_total_us=total_us, host_avg_us=total_us / count)
+    samples = []
+    for _ in range(count):
+        start = clock()
+        launch()
+        synchronize()
+        samples.append((clock() - start) / 1000)
+    return dict(sync_mode=sync_mode, host_call_us=samples,
+                host_avg_us=sum(samples) / count)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bytes", type=int, default=4194304, help="FP32 bytes per destination, including self")
-    parser.add_argument("--warmup", type=int, default=500)
+    parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--sync-mode", choices=("batch", "per-call"), default="batch",
+                        help="batch: synchronize after all calls; per-call: isolated-call control")
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
@@ -87,9 +117,7 @@ def main():
         check(epoch)
     # First-call communicator/algorithm resource creation is already outside timing.
     phase("warmup")
-    for _ in range(args.warmup):
-        launch()
-        torch.npu.synchronize()
+    warmup_calls(launch, torch.npu.synchronize, args.warmup, args.sync_mode)
     check(2)
     barrier("warmup_done")
     # Start only after every rank finishes warmup. The trace excludes resource
@@ -97,16 +125,15 @@ def main():
     profiler = make_profiler(args.run_dir / "profiling" / f"rank{rank}", rank) if args.profile else None
     if profiler:
         profiler.start()
-    samples = []
     try:
+        # Drain device work after enabling profiling, before the timed batch.
+        torch.npu.synchronize()
         phase("measurement_rendezvous")
         lateness = measurement_start(sync, rank, k)
         phase("measure")
-        for _ in range(args.iters):
-            start = time.perf_counter_ns()
-            launch()
-            torch.npu.synchronize()
-            samples.append((time.perf_counter_ns() - start) / 1000)
+        print(f"NATIVE_MEASUREMENT rank={rank} sync_mode={args.sync_mode} "
+              f"calls={args.iters} warmup_in_profile=0", flush=True)
+        timing = measure_calls(launch, torch.npu.synchronize, args.iters, args.sync_mode)
     finally:
         if profiler:
             profiler.stop()
@@ -120,7 +147,7 @@ def main():
         rank=rank, ranks=k, correctness="PASS", bytes_per_peer=args.bytes,
         tensor_bytes=k * args.bytes, network_send_bytes=(k - 1) * args.bytes,
         warmup=args.warmup, iterations=args.iters, graph_backend="none",
-        host_call_us=samples, host_avg_us=sum(samples) / len(samples),
+        **timing,
         measurement_start_lateness_us=lateness, hccl_libraries=hccl_libraries)
     write_rank_result(args.run_dir, rank, result)
     print("RESULT_JSON " + json.dumps(result), flush=True)
