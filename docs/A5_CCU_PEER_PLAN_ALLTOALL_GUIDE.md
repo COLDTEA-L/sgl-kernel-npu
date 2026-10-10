@@ -424,10 +424,11 @@ bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
   --timeout-seconds 600 \
   --output-root /home/l00934901/profiling
 
-# 正式 baseline，带 MindStudio 可查看的 profiling。
+# 正式 baseline：只跑一轮，500次warmup + 20次正式执行。
+# profiler仅在warmup结束后开启，只采正式20次，不采前500次。
 bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
   --devices 0,1,2,3 \
-  --bytes 4194304 --warmup 100 --iters 20 --repeats 3 --profile \
+  --bytes 4194304 --warmup 500 --iters 20 --repeats 1 --profile \
   --timeout-seconds 600 \
   --output-root /home/l00934901/profiling
 ```
@@ -440,10 +441,15 @@ bash scripts/run_a5_ccu_native_alltoall_baseline.sh \
 
 每 rank 的 send/recv 都为 `[4,1048576]` FP32，即 **16 MiB tensor**；每个目的 rank
 分片 **4 MiB**，其中 self 4 MiB，网络发送给另外三卡共 **12 MiB/rank**。
-数据模式和 peer-plan 一致。三次变化输入的正确性检查、首次资源创建、100次 warmup
-均不计时；正式20次每次 AllToAll 后 synchronize，再执行下一次。不强制 graph capture。
+数据模式和 peer-plan 一致。三次变化输入的正确性检查、首次资源创建、500次 warmup
+均不计时、不开 profiler；全部 rank 完成 warmup 后才开启 profiler，正式20次每次
+AllToAll 后 synchronize，再执行下一次，测量循环结束后关闭 profiler。
+因此一轮包含500次独立预热和20次独立正式调用（另有3次图外正确性检查）。
+profiling可能包含测量阶段的同步/运行时任务；“20次”指20次AllToAll调用，
+不保证只出现20个CCU任务，因为一次AllToAll可能展开为多个任务。不强制 graph capture。
+脚本默认值同步为 `--warmup 500 --iters 20 --repeats 1`；无需连续运行三轮。
 
-结果目录如下，每个 repeat 启动一套新的四 rank 进程：
+结果目录如下，当前命令只启动一轮四 rank 进程：
 
 ```text
 a5_ccu_native_alltoall_0_1_2_3_<time>.<suffix>/
@@ -452,7 +458,6 @@ a5_ccu_native_alltoall_0_1_2_3_<time>.<suffix>/
 ├── cases/native_alltoall_r1.status
 ├── r1/results/rank0.json ... rank3.json
 ├── r1/profiling/rank0/..._ascend_pt/    # --profile时生成，rank1..3同样
-├── r2/ ...
 ├── native_alltoall_results.tsv
 ├── native_alltoall_summary.json
 └── native_alltoall_report.md

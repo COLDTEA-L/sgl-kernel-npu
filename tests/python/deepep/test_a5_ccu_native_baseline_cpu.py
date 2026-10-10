@@ -92,6 +92,28 @@ class NativeBaselineTest(unittest.TestCase):
             calls = [ast.unparse(node.value) for node in loop.body if isinstance(node, ast.Expr)]
             self.assertLess(calls.index("launch()"), calls.index("torch.npu.synchronize()"))
 
+    def test_defaults_and_measured_only_profiler_window(self):
+        script = Path(__file__).with_name("test_a5_ccu_native_alltoall.py")
+        source = script.read_text()
+        tree = ast.parse(source)
+        defaults = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument" and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                for kw in node.keywords:
+                    if kw.arg == "default" and isinstance(kw.value, ast.Constant):
+                        defaults[node.args[0].value] = kw.value.value
+        self.assertEqual(defaults["--warmup"], 500)
+        self.assertEqual(defaults["--iters"], 20)
+        runner = (ROOT / "scripts/run_a5_ccu_native_alltoall_baseline.sh").read_text()
+        self.assertIn("\nwarmup=500\n", runner)
+        self.assertIn("\niterations=20\n", runner)
+        self.assertIn("\nrepeats=1\n", runner)
+        self.assertLess(source.index('barrier("warmup_done")'), source.index("profiler.start()"))
+        self.assertLess(source.index("profiler.start()"), source.index("range(args.iters)"))
+        self.assertLess(source.index("range(args.iters)"), source.index("profiler.stop()"))
+
 
 if __name__ == "__main__":
     unittest.main()

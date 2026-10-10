@@ -4,7 +4,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 devices=0,1,2,3
 bytes=4194304
-warmup=100
+warmup=500
 iterations=20
 repeats=1
 timeout_seconds=600
@@ -23,7 +23,8 @@ while (($#)); do
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --help)
-            echo 'Native dist.all_to_all_single baseline. --devices 0,1,2,3 --bytes BYTES_PER_PEER --warmup 100 --iters 20 --repeats 3 [--profile]'
+            echo 'Native dist.all_to_all_single baseline. --devices 0,1,2,3 --bytes BYTES_PER_PEER --warmup 500 --iters 20 --repeats 1 [--profile]'
+            echo 'Profiling covers measured iterations only, after all warmup calls complete.'
             echo 'No DeepEP/route package, relay-map, candidate index or graph capture required.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;

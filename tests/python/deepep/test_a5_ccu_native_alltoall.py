@@ -33,7 +33,7 @@ def write_rank_result(run_dir, rank, result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bytes", type=int, default=4194304, help="FP32 bytes per destination, including self")
-    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
@@ -92,6 +92,8 @@ def main():
         torch.npu.synchronize()
     check(2)
     barrier("warmup_done")
+    # Start only after every rank finishes warmup. The trace excludes resource
+    # creation, payload prechecks and warmup; it covers the measured calls below.
     profiler = make_profiler(args.run_dir / "profiling" / f"rank{rank}", rank) if args.profile else None
     if profiler:
         profiler.start()
