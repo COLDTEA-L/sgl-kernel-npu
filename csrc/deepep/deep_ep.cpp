@@ -30,11 +30,27 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
     // task queue. stream(false) can submit communication before tensor fills.
     // Version 11 validates tensor devices/aliasing and records allocator
     // lifetimes for raw CCU work submitted on the execution stream.
-    return 11;
+    // Version 12 infers payload dtype for object-style prepared/peer plans.
+    return 12;
 }
 
 namespace deep_ep {
 namespace {
+HcclDataType CcuPayloadType(const torch::Tensor &tensor)
+{
+    switch (tensor.scalar_type()) {
+        case at::kHalf: return HCCL_DATA_TYPE_FP16;
+        case at::kBFloat16: return HCCL_DATA_TYPE_BFP16;
+        case at::kFloat: return HCCL_DATA_TYPE_FP32;
+        case at::kChar: return HCCL_DATA_TYPE_INT8;
+        case at::kInt: return HCCL_DATA_TYPE_INT32;
+        default:
+            TORCH_CHECK(false, "CCU AllToAll supports float16, bfloat16, float32, int8, int32; got ",
+                        tensor.scalar_type());
+    }
+    return HCCL_DATA_TYPE_RESERVED;
+}
+
 aclrtStream OrderedCcuTensorStream(const torch::Tensor &send,
                                   const torch::Tensor &recv)
 {
@@ -437,8 +453,8 @@ torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
-    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(recv_data.scalar_type() == send_data.scalar_type());
     EP_HOST_ASSERT(num_ranks == 2);
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
 
@@ -447,7 +463,7 @@ torch::Tensor Buffer::ccu_urma_multiroute_alltoall_out(const torch::Tensor &send
     // This orders tensor producers without waiting for device completion.
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaMultiRouteAllToAll()(send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32, comm, stream));
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data), comm, stream));
     return recv_data;
 }
 
@@ -468,8 +484,8 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
-    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(recv_data.scalar_type() == send_data.scalar_type());
     EP_HOST_ASSERT(num_ranks == 2);
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
     EP_HOST_ASSERT(!relay_manifest.empty());
@@ -489,7 +505,7 @@ torch::Tensor Buffer::ccu_urma_explicit_multipath_alltoall_out(
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathAllToAll()(
         send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data),
         comm, stream, relay_manifest.c_str(), static_cast<uint32_t>(direct_route),
         weights.data(), static_cast<uint32_t>(weights.size())));
     return recv_data;
@@ -577,8 +593,8 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
-    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(recv_data.scalar_type() == send_data.scalar_type());
     EP_HOST_ASSERT(num_ranks == 2 && plan_handle > 0);
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
 
@@ -588,7 +604,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_out(
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data),
         comm, stream, static_cast<uint64_t>(plan_handle)));
     return recv_data;
 }
@@ -611,8 +627,8 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
     EP_HOST_ASSERT(send_data.is_contiguous() && recv_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
     EP_HOST_ASSERT(send_data.sizes() == recv_data.sizes());
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
-    EP_HOST_ASSERT(recv_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
+    EP_HOST_ASSERT(recv_data.scalar_type() == send_data.scalar_type());
     EP_HOST_ASSERT(num_ranks == 2 && plan_handle > 0);
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send_data) && torch_npu::utils::is_npu(recv_data));
     const std::vector<uint32_t> weights = NormalizePreparedPathWeights(path_weights);
@@ -623,7 +639,7 @@ torch::Tensor Buffer::ccu_urma_prepared_multipath_alltoall_policy_out(
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data),
         comm, stream, static_cast<uint64_t>(plan_handle), weights.data(),
         static_cast<uint32_t>(weights.size())));
     return recv_data;
@@ -644,7 +660,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     c10::DeviceGuard deviceGuard(send_data.device());
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
     EP_HOST_ASSERT(plan_handle > 0 && torch_npu::utils::is_npu(send_data));
     auto recv_data = torch::empty_like(send_data);
     // Flush prior torch_npu host submissions before calling ACL/HCOMM directly.
@@ -652,7 +668,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_op(
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecute()(
         send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data),
         nullptr, stream, static_cast<uint64_t>(plan_handle)));
     return recv_data;
 }
@@ -661,8 +677,8 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_meta(
     const torch::Tensor &send_data, int64_t plan_handle)
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
-    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0 &&
-                   send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0);
+    CcuPayloadType(send_data);
     return torch::empty_like(send_data);
 }
 
@@ -673,7 +689,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
     c10::DeviceGuard deviceGuard(send_data.device());
     EP_HOST_ASSERT(send_data.is_contiguous());
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2);
-    EP_HOST_ASSERT(send_data.numel() > 0 && send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.numel() > 0);
     EP_HOST_ASSERT(plan_handle > 0 && torch_npu::utils::is_npu(send_data));
     const std::vector<uint32_t> weights = NormalizePreparedPathWeights(
         ToWeightVector(path_weights));
@@ -683,7 +699,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_op(
     auto stream = OrderedCcuTensorStream(send_data, recv_data);
     HCCL_CHECK(GetCcuUrmaExplicitMultipathPlanExecuteV2()(
         send_data.data_ptr(), recv_data.data_ptr(),
-        static_cast<uint64_t>(send_data.size(1)), HCCL_DATA_TYPE_FP32,
+        static_cast<uint64_t>(send_data.size(1)), CcuPayloadType(send_data),
         nullptr, stream, static_cast<uint64_t>(plan_handle), weights.data(),
         static_cast<uint32_t>(weights.size())));
     return recv_data;
@@ -695,13 +711,13 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
 {
     EP_HOST_ASSERT(send_data.dim() == 2 && send_data.size(0) == 2 && plan_handle > 0);
     EP_HOST_ASSERT(path_weights.size() >= 2 && path_weights.size() <= 13);
-    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0 &&
-                   send_data.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send_data.is_contiguous() && send_data.numel() > 0);
+    CcuPayloadType(send_data);
     NormalizePreparedPathWeights(ToWeightVector(path_weights));
     return torch::empty_like(send_data);
 }
 
-extern "C" __attribute__((visibility("default"))) int A5DeepEpPeerPlanAbiVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int A5DeepEpPeerPlanAbiVersion() { return 2; }
 
 namespace {
 void *PeerPlanSymbol(const char *name)
@@ -734,19 +750,20 @@ std::vector<uint32_t> PeerWeights(const std::vector<int64_t> &values)
 void PeerTensorCheck(const torch::Tensor &send, int64_t handle)
 {
     EP_HOST_ASSERT(handle > 0 && send.dim() == 2 && (send.sym_size(0) == 2 || send.sym_size(0) == 4));
-    EP_HOST_ASSERT(send.is_contiguous() && send.sym_numel() > 0 && send.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(send.is_contiguous() && send.sym_numel() > 0);
+    CcuPayloadType(send);
 }
 void PeerLaunch(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
     HcclComm comm, const std::vector<int64_t> &policy)
 {
     PeerTensorCheck(send, handle);
-    EP_HOST_ASSERT(recv.sizes() == send.sizes() && recv.is_contiguous() && recv.scalar_type() == at::kFloat);
+    EP_HOST_ASSERT(recv.sizes() == send.sizes() && recv.is_contiguous() && recv.scalar_type() == send.scalar_type());
     EP_HOST_ASSERT(recv.device() == send.device() && torch_npu::utils::is_npu(send));
     const auto weights = PeerWeights(policy);
     auto stream = OrderedCcuTensorStream(send, recv);
     static auto execute = reinterpret_cast<PeerExecute>(PeerPlanSymbol("HcclCcuUrmaPeerPlanExecute"));
     HCCL_CHECK(execute(send.data_ptr(), recv.data_ptr(), static_cast<uint64_t>(send.size(1)),
-        static_cast<uint32_t>(send.size(0)), HCCL_DATA_TYPE_FP32, comm, stream,
+        static_cast<uint32_t>(send.size(0)), CcuPayloadType(send), comm, stream,
         static_cast<uint64_t>(handle), weights.data(), static_cast<uint32_t>(weights.size())));
 }
 } // namespace

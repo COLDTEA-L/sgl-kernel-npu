@@ -1,5 +1,6 @@
 #include "a5_ccu_urma_route_probe.h"
 #include "utils.h"
+#include "data_type.h"
 #include "route_kernel.h"
 #include <hcomm/ccu/hccl_ccu_res.h>
 #include <hcomm/hcomm_res.h>
@@ -120,7 +121,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
 }
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 2; }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
@@ -171,7 +172,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     uint64_t handle, const uint32_t *policy, uint32_t policyCount)
 {
     if (!send || !recv || !stream) return HCCL_E_PTR;
-    if (dtype != HCCL_DATA_TYPE_FP32 || (policyCount && !policy)) return HCCL_E_PARA;
+    const uint32_t elementBytes = PayloadElementBytes(dtype);
+    if (!elementBytes || (policyCount && !policy)) return HCCL_E_PARA;
     std::lock_guard<std::mutex> submit(submitMutex);
     PeerPlanResources resources;
     HcclComm owner;
@@ -198,7 +200,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
         weights.assign(policy, policy + policyCount);
     }
     PeerPathLayout layout;
-    if (!BuildPeerPathLayout(elementsPerPeer, r.rank, r.rankSize, resources.peers, weights, &layout) ||
+    if (!BuildPeerPathLayout(elementsPerPeer, r.rank, r.rankSize, resources.peers, weights, &layout, elementBytes) ||
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
                               layout.totalBytes)) return HCCL_E_PARA;
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), layout.totalBytes);

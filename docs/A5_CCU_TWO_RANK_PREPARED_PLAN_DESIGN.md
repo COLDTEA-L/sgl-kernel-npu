@@ -1,10 +1,10 @@
 # 两卡显式多路径 AllToAll：当前实现设计
 
-本文描述 `feature/a5-ccu-explicit-multipath-alltoall` 的 prepared-plan 实现（DeepEP ABI 11、route runtime ABI 12），不是早期修改 libhccl 的标准 Ascend C 实验。四卡扩展在 `feature/a5-ccu-peer-plan-alltoall-4rank` 上新增独立接口，保留这里的接口。
+本文在 `feature/a5-ccu-multidtype-alltoall` 更新：旧两卡 prepared-plan 的 DeepEP attr ABI >=12、route prepared ABI >=13，两卡/四卡 peer-plan 的独立 ABI 均 >=2。原接口保留，不是早期修改 libhccl 的标准 Ascend C 实验。拉取、构建及多类型验证以 [多类型指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md) 为准。
 
 ## 1. 输入输出与数据量
 
-输入、输出是连续 FP32 NPU tensor，形状 `[2, elements_per_peer]`。`send[dst_rank]` 发送至目的卡的 `recv[src_rank]`。每个 rank 的本地分片复制到自己的接收分片；远端分片按路径权重拆开。测试参数 `--bytes` 是每个目的 rank 的分片字节数，不是整个 tensor 大小。
+输入、输出是同类型的连续 NPU tensor，支持 FP16/BF16/FP32/INT8/INT32，形状 `[2, elements_per_peer]`。算子自动读取输入dtype，不做转换。`send[dst_rank]` 发送至目的卡的 `recv[src_rank]`。每个 rank 的本地分片复制到自己的接收分片；远端分片按路径权重拆开。测试参数 `--bytes` 是每个目的 rank 的分片字节数，不是整个 tensor 大小。
 
 例如每 peer 4 MiB，direct + 两条 relay，权重 `[2,1,1]`：direct 2 MiB，每条 relay 1 MiB；send/recv 各 8 MiB。比例是 **direct : 每一条 relay = 2:1**，不是 direct : relay 总和 = 2:1。对齐粒度 256 bytes，最后一条路径承接余数；所有分片恰好覆盖远端数据，不重叠、不遗漏。
 
@@ -63,7 +63,7 @@ relay 卡不加入两 rank 通信域，不运行 relay 用户进程，不分配 
 | `torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy` | 图内/执行 | `send, plan_handle, int[] weights`，返回新 output；有 PrivateUse1/Meta 注册 |
 | `HcclCcuUrmaExplicitMultipathPlanCreate` | 图外 C ABI | `comm, stream, planId, relayManifest, directRoute, uint32 weights[], pathCount, handle*` |
 | `HcclCcuUrmaExplicitMultipathPlanBindStream` | 图外 C ABI | `handle, comm, stream` |
-| `HcclCcuUrmaExplicitMultipathPlanExecute/V2` | 数据面 C ABI | 指针、每 peer 元素数、FP32、comm、stream、handle；V2 接受新权重 |
+| `HcclCcuUrmaExplicitMultipathPlanExecute/V2` | 数据面 C ABI | 指针、每 peer 元素数、由输入dtype映射的HcclDataType、comm、stream、handle；V2 接受新权重 |
 
 原两卡 prepared API 要求至少 direct + 一条 relay（2..13 paths），不能靠空 manifest 切成 direct-only。新多 peer API 会支持 direct-only，旧 API 保持原有契约。原生 baseline 应调用 `dist.all_to_all_single`；旧脚本的 `native0/native2` 是自定义 discovered-path 对照，不是原生 collective。
 

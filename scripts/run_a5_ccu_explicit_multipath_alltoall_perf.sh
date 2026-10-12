@@ -12,6 +12,7 @@ relay_phys=""
 relay_planes=""
 direct_route=0
 bytes=4194304
+dtype=float32
 warmup=100
 iterations=20
 repeats=3
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --relay-planes) relay_planes=$2; shift 2 ;;
         --direct-route) direct_route=$2; shift 2 ;;
         --bytes) bytes=$2; shift 2 ;;
+        --dtype) dtype=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
         --repeats) repeats=$2; shift 2 ;;
@@ -58,6 +60,7 @@ case "${graph_backend}" in
     none|eager|aot_eager|npu|npugraphs|npugraph_ex|inductor|aclgraph) ;;
     *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
 esac
+case "${dtype}" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --dtype' >&2; exit 2;; esac
 
 case "${graph_backend}" in
     none) measurement_mode=eager_no_graph ;;
@@ -224,7 +227,7 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 12, f"route runtime ABI {value}, expected >= 12 (single-candidate layout regression fixed)"
+assert value >= 13, f"route runtime ABI {value}, expected >= 13 (multi-dtype)"
 PY
     route_probe_lib=$(readlink -f "${route_probe_lib}")
     export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"
@@ -262,9 +265,9 @@ except AttributeError as error:
     ) from error
 abi_version.restype = ctypes.c_int
 version = abi_version()
-if version < 11:
+if version < 12:
     raise RuntimeError(
-        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 11 (stream ordering and tensor lifetime); "
+        f"loaded deep_ep_cpp has explicit-multipath ABI {version}, expected >= 12 (multi-dtype); "
         "rebuild and force-reinstall the wheel from the current branch"
     )
 print(f"Verified requested APIs: legacy={need_legacy} prepared={need_prepared}; "
@@ -326,7 +329,7 @@ run_case() {
         PYTHONUNBUFFERED=1 A5_CCU_PHASE_WATCHDOG_SECONDS=60 \
         A5_CCU_PG_INIT_FILE="${pg_init_file}" \
       python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
-        "${test_script}" --bytes "${bytes}" --warmup "${warmup}" \
+        "${test_script}" --bytes "${bytes}" --dtype "${dtype}" --warmup "${warmup}" \
         --iters "${iterations}" "${profile_args[@]}" "${diagnostic_args[@]}" "$@" \
         >"${log}" 2>&1 || status=$?
     rm -f "${pg_init_file}"

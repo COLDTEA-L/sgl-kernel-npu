@@ -6,6 +6,7 @@ available=0,1,2,3,4,5,6,7
 relay_map=
 direct_route=0
 bytes=4194304
+dtype=float32
 warmup=100
 iterations=20
 repeats=1
@@ -25,6 +26,7 @@ while (($#)); do
         --relay-map) relay_map=$2; shift 2;;
         --direct-route) direct_route=$2; shift 2;;
         --bytes) bytes=$2; shift 2;;
+        --dtype) dtype=$2; shift 2;;
         --warmup) warmup=$2; shift 2;;
         --iters) iterations=$2; shift 2;;
         --repeats) repeats=$2; shift 2;;
@@ -38,7 +40,8 @@ while (($#)); do
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
         --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
-            echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).'; exit 0;;
+            echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).';
+            echo '--dtype float16|bfloat16|float32|int8|int32 (default float32).'; exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
@@ -46,6 +49,7 @@ for value in "$bytes" "$iterations" "$repeats" "$timeout_seconds"; do
     [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || { echo 'positive numeric argument required' >&2; exit 2; }
 done
 [[ "$warmup" =~ ^[0-9]+$ ]] || exit 2
+case "$dtype" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --dtype' >&2; exit 2;; esac
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
 [[ "$sync_mode" == per-call || "$sync_mode" == batch ]] || { echo 'invalid --sync-mode' >&2; exit 2; }
 [[ "$sync_mode" != batch || "$graph" == none ]] || { echo 'batch requires --graph-backend none' >&2; exit 2; }
@@ -56,15 +60,15 @@ export LD_LIBRARY_PATH="${cann_root}/lib64:${cann_root}/opp/vendors/cust/lib64:$
 unset A5_CCU_SYNTHETIC_SRC_EID A5_CCU_SYNTHETIC_DST_EID A5_CCU_SYNTHETIC_ROUTE_MANIFEST
 unset A5_CCU_ROUTE_INDEX A5_CCU_ROUTE_INDICES A5_CCU_PATH_UIDS A5_CCU_PATH_WEIGHTS A5_CCU_ROUTE_SCHEDULE
 timeout --signal=TERM --kill-after=5 180 \
-    python3 "${repo}/tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py" --runtime-check
+    python3 "${repo}/tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py" --runtime-check --dtype "$dtype"
 mkdir -p "${output_root}"
 run_dir=$(mktemp -d "${output_root}/a5_ccu_peer_plan_${devices//,/_}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "${run_dir}/cases"
-python3 - "$run_dir" "$repeats" "$sync_mode" "$bytes" "$warmup" "$iterations" "$graph" <<'PY'
+python3 - "$run_dir" "$repeats" "$sync_mode" "$bytes" "$warmup" "$iterations" "$graph" "$dtype" <<'PY'
 import json, pathlib, sys
 (pathlib.Path(sys.argv[1]) / 'run_settings.json').write_text(json.dumps(dict(
     repeats=int(sys.argv[2]), sync_mode=sys.argv[3], bytes_per_peer=int(sys.argv[4]),
-    warmup=int(sys.argv[5]), iterations=int(sys.argv[6]), graph_backend=sys.argv[7])) + '\n')
+    warmup=int(sys.argv[5]), iterations=int(sys.argv[6]), graph_backend=sys.argv[7], dtype=sys.argv[8])) + '\n')
 PY
 echo "Result directory: ${run_dir}"
 plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
@@ -91,7 +95,7 @@ for ((r=1; r<=repeats; r++)); do
         python3 -m torch.distributed.run --standalone --nproc-per-node="$k" \
         "${repo}/tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py" \
         --manifest "${run_dir}/plans/peer_plan.tsv" --available-cards "$n" \
-        --bytes "$bytes" --warmup "$warmup" --iters "$iterations" \
+        --bytes "$bytes" --dtype "$dtype" --warmup "$warmup" --iters "$iterations" \
         --run-dir "$case_dir" --graph-backend "$graph" --sync-mode "$sync_mode" "${profile_args[@]}" > "$log" 2>&1
     rc=$?
     set -e

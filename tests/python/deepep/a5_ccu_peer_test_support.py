@@ -4,6 +4,14 @@ import json
 from pathlib import Path
 import time
 
+PAYLOAD_DTYPES = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}
+
+
+def payload_code(position, source, destination, epoch):
+    # Exactly representable in all supported types; -128 is reserved poison.
+    # Position may also be an int32 tensor. No float arithmetic/conversion here.
+    return (position % 31 + source * 19 + destination * 7 + epoch * 11) % 127 - 63
+
 
 def warmup_calls(launch, synchronize, count, sync_mode):
     for _ in range(count):

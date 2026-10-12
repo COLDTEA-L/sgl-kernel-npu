@@ -1,5 +1,9 @@
 # A5 CCU+URMA prepared-plan 显式多路径 AllToAll 实现说明
 
+当前分支 `feature/a5-ccu-multidtype-alltoall` 自动读取tensor dtype，支持 FP16/BF16/FP32/INT8/INT32。
+扩展同时覆盖两卡 prepared-plan 和两卡/四卡 peer-plan；共用按byte搬运的RouteKernel。
+类型映射、字节/元素边界、版本和有卡测试见 [多类型实现指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md)。
+
 ## 1. 结论
 
 当前实现采用“图外资源准备 + 图内缓存 launch”，不修改系统 `libhccl.so`：
@@ -69,7 +73,7 @@ host queue 提交；原始 ACL 调用可能抢先读取输入。`stream()` 清�
 让 tensor producer、D2D self-copy、CCU launch 按流顺序提交；它不等待 device 完成。
 这是 PyTorch bridge 的要求，单独 C++ probe 没有这层 torch_npu host queue。
 
-当前 route ABI 为 12、DeepEP ABI 为 11，保留上述提交顺序修复。bridge 增加 tensor DeviceGuard、
+当前 prepared route ABI 为13、DeepEP attr ABI 为12（独立peer ABI均为2），保留上述提交顺序修复。bridge 增加 tensor DeviceGuard、
 同 device/不重叠检查和 caching allocator `recordStream`。后者保证异步访问期间的存储
 生命周期，不代替生产流与执行流的依赖；跨流输入需要调用者先 `wait_stream`。
 
@@ -213,7 +217,7 @@ V2 允许同一个 plan 在 eager 模式下使用另一组同长度正权重，�
 零权重暂时拒绝：尚未证明所有 T560 provider 对 zero-byte `WriteNb` 都有一致且无副作用的
 语义。
 
-公共 `BuildTwoRankPathLayout` 在任何复制/launch 前验证完整布局：FP32、两 rank、正权重、
+公共 `BuildTwoRankPathLayout` 在任何复制/launch 前验证完整布局：1/2/4字节元素、两rank、正权重、
 总字节及地址无溢出、各路径非零、256-byte 分片对齐（末片保留余数）及完整覆盖。
 权重乘积使用 `__uint128_t`。注册签名包含实际 Channels 和带分隔符的 ordinals，不能仅
 用 route 编号决定 kernel 身份；运行时权重/地址仍是 task 参数，不触发重新注册。

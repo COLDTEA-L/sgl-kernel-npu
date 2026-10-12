@@ -182,6 +182,10 @@ required_symbols=(
     HcclCcuUrmaExplicitMultipathPlanExecute
     HcclCcuUrmaExplicitMultipathPlanExecuteV2
     A5CcuUrmaPreparedPlanAbiVersion
+    A5CcuPeerPlanAbiVersion
+    HcclCcuUrmaPeerPlanCreate
+    HcclCcuUrmaPeerPlanBindStream
+    HcclCcuUrmaPeerPlanExecute
     HcclCcuUrmaCommandBlockWorkerCreate
     HcclCcuUrmaCommandBlockWorkerStop
     A5CcuHbmCommandPunctureAbiVersion
@@ -206,8 +210,14 @@ version = library.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 actual = version()
 print(f"Verified prepared-plan ABI: {actual} ({library_path})")
-if actual < 12:
-    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 12 (single-candidate layout regression fixed)")
+if actual < 13:
+    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 13 (multi-dtype)")
+peer_version = library.A5CcuPeerPlanAbiVersion
+peer_version.restype = ctypes.c_int
+peer_actual = peer_version()
+print(f"Verified peer-plan ABI: {peer_actual} ({library_path})")
+if peer_actual < 2:
+    raise SystemExit(f"peer-plan ABI {peer_actual} is stale; expected >= 2 (multi-dtype)")
 PY
 }
 verify_prepared_plan_abi "${built_library}"

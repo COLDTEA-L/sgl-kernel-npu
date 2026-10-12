@@ -85,14 +85,16 @@ struct PeerPathLayout {
 // its own full byte budget, not a share of all remote peers' bytes.
 inline bool BuildPeerPathLayout(uint64_t elementsPerPeer, uint32_t rank,
     uint32_t rankSize, const std::vector<uint32_t> &peers,
-    const std::vector<uint32_t> &weights, PeerPathLayout *result)
+    const std::vector<uint32_t> &weights, PeerPathLayout *result,
+    uint32_t elementBytes = 4)
 {
     if (result == nullptr || (rankSize != 2 && rankSize != 4) || rank >= rankSize ||
-        elementsPerPeer == 0 || elementsPerPeer > UINT64_MAX / (4U * rankSize) ||
+        elementsPerPeer == 0 || (elementBytes != 1 && elementBytes != 2 && elementBytes != 4) ||
+        elementsPerPeer > UINT64_MAX / (elementBytes * rankSize) ||
         peers.empty() || peers.size() != weights.size() || 4 + 3 * peers.size() > 48)
         return false;
     PeerPathLayout layout;
-    layout.peerBytes = elementsPerPeer * 4;
+    layout.peerBytes = elementsPerPeer * elementBytes;
     layout.totalBytes = layout.peerBytes * rankSize;
     layout.selfOffset = rank * layout.peerBytes;
     std::set<uint32_t> seen;

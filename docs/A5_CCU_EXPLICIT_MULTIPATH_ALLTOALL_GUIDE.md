@@ -1,9 +1,14 @@
 # A5 CCU+URMA prepared-plan 显式多路径 AllToAll 操作指南
 
+当前多类型分支为 `feature/a5-ccu-multidtype-alltoall`，自动支持 FP16/BF16/FP32/INT8/INT32。
+首次升级需同时重编 route package 和 DeepEP wheel；以
+[多类型构建和测试指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md) 第3节为准。
+该指南亦给出统一两卡/四卡的短测、profiling及图验证命令。
+
 两卡实现的逻辑、调用链、参数及 API 见
 [两卡 prepared-plan 设计](A5_CCU_TWO_RANK_PREPARED_PLAN_DESIGN.md)。
 新增两卡/四卡、显式 peer relay 分配及 direct-only 接口见
-[peer-plan 两卡/四卡指南](A5_CCU_PEER_PLAN_ALLTOALL_GUIDE.md)，其独立 ABI 为 1。
+[peer-plan 两卡/四卡指南](A5_CCU_PEER_PLAN_ALLTOALL_GUIDE.md)，其独立 ABI 要求 >=2。
 本文件保留原两卡 API 的实验步骤，四卡不要直接沿用原 WORLD_SIZE=2 脚本。
 
 ## 1. 当前实现和边界
@@ -43,10 +48,10 @@ GE/Ascend C `op_def + tiling.cpp + AIV kernel` 形态。T560 AIV kernel 不能�
 host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层伪装成已经完成的
 原生 Ascend C 算子。
 
-本次 ABI 要求：route runtime ABI >= 12，DeepEP ABI >= 11。由 ABI 11 升级到本次修复，
-只需重新执行第 3 节安装 route package，已有 DeepEP ABI 11 wheel 不必重编；
-若 wheel 也低于 11，再执行第 4 节。不需要编译或替换系统 HCCL。
-当前 prepared 数据面仅支持两 rank、连续 FP32 tensor、互不重叠的输入/输出。
+本次 ABI 要求：route runtime ABI >=13，DeepEP attr ABI >=12。
+首次切换多类型分支必须执行第3/4节重编安装两份库，不需要编译或替换系统HCCL。
+当前旧 prepared 接口支持两rank、连续 FP16/BF16/FP32/INT8/INT32 tensor、互不重叠输入/输出。
+新增 peer-plan 接口兼容两rank/四rank、direct-only，独立peer ABI两份库均需 >=2。
 
 ## 2. 只拉取 sgl-kernel-npu（不要拉取 HCCL）
 
@@ -54,7 +59,7 @@ host runtime；在缺少官方 host-task/doorbell 接口时，不能把这一层
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-BRANCH=feature/a5-ccu-explicit-multipath-alltoall
+BRANCH=feature/a5-ccu-multidtype-alltoall
 
 git fetch origin "${BRANCH}"
 git switch "${BRANCH}"
@@ -96,13 +101,13 @@ bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install-path /usr/local/Ascend/cann-9.1.T560
 ```
 
-脚本会强制检查三个 prepared-plan 入口以及 route ABI 12：
+脚本会检查 prepared-plan 入口、route ABI13，以及新增peer-plan符号和peer ABI2：
 
 ```text
 HcclCcuUrmaExplicitMultipathPlanCreate
 HcclCcuUrmaExplicitMultipathPlanBindStream
 HcclCcuUrmaExplicitMultipathPlanExecuteV2
-A5CcuUrmaPreparedPlanAbiVersion() >= 12
+A5CcuUrmaPreparedPlanAbiVersion() >= 13
 ```
 
 也可以手工检查已安装文件：
@@ -121,7 +126,7 @@ lib = ctypes.CDLL(os.environ["ROUTE_SO"], mode=ctypes.RTLD_GLOBAL)
 version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 print("prepared-plan route ABI:", version())
-assert version() >= 12
+assert version() >= 13
 PY
 ```
 
@@ -171,7 +176,7 @@ y = torch.ops.deep_ep.ccu_urma_prepared_multipath_alltoall_policy(
 )
 print("Meta:", y.device, tuple(y.shape), y.dtype)
 
-assert version() >= 11
+assert version() >= 12
 assert tuple(y.shape) == tuple(x.shape)
 PY
 ```
@@ -204,8 +209,8 @@ bash scripts/run_a5_ccu_explicit_multipath_alltoall_perf.sh \
 成功日志应包含：
 
 ```text
-Verified prepared-plan route runtime: ... (ABI=12)
-Verified requested APIs: ... prepared=True; DeepEP ABI=11
+Verified prepared-plan route runtime: ... (ABI=13)
+Verified requested APIs: ... prepared=True; DeepEP ABI=12
 PREPARED_MULTIPATH_STREAM phase=bind_ready ... paths=3
 PREPARED_MULTIPATH_PLAN ... paths=3
 PASS: implementation=prepared ...
@@ -512,7 +517,7 @@ find "${BASELINE_DIR}" -type d -name '*_ascend_pt' -print
 
 ## 9. 常见故障
 
-### 9.1 route runtime ABI 小于 12
+### 9.1 route runtime ABI 小于 13
 
 重新执行第 3 节并确认安装路径。构建脚本会比较 packaged 和 installed `.so`，避免
 custom package installer 留下旧文件。
@@ -532,7 +537,7 @@ D2D 和 CCU launch；不增加每次 device synchronize。这个缺陷已从源�
 本次整行缺失仍须用下面的逐轮有卡实验确认。
 
 ABI 11 的进一步审查修复见第 9.7 节，单候选基线回归修复见第 9.8 节。确认
-**route ABI >= 12、DeepEP ABI >= 11**；已有 DeepEP ABI 11 时只需重做第 3 节。
+**route ABI >=13、DeepEP attr ABI >=12**；首次升级多类型需同时重做第3/4节。
 
 语义依据：[torch_npu NPUStream 源码](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp)
 中的 `NPUStream::stream(bool)` 和 `NPUStream::stream()`；同时已核对开发容器
@@ -548,7 +553,7 @@ ABI 7 曾照搬新版 primitive API 的 bitmask 布局，但 T560 object API 首
 因此不能使用该布局。
 
 升级后先用第 5 节的 `--warmup 2 --iters 2 --repeats 1` 验证连续四次独立调用。日志应同时
-出现 route `ABI=12`、`DeepEP ABI=11`（或更高）、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
+出现 route `ABI=13`、`DeepEP ABI=12`（或更高）、`CASE_LAUNCH_COMPLETION` 和最终 `PASS`。未通过前不要进行性能或 profiling
 实验。
 
 如果短序列通过而 100 次 warmup 失败，用下面的诊断模式定位第一轮错误；该选项每轮读取并

@@ -24,10 +24,12 @@ struct TwoRankPathLayout {
 // Pure preflight shared by single-candidate baselines and prepared multipath.
 // The prepared-plan API enforces its own >= 2 path contract before calling us.
 inline bool BuildTwoRankPathLayout(uint64_t elementsPerPeer, uint32_t rank,
-    const std::vector<uint32_t> &weights, TwoRankPathLayout *result)
+    const std::vector<uint32_t> &weights, TwoRankPathLayout *result,
+    uint32_t elementBytes = 4)
 {
     if (result == nullptr || rank >= 2 || elementsPerPeer == 0 ||
-        elementsPerPeer > std::numeric_limits<uint64_t>::max() / 8 ||
+        (elementBytes != 1 && elementBytes != 2 && elementBytes != 4) ||
+        elementsPerPeer > std::numeric_limits<uint64_t>::max() / (2U * elementBytes) ||
         weights.empty() || weights.size() > PREPARED_MAX_PATHS) return false;
     uint64_t totalWeight = 0;
     for (uint32_t weight : weights) {
@@ -35,14 +37,14 @@ inline bool BuildTwoRankPathLayout(uint64_t elementsPerPeer, uint32_t rank,
         totalWeight += weight;
     }
     TwoRankPathLayout layout;
-    layout.peerBytes = elementsPerPeer * 4;
+    layout.peerBytes = elementsPerPeer * elementBytes;
     layout.totalBytes = layout.peerBytes * 2;
     layout.selfOffset = rank * layout.peerBytes;
     uint64_t assigned = 0;
     for (size_t i = 0; i < weights.size(); ++i) {
         uint64_t bytes = layout.peerBytes - assigned;
         if (i + 1 != weights.size()) {
-            // FP32 payload * uint32 weight can exceed uint64 even when each
+            // Payload bytes * uint32 weight can exceed uint64 even when each
             // buffer and the final quotient fit. Keep this product exact.
             bytes = static_cast<uint64_t>(
                 static_cast<__uint128_t>(layout.peerBytes) * weights[i] / totalWeight);

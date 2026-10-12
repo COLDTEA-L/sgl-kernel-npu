@@ -72,9 +72,36 @@ int main()
     auto seventh = bad.back(); seventh.relayPhy = 8; bad.push_back(seventh);
     assert(!ValidatePeerPlan(2, 8, bad, &error));
     PeerPathLayout out;
+    for (uint32_t size : {1U, 2U, 4U}) {
+        for (uint32_t k : {2U, 4U}) {
+            for (uint32_t rank = 0; rank < k; ++rank) {
+                for (bool relay : {false, true}) {
+                    std::vector<uint32_t> peers, weights;
+                    for (uint32_t p = 0; p < k; ++p) if (p != rank) {
+                        peers.push_back(p); weights.push_back(2);
+                        if (relay) { peers.push_back(p); weights.push_back(1); }
+                    }
+                    assert(BuildPeerPathLayout(1048577, rank, k, peers, weights, &out, size));
+                    assert(out.peerBytes == 1048577ULL * size && out.totalBytes == out.peerBytes * k);
+                    assert(out.selfOffset == rank * out.peerBytes);
+                    std::map<uint32_t, uint64_t> assigned;
+                    for (size_t i = 0; i < peers.size(); ++i) {
+                        assert(out.sourceOffsets[i] == peers[i] * out.peerBytes + assigned[peers[i]]);
+                        assert(out.remoteOffsets[i] == rank * out.peerBytes + assigned[peers[i]]);
+                        assert(out.pathBytes[i] % size == 0);
+                        assigned[peers[i]] += out.pathBytes[i];
+                    }
+                    for (auto item : assigned) assert(item.second == out.peerBytes);
+                    assert(!BuildPeerPathLayout(UINT64_MAX, rank, k, peers, weights, &out, size));
+                }
+            }
+        }
+    }
+    assert(!BuildPeerPathLayout(1024, 0, 2, {1}, {2}, &out, 0));
+    assert(!BuildPeerPathLayout(1024, 0, 2, {1}, {2}, &out, 3));
     assert(!BuildPeerPathLayout(UINT64_MAX, 0, 2, {1}, {2}, &out));
     assert(!BuildPeerPathLayout(1, 0, 2, {1, 1}, {2, 1}, &out));
     assert(!BuildPeerPathLayout(1024, 0, 4, {1, 2}, {2, 2}, &out));
     assert(!BuildPeerPathLayout(1024, 0, 2, {0}, {2}, &out));
-    std::cout << "2/4-rank direct-only, relays, partition/overflow/invalid plan: PASS\n";
+    std::cout << "2/4-rank multi-dtype byte layouts, direct-only, relays, overflow: PASS\n";
 }

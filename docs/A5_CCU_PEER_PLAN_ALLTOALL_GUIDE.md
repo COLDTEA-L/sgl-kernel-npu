@@ -1,12 +1,15 @@
 # 显式 peer-plan CCU AllToAll：两卡 / 四卡
 
-分支：`feature/a5-ccu-peer-plan-alltoall-4rank`。本版在已验证的两卡 prepared-plan
+分支：`feature/a5-ccu-multidtype-alltoall`（基于四卡分支）。本版在已验证的两卡 prepared-plan
 数据面上扩展 peer 维度，不改 HCCL、不改 UBUS route table，不加载新 ko。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
 
 ## 1. 范围、数据流与约束
 
-输入、输出均为 contiguous FP32 `[k, elements_per_peer]`，`k=2` 或 `4`。
+输入、输出均为 contiguous `[k, elements_per_peer]`，`k=2` 或 `4`。
+支持 FP16、BF16、FP32、INT8、INT32，算子从输入 tensor 自动获取 dtype，输出同类型，
+不做转换。`--dtype` 仅供测试脚本创建输入，不是算子额外参数。
+实现、版本和逐类型验证见 [多类型实现与测试指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md)。
 源 rank `s` 的 `send[d]` 写入目的 rank `d` 的 `recv[s]`；self 分片在本地 D2D copy。
 `--bytes` 是**每个目的 rank**的数据量，包含 self；四卡 4 MiB/peer 对应 16 MiB tensor，
 每 rank 网络发送总量是 12 MiB，而非把 4 MiB 平分给三个 peer。
@@ -50,7 +53,7 @@ untracked 文件；不需要在内网机器 push，不要恢复旧 stash）。�
 set -e
 cd /home/l00934901/sgl-kernel-npu
 git stash push -m "backup-before-4rank-update-$(date +%Y%m%d_%H%M%S)"
-BRANCH=feature/a5-ccu-peer-plan-alltoall-4rank
+BRANCH=feature/a5-ccu-multidtype-alltoall
 git fetch origin "${BRANCH}"
 git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
@@ -64,9 +67,9 @@ git status --short
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-git fetch origin feature/a5-ccu-peer-plan-alltoall-4rank
-git switch feature/a5-ccu-peer-plan-alltoall-4rank
-git pull --ff-only origin feature/a5-ccu-peer-plan-alltoall-4rank
+git fetch origin feature/a5-ccu-multidtype-alltoall
+git switch feature/a5-ccu-multidtype-alltoall
+git pull --ff-only origin feature/a5-ccu-multidtype-alltoall
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
 
@@ -85,8 +88,9 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
 构建脚本的 offline cann-cmake 与 UTF-8 源码预检保持原有行为。
 需要重新装 route package 和 wheel；**不需要重编 HCCL**。
 
-**2026-10-09 测试统一更新仅修改 Python、shell 与文档**：若第 3 节独立 peer-plan
-ABI 已通过，本次仅拉取更新即可，不需要重复编译/安装 route package 或 wheel。
+**多类型分支首次升级必须重编/安装 route package 和 wheel**：route peer ABI >=2、
+DeepEP peer ABI >=2，原两卡 prepared route ABI >=13、DeepEP attr ABI >=12。
+这与 2026-10-09 仅改测试脚本的更新不同，不能使用旧 peer ABI=1 二进制。
 先做无需 NPU 的入口回归，再执行第 4 节：
 
 ```bash
@@ -132,12 +136,13 @@ Buffer = package.Buffer
 deep = ctypes.CDLL(str(Path(ext.__file__).resolve()))
 for library, name in [(route, 'A5CcuPeerPlanAbiVersion'), (deep, 'A5DeepEpPeerPlanAbiVersion')]:
     fn = getattr(library, name); fn.restype = ctypes.c_int
-    print(name, fn()); assert fn() >= 1
+    print(name, fn()); assert fn() >= 2
 assert hasattr(Buffer, 'prepare_ccu_urma_peer_plan')
-for k in (2, 4):
-    x = torch.empty((k, 1024), device='meta', dtype=torch.float32)
-    y = torch.ops.deep_ep.ccu_urma_peer_plan_alltoall(x, 1, [])
-    assert y.shape == x.shape and y.dtype == x.dtype
+for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.int32):
+    for k in (2, 4):
+        x = torch.empty((k, 1024), device='meta', dtype=dtype)
+        y = torch.ops.deep_ep.ccu_urma_peer_plan_alltoall(x, 1, [])
+        assert y.shape == x.shape and y.dtype == x.dtype
 print('peer-plan Meta PASS; not a hardware correctness test')
 PY
 ```
@@ -155,7 +160,8 @@ PY
 `.so` 的真实错误。后续独立 peer-plan ABI/API 检查仍保留；名称兼容不等于旧
 二进制自动具备新版 API。
 
-本次修复仅测试加载代码与文档，**不需要重新编译算子、安装 wheel 或编译 HCCL**。
+原导入兼容修复仅测试代码；但**首次切换当前多类型分支必须重编 route 和 wheel**。
+已安装本分支 peer ABI >=2 后，若后续只有 loader 更新则不需再编译。不编译 HCCL。
 拉取本分支更新后，在当前 Docker/Python 中执行（不初始化 NPU）：
 
 ```bash
@@ -695,7 +701,8 @@ bootstrap/rendezvous、计划/报告、退出观察器 CPU 回归，以及两卡
 `/tmp/a5-peer-plan-install/lib/liba5_ccu_urma_route_probe.so`（peer ABI=1）及安装的 wheel，
 两卡 prepared 入口亦可正常加载。这不是有卡传输测试。
 容器 CANN 默认安装位置仍是旧 route package，预检能正确拒绝缺失 peer ABI 的库；
-没有为了这次 Python 修改覆盖安装包。用户机器第 3 节 peer ABI 已通过则不用重新安装。
+没有为了当时的 Python 修改覆盖安装包。以上是历史测试；当前多类型分支要求
+第 2 节重新构建安装且独立 peer ABI >=2，不能用旧 peer ABI=1 代替。
 
 若预检报 `No module named torch`，先核对 `command -v python3` 与
 `python3 -c 'import sys, torch; print(sys.executable, torch.__version__)'`，使用已经安装

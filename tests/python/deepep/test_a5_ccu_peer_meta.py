@@ -9,16 +9,19 @@ from deep_ep import Buffer
 library = ctypes.CDLL(str(Path(ext.__file__).resolve()))
 fn = library.A5DeepEpPeerPlanAbiVersion
 fn.restype = ctypes.c_int
-assert fn() == 1
+assert fn() >= 2
 assert hasattr(Buffer, "prepare_ccu_urma_peer_plan")
 assert hasattr(Buffer, "bind_ccu_urma_peer_plan")
-for k in (2, 4):
-    x = torch.empty((k, 1024), device="meta", dtype=torch.float32)
-    op = torch.ops.deep_ep.ccu_urma_peer_plan_alltoall
-    y = op(x, 1, [])
-    assert y.shape == x.shape and y.dtype == x.dtype
-    captured = torch.compile(lambda t: op(t, 1, []), backend="eager", fullgraph=True)
-    assert captured(x).shape == x.shape
+op = torch.ops.deep_ep.ccu_urma_peer_plan_alltoall
+for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.int32):
+    for k in (2, 4):
+        x = torch.empty((k, 1024), device="meta", dtype=dtype)
+        y = op(x, 1, [])
+        assert y.shape == x.shape and y.dtype == x.dtype
+        torch._dynamo.reset()
+        captured = torch.compile(lambda t: op(t, 1, []), backend="eager", fullgraph=True)
+        result = captured(x)
+        assert result.shape == x.shape and result.dtype == dtype
 for k in (1, 3, 8):
     try:
         torch.ops.deep_ep.ccu_urma_peer_plan_alltoall(torch.empty((k, 1024), device="meta"), 1, [])

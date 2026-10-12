@@ -67,7 +67,8 @@ HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
  * stream binding and per-launch host path weights. */
 int A5CcuUrmaPreparedPlanAbiVersion(void);
 
-/** Independent peer-plan ABI: complete canonical peer manifest, 2/4 ranks,
+/** Independent peer-plan ABI: version 2 supports inferred FP16/BF16/FP32/INT8/INT32;
+ * complete canonical peer manifest, 2/4 ranks,
  * direct-only or explicit communicator-external relay paths. */
 int A5CcuPeerPlanAbiVersion(void);
 HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,

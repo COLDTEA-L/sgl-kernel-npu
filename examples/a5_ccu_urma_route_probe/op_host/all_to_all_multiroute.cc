@@ -3,6 +3,7 @@
 #include "command_block_worker_kernel.h"
 #include "route_kernel.h"
 #include "utils.h"
+#include "data_type.h"
 #include "../common/path_layout.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -162,7 +163,8 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr) {
         return HCCL_E_PTR;
     }
-    if (dataType != HCCL_DATA_TYPE_FP32 || elementsPerPeer == 0) {
+    const uint32_t elementBytes = PayloadElementBytes(dataType);
+    if (!elementBytes || elementsPerPeer == 0) {
         return HCCL_E_NOT_SUPPORT;
     }
     if (resources.channels.empty() || launchWeights.size() != resources.channels.size() ||
@@ -171,7 +173,7 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     }
 
     TwoRankPathLayout layout;
-    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout) ||
+    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout, elementBytes) ||
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(sendBuf),
                               reinterpret_cast<uint64_t>(recvBuf), layout.totalBytes)) {
         std::fprintf(stderr,
@@ -233,7 +235,8 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     if (sendBuf == nullptr || recvBuf == nullptr || comm == nullptr || stream == nullptr) {
         return HCCL_E_PTR;
     }
-    if (dataType != HCCL_DATA_TYPE_FP32 || elementsPerPeer == 0) {
+    const uint32_t elementBytes = PayloadElementBytes(dataType);
+    if (!elementBytes || elementsPerPeer == 0) {
         return HCCL_E_NOT_SUPPORT;
     }
     if (resources.channels.empty() || launchWeights.size() != resources.channels.size() ||
@@ -242,7 +245,7 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     }
 
     TwoRankPathLayout layout;
-    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout) ||
+    if (!BuildTwoRankPathLayout(elementsPerPeer, resources.rank, launchWeights, &layout, elementBytes) ||
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(sendBuf),
                               reinterpret_cast<uint64_t>(recvBuf), layout.totalBytes)) {
         std::fprintf(stderr, "[A5 CCU URMA] invalid size, chunks, or overlapping buffers\n");
@@ -359,7 +362,8 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // signatures to actual Channels rather than ordinal numbers alone.
     // Version 12 preserves single-candidate legacy baselines. The common
     // layout validator accepts one path; prepared-plan APIs still require >=2.
-    return 12;
+    // Version 13 infers byte layouts from FP16/BF16/FP32/INT8/INT32.
+    return 13;
 }
 
 namespace {

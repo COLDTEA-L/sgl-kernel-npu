@@ -99,7 +99,7 @@ if IMPLEMENTATION != "native":
             ) from error
         attr_abi.restype = ctypes.c_int
         version = attr_abi()
-        required_version = 11 if IMPLEMENTATION == "prepared" else 8
+        required_version = 12 if IMPLEMENTATION == "prepared" else 8
         if version < required_version:
             raise RuntimeError(
                 f"worker loaded DeepEP attr ABI {version}, expected >= {required_version}: {EXTENSION}"
@@ -115,7 +115,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 12:
+            if plan_abi() < 13:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -137,6 +137,8 @@ def parse_args():
                         default="multiroute")
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32", "int8", "int32"),
+                        default="float32", help="operator infers dtype from the input tensor")
     parser.add_argument("--route-index", type=int, default=0)
     parser.add_argument("--route-indices", default="")
     parser.add_argument("--path-uids", default="",
@@ -174,8 +176,11 @@ def parse_args():
     )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    if args.bytes <= 0 or args.bytes % 4:
-        parser.error("--bytes must be a positive multiple of sizeof(float)")
+    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}[args.dtype]
+    if args.bytes <= 0 or args.bytes % element_bytes:
+        parser.error("--bytes must be a positive multiple of dtype element size")
+    if args.implementation == "standard" and args.dtype != "float32":
+        parser.error("the historical ACLNN standard experiment is outside the multi-dtype prepared-plan change")
     if args.warmup < 0 or args.iters <= 0 or args.profile_iters <= 0:
         parser.error("invalid warmup/iters/profile-iters")
     if args.profile and args.profile_iters != args.iters:
@@ -328,10 +333,11 @@ def main():
               f"plan_handle={plan_handle} paths={len(explicit_weights)}", flush=True)
         mark_phase("prepare_explicit_multipath_plan_done")
 
-    elements = args.bytes // 4
+    dtype = getattr(torch, args.dtype)
+    elements = args.bytes // torch.empty((), dtype=dtype).element_size()
     send = torch.stack([
         torch.full((elements,), float(rank * 100 + dst + 1),
-                   dtype=torch.float32, device="npu")
+                   dtype=dtype, device="npu")
         for dst in range(world_size)
     ])
     recv = torch.empty_like(send)
@@ -340,13 +346,13 @@ def main():
     ) if args.implementation == "standard" else None
     expected = torch.stack([
         torch.full((elements,), float(src * 100 + rank + 1),
-                   dtype=torch.float32, device="npu")
+                   dtype=dtype, device="npu")
         for src in range(world_size)
     ])
 
     def check_result():
         try:
-            torch.testing.assert_close(recv, expected)
+            torch.testing.assert_close(recv, expected, rtol=0, atol=0)
         except AssertionError:
             mismatch_by_row = torch.count_nonzero(
                 recv != expected, dim=1
@@ -428,9 +434,9 @@ def main():
                 # Leave these producers in the normal torch_npu host queue.
                 # The bridge must order its raw ACL/HCOMM launch after them.
                 # Fresh input and poisoned output also reject stale replay.
-                send.add_(17.0)
-                expected.add_(17.0)
-                recv.fill_(-999.0)
+                send.add_(17)
+                expected.add_(17)
+                recv.fill_(-128)
             run_op()
             if complete_each_invocation:
                 torch.npu.synchronize()
@@ -504,8 +510,8 @@ def main():
         print(f"CASE_ACLGRAPH_CAPTURE rank={rank} PASS", flush=True)
 
         # Mutating the stable captured input makes stale-output replay fail.
-        send.add_(1000.0)
-        expected.add_(1000.0)
+        send.add_(7)
+        expected.add_(7)
         if args.implementation == "standard":
             path_policy.fill_(encode_path_policy(replay_weights))
             print(f"CASE_DYNAMIC_PATH_POLICY rank={rank} weights={replay_weights}", flush=True)
@@ -529,8 +535,8 @@ def main():
         # Change the captured input storage before the second execution. A
         # successful equality check now proves that replay consumed current
         # data instead of returning the first execution's stale output.
-        send.add_(1000.0)
-        expected.add_(1000.0)
+        send.add_(7)
+        expected.add_(7)
         torch.npu.synchronize()
         mark_phase(f"graph_replay_{args.compile_backend}")
         run_op()
@@ -589,6 +595,7 @@ def main():
 
     if rank == 0:
         result = {
+            "dtype": args.dtype,
             "implementation": args.implementation,
             "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
                       if args.implementation in ("explicit", "standard", "prepared") else

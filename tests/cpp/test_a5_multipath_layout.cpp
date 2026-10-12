@@ -8,6 +8,23 @@ static void CheckCoverage(uint64_t elements, uint32_t rank,
                           const std::vector<uint32_t> &weights)
 {
     TwoRankPathLayout layout;
+    for (uint32_t size : {1U, 2U, 4U}) for (uint32_t rank : {0U, 1U}) {
+        for (const auto &weights : {std::vector<uint32_t>{2}, std::vector<uint32_t>{2, 1, 1}}) {
+            assert(BuildTwoRankPathLayout(1048577, rank, weights, &layout, size));
+            assert(layout.peerBytes == 1048577ULL * size && layout.totalBytes == layout.peerBytes * 2);
+            uint64_t cursor = 0;
+            for (size_t i = 0; i < weights.size(); ++i) {
+                assert(layout.sourceOffsets[i] == (1 - rank) * layout.peerBytes + cursor);
+                assert(layout.remoteOffsets[i] == rank * layout.peerBytes + cursor);
+                assert(layout.pathBytes[i] % size == 0);
+                cursor += layout.pathBytes[i];
+            }
+            assert(cursor == layout.peerBytes);
+            assert(!BuildTwoRankPathLayout(UINT64_MAX, rank, weights, &layout, size));
+        }
+    }
+    assert(!BuildTwoRankPathLayout(1024, 0, {2}, &layout, 0));
+    assert(!BuildTwoRankPathLayout(1024, 0, {2}, &layout, 3));
     assert(BuildTwoRankPathLayout(elements, rank, weights, &layout));
     uint64_t cursor = 0;
     for (size_t i = 0; i < weights.size(); ++i) {

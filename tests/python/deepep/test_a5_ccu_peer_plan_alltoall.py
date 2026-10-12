@@ -12,7 +12,8 @@ from pathlib import Path
 import time
 
 from a5_ccu_peer_test_support import (file_barrier, make_profiler, measurement_start,
-    warmup_calls, measure_calls, validate_queued_calls, write_rank_result)
+    warmup_calls, measure_calls, validate_queued_calls, write_rank_result,
+    PAYLOAD_DTYPES, payload_code)
 from a5_ccu_test_runtime import prepare_runtime, import_deep_ep
 
 
@@ -25,6 +26,8 @@ def main():
     p.add_argument("--manifest", type=Path)
     p.add_argument("--available-cards", type=int, default=8)
     p.add_argument("--bytes", type=int, default=4194304, help="bytes per destination, including self")
+    p.add_argument("--dtype", choices=tuple(PAYLOAD_DTYPES), default="float32",
+                   help="test tensor dtype; the operator infers dtype from the tensor")
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--sync-mode", choices=("per-call", "batch"), default="per-call",
@@ -34,8 +37,8 @@ def main():
     p.add_argument("--graph-backend", choices=("none", "aclgraph"), default="none")
     p.add_argument("--profile", action="store_true")
     args = p.parse_args()
-    if args.bytes <= 0 or args.bytes % 4 or args.warmup < 0 or args.iters < 1:
-        p.error("positive FP32-aligned byte count and iterations required")
+    if args.bytes <= 0 or args.bytes % PAYLOAD_DTYPES[args.dtype] or args.warmup < 0 or args.iters < 1:
+        p.error("positive dtype-element-aligned byte count and iterations required")
     if args.sync_mode == "batch" and args.graph_backend != "none":
         p.error("batch validation currently requires --graph-backend none; validate graph separately in per-call mode")
     if not args.runtime_check:
@@ -70,8 +73,8 @@ def main():
         version = getattr(library, symbol)
         version.restype = ctypes.c_int
         abi_versions[symbol] = version()
-        if abi_versions[symbol] < 1:
-            raise RuntimeError(f"invalid worker ABI: {symbol}")
+        if abi_versions[symbol] < 2:
+            raise RuntimeError(f"stale worker ABI {symbol}={abi_versions[symbol]}; rebuild/install multi-dtype branch (>=2)")
     for api in ("prepare_ccu_urma_peer_plan", "bind_ccu_urma_peer_plan", "ccu_urma_peer_plan_alltoall_out"):
         if not hasattr(Buffer, api):
             raise RuntimeError(f"missing peer-plan Buffer API: {api}")
@@ -97,21 +100,21 @@ def main():
     # stream in graph mode. Do not first create a second set on default stream.
     with torch.npu.stream(capture_stream) if capture_stream is not None else nullcontext():
         handle = buffer.prepare_ccu_urma_peer_plan("peer-plan", str(args.manifest.resolve()), args.available_cards)
-    n = args.bytes // 4
+    dtype = getattr(torch, args.dtype)
+    n = args.bytes // PAYLOAD_DTYPES[args.dtype]
     # Position + source + destination identify each slice. Poisoned receive
     # buffers also reject missing chunks, overlapping writes and stale outputs.
-    pattern = torch.arange(n, dtype=torch.int32, device="npu").remainder_(8191).float()
-    send = torch.empty((k, n), dtype=torch.float32, device="npu")
+    pattern = torch.arange(n, dtype=torch.int32, device="npu")
+    def input_for(epoch):
+        return torch.stack([payload_code(pattern, rank, peer, epoch).to(dtype) for peer in range(k)])
+    def expected_for(epoch):
+        return torch.stack([payload_code(pattern, source, rank, epoch).to(dtype) for source in range(k)])
+    send = input_for(0)
     recv = torch.empty_like(send)
-    for peer in range(k):
-        send[peer].copy_(pattern + rank * 1000000 + peer * 100000)
-    expected = torch.empty_like(send)
-    for source in range(k):
-        expected[source].copy_(pattern + source * 1000000 + rank * 100000)
     torch.npu.synchronize()
     barrier("prepared")
     def check(tensor, epoch):
-        torch.testing.assert_close(tensor, expected + epoch, rtol=0, atol=0)
+        torch.testing.assert_close(tensor, expected_for(epoch), rtol=0, atol=0)
     def eager():
         if capture_stream is not None:
             capture_stream.wait_stream(torch.npu.current_stream())
@@ -122,8 +125,8 @@ def main():
     phase("changed_payload_checks")
     for epoch in range(3):
         if epoch:
-            send.add_(1)
-        recv.fill_(-999)
+            send.copy_(input_for(epoch))
+        recv.fill_(-128)
         torch.npu.synchronize()
         barrier(f"correctness_{epoch}")
         eager()
@@ -141,21 +144,21 @@ def main():
         # Reuse send/recv exactly as timing does, but vary inputs and poison
         # output each call so a stale or missing execution cannot pass.
         for round_index in range(2):
-            deltas = [100 * (round_index + 1) + i + 1 for i in range(queued_count)]
-            inputs = [send + delta for delta in deltas]
-            snapshots = [torch.empty_like(recv) for _ in deltas]
+            epochs = [3 + round_index * queued_count + i for i in range(queued_count)]
+            inputs = [input_for(value) for value in epochs]
+            snapshots = [torch.empty_like(recv) for _ in epochs]
             torch.npu.synchronize()
             barrier(f"batch_validation_{round_index}_begin")
             def prepare(index):
                 send.copy_(inputs[index])
-                recv.fill_(-999)
+                recv.fill_(-128)
             def snapshot(index):
                 snapshots[index].copy_(recv)
             def check_snapshot(index):
-                check(snapshots[index], epoch + deltas[index])
+                check(snapshots[index], epochs[index])
             validate_queued_calls(prepare, eager, snapshot, torch.npu.synchronize,
                                   check_snapshot, queued_count)
-            epoch += deltas[-1]
+            epoch = epochs[-1]
             check(recv, epoch)
             barrier(f"batch_validation_{round_index}_passed")
             del inputs, snapshots
@@ -177,8 +180,8 @@ def main():
         torch.npu.synchronize()
         barrier("capture_done")
         for index in range(2):
-            send.add_(1)
             epoch += 1
+            send.copy_(input_for(epoch))
             torch.npu.synchronize()
             barrier(f"replay_{index}")
             graph.replay()
@@ -207,7 +210,8 @@ def main():
     check(graph_output, epoch)
     barrier("measured")
     result = dict(rank=rank, ranks=k, correctness="PASS",
-        bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, warmup=args.warmup,
+        bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, dtype=args.dtype,
+        element_bytes=send.element_size(), warmup=args.warmup,
         iterations=args.iters, graph_backend=args.graph_backend, **timing,
         batch_validation=batch_validation, measurement_start_lateness_us=start_lateness_us,
         manifest=str(args.manifest))
