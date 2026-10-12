@@ -13,12 +13,13 @@ public:
     using RouteKernel::RouteKernel;
     using RouteKernel::GeneArgs;
 };
-static void CheckGraph(const TestKernel &kernel, size_t paths, bool local)
+static void CheckGraph(const TestKernel &kernel, size_t paths, bool local,bool group=false)
 {
     size_t locals=0, remotes=0, waits=0, postRecords=0, postWaits=0;
     std::set<int> events, waited;
     bool firstWait=false;
     for (const auto &i : kernel.instructions) {
+        if(i.op=="group_local") { assert(group && !firstWait && remotes==paths); ++locals; }
         if (i.op=="local" || i.op=="remote") {
             assert(!firstWait); // all data submissions before any completion wait
             assert(events.insert(i.event).second);
@@ -28,15 +29,16 @@ static void CheckGraph(const TestKernel &kernel, size_t paths, bool local)
             firstWait=true; ++waits;
             assert(events.count(i.event)); assert(waited.insert(i.event).second);
         }
-        if (i.slot==2 && i.op=="record") { assert(waits==paths+(local?1:0)); ++postRecords; }
+        if (i.slot==2 && i.op=="record") { assert(waits==paths+(local&&!group?1:0)); ++postRecords; }
         if (i.slot==2 && i.op=="notify_wait") { assert(postRecords==paths); ++postWaits; }
     }
     assert(locals==(local?1U:0U) && remotes==paths && waits==events.size());
     assert(postRecords==paths && postWaits==paths);
 }
-static void Run(uint32_t k, uint32_t pathsPerPeer, uint32_t elementBytes)
+static void Run(uint32_t k, uint32_t pathsPerPeer, uint32_t elementBytes,
+    size_t peerBytes=4096, uint32_t epochs=40)
 {
-    constexpr size_t guard=32, peerBytes=4096;
+    constexpr size_t guard=32;
     const size_t total=k*peerBytes;
     std::vector<std::vector<unsigned char>> input(k), output(k);
     std::vector<std::unique_ptr<TestKernel>> kernels;
@@ -55,12 +57,12 @@ static void Run(uint32_t k, uint32_t pathsPerPeer, uint32_t elementBytes)
         assert(arg.GetKernelSignature().value!=old.GetKernelSignature().value);
         kernels.emplace_back(new TestKernel(arg));
         assert(kernels.back()->Init()==0);
-        CheckGraph(*kernels.back(), channels.size(), true);
+        CheckGraph(*kernels.back(), channels.size(), true,true);
         input[rank].resize(total+2*guard); output[rank].resize(total+2*guard);
     }
     // Reuse registered graphs and buffers for changing epochs, rotate rank and
     // reverse copy completion order: no dependence on a particular submission.
-    for (uint32_t epoch=0; epoch<40; ++epoch) {
+    for (uint32_t epoch=0; epoch<epochs; ++epoch) {
         for (uint32_t rank=0; rank<k; ++rank) {
             std::fill(input[rank].begin(), input[rank].end(), 0xb7);
             std::fill(output[rank].begin(), output[rank].end(), 0xc3);
@@ -76,12 +78,12 @@ static void Run(uint32_t k, uint32_t pathsPerPeer, uint32_t elementBytes)
                 l.sourceOffsets,l.remoteOffsets,l.pathBytes,l.selfOffset,l.peerBytes);
             hcomm::CcuRep::Env env;
             env.args=kernels[rank]->GeneArgs(task);
-            assert(env.args.size()==6+3*l.pathBytes.size());
+            assert(env.args.size()==9+3*l.pathBytes.size());
             env.remote=[&output](ChannelHandle ch,uint32_t slot) {
                 return slot==0 ? reinterpret_cast<uint64_t>(output[(ch-1)/100].data()+guard) : 2ULL;
             };
             for (const auto &i:kernels[rank]->instructions)
-                if(i.op=="local" || i.op=="remote") copies.emplace_back(i,env);
+                if(i.op=="local" || i.op=="remote" || i.op=="group_local") copies.emplace_back(i,env);
         }
         if(epoch%2) std::reverse(copies.begin(),copies.end());
         for(const auto &copy:copies) {
@@ -109,8 +111,11 @@ int main()
         for(auto paths:{1U,2U,3U,5U,7U}) Run(2,paths,bytes);
         for(auto paths:{1U,2U}) Run(4,paths,bytes);
     }
+    for(auto bytes:{33024U,262400U,4194304U}) {
+        Run(2,7,4,bytes,2); Run(4,2,4,bytes,2);
+    }
     for (auto local:{false,true}) {
-        RouteKernelArg arg({1,2},{0,1},local); TestKernel kernel(arg);
+        RouteKernelArg arg({1,2},{0,1},local,false); TestKernel kernel(arg);
         assert(kernel.Init()==0); CheckGraph(kernel,2,local);
         RouteTaskArg task(1,2,3,4,{0,256},{0,256},{256,256},0,512);
         assert(kernel.GeneArgs(task).size()==(local?12U:10U));
@@ -123,5 +128,9 @@ int main()
         TestKernel overKernel(over); assert(overKernel.Init()==HCCL_E_PARA);
         assert(overKernel.instructions.empty());
     }
+    RouteKernelArg boundary(std::vector<ChannelHandle>(13,1),std::vector<uint32_t>(13,0),true);
+    TestKernel boundaryKernel(boundary); assert(boundaryKernel.Init()==HCCL_SUCCESS);
+    RouteKernelArg tooMany(std::vector<ChannelHandle>(14,1),std::vector<uint32_t>(14,0),true);
+    TestKernel tooManyKernel(tooMany); assert(tooManyKernel.Init()==HCCL_E_PARA);
     std::cout<<"CPU_MODEL_PASS: production combined graph, 2/4 ranks, byte sizes 1/2/4, disjoint rows/guards, event ordering; NOT hardware proof\n";
 }

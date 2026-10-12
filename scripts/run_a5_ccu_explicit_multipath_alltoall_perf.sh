@@ -63,7 +63,7 @@ case "${graph_backend}" in
     *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
 esac
 case "${dtype}" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --dtype' >&2; exit 2;; esac
-[[ "$self_copy_mode" == overlap || "$self_copy_mode" == serial || "$self_copy_mode" == ccu ]] || exit 2
+[[ "$self_copy_mode" == overlap || "$self_copy_mode" == serial || "$self_copy_mode" == ccu || "$self_copy_mode" == ccu-direct ]] || exit 2
 export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
 
 case "${graph_backend}" in
@@ -232,10 +232,10 @@ version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
 assert value >= 14, f"route runtime ABI {value}, expected >= 14 (self-copy overlap)"
-if os.environ.get('A5_CCU_SELF_COPY_MODE') == 'ccu':
+if os.environ.get('A5_CCU_SELF_COPY_MODE') in ('ccu', 'ccu-direct'):
     combined = lib.A5CcuLocalRemoteAbiVersion
     combined.restype = ctypes.c_int
-    assert value >= 15 and combined() >= 1, 'ccu local+remote requires route ABI>=15; rebuild route probe'
+    assert value >= 16 and combined() >= 2, 'grouped-copy modes require route ABI>=16/local ABI>=2; rebuild route probe'
 overlap = lib.A5CcuCopyOverlapSupported
 overlap.restype = ctypes.c_int
 if os.environ.get('A5_CCU_SELF_COPY_MODE', 'overlap') == 'overlap':

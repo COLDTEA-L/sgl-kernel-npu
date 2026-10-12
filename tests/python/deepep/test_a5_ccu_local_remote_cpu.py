@@ -22,6 +22,7 @@ class CombinedTests(unittest.TestCase):
                 "-I" + str(ROOT / "tests/cpp/fake_ccu"),
                 str(ROOT / "tests/cpp/test_a5_ccu_local_remote_kernel.cpp"),
                 str(ROOT / "examples/a5_ccu_urma_route_probe/op_kernel_ccu/route_kernel.cc"),
+                str(ROOT / "tests/cpp/group_copy_model_stub.cc"),
                 "-o", binary], check=True, timeout=60)
             result = subprocess.run([binary], check=True, text=True, capture_output=True, timeout=30)
             self.assertIn("CPU_MODEL_PASS", result.stdout)
@@ -40,13 +41,16 @@ class CombinedTests(unittest.TestCase):
                     self_copy_mode="ccu", batch_validation=dict(status="PASS", rounds=2, calls_per_round=2))
                     for r in range(k)]
                 lines = ["RESULT_JSON " + json.dumps(r) for r in results]
-                markers = [f"CCU_LOCAL_REMOTE_PLAN handle=1 rank={r} enabled=1 self_copy=LocalCopyNb" for r in range(k)]
+                markers = [f"CCU_LOCAL_REMOTE_PLAN handle=1 rank={r} enabled=1 self_copy=GroupCopy8x32K" for r in range(k)]
                 log.write_text("\n".join(lines))
                 self.assertFalse(analyze(root)["complete"])
                 log.write_text("\n".join(lines + markers[:-1]))
                 self.assertFalse(analyze(root)["complete"])
                 log.write_text("\n".join(lines + markers))
                 self.assertTrue(analyze(root)["complete"])
+                log.write_text("\n".join(lines + [m.replace("GroupCopy8x32K","LocalCopyNb") for m in markers]))
+                self.assertFalse(analyze(root)["complete"])
+                log.write_text("\n".join(lines+markers))
                 status.write_text("137")
                 self.assertFalse(analyze(root)["complete"])
 

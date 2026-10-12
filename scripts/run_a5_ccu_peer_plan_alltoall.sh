@@ -48,7 +48,7 @@ while (($#)); do
         --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-phys IDs (two cards) | --relay-map JSON (per-pair policy)]; omit both for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
             echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).';
             echo '--dtype float16|bfloat16|float32|int8|int32 (default float32).';
-            echo '--self-copy-mode ccu (one CCU local+remote graph), overlap (default) or serial (D2D controls).'; exit 0;;
+            echo '--self-copy-mode ccu (one CCU local+remote graph, grouped MS copy), ccu-direct (large-copy control), overlap (default) or serial (D2D).'; exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
@@ -57,7 +57,7 @@ for value in "$bytes" "$iterations" "$repeats" "$timeout_seconds"; do
 done
 [[ "$warmup" =~ ^[0-9]+$ ]] || exit 2
 case "$dtype" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --dtype' >&2; exit 2;; esac
-[[ "$self_copy_mode" == overlap || "$self_copy_mode" == serial || "$self_copy_mode" == ccu ]] || exit 2
+[[ "$self_copy_mode" == overlap || "$self_copy_mode" == serial || "$self_copy_mode" == ccu || "$self_copy_mode" == ccu-direct ]] || exit 2
 export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
 [[ "$sync_mode" == per-call || "$sync_mode" == batch ]] || { echo 'invalid --sync-mode' >&2; exit 2; }

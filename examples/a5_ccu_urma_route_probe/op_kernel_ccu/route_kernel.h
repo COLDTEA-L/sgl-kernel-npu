@@ -1,7 +1,7 @@
 #ifndef A5_CCU_URMA_ROUTE_PROBE_KERNEL_H
 #define A5_CCU_URMA_ROUTE_PROBE_KERNEL_H
 
-#include <hcomm/ccu/ccu_kernel.h>
+#include "grouped_local_copy_kernel.h"
 
 #include <cstdint>
 #include <memory>
@@ -12,13 +12,15 @@ namespace a5_ccu_urma_probe {
 class RouteKernelArg : public hcomm::CcuKernelArg {
 public:
     RouteKernelArg(const std::vector<ChannelHandle> &channels,
-                   const std::vector<uint32_t> &routeIndices, bool localCopy = false);
+                   const std::vector<uint32_t> &routeIndices, bool localCopy = false, bool groupCopy = true);
     hcomm::CcuKernelSignature GetKernelSignature() const override;
     bool localCopy() const { return localCopy_; }
+    bool groupCopy() const { return localCopy_ && groupCopy_; }
 
 private:
     std::vector<uint32_t> routeIndices_;
     bool localCopy_ = false;
+    bool groupCopy_ = true;
 };
 
 class RouteTaskArg : public hcomm::CcuTaskArg {
@@ -44,16 +46,18 @@ public:
     uint64_t selfBytes;
 };
 
-class RouteKernel : public hcomm::CcuKernel {
+class RouteKernel : public GroupedLocalCopyKernel {
 public:
     explicit RouteKernel(const hcomm::CcuKernelArg &arg)
-        : hcomm::CcuKernel(arg), localCopy_(dynamic_cast<const RouteKernelArg &>(arg).localCopy()) {}
+        : GroupedLocalCopyKernel(arg), localCopy_(dynamic_cast<const RouteKernelArg &>(arg).localCopy()),
+          groupCopy_(dynamic_cast<const RouteKernelArg &>(arg).groupCopy()) {}
 
 protected:
     HcclResult Algorithm() override;
     std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
 private:
     bool localCopy_ = false;
+    bool groupCopy_ = false;
 };
 
 std::unique_ptr<hcomm::CcuKernel> CreateRouteKernel(const hcomm::CcuKernelArg &arg);

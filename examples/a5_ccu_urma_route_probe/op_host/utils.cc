@@ -795,7 +795,8 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     if (comm == nullptr || stream == nullptr || resources == nullptr) {
         return HCCL_E_PTR;
     }
-    const bool localCopy = kernelKind == RouteKernelKind::ROUTE_WRITE_LOCAL;
+    const bool groupCopy = kernelKind == RouteKernelKind::ROUTE_WRITE_GROUP_LOCAL;
+    const bool localCopy = groupCopy || kernelKind == RouteKernelKind::ROUTE_WRITE_LOCAL;
     std::vector<uint32_t> routeIndices;
     std::vector<std::string> requestedPathUids;
     CommandWorkerRegisterMode commandRegisterMode = CommandWorkerRegisterMode::FULL;
@@ -1071,7 +1072,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
                 "after all required CCU threads are ready\n",
                 rank, 1U - rank, routeIndices.front(), created.dieId);
     std::fflush(stdout);
-    if (localCopy && 6 + 3 * selectedDescs.size() > 48) return HCCL_E_PARA;
+    if (localCopy && (groupCopy ? 9 : 6) + 3 * selectedDescs.size() > 48) return HCCL_E_PARA;
     created.channels.resize(selectedDescs.size());
     const auto acquireBegin = std::chrono::steady_clock::now();
     if (EnvEnabled("A5_CCU_SEQUENTIAL_ACQUIRE_TRACE")) {
@@ -1165,17 +1166,17 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     HcclResult registerStatus = HCCL_E_INTERNAL;
     const char *kernelName = "unknown";
     std::printf("[A5 CCU URMA][rank=%u] register %s begin\n", rank,
-                kernelKind == RouteKernelKind::ROUTE_WRITE_LOCAL ? "local_and_remote" :
+                localCopy ? "local_and_remote" :
                 kernelKind == RouteKernelKind::ROUTE_WRITE ? "route_write" :
                 (kernelKind == RouteKernelKind::ALLTOALL_SERIAL ?
                     "alltoall_serial" :
                     (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER ?
                         "command_block_worker" : "alltoall_concurrent")));
     std::fflush(stdout);
-    if (kernelKind == RouteKernelKind::ROUTE_WRITE || kernelKind == RouteKernelKind::ROUTE_WRITE_LOCAL) {
-        created.ccuSelfCopy = kernelKind == RouteKernelKind::ROUTE_WRITE_LOCAL;
+    if (kernelKind == RouteKernelKind::ROUTE_WRITE || localCopy) {
+        created.ccuSelfCopy = localCopy; created.ccuGroupCopy=groupCopy;
         kernelName = created.ccuSelfCopy ? "local_and_remote" : "route_write";
-        RouteKernelArg kernelArg(created.channels, routeIndices, created.ccuSelfCopy);
+        RouteKernelArg kernelArg(created.channels, routeIndices, localCopy, groupCopy);
         hcomm::KernelCreator creator = CreateRouteKernel;
         registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
     } else if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
@@ -1225,7 +1226,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     if (!comm || !stream || !resources) return HCCL_E_PTR;
     PeerPlanResources result;
     auto &r = result.route;
-    const auto copyModeStatus = GetCcuSelfCopyMode(&r.ccuSelfCopy);
+    const auto copyModeStatus = GetCcuSelfCopyMode(&r.ccuSelfCopy,&r.ccuGroupCopy);
     if (copyModeStatus != HCCL_SUCCESS) return copyModeStatus;
     HcclResult status = HcclGetRankId(comm, &r.rank);
     if (status != HCCL_SUCCESS) return status;
@@ -1286,7 +1287,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                 CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
         }
     }
-    if (descs.empty() || (r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
+    if (descs.empty() || (r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);
     // Thread resources must exist before ChannelAcquire on every rank.
     status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread);
@@ -1311,7 +1312,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             r.rank, result.peers[i], i, r.weights[i], states[i], static_cast<unsigned long>(r.channels[i]));
         if (states[i] != 0 || !handles.insert(r.channels[i]).second) return HCCL_E_RUNTIME;
     }
-    RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy);
+    RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy);
     hcomm::KernelCreator creator = CreateRouteKernel;
     status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
     if (status != HCCL_SUCCESS) return status;

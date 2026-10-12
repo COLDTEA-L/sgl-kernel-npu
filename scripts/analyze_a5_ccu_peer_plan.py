@@ -11,7 +11,7 @@ from pathlib import Path
 def valid_result(result, k):
     sizes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}
     dtype = result.get("dtype", "float32")
-    if result.get("self_copy_mode", "serial") not in ("ccu", "serial", "overlap"):
+    if result.get("self_copy_mode", "serial") not in ("ccu", "ccu-direct", "serial", "overlap"):
         return False
     if not isinstance(dtype, str) or dtype not in sizes:
         return False
@@ -83,12 +83,14 @@ def analyze(root):
                 except (OSError, ValueError):
                     pass
         ccu_ranks = set()
+        group_ranks = set()
         for line in (log.read_text(errors="replace").splitlines() if log.exists() else []):
             if line.startswith("CCU_LOCAL_REMOTE_PLAN "):
                 fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
-                if fields.get("enabled") == "1" and fields.get("self_copy") == "LocalCopyNb":
+                if fields.get("enabled") == "1" and fields.get("self_copy") in ("LocalCopyNb", "GroupCopy8x32K"):
                     try:
                         ccu_ranks.add(int(fields["rank"]))
+                        if fields["self_copy"] == "GroupCopy8x32K": group_ranks.add(int(fields["rank"]))
                     except (KeyError, ValueError):
                         pass
         status_file = log.with_suffix(".status")
@@ -103,10 +105,14 @@ def analyze(root):
                              "float32" if key == "dtype" else "serial" if key == "self_copy_mode" else None) == settings[key]
                          for key in ("sync_mode", "warmup", "iterations", "bytes_per_peer", "graph_backend", "dtype", "self_copy_mode"))
                      for r in results))
-        combined_requested = settings.get("self_copy_mode") == "ccu" or any(
-            r.get("self_copy_mode") == "ccu" for r in results)
+        combined_requested = settings.get("self_copy_mode") in ("ccu", "ccu-direct") or any(
+            r.get("self_copy_mode") in ("ccu", "ccu-direct") for r in results)
         if combined_requested and ccu_ranks != set(range(k)):
             data_valid = False  # never accept a silent D2D fallback as CCU PASS
+        if settings.get("self_copy_mode") == "ccu" or any(r.get("self_copy_mode") == "ccu" for r in results):
+            if group_ranks != set(range(k)): data_valid = False
+        if settings.get("self_copy_mode") == "ccu-direct" or any(r.get("self_copy_mode") == "ccu-direct" for r in results):
+            if group_ranks: data_valid = False  # control must not silently run grouped copy
         valid = status == "0" and data_valid
         complete &= valid
         rows.append(dict(case=log.stem, status=status,
@@ -154,11 +160,12 @@ def analyze(root):
         "New runs use r*/results/rank*.json as authoritative; old stdout-only runs remain supported.",
         "A correct result does not independently identify the physical relay. Correlate topology ports with HCCN deltas."])
     (root / "peer_plan_report.md").write_text("\n".join(report) + "\n")
-    if summary["self_copy_mode"] == "ccu":
+    if summary["self_copy_mode"] in ("ccu", "ccu-direct"):
         verified = ("data, queued snapshots and lifecycle verified." if
                     all(r["sync_mode"] == "batch" for r in rows) else
                     "data and lifecycle verified (queued validation not requested).")
-        print("PASS: combined LocalCopyNb + peer WriteNb AllToAll; " + verified
+        local = "grouped MS copy" if summary["self_copy_mode"] == "ccu" else "direct LocalCopyNb"
+        print("PASS: combined " + local + " + peer WriteNb AllToAll; " + verified
               if complete else "FAIL_OR_INCOMPLETE: combined CCU AllToAll is not validated by this run.")
     return summary
 

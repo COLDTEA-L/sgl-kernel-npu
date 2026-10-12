@@ -1,6 +1,7 @@
 // Isolated CCU local-copy diagnostic. No ChannelAcquire, remote WriteNb,
 // ACL D2D memcpy, torch, or DeepEP. H2D/D2H are test setup/verification only.
 #include "local_copy_probe_data.h"
+#include "../op_kernel_ccu/grouped_local_copy_kernel.h"
 #include <acl/acl.h>
 #include <acl/acl_prof.h>
 #include <hccl/hccl_comm.h>
@@ -24,7 +25,7 @@ namespace {
 struct Options {
     uint32_t rank = 0, ranks = 2, changed = 3, queued = 20;
     size_t bytes = 4096;
-    bool chunked = false, builder = false, benchmark = false;
+    bool chunked = false, grouped = false, builder = false, benchmark = false;
     uint32_t warmup = 100, iterations = 20;
     std::string directory, profileDirectory;
 };
@@ -60,9 +61,10 @@ Options Parse(int argc, char **argv)
         if (key == "--case-dir") { result.directory = value; continue; }
         if (key == "--profile-dir") { result.profileDirectory = value; continue; }
         if (key == "--copy-mode") {
-            if (std::string(value) != "direct" && std::string(value) != "chunked")
-                throw std::runtime_error("copy-mode must be direct or chunked");
-            result.chunked = std::string(value) == "chunked"; continue;
+            if (std::string(value) != "direct" && std::string(value) != "chunked" && std::string(value) != "group")
+                throw std::runtime_error("copy-mode must be direct, chunked or group");
+            result.chunked = std::string(value) == "chunked";
+            result.grouped = std::string(value) == "group"; continue;
         }
         const auto number = Uint(value);
         if (number > UINT32_MAX) throw std::runtime_error("argument exceeds uint32 range");
@@ -84,14 +86,15 @@ Options Parse(int argc, char **argv)
         throw std::runtime_error("invalid benchmark options; profiling requires --benchmark");
     return result;
 }
+const char *ModeName() { return options.grouped ? "group" : options.chunked ? "chunked" : "direct"; }
 class LocalArg : public hcomm::CcuKernelArg {
 public:
-    explicit LocalArg(bool chunked) : chunked(chunked) {}
-    bool chunked;
+    LocalArg(bool chunked,bool group) : chunked(chunked),group(group) {}
+    bool chunked,group;
     hcomm::CcuKernelSignature GetKernelSignature() const override
     {
         hcomm::CcuKernelSignature signature;
-        signature.Append(chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
+        signature.Append(group ? "A5LocalGroup8x32KV1" : chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
         return signature;
     }
 };
@@ -101,23 +104,30 @@ public:
     LocalTask(uint64_t i, uint64_t o, uint64_t it, uint64_t ot, uint64_t n)
         : input(i), output(o), inputToken(it), outputToken(ot), bytes(n) {}
 };
-class LocalKernel : public hcomm::CcuKernel {
+class LocalKernel : public a5_ccu_urma_probe::GroupedLocalCopyKernel {
 public:
-    explicit LocalKernel(const hcomm::CcuKernelArg &arg) : CcuKernel(arg)
+    explicit LocalKernel(const hcomm::CcuKernelArg &arg) : GroupedLocalCopyKernel(arg)
     {
         const auto *local = dynamic_cast<const LocalArg *>(&arg);
         if (!local) throw std::runtime_error("wrong kernel argument type");
         chunked_ = local->chunked;
+        grouped_ = local->group;
     }
 protected:
     HcclResult Algorithm() override
     {
         auto input = CreateVariable(), output = CreateVariable();
         auto inputToken = CreateVariable(), outputToken = CreateVariable(), bytes = CreateVariable();
-        Load(input); Load(output); Load(inputToken); Load(outputToken); Load(bytes);
+        Load(input); Load(output); Load(inputToken); Load(outputToken);
         auto source = CreateLocalAddr(), destination = CreateLocalAddr();
         source.addr = input; source.token = inputToken;
         destination.addr = output; destination.token = outputToken;
+        if(grouped_) {
+            std::array<hcomm::CcuRep::Variable,4> go;
+            for(auto &v:go) {v=CreateVariable(); Load(v);}
+            return GroupedLocalCopy(destination,source,go);
+        }
+        Load(bytes);
         auto done = CreateCompletedEvent(); // one event, stable lifetime, reused only after Wait
         if (!chunked_) {
             const auto status = LocalCopyNb(destination, source, bytes, done);
@@ -142,10 +152,17 @@ protected:
     {
         const auto *task = dynamic_cast<const LocalTask *>(&arg);
         if (!task) return {};
-        return {task->input, task->output, task->inputToken, task->outputToken, task->bytes};
+        std::vector<uint64_t> values={task->input,task->output,task->inputToken,task->outputToken};
+        if(grouped_) {
+            std::array<uint64_t,4> go;
+            if(!a5_ccu_urma_probe::BuildGroupCopyPlan(task->bytes,&go)) return {};
+            values.insert(values.end(),go.begin(),go.end());
+        } else values.push_back(task->bytes);
+        return values;
     }
 private:
     bool chunked_ = false;
+    bool grouped_ = false;
 };
 std::unique_ptr<hcomm::CcuKernel> CreateKernel(const hcomm::CcuKernelArg &arg)
 {
@@ -297,7 +314,7 @@ void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalT
         "\"warmup\":%u,\"iterations\":%u,\"host_batch_total_us\":%.9f,\"host_batch_avg_us\":%.9f,"
         "\"profile_requested\":%s,\"formal_h2d_d2h\":false,\"remote_write\":false,"
         "\"engine\":\"CCU\",\"post_check\":\"PASS\"}\n",
-        options.rank, static_cast<int>(getpid()), options.chunked ? "chunked" : "direct", options.bytes, options.warmup,
+        options.rank, static_cast<int>(getpid()), ModeName(), options.bytes, options.warmup,
         options.iterations, totalUs, totalUs / options.iterations,
         options.profileDirectory.empty() ? "false" : "true");
     std::fflush(stdout);
@@ -324,14 +341,14 @@ void Run()
     Mark("thread_acquire");
     Check(HcclThreadAcquireWithStream(resources.comm, COMM_ENGINE_CCU, resources.stream, 1, &thread),
           "HcclThreadAcquireWithStream");
-    LocalArg arg(options.chunked); // channels intentionally empty
+    LocalArg arg(options.chunked,options.grouped); // channels intentionally empty
     hcomm::KernelCreator creator = CreateKernel;
     CcuKernelHandle kernel = 0;
     Mark("kernel_register");
     Check(HcclCcuKernelRegister(resources.comm, &kernel, &creator, &arg), "HcclCcuKernelRegister");
     Check(HcclCcuKernelRegisterFinish(resources.comm), "HcclCcuKernelRegisterFinish");
     std::printf("LOCAL_COPY_KERNEL_REGISTERED rank=%u mode=%s channels=0\n", options.rank,
-                options.chunked ? "chunked" : "direct");
+                ModeName());
     const size_t span = options.bytes + 2 * GUARD, hostSpan = span * options.queued;
     Mark("allocate");
     Check(aclrtMalloc(&resources.input, span, ACL_MEM_MALLOC_HUGE_ONLY), "aclrtMalloc(input)");
@@ -379,7 +396,7 @@ void Run()
     std::printf("LOCAL_COPY_RESULT_JSON {\"rank\":%u,\"copy_mode\":\"%s\",\"bytes\":%zu,"
         "\"changed_calls\":%u,\"queued_calls\":%u,\"guards\":\"PASS\",\"status\":\"PASS\","
         "\"engine\":\"CCU\",\"channel_count\":0,\"acl_d2d\":false}\n",
-        options.rank, options.chunked ? "chunked" : "direct", options.bytes, options.changed, options.queued);
+        options.rank, ModeName(), options.bytes, options.changed, options.queued);
     std::fflush(stdout);
     Mark("cleanup_barrier"); CleanupBarrier(); resources.Close();
     std::printf("LOCAL_COPY_WORKER_PASS rank=%u LocalCopyNb+WaitEvent data+guards+cleanup=PASS\n", options.rank);
@@ -391,10 +408,10 @@ int main(int argc, char **argv)
     try {
         options = Parse(argc, argv);
         if (options.builder) {
-            LocalArg arg(options.chunked); LocalKernel kernel(arg);
+            LocalArg arg(options.chunked,options.grouped); LocalKernel kernel(arg);
             Check(kernel.Init(), "CcuKernel::Init");
             std::printf("LOCAL_COPY_BUILDER_PASS mode=%s graph_only=1 hardware_copy_executed=0\n",
-                options.chunked ? "chunked" : "direct");
+                ModeName());
         } else Run();
         return 0;
     } catch (const std::exception &error) {

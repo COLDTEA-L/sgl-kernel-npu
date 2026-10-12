@@ -3,8 +3,9 @@
 分支 `feature/a5-ccu-copy-comm-overlap`，基于多类型分支 `2bb77ec`。
 支持两卡 prepared-plan、两/四卡 peer-plan、FP16/BF16/FP32/INT8/INT32。
 默认 `--self-copy-mode overlap`；`serial` 保留原本本地copy后再CCU的对照。
-新增 `--self-copy-mode ccu`：同一个已注册CCU kernel内提交本地LocalCopyNb和远端WriteNb，
-不再创建D2D copy stream/Event；执行和验收指令见**第9节**。
+`--self-copy-mode ccu` 现为原生风格 GroupCopy（8路×32KiB、HBM→MS→HBM）与远端WriteNb；
+旧的整块LocalCopyNb保留为 `ccu-direct` 对照，不再作为高性能实现。
+不创建D2D copy stream/Event；新版本验证请从**第11节**开始，第9节组合测试也采用新版GroupCopy。
 不是直接恢复旧组合CCU kernel，不修改系统HCCL、不加载ko、不改变UB路由表。
 
 ## 1. 数据区域与 fork/join
@@ -106,8 +107,8 @@ python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check --
 
 需要重编安装route package。若已装多类型版DeepEP(peer ABI>=2、attr ABI>=12)，
 **无需重编DeepEP/wheel**；如果仍是旧FP32/旧四卡wheel，按多类型指南先升级wheel。
-不编译/替换系统libhccl。新版route产物：prepared ABI=15、peer ABI=4、
-local+remote ABI=1。旧serial/overlap最低要求仍为prepared ABI>=14、peer ABI>=3、
+不编译/替换系统libhccl。新版route产物：prepared ABI=16、peer ABI=5、
+local+remote ABI=2（原生风格GroupCopy）。旧serial/overlap最低要求仍为prepared ABI>=14、peer ABI>=3、
 copy-overlap ABI>=1。Supported()=1只说明找到Ex Event符号，不表示硬件/capture已验证。
 缺少该接口时overlap模式明确失败，不默默换不安全event；可选serial模式作对照。
 安装前停止本用户使用旧库的进程；共享CANN目录仍有公共文件覆盖风险。
@@ -461,7 +462,8 @@ bash scripts/run_a5_ccu_local_copy_probe.sh --builder-only \
 旧两卡 `ccu_urma_prepared_multipath_alltoall_policy_out` prepared-plan入口也支持ccu模式；
 推荐下面统一的peer-plan测试，两卡/四卡共用同一份环境和计时逻辑。
 
-组合CCU指令次序：
+新版 `ccu` 按原生GroupCopy结构执行；旧整块方案为 `ccu-direct` 对照。
+**以下第9.1节的指令图仅描述ccu-direct，不是新版ccu。** 新版见第11.2节。
 
 ```text
 Load input/output/tokens/selfOffset/selfBytes/path offsets
@@ -490,7 +492,8 @@ LocalCopyNb使用`LocalAddr -> LocalAddr`，与第8节direct模式相同，不�
 - **所有WriteNb都在第一次WaitEvent之前提交**；逐Channel后置握手防止前一轮接收未完
   就返回、下一轮覆写buffer。保留bridge的输入任务flush、DeviceGuard、recordStream。
 - 内核签名包含local模式和实际Channel集合；旧remote-only注册缓存不可能冒充组合kernel。
-- 共6+3×Channel数个uint64 launch参数，仍受48个参数限制（最多14 Channels）。
+- ccu-direct共6+3×Channel数个uint64 launch参数，最多14 Channels；新版ccu为
+  9+3×Channel数，最多13 Channels。两者受旧SDK48参数限制。
   两卡direct+6relay为7条，四卡每peer direct+1relay为6条；不是无限资源承诺。
 - 模式在图外绑定时固定；想换serial/overlap/ccu请建立新plan或用独立进程，不在同一
   plan执行中途改环境变量。不同stream须图外绑定，各rank策略匹配。
@@ -518,8 +521,8 @@ python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py \
   --runtime-check --self-copy-mode ccu
 ```
 
-要求route peer ABI>=4且`A5CcuLocalRemoteAbiVersion()>=1`；旧两卡入口要求prepared
-ABI>=15。检查通过只证明正确库已加载，不证明有卡数据正确。此预检会拒绝旧库。
+要求route peer ABI>=5且`A5CcuLocalRemoteAbiVersion()>=2`；旧两卡入口要求prepared
+ABI>=16。检查通过只证明正确库已加载，不证明有卡数据正确。此预检会拒绝旧库。
 
 ### 9.3 先验证direct-only，再验证显式relay
 
@@ -621,10 +624,10 @@ fi
 ```
 
 所有rank结果、改变输入batch gate、case退出清理均正确，且每个rank明确注册了
-LocalCopyNb组合模式，分析脚本才输出：
+GroupCopy8x32K组合模式，分析脚本才输出：
 
 ```text
-PASS: combined LocalCopyNb + peer WriteNb AllToAll; data, queued snapshots and lifecycle verified.
+PASS: combined grouped MS copy + peer WriteNb AllToAll; data, queued snapshots and lifecycle verified.
 ```
 
 缺rank、缺组合标记、退出失败、数据错误不会给整体PASS。这个PASS验证本次算子功能，
@@ -651,6 +654,7 @@ python3 tests/python/deepep/test_a5_ccu_local_remote_cpu.py
 此测试用CPU表示记录器编译**实际生产RouteKernel源码**，验证所有WriteNb在完成等待
 前提交、local/remote独立事件、逐Channel结束握手、参数Load/GeneArgs匹配，并模拟
 2/4卡、1/2/4字节、不同path数、40次新输入复用/乱序copy完成、source和guard保护。
+GroupCopy使用明确的CPU语义替身模拟字节位置，不模拟MS/Executor硬件；另有分批和尾块数学回归。
 它不是设备并行模拟器，不验证目标固件资源、DMA/CCU性能或真实graph capture。
 
 ## 10. 单独测量 CCU LocalCopyNb 的设备时间
@@ -785,3 +789,171 @@ bash scripts/run_a5_ccu_local_copy_perf.sh \
 `chunked`仍是每4KiB后Wait的串行控制，不等于原生GroupCopy，不能当作高性能优化。
 本次无卡开发验证只包含独立程序编译/构图、计时边界及合成CSV/timeline解析回归，
 **没有测得或预设真实NPU复制耗时**。
+
+## 11. 按原生 HCCL 改造 self copy：GroupCopy
+
+### 11.1 为什么改，具体借鉴了哪里
+
+已反馈4MiB整块LocalCopyNb约65–66us，ACL D2D约6–7us。按单份payload换算，
+分别约64GB/s与599–699GB/s。这说明在该配置下两种实现的有效吞吐相差约一个数量级，
+**不是卡内复制天然就要65us**；但单凭耗时不能断定是某条固件规则或某个内存通道造成。
+CCU local-memory指令与ACL D2D的搬运方式不同，也不能直接拿整卡HBM聚合带宽作为其保证。
+
+原生HCCL并不是用我们原来的单条大长度LocalCopyNb做self copy。参考：
+
+- `hccl/src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_all_to_all_mesh1d_multi_jetty.cc`：
+  先提交RemoteWrite，再GroupCopy，之后等待远端事件并PostSync。
+- `hccl/src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_alg_base.cc`：
+  `CreateMultiOpCopy / GroupCopy` 用LoopGroup、MS缓冲和多执行器并行复制。
+- `hccl/src/ops/all_to_all_v/template/ccu/kernel/ccu_kernel_utils.cc`：
+  完整批、尾块与Loop/Parallel/Offset参数编码。
+
+当前仓的原生代码含较新接口，不能直接照搬其缺失的C primitives。
+我们用目标CANN已具备的旧对象式SDK重建同一结构；也核对了开发容器旧版
+libhccl中GroupCopy的调用结构和三个参数编码函数。**不继承私有HCCL实现类、
+不链接新C primitives、不修改libhccl/MUE/UBUS路由表。**
+
+### 11.2 新数据面顺序及正确性
+
+```text
+注册一次：64个连续MS（8×8）+ 8个完成事件 + 8个执行器 + 两个LoopBlock
+
+每次CCU执行：交换各Channel远端地址/token
+    -> 所有显式direct/relay Channel提交WriteNb
+    -> GroupCopy本地self row
+         8路LoopGroup，每路每轮32KiB
+         HBM -> MS -> WaitEvent -> MS -> HBM -> WaitEvent
+         完整256KiB批 + residual-first尾块
+    -> 等待各远端WriteNb事件
+    -> 每Channel completion record/wait
+    -> kernel完成，后续才允许消费/覆写tensor
+```
+
+4MiB恰好是16批×8路×32KiB。它不是每4KiB host发一次，也不是每4KiB同步一次。
+LoopGroup在CCU图内运行，host仍只launch一次；组内读写Wait确保MS数据就绪和复用安全。
+资源使用连续块，MS/event按lane偏移，不能以不连续的单个资源代替。
+在原生顺序下远端写已提交，组内等待不会把远端提交拖到本地复制之后。
+能否实际并行及其性能仍要设备测量，不用指令顺序替代硬件证据。
+
+`send[r] -> recv[r]`与所有remote行互不重叠；源不被修改。保留原有输入生产依赖、
+非别名检查、元素对齐分片、token、per-channel尾握手、图和tensor寿命检查。
+完整批/尾块使用不同kernel参数，但不重新建Channel或注册资源。
+
+实现位置：
+
+| 内容 | sgl-kernel-npu文件 |
+|---|---|
+| 分批与尾块、编码 | `examples/a5_ccu_urma_route_probe/common/group_copy_plan.h` |
+| 旧SDK GroupCopy图 | `examples/a5_ccu_urma_route_probe/op_kernel_ccu/grouped_local_copy_kernel.cc` |
+| 与所有remote WriteNb组合 | `examples/a5_ccu_urma_route_probe/op_kernel_ccu/route_kernel.cc` |
+| peer-plan准备/调用 | `examples/a5_ccu_urma_route_probe/op_host/peer_plan_runtime.cc` |
+| 两卡prepared-plan准备/调用 | `examples/a5_ccu_urma_route_probe/op_host/all_to_all_multiroute.cc` |
+| 孤立复制正确性/prof | `examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc` |
+
+当前旧接口launch最多48个参数。group前缀9项，每Channel3项，所以当前实现最多
+13个Channel（两卡direct+6relay为7个；四卡每peer direct+1relay为6个，均满足）。
+self row最多2GiB，是此版循环编码边界，不是“硬件只能复制2GiB”。非法容量在launch前拒绝；
+未来更多peer/路径要扩展参数布局，不能静默丢路径。mode在图外bind时固定，切mode必须重建plan。
+
+### 11.3 先测孤立GroupCopy，不需要安装wheel或route SO
+
+先按第3节拉取本分支。该独立程序自行编译，仅使用当前系统CANN；不会覆盖生产SO。
+先做变化输入、guard、queued快照正确性测试，覆盖整批和尾块：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_local_copy_probe.sh \
+  --devices 2,3 --copy-mode group \
+  --sizes 4096,32768,33024,262144,262400,4194304 \
+  --changed-iters 3 --queued-iters 20 \
+  --timeout-seconds 300 --output-root /home/l00934901/profiling
+```
+
+所有case正确性PASS、guard/source未改变、正常退出才继续。`--builder-only`只是构图，
+不是设备PASS。整体通过时输出`PASS: GroupCopy8x32K (HBM-MS-HBM) completed on device`。
+再只测4MiB，100次warmup、20次正式，只采正式20：
+
+```bash
+bash scripts/run_a5_ccu_local_copy_perf.sh \
+  --devices 2,3 --copy-mode group --sizes 4194304 \
+  --warmup 100 --iters 20 --timeout-seconds 300 \
+  --output-root /home/l00934901/profiling
+```
+
+查看第10.3节的`local_copy_perf_summary.tsv`和MindStudio文件。本次case名为
+`group_4194304`。每rank必须有20个设备CCU任务、无正式memcpy，比较min/median/mean/max，
+不要用host均值或profiler size哨兵当作复制性能。旧控制仍可用`--copy-mode direct`重测。
+新版group不会回退到ACL D2D或整块LocalCopyNb；失败就保留日志停止，不能报性能成功。
+
+### 11.4 组合算子：构建安装及快速正确性
+
+第3节完整命令已包含route package编译安装与runtime-check；**组合算子必须安装新版**：
+prepared ABI16、peer ABI5、local+remote ABI2。已安装多dtype DeepEP wheel无需重装。
+不需要拉取/编译修改版libhccl，只使用HCCL仓作自定义package构建框架。
+
+```bash
+python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py \
+  --runtime-check --self-copy-mode ccu
+
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-phys 0,1 --dtype float32 --self-copy-mode ccu \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --dtype float32 --self-copy-mode ccu --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+```
+
+报告须complete=True；每rank日志应有`CCU_LOCAL_REMOTE_PLAN ... self_copy=GroupCopy8x32K`。
+`PASS: combined grouped MS copy + peer WriteNb AllToAll`表示数据、队列快照和生命周期通过，
+**不是性能PASS**。分析器拒绝以旧`LocalCopyNb`marker冒充新版group结果。
+尚未证明新kernel的ACLGraph时，不能沿用旧kernel的capture/replay PASS。
+可单独用`--sync-mode per-call --graph-backend aclgraph`做功能验证，性能仍用batch/none。
+五种dtype、direct-only也应按第9节矩阵分别检查。
+
+### 11.5 两卡2/4/6relay与四卡1relay的性能命令
+
+仅在通信卡和明确指定的外部relay允许使用时执行。所有命令只跑一轮，
+warmup100、正式20、同步在循环外、profiling只采正式阶段；direct:每条relay=2:1。
+
+```bash
+for relays in 0,1 0,1,4,5 0,1,4,5,6,7; do
+  bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+    --devices 2,3 --relay-phys "${relays}" --dtype float32 --self-copy-mode ccu \
+    --sync-mode batch --graph-backend none \
+    --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+    --output-root /home/l00934901/profiling || break
+done
+
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --dtype float32 --self-copy-mode ccu --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --output-root /home/l00934901/profiling
+```
+
+同一组卡/路径/大小做对照，仅改self-copy-mode：
+
+| mode | 本地复制实现 | 用途 |
+|---|---|---|
+| `ccu` | GroupCopy8x32K，同CCU kernel内 | 本次原生风格优化 |
+| `ccu-direct` | 整块LocalCopyNb+WaitEvent，同CCU kernel内 | 65–66us旧实现对照 |
+| `serial` | ACL D2D后远端CCU，caller stream | 6–7us D2D及总时间对照 |
+| `overlap` | 独立D2D stream与远端CCU fork/join | 原重叠方案，可能有peer等待偏斜 |
+
+`ccu`与`ccu-direct`的CCU任务包含本地复制；`serial/overlap`的CCU任务不包含D2D。
+应分别比较本地诊断、设备CCU任务及完整算子时间，不能只比不等价的CCU duration。
+四卡self4MiB、发送12MiB、接收12MiB，与两卡资源争用不同；若group孤立快但组合仍慢，
+再查活跃remote竞争/peer等待，而不是直接认定新增relay没有作用。
+
+开发验证：无卡容器完成自定义package编译（ABI16/5）、direct/chunked/group构图，
+旧libhccl编码函数数值比对、58项CPU回归（含2/4rank、4MiB/尾块/guard/容量）。
+CPU模型不模拟MS硬件调度，**新group的设备正确性和吞吐尚待上述有卡实验确认**；
+目前不承诺达到D2D的6–7us或恢复任何理论带宽。

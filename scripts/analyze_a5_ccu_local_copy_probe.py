@@ -76,7 +76,9 @@ def main():
     for row in result['cases']:
         print(f'{row["case"]}: {row["result"]} (process status={row["status"]})')
     if result['complete']:
-        print('PASS: LocalCopyNb + WaitEvent completed on device; changed payload, every queued snapshot, guards and cleanup verified.')
+        label = ('GroupCopy8x32K (HBM-MS-HBM)' if all(row['copy_mode'] == 'group' for row in result['cases'])
+                 else 'LocalCopyNb + WaitEvent')
+        print(f'PASS: {label} completed on device; changed payload, every queued snapshot, guards and cleanup verified.')
     else:
         print('FAIL_OR_INCOMPLETE: no overall hardware PASS; inspect per-case evidence and rank logs.')
     raise SystemExit(0 if result['complete'] else 1)

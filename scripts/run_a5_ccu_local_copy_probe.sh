@@ -35,7 +35,7 @@ while (($#)); do
         --help)
             echo 'Isolated CCU LocalCopyNb + WaitEvent diagnostic; no remote writes or ACL D2D.'
             echo 'Example (on NPU): bash scripts/run_a5_ccu_local_copy_probe.sh --devices 2,3 --output-root /home/l00934901/profiling'
-            echo '--devices one/two IDs; --sizes 4096,4194304; --copy-mode direct|chunked|both'
+            echo '--devices one/two IDs; --sizes 4096,4194304; --copy-mode direct|chunked|both|group (native-style parallel MS copy)'
             echo '--changed-iters 3 --queued-iters 20 --timeout-seconds 300 --cann-root PATH'
             echo '--builder-only compiles/builds representations without NPU; never counts as hardware PASS.'
             echo '--benchmark --warmup 100 --iters 20 [--profile] [--no-export]; times CCU-only batch after correctness gate.'
@@ -55,18 +55,19 @@ try:
     benchmark, profile, warmup, iterations = bool(int(sys.argv[9])), bool(int(sys.argv[10])), int(sys.argv[11]), int(sys.argv[12])
     if not 0 <= warmup <= 100000 or not 1 <= iterations <= 100000 or (profile and not benchmark):
         raise ValueError('profiling requires --benchmark; warmup 0..100000, iters 1..100000')
-    if len(devices) not in (1, 2) or mode not in ('direct', 'chunked', 'both'):
-        raise ValueError('one/two devices and direct|chunked|both required')
+    if len(devices) not in (1, 2) or mode not in ('direct', 'chunked', 'both', 'group'):
+        raise ValueError('one/two devices and direct|chunked|both|group required')
     if not 1 <= changed <= 1000 or not 1 <= queued <= 32 or timeout < 1:
         raise ValueError('invalid iteration count or timeout')
     if any(n < 256 or n > 64*1024*1024 or n % 256 or
-           (mode != 'direct' and n % 4096) or (n+8192)*2*queued > 256*1024*1024 for n in sizes):
-        raise ValueError('size must be aligned (chunked:4096, direct:256); pinned host budget <=256MiB/rank')
+           (mode in ('chunked','both') and n % 4096) or (n+8192)*2*queued > 256*1024*1024 for n in sizes):
+        raise ValueError('size must be aligned (chunked:4096, direct/group:256); pinned host budget <=256MiB/rank')
     # Small direct first; chunked controls before the largest single-operation
     # test, so a large-length failure cannot erase the smaller positive evidence.
     pairs = [('direct', sizes[0])] if mode == 'both' else []
     if mode in ('chunked', 'both'): pairs += [('chunked', n) for n in sizes]
     if mode == 'direct': pairs += [('direct', n) for n in sizes]
+    if mode == 'group': pairs += [('group', n) for n in sizes]
     elif mode == 'both': pairs += [('direct', n) for n in sizes[1:]]
     print(json.dumps(dict(devices=devices, changed_calls=changed, queued_calls=queued,
         builder_only=builder, benchmark=benchmark, profile=profile, warmup=warmup, iterations=iterations,
@@ -101,6 +102,7 @@ if ! g++ -std=c++14 -Wall -Wextra -Werror -DHOST_COMPILE -D_GLIBCXX_USE_CXX11_AB
     -I"${cann_root}/include" -I"${cann_root}/include/hccl" -I"${cann_root}/include/hcomm" \
     -I"${cann_root}/pkg_inc" -I"${cann_root}/pkg_inc/hcomm" -I"${cann_root}/pkg_inc/hcomm/ccu" \
     "${repo}/examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc" \
+    "${repo}/examples/a5_ccu_urma_route_probe/op_kernel_ccu/grouped_local_copy_kernel.cc" \
     -L"${cann_root}/lib64" -Wl,-rpath,"${cann_root}/lib64" \
     -Wl,--no-as-needed -lhccl -lhcomm -lascendcl -lmsprofiler -Wl,--as-needed -ldl -pthread \
     -o "$binary" > "${run_dir}/build.log" 2>&1; then
@@ -109,7 +111,7 @@ if ! g++ -std=c++14 -Wall -Wextra -Werror -DHOST_COMPILE -D_GLIBCXX_USE_CXX11_AB
 fi
 ranks=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["devices"]))' "${run_dir}/run_settings.json")
 if ((builder_only)); then
-    for mode in direct chunked; do
+    for mode in direct chunked group; do
         timeout --signal=TERM --kill-after=5 "$timeout_seconds" "$binary" --builder-check --copy-mode "$mode" \
             > "${run_dir}/builder_${mode}.log" 2>&1
         cat "${run_dir}/builder_${mode}.log"

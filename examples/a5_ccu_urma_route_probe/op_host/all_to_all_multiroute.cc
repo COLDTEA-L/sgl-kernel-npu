@@ -250,6 +250,7 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
         std::fprintf(stderr, "[A5 CCU URMA] invalid size, chunks, or overlapping buffers\n");
         return HCCL_E_PARA;
     }
+    if(resources.ccuGroupCopy && layout.peerBytes > a5_ccu_urma_probe::GROUP_MAX_BYTES) return HCCL_E_PARA;
     const uint64_t bytes = layout.peerBytes;
     const uint64_t totalBytes = layout.totalBytes;
     auto *input = static_cast<unsigned char *>(sendBuf);
@@ -360,7 +361,8 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // Version 13 infers byte layouts from FP16/BF16/FP32/INT8/INT32.
     // Version 14 adds separate self-copy fork/join with reusable Ex events.
     // Version 15 adds opt-in combined LocalCopyNb + WriteNb (no ACL D2D).
-    return 15;
+    // Version 16: native-style grouped MS copy, opt-in ccu-direct control.
+    return 16;
 }
 
 namespace {
@@ -405,11 +407,12 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
                 static_cast<unsigned long>(planHandle), stream);
     std::fflush(stdout);
     RouteResources created;
-    bool ccuCopy = false;
-    const auto modeStatus = GetCcuSelfCopyMode(&ccuCopy);
+    bool ccuCopy = false,groupCopy=false;
+    const auto modeStatus = GetCcuSelfCopyMode(&ccuCopy,&groupCopy);
     if (modeStatus != HCCL_SUCCESS) return modeStatus;
     const HcclResult status = GetRouteResources(
-        preparedComm, stream, ccuCopy ? RouteKernelKind::ROUTE_WRITE_LOCAL : RouteKernelKind::ROUTE_WRITE,
+        preparedComm, stream, groupCopy ? RouteKernelKind::ROUTE_WRITE_GROUP_LOCAL :
+            ccuCopy ? RouteKernelKind::ROUTE_WRITE_LOCAL : RouteKernelKind::ROUTE_WRITE,
         &created, &request);
     if (status != HCCL_SUCCESS) return status;
     if (!created.ccuSelfCopy) {
@@ -418,7 +421,7 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
     }
     std::printf("CCU_LOCAL_REMOTE_PLAN handle=%lu rank=%u enabled=%u self_copy=%s\n",
         static_cast<unsigned long>(planHandle), created.rank, created.ccuSelfCopy ? 1U : 0U,
-        created.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
+        created.ccuGroupCopy ? "GroupCopy8x32K" : created.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
     std::fflush(stdout);
     {
         std::lock_guard<std::mutex> lock(g_planMutex);

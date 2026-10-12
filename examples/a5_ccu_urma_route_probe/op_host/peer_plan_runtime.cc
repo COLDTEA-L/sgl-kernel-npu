@@ -124,13 +124,13 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
     std::fflush(stdout);
     std::printf("CCU_LOCAL_REMOTE_PLAN handle=%lu rank=%u enabled=%u self_copy=%s\n",
         static_cast<unsigned long>(handle), resources.route.rank, resources.route.ccuSelfCopy ? 1U : 0U,
-        resources.route.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
+        resources.route.ccuGroupCopy ? "GroupCopy8x32K" : resources.route.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
     std::fflush(stdout);
     return HCCL_SUCCESS;
 }
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 4; }
+extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 5; }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
@@ -212,6 +212,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     if (!BuildPeerPathLayout(elementsPerPeer, r.rank, r.rankSize, resources.peers, weights, &layout, elementBytes) ||
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
                               layout.totalBytes)) return HCCL_E_PARA;
+    if (r.ccuGroupCopy && layout.peerBytes > GROUP_MAX_BYTES) return HCCL_E_PARA;
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), layout.totalBytes);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), layout.totalBytes);
     auto *input = static_cast<unsigned char *>(send);

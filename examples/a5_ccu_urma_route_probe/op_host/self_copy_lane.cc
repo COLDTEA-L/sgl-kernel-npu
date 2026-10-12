@@ -28,18 +28,19 @@ extern "C" __attribute__((visibility("default"))) int A5CcuCopyOverlapSupported(
 }
 
 namespace a5_ccu_urma_probe {
-HcclResult GetCcuSelfCopyMode(bool *ccu)
+HcclResult GetCcuSelfCopyMode(bool *ccu, bool *group)
 {
     if (!ccu) return HCCL_E_PTR;
     const char *mode = std::getenv("A5_CCU_SELF_COPY_MODE");
-    *ccu = mode && std::strcmp(mode, "ccu") == 0;
+    *ccu = mode && (std::strcmp(mode, "ccu") == 0 || std::strcmp(mode, "ccu-direct") == 0);
+    if(group) *group = mode && std::strcmp(mode,"ccu")==0;
     if (!mode || *ccu || std::strcmp(mode, "overlap") == 0 || std::strcmp(mode, "serial") == 0)
         return HCCL_SUCCESS;
-    std::fprintf(stderr, "invalid A5_CCU_SELF_COPY_MODE; use ccu, serial or overlap\n");
+    std::fprintf(stderr, "invalid A5_CCU_SELF_COPY_MODE; use ccu, ccu-direct, serial or overlap\n");
     return HCCL_E_PARA;
 }
 
-extern "C" __attribute__((visibility("default"))) int A5CcuLocalRemoteAbiVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int A5CcuLocalRemoteAbiVersion() { return 2; }
 
 HcclResult SelfCopyLane::Create(aclrtStream main, std::shared_ptr<SelfCopyLane> *out)
 {

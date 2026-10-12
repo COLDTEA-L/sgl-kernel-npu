@@ -3,17 +3,19 @@
 分支：`feature/a5-ccu-copy-comm-overlap`（基于多类型分支）。本版在已验证的两卡 prepared-plan
 数据面上扩展 peer 维度，不改 HCCL、不改 UBUS route table，不加载新 ko。
 本地copy默认独立stream，与远端CCU分支fork/join；`--self-copy-mode serial`为对照。
-新增`--self-copy-mode ccu`：同一CCU kernel提交LocalCopyNb+所有WriteNb后再等待，
-不使用独立self D2D stream。更新要求、两/四卡短测、2/4/6 relay profiling及PASS分析
-见 [并行指南第9节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#9-已通过-local-copy-穿刺后的组合-alltoall-算子)。
-ccu模式需要route peer ABI>=4/local+remote ABI>=1；已有多类型DeepEP wheel不必重编。
+`--self-copy-mode ccu` 现为原生风格8路×32KiB GroupCopy，与所有remote WriteNb组合，
+不使用独立self D2D stream；旧整块LocalCopyNb保留为 `ccu-direct` 控制。
+先测孤立GroupCopy、再测组合算子的完整操作见
+[并行指南第11节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#11-按原生-hccl-改造-self-copygroupcopy)。
+ccu模式需要route peer ABI>=5/local+remote ABI>=2；需重编安装route自定义包，
+已有多类型DeepEP wheel不必重编。
 构建、正确性与性能A/B优先看 [copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
 两卡现在可直接用 `--devices 2,3 --relay-phys 0,1` 选择relay，无需修改JSON；
 两参数 `--relay-phys` / `--relay-map` 互斥，省略二者为direct-only。
 支持1、2、3等任意合法relay数量；四卡逐对策略仍用JSON，避免自动分配错误。
 2/4/6条relay的完整profiling命令见并行指南第5.1节。本次命令行更新只改脚本，
-已安装并行copy版runtime后，无需再次编译/安装。
+命令行功能不需重编，但本次GroupCopy升级须安装新版route runtime。
 
 ## 1. 范围、数据流与约束
 
@@ -21,7 +23,8 @@ ccu模式需要route peer ABI>=4/local+remote ABI>=1；已有多类型DeepEP whe
 支持 FP16、BF16、FP32、INT8、INT32，算子从输入 tensor 自动获取 dtype，输出同类型，
 不做转换。`--dtype` 仅供测试脚本创建输入，不是算子额外参数。
 实现、版本和逐类型验证见 [多类型实现与测试指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md)。
-源 rank `s` 的 `send[d]` 写入目的 rank `d` 的 `recv[s]`；self 分片在本地 D2D copy。
+源 rank `s` 的 `send[d]` 写入目的 rank `d` 的 `recv[s]`；self 分片按self-copy-mode
+使用本地D2D或CCU GroupCopy，不改变输出布局。
 `--bytes` 是**每个目的 rank**的数据量，包含 self；四卡 4 MiB/peer 对应 16 MiB tensor，
 每 rank 网络发送总量是 12 MiB，而非把 4 MiB 平分给三个 peer。
 

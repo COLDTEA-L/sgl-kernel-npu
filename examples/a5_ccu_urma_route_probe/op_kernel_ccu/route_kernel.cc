@@ -21,8 +21,8 @@ constexpr size_t MAX_ROUTE_PATHS = 64U;
 } // namespace
 
 RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
-                               const std::vector<uint32_t> &routeIndices, bool localCopy)
-    : routeIndices_(routeIndices), localCopy_(localCopy)
+                               const std::vector<uint32_t> &routeIndices, bool localCopy, bool groupCopy)
+    : routeIndices_(routeIndices), localCopy_(localCopy), groupCopy_(groupCopy)
 {
     channels = inputChannels;
 }
@@ -30,7 +30,8 @@ RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
 hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append(MakePathKernelSignature(localCopy_ ? "A5CcuUrmaLocalAndRemoteV1" :
+    signature.Append(MakePathKernelSignature(groupCopy() ? "A5CcuUrmaGroupedSelf8x32KV1" :
+        localCopy_ ? "A5CcuUrmaLocalAndRemoteV1" :
         "A5CcuUrmaMultiRouteV2", routeIndices_, channels));
     return signature;
 }
@@ -38,7 +39,7 @@ hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 HcclResult RouteKernel::Algorithm()
 {
     if (channels_.empty() || channels_.size() > MAX_ROUTE_PATHS ||
-        (localCopy_ ? 6U : 4U) + 3U * channels_.size() > 48U) {
+        (groupCopy_ ? 9U : localCopy_ ? 6U : 4U) + 3U * channels_.size() > 48U) {
         return HCCL_E_PARA;
     }
 
@@ -53,11 +54,13 @@ HcclResult RouteKernel::Algorithm()
 
     hcomm::CcuRep::Variable selfOffset;
     hcomm::CcuRep::Variable selfBytes;
+    std::array<hcomm::CcuRep::Variable,4> selfGo;
     if (localCopy_) {
         selfOffset = CreateVariable();
-        selfBytes = CreateVariable();
         Load(selfOffset);
-        Load(selfBytes);
+        if(groupCopy_) {
+            for(auto &v:selfGo) { v=CreateVariable(); Load(v); }
+        } else { selfBytes=CreateVariable(); Load(selfBytes); }
     }
 
     std::vector<hcomm::CcuRep::Variable> sourceOffsets;
@@ -90,7 +93,7 @@ HcclResult RouteKernel::Algorithm()
     // before peer waits, but DO NOT wait for it before submitting WriteNb.
     // The host validated self row vs incoming peer rows are disjoint.
     hcomm::CcuRep::CompletedEvent localEvent;
-    if (localCopy_) {
+    if (localCopy_ && !groupCopy_) {
         localEvent = CreateCompletedEvent();
         hcomm::CcuRep::LocalAddr src = CreateLocalAddr();
         hcomm::CcuRep::LocalAddr dst = CreateLocalAddr();
@@ -117,9 +120,14 @@ HcclResult RouteKernel::Algorithm()
         events.push_back(CreateCompletedEvent());
         CCU_KERNEL_CHECK(WriteNb(channels_[i], destination, source, pathBytes[i], events.back()));
     }
-    // Every remote WriteNb has now been issued. Local and remote work may
-    // overlap; waiting here does not serialize their submission.
-    if (localCopy_) CCU_KERNEL_CHECK(WaitEvent(localEvent));
+    // Native order: issue ALL remote writes first, then grouped local copy.
+    // Group's internal MS read/write waits do not delay remote submission.
+    if(groupCopy_) {
+        auto src=CreateLocalAddr(),dst=CreateLocalAddr();
+        src.addr=localInput; src.addr+=selfOffset; src.token=localInputToken;
+        dst.addr=localOutput; dst.addr+=selfOffset; dst.token=localOutputToken;
+        CCU_KERNEL_CHECK(GroupedLocalCopy(dst,src,selfGo));
+    } else if (localCopy_) CCU_KERNEL_CHECK(WaitEvent(localEvent));
     for (auto &event : events) {
         CCU_KERNEL_CHECK(WaitEvent(event));
     }
@@ -139,14 +147,18 @@ std::vector<uint64_t> RouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
         taskArg->sourceOffsets.size() != channels_.size() ||
         taskArg->remoteOffsets.size() != channels_.size() ||
         (localCopy_ && taskArg->selfBytes == 0) ||
-        (localCopy_ ? 6 : 4) + 3 * channels_.size() > 48) {
+        (groupCopy_ ? 9 : localCopy_ ? 6 : 4) + 3 * channels_.size() > 48) {
         return {};
     }
     std::vector<uint64_t> args = {taskArg->inputAddr, taskArg->outputAddr,
                                   taskArg->inputToken, taskArg->outputToken};
     if (localCopy_) {
         args.push_back(taskArg->selfOffset);
-        args.push_back(taskArg->selfBytes);
+        if(groupCopy_) {
+            std::array<uint64_t,4> go;
+            if(!BuildGroupCopyPlan(taskArg->selfBytes,&go)) return {};
+            args.insert(args.end(),go.begin(),go.end());
+        } else args.push_back(taskArg->selfBytes);
     }
     for (size_t i = 0; i < taskArg->pathBytes.size(); ++i) {
         args.push_back(taskArg->sourceOffsets[i]);

@@ -6,7 +6,7 @@
 
 namespace a5_ccu_urma_probe {
 // Validate mode before resource provisioning. ccu uses no D2D stream/events.
-HcclResult GetCcuSelfCopyMode(bool *ccu);
+HcclResult GetCcuSelfCopyMode(bool *ccu, bool *group = nullptr);
 // Owned by a (plan, execution stream), not constructed per invocation.
 // The caller stream joins the copy branch, so tensor allocator lifetimes
 // recorded on that caller stream also cover copy-stream accesses.
