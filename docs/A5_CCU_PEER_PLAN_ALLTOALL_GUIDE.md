@@ -5,6 +5,11 @@
 本地copy默认独立stream，与远端CCU分支fork/join；`--self-copy-mode serial`为对照。
 构建、正确性与性能A/B优先看 [copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
+两卡现在可直接用 `--devices 2,3 --relay-phys 0,1` 选择relay，无需修改JSON；
+两参数 `--relay-phys` / `--relay-map` 互斥，省略二者为direct-only。
+支持1、2、3等任意合法relay数量；四卡逐对策略仍用JSON，避免自动分配错误。
+2/4/6条relay的完整profiling命令见并行指南第5.1节。本次命令行更新只改脚本，
+已安装并行copy版runtime后，无需再次编译/安装。
 
 ## 1. 范围、数据流与约束
 
@@ -206,7 +211,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
   --output-root /home/l00934901/profiling
 ```
 
-不传 `--relay-map` 就是 direct-only，也不依赖 hccn EID 文件。
+不传 `--relay-map` 或 `--relay-phys` 就是 direct-only，也不依赖 hccn EID 文件。
 逻辑 rank 与 `--devices` 的顺序对应，可使用其他四张卡或任意两张卡。
 
 ### 4.1 `unrecognized arguments` / 错误进入旧两卡脚本
@@ -407,13 +412,13 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_example.json \
+  --devices 2,3 --relay-phys 0,1 \
   --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
   --output-root /home/l00934901/profiling
 ```
 
-`{"2,3":[0]}`、`{"2,3":[0,1,4]}`、五条或六条均允许，不要求偶数。
-两卡 direct-only 只需 `--devices 2,3`，不传 map。
+`--relay-phys 0`、`--relay-phys 0,1,4`、五条或六条均允许，不要求偶数。
+两卡 direct-only 只需 `--devices 2,3`，不传relay列表或map。原JSON方式保留兼容。
 原来的 `run_a5_ccu_explicit_multipath_alltoall_perf.sh` 与旧 APIs 未替换，仍按旧两卡行为运行。
 
 ## 7. 性能 / profiling / graph 分开验证

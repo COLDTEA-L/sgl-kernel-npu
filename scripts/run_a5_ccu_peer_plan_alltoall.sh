@@ -4,6 +4,9 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 devices=0,1,2,3
 available=0,1,2,3,4,5,6,7
 relay_map=
+relay_phys=
+relay_map_set=0
+relay_phys_set=0
 direct_route=0
 bytes=4194304
 dtype=float32
@@ -24,7 +27,8 @@ while (($#)); do
     case "$1" in
         --devices) devices=$2; shift 2;;
         --available-phys) available=$2; shift 2;;
-        --relay-map) relay_map=$2; shift 2;;
+        --relay-map) relay_map=$2; relay_map_set=1; shift 2;;
+        --relay-phys) relay_phys=$2; relay_phys_set=1; shift 2;;
         --direct-route) direct_route=$2; shift 2;;
         --bytes) bytes=$2; shift 2;;
         --dtype) dtype=$2; shift 2;;
@@ -41,7 +45,7 @@ while (($#)); do
         --output-root) output_root=$2; shift 2;;
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
-        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-map JSON]; omit map for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
+        --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-phys IDs (two cards) | --relay-map JSON (per-pair policy)]; omit both for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
             echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).';
             echo '--dtype float16|bfloat16|float32|int8|int32 (default float32).';
             echo '--self-copy-mode overlap (default) or serial (control).'; exit 0;;
@@ -58,6 +62,16 @@ export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
 [[ "$sync_mode" == per-call || "$sync_mode" == batch ]] || { echo 'invalid --sync-mode' >&2; exit 2; }
 [[ "$sync_mode" != batch || "$graph" == none ]] || { echo 'batch requires --graph-backend none' >&2; exit 2; }
+if ((relay_map_set && relay_phys_set)); then
+    echo '--relay-phys and --relay-map are mutually exclusive' >&2; exit 2
+fi
+# Validate the physical policy before importing any NPU runtime. Reuse the
+# same argument vector for manifest generation; never hard-code a relay pool.
+plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
+    --topology "$topology" --topology-json "$topology_json")
+((relay_map_set == 0)) || plan_args+=(--relay-map "$relay_map")
+((relay_phys_set == 0)) || plan_args+=(--relay-phys "$relay_phys")
+python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}" --validate-only
 source "${repo}/scripts/a5_ccu_test_env.sh"
 a5_ccu_prepare_test_env "$cann_root" "$repo"
 export A5_CCU_ROUTE_PROBE_LIB=${A5_CCU_ROUTE_PROBE_LIB:-${cann_root}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so}
@@ -77,10 +91,7 @@ import json, pathlib, sys
     self_copy_mode=sys.argv[9])) + '\n')
 PY
 echo "Result directory: ${run_dir}"
-plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
-    --topology "$topology" --topology-json "$topology_json" --output-dir "${run_dir}/plans")
-[[ -z "$relay_map" ]] || plan_args+=(--relay-map "$relay_map")
-python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}"
+python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}" --output-dir "${run_dir}/plans"
 k=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["devices"]))' "${run_dir}/plans/peer_plan.json")
 n=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["available_devices"]))' "${run_dir}/plans/peer_plan.json")
 export ASCEND_RT_VISIBLE_DEVICES="$devices" PYTHONUNBUFFERED=1

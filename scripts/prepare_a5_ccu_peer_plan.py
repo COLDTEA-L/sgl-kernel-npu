@@ -13,6 +13,27 @@ FIELDS = ("src_rank", "dst_rank", "src_phy", "dst_phy", "kind", "relay_phy",
           "direct_route", "weight", "src_die", "dst_die", "src_eid", "dst_eid")
 
 
+def parse_phys_ids(value, option):
+    parts = value.split(",")
+    if any(not part.strip().isascii() or not part.strip().isdecimal() for part in parts):
+        raise ValueError(f"{option} requires comma-separated nonnegative physical IDs")
+    ids = [int(part.strip()) for part in parts]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{option} must contain no duplicates")
+    return ids
+
+
+def load_requested_policy(devices, relay_map=None, relay_phys=None):
+    if relay_map is not None and relay_phys is not None:
+        raise ValueError("--relay-phys and --relay-map are mutually exclusive")
+    if relay_phys is not None:
+        if len(devices) != 2:
+            raise ValueError("--relay-phys is for two-card tests; use --relay-map for per-pair four-card policies")
+        relays = parse_phys_ids(relay_phys, "--relay-phys")
+        return {",".join(str(device) for device in sorted(devices)): relays}
+    return json.loads(relay_map.read_text()) if relay_map is not None else {}
+
+
 def validate_policy(devices, available, policy):
     if len(devices) not in (2, 4) or len(set(devices)) != len(devices):
         raise ValueError("--devices requires 2 or 4 distinct physical devices")
@@ -81,19 +102,28 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--devices", required=True)
     p.add_argument("--available-phys", default="0,1,2,3,4,5,6,7")
-    p.add_argument("--relay-map", type=Path)
+    relay_options = p.add_mutually_exclusive_group()
+    relay_options.add_argument("--relay-map", type=Path, help="explicit physical-pair JSON policy (two or four cards)")
+    relay_options.add_argument("--relay-phys", help="two-card explicit relay IDs, e.g. 0,1; omit both options for direct-only")
     p.add_argument("--direct-route", type=int, default=0)
     p.add_argument("--topology", type=Path, default=Path("docs/topology/a5_hccn_device_topology_raw.txt"))
     p.add_argument("--topology-json", type=Path, default=Path("/usr/local/Ascend/driver/topo/950/atlas_950_1.json"))
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path)
+    p.add_argument("--validate-only", action="store_true", help="validate policy without runtime, topology reads or file writes")
     args = p.parse_args()
+    if not args.validate_only and args.output_dir is None:
+        p.error("--output-dir is required unless --validate-only is used")
     try:
-        devices = [int(x) for x in args.devices.split(",")]
-        available = [int(x) for x in args.available_phys.split(",")]
+        devices = parse_phys_ids(args.devices, "--devices")
+        available = parse_phys_ids(args.available_phys, "--available-phys")
         if args.direct_route < 0:
             raise ValueError("direct route must be nonnegative")
-        policy = json.loads(args.relay_map.read_text()) if args.relay_map else {}
-        normalized, _ = validate_policy(devices, available, policy)
+        policy = load_requested_policy(devices, args.relay_map, args.relay_phys)
+        normalized, limit = validate_policy(devices, available, policy)
+        if args.validate_only:
+            print("PEER_POLICY_VALIDATED " + json.dumps(dict(devices=devices,
+                available_devices=available, relay_limit_per_peer=limit, relay_policy=policy)))
+            return
         if any(normalized.values()):
             entries = load_entries(args.topology)
             known, edges = load_topology(args.topology_json)
@@ -102,6 +132,9 @@ def main():
         else:
             entries, edges = [], []  # direct-only never requires an EID inventory
         rows, summary = build_rows(devices, available, policy, entries, edges, args.direct_route)
+        summary["policy_source"] = ("command_line" if args.relay_phys is not None
+                                    else "json" if args.relay_map is not None else "direct_only")
+        summary["requested_relay_policy"] = policy
     except (ValueError, KeyError, TypeError, OSError) as exc:
         p.error(str(exc))
     args.output_dir.mkdir(parents=True, exist_ok=True)

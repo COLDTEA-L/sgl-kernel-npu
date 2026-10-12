@@ -2,16 +2,61 @@
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
-from prepare_a5_ccu_peer_plan import build_rows, validate_policy
+from prepare_a5_ccu_peer_plan import build_rows, validate_policy, load_requested_policy
 from analyze_a5_ccu_peer_plan import analyze, valid_result
 
 
 class PeerPlanTests(unittest.TestCase):
+    def test_command_line_relay_policy_preserves_ids_and_order(self):
+        pool = [0, 1, 4, 5, 6, 7]
+        for count in range(1, 7):
+            relays = list(reversed(pool[:count]))
+            policy = load_requested_policy([3, 2], relay_phys=",".join(map(str, relays)))
+            self.assertEqual(policy, {"2,3": relays})
+            validate_policy([3, 2], list(range(8)), policy)
+        self.assertEqual(load_requested_policy([2, 3]), {})
+        for value in ("", "0,", ",1", "0,,1", "0,0", "-1", "1.5"):
+            with self.assertRaises(ValueError):
+                load_requested_policy([2, 3], relay_phys=value)
+        with self.assertRaises(ValueError):
+            load_requested_policy([0, 1, 2, 3], relay_phys="4")
+        with self.assertRaises(ValueError):
+            load_requested_policy([2, 3], Path("unused.json"), "0,1")
+
+    def test_relay_cli_validates_without_topology_or_runtime(self):
+        command = [sys.executable, str(ROOT / "scripts/prepare_a5_ccu_peer_plan.py"),
+                   "--devices", "3,2", "--topology", "/not-present/eids.txt",
+                   "--topology-json", "/not-present/topology.json", "--validate-only"]
+        for relays in ("0", "0,1", "0,1,4", "0,1,4,5", "0,1,4,5,6", "0,1,4,5,6,7"):
+            result = subprocess.run(command + ["--relay-phys", relays],
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout.split(" ", 1)[1])
+            self.assertEqual(data["relay_policy"], {"2,3": list(map(int, relays.split(",")))})
+        for options in (["--relay-phys", "2"], ["--relay-phys", "9"],
+                        ["--relay-phys", "0,0"], ["--relay-phys", ""],
+                        ["--relay-phys", "0", "--relay-map", "unused.json"]):
+            result = subprocess.run(command + options, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_launcher_rejects_relay_errors_before_loading_runtime(self):
+        script = str(ROOT / "scripts/run_a5_ccu_peer_plan_alltoall.sh")
+        for options in (["--devices", "2,3", "--relay-phys", "2"],
+                        ["--devices", "2,3", "--relay-phys", "0,0"],
+                        ["--devices", "0,1,2,3", "--relay-phys", "4"],
+                        ["--devices", "2,3", "--relay-phys", "0", "--relay-map", "unused.json"]):
+            result = subprocess.run(["bash", script, "--cann-root", "/not-present/cann"] + options,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("runtime_bootstrap", result.stdout)
+            self.assertNotIn("Result directory:", result.stdout)
+
     def test_malformed_timing_results_fail_closed(self):
         valid = dict(rank=0, ranks=4, correctness="PASS", host_call_us=[10], iterations=1, host_avg_us=10)
         self.assertTrue(valid_result(valid, 4))
@@ -75,6 +120,9 @@ class PeerPlanTests(unittest.TestCase):
         self.assertEqual(rows[1]["dst_eid"], entries[1]["eid"])
         self.assertEqual(data["relay_edges"][0]["relay_die"], 1)
         self.assertEqual(data["channels_per_rank"], [2, 2])
+        cli_rows, _ = build_rows([2, 3], list(range(8)),
+            load_requested_policy([2, 3], relay_phys="4"), entries, edges)
+        self.assertEqual(cli_rows, rows)
 
     def test_incomplete_analysis(self):
         with tempfile.TemporaryDirectory() as tmp:

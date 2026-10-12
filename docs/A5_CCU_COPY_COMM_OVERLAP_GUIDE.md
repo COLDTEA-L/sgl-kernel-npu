@@ -149,19 +149,35 @@ release_copy_plan_done。必须分别验证五种dtype；数据图外gate使用�
 
 ### 5.1 两卡 direct + 2 / 4 / 6 条显式 relay
 
-下面以通信卡2、3为例，使用三个独立JSON选择relay。三组分别是：
+下面以通信卡2、3为例，直接用命令行 `--relay-phys` 选择relay，不需要修改JSON。
+三组分别是：
 
-| 配置 | 显式 relay 卡 | 总 Channel 数 | 权重（direct在前） |
+| 命令行参数 | 显式 relay 卡 | 总 Channel 数 | 权重（direct在前） |
 |---|---|---:|---|
-| `a5_peer_plan_2rank_2relay.json` | 0、1 | 3 | 2,1,1 |
-| `a5_peer_plan_2rank_4relay.json` | 0、1、4、5 | 5 | 2,1,1,1,1 |
-| `a5_peer_plan_2rank_6relay.json` | 0、1、4、5、6、7 | 7 | 2,1,1,1,1,1,1 |
+| `--relay-phys 0,1` | 0、1 | 3 | 2,1,1 |
+| `--relay-phys 0,1,4,5` | 0、1、4、5 | 5 | 2,1,1,1,1 |
+| `--relay-phys 0,1,4,5,6,7` | 0、1、4、5、6、7 | 7 | 2,1,1,1,1,1,1 |
 
-每个JSON形如 `{"2,3": [0, 1]}`，key是通信双方的physical ID，数组是显式指定的
-relay physical ID。可修改数组或复制成自己的配置；修改通信卡时，同时修改key与
-`--devices`。这些编号只在示例配置中，不写死在算子里；真实port/EID由拓扑解析。
+只需修改 `--devices` 和 `--relay-phys` 的卡号即可适应资源变化。`--relay-phys`
+用于两卡唯一的通信对；保留列表顺序，不自动增减/替换relay。1、3、5条同样支持，
+不限制必须为2、4、6条。脚本将参数交给同一个拓扑/EID解析及manifest构建逻辑，
+不会根据卡号硬编码port/EID，也不修改CCU数据面。
 relay不能是通信域内的卡，且全部卡必须在 `--available-phys` 的集合中（默认0..7）。
-资源不允许时减少relay或去掉 `--relay-map` 测direct-only，不要借用未获准使用的卡。
+重复、负数、空列表、通信域内或不在available集合的relay会在加载NPU runtime之前
+被拒绝。资源不允许时减少relay，或省略 `--relay-phys` 和 `--relay-map` 测direct-only。
+不要借用未获准使用的卡。两参数互斥，不接受同时传入。
+
+四卡有多个通信对，继续用 `--relay-map JSON` 指定逐对策略；不能把一份relay列表
+自动复制给所有peer。原来的两卡JSON接口及2/4/6relay示例文件也保留兼容。
+
+可先只检查参数，不加载runtime、不读拓扑、不写文件：
+
+```bash
+python3 scripts/prepare_a5_ccu_peer_plan.py \
+  --devices 2,3 --relay-phys 0,1 --validate-only
+```
+
+`PEER_POLICY_VALIDATED` 只表示配置合法，不证明这些物理路径已经可以建链。
 
 三组都采用 **direct : 每一条relay = 2:1**。每peer总数据4MiB不变，因此每条路径
 分到的数据会随路径数改变，不是额外增加总流量。`--dtype` 可替换为其他支持的类型。
@@ -173,7 +189,7 @@ relay不能是通信域内的卡，且全部卡必须在 `--available-phys` 的�
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_2relay.json \
+  --devices 2,3 --relay-phys 0,1 \
   --direct-route 0 --dtype float32 --self-copy-mode overlap \
   --sync-mode batch --graph-backend none \
   --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
@@ -184,7 +200,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_4relay.json \
+  --devices 2,3 --relay-phys 0,1,4,5 \
   --direct-route 0 --dtype float32 --self-copy-mode overlap \
   --sync-mode batch --graph-backend none \
   --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
@@ -195,7 +211,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_6relay.json \
+  --devices 2,3 --relay-phys 0,1,4,5,6,7 \
   --direct-route 0 --dtype float32 --self-copy-mode overlap \
   --sync-mode batch --graph-backend none \
   --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
@@ -210,7 +226,7 @@ EID和权重；`peer_plan_report.md` 应complete=True且所有rank正确、正�
 
 ### 5.2 本地copy串行 / 并行A/B
 
-以下以6条relay为例。测2条或4条时，把JSON换成第5.1节对应文件即可。
+以下以6条relay为例。测2条或4条时，把 `--relay-phys` 换成第5.1节对应列表即可。
 两次都使用同一组路径，唯一改变的是本地copy与CCU的调度方式：
 
 ```bash
@@ -218,7 +234,7 @@ EID和权重；`peer_plan_report.md` 应complete=True且所有rank正确、正�
 set -e
 for mode in serial overlap; do
   bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-    --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_6relay.json \
+    --devices 2,3 --relay-phys 0,1,4,5,6,7 \
     --dtype float32 --self-copy-mode "${mode}" \
     --sync-mode batch --graph-backend none \
     --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
@@ -256,7 +272,7 @@ T560 runtime，编译或Ex符号存在不能替代这一步；任何失败都停
 
 ```bash
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_6relay.json \
+  --devices 2,3 --relay-phys 0,1,4,5,6,7 \
   --dtype bfloat16 --self-copy-mode overlap \
   --sync-mode per-call --graph-backend aclgraph \
   --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
