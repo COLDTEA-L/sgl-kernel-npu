@@ -147,9 +147,71 @@ release_copy_plan_done。必须分别验证五种dtype；数据图外gate使用�
 
 ## 5. 串行/并行A/B与profiling
 
-你的两卡direct+6relay使用以下可修改JSON示例：
-`docs/topology/a5_peer_plan_2rank_6relay.json`，物理2↔3借0、1、4、5、6、7。
-不把这些卡写死在算子；资源不允许时修改配置，或去掉relay-map测direct-only。
+### 5.1 两卡 direct + 2 / 4 / 6 条显式 relay
+
+下面以通信卡2、3为例，使用三个独立JSON选择relay。三组分别是：
+
+| 配置 | 显式 relay 卡 | 总 Channel 数 | 权重（direct在前） |
+|---|---|---:|---|
+| `a5_peer_plan_2rank_2relay.json` | 0、1 | 3 | 2,1,1 |
+| `a5_peer_plan_2rank_4relay.json` | 0、1、4、5 | 5 | 2,1,1,1,1 |
+| `a5_peer_plan_2rank_6relay.json` | 0、1、4、5、6、7 | 7 | 2,1,1,1,1,1,1 |
+
+每个JSON形如 `{"2,3": [0, 1]}`，key是通信双方的physical ID，数组是显式指定的
+relay physical ID。可修改数组或复制成自己的配置；修改通信卡时，同时修改key与
+`--devices`。这些编号只在示例配置中，不写死在算子里；真实port/EID由拓扑解析。
+relay不能是通信域内的卡，且全部卡必须在 `--available-phys` 的集合中（默认0..7）。
+资源不允许时减少relay或去掉 `--relay-map` 测direct-only，不要借用未获准使用的卡。
+
+三组都采用 **direct : 每一条relay = 2:1**。每peer总数据4MiB不变，因此每条路径
+分到的数据会随路径数改变，不是额外增加总流量。`--dtype` 可替换为其他支持的类型。
+
+先按第4节完成短测。下面每条命令只跑一轮，warmup100次、正式20次，profiling
+只采正式20次；没有graph capture，没有逐次device synchronize。
+
+两卡 direct + 2 条relay（0、1）：
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_2relay.json \
+  --direct-route 0 --dtype float32 --self-copy-mode overlap \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --output-root /home/l00934901/profiling
+```
+
+两卡 direct + 4 条relay（0、1、4、5）：
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_4relay.json \
+  --direct-route 0 --dtype float32 --self-copy-mode overlap \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --output-root /home/l00934901/profiling
+```
+
+两卡 direct + 6 条relay（0、1、4、5、6、7）：
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-map docs/topology/a5_peer_plan_2rank_6relay.json \
+  --direct-route 0 --dtype float32 --self-copy-mode overlap \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --output-root /home/l00934901/profiling
+```
+
+每条命令结束后记下它打印的 `Result directory`，三个目录使用相同前缀，
+不要仅取latest目录就当成全部三组结果。每组prof在其结果目录的
+`r1/profiling/rank0/` 和 `r1/profiling/rank1/` 下，MindStudio读取里面的
+`*_ascend_pt` 目录。`plans/peer_plan.tsv` 和 `plans/peer_plan.json` 可核对实际relay、
+EID和权重；`peer_plan_report.md` 应complete=True且所有rank正确、正常退出。
+
+### 5.2 本地copy串行 / 并行A/B
+
+以下以6条relay为例。测2条或4条时，把JSON换成第5.1节对应文件即可。
+两次都使用同一组路径，唯一改变的是本地copy与CCU的调度方式：
 
 ```bash
 (
@@ -171,6 +233,8 @@ done
 四卡换devices和relay-map即可，当前每peer最多1外部relay的约束不变。
 旧两卡性能脚本亦新增 `--self-copy-mode`，对prepared实现有效；native和legacy组合
 probe不由这个开关改写，因此不要把它当remote路径串/并行的schedule开关。
+
+### 5.3 如何判断重叠与完整耗时
 
 MindStudio中重叠要用**同一调用**的设备Ccu与D2D copy时间区间判断：
 
