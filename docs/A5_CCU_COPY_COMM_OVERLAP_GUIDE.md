@@ -91,6 +91,8 @@ git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
 git branch --show-current
 git rev-parse --short HEAD
+# 必须包含LocalCopyNb+WriteNb实现，不能只拉到旧的overlap版本。
+git merge-base --is-ancestor 613ce68 HEAD
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
 
@@ -98,7 +100,7 @@ HCCL_REPO=/home/l00934901/hccl \
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install --install-path /usr/local/Ascend/cann-9.1.T560
 
-python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
+python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check --self-copy-mode ccu
 )
 ```
 
@@ -567,12 +569,44 @@ for RELAYS in 0,1 0,1,4,5 0,1,4,5,6,7; do
 done
 ```
 
-四卡profiling把第9.3四卡命令改为`--warmup 100 --iters 20 --repeats 1 --profile`即可。
 serial对照用完全相同卡/路径/大小/计时模式，只改`--self-copy-mode serial`。
 组合模式正式区域预期主要是一个CCU任务，不再有算子self行的ACL D2D MemcpyAsync；
 输入构造、正确性快照、profiler自身仍可能产生其他memcpy，勿据名称一概判错。
 CCU任务含本地复制、远端通信及peer等待；它的时长不是纯链路write时间。系统仍可能
 出现rank起始偏差或资源争用，不能承诺全部消除历史波动。
+
+### 9.4.1 四卡 direct+relay：完整 profiling 指令
+
+先完成第9.2节新版安装/预检及第9.3节四卡短测，再执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX A5_CCU_PREPARED_ALLOW_LAZY_STREAM
+
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --self-copy-mode ccu \
+  --sync-mode batch --graph-backend none \
+  --dtype float32 --bytes 4194304 \
+  --warmup 100 --iters 20 --repeats 1 --profile \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+示例JSON显式指定：0↔1、2↔3用relay4；0↔2、1↔3用relay5；0↔3、1↔2用relay6。
+这些relay均在通信域0～3之外，不启动relay rank进程；每rank对应3个peer、共6条
+远端Channel（每peer一个direct和一个relay），另有本地self copy。
+每peer direct:relay=2:1；`--bytes`是每目的rank 4MiB，tensor总大小16MiB，含self行。
+如果卡组或relay不可用，先更换对应的逐peer JSON，不要只改devices沿用不匹配的map。
+
+初始化/资源注册一次；batch正确性gate、warmup100不采profiler，**只采正式20次**。
+warmup循环外同步，正式循环外同步，跑一轮。MindStudio输出位于本次目录
+`r1/profiling/rank0/`～`rank3/`；结果/PASS检查使用第9.5节命令。
+想测四卡direct-only，省略`--relay-map`即可；想做旧D2D串行对照，只改
+`--self-copy-mode serial`，其余卡组、数据量和计时参数保持一致。
 
 ### 9.5 组合PASS提示与分析
 

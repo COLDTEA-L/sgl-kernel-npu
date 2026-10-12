@@ -522,7 +522,48 @@ find "${RUN_DIR}" -path '*/results/rank*.json' -o -type d -name '*_ascend_pt'
 仍兼容旧stdout-only结果。分析器拒绝缺少batch门槛记录、模式不一致或错误的批均值。
 需要A/B对照时把`--sync-mode batch`改为`per-call`，其余参数保持不变。
 batch目前不与aclgraph组合；图capture/replay继续使用per-call单独验证。
-只修改Python/shell/分析脚本和文档，无HCCL或CCU二进制改动，**拉取即可，不用重新编译安装**。
+上述“拉取即可”仅指当时增加batch测试逻辑的更新；新增ccu本地+远端组合kernel必须
+重编安装route自定义包。已有多类型DeepEP wheel仍可用，见下节。
+
+### 7.0.1 四卡 direct+relay：CCU 本地复制与远端 WriteNb 组合模式
+
+先按[并行指南第3节及9.2节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#92-更新安装与abi预检)
+拉取包含`613ce68`的overlap分支并重编/安装route包，确认peer ABI>=4、local+remote
+ABI>=1。**不重编系统HCCL；已有多类型DeepEP wheel(peer ABI>=2)不必重装。**
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX A5_CCU_PREPARED_ALLOW_LAZY_STREAM
+
+# 先做四卡组合数据面短测；通过后再采性能。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --self-copy-mode ccu --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+
+# 正式：资源初始化一次，warmup100，测20，只采正式20，跑一轮。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 \
+  --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --self-copy-mode ccu --sync-mode batch --graph-backend none \
+  --dtype float32 --bytes 4194304 \
+  --warmup 100 --iters 20 --repeats 1 --profile \
+  --timeout-seconds 600 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+示例每对peer有direct+1 relay，direct:relay=2:1；0↔1/2↔3用4，0↔2/1↔3用5，
+0↔3/1↔2用6。relay不属于0～3通信域，不启动relay进程。每peer 4MiB，tensor为
+4×4MiB（含self行）。warmup/正式的显式synchronize均在各自循环外。
+profiler位于`r1/profiling/rank0/`～`rank3/`。
+batch gate之外的初始化、输入构造等任务不要与正式区域的组合CCU耗时混算。
+组合功能PASS、分析指令见[并行指南第9.5节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#95-组合pass提示与分析)。
+省略relay-map可测direct-only；换成serial可作原D2D模式对照。图验证另测，不混入性能。
 
 ### 7.1 四卡原生 HCCL AllToAll baseline（不是自定义 direct-only）
 
