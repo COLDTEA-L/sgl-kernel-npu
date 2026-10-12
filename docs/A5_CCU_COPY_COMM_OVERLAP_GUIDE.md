@@ -652,3 +652,136 @@ python3 tests/python/deepep/test_a5_ccu_local_remote_cpu.py
 前提交、local/remote独立事件、逐Channel结束握手、参数Load/GeneArgs匹配，并模拟
 2/4卡、1/2/4字节、不同path数、40次新输入复用/乱序copy完成、source和guard保护。
 它不是设备并行模拟器，不验证目标固件资源、DMA/CCU性能或真实graph capture。
+
+## 10. 单独测量 CCU LocalCopyNb 的设备时间
+
+### 10.1 目的、更新与执行
+
+用于定位组合模式2/4/6 relay均约80us：先测**单独4MiB本地复制**，而不是根据
+“local-copy正确性PASS”或整卡HBM理论峰值推断它一定很快。
+这只升级独立诊断程序/脚本，**拉取即可，不重编安装route包、不装DeepEP wheel、
+不改系统HCCL或ko**。脚本现场编译独立程序到本次结果目录，使用现有CANN SDK。
+
+```bash
+(
+set -e
+cd /home/l00934901/sgl-kernel-npu
+git stash push -m "backup-before-local-copy-perf-$(date +%Y%m%d_%H%M%S)"
+BRANCH=feature/a5-ccu-copy-comm-overlap
+git fetch origin "${BRANCH}"
+git switch "${BRANCH}"
+git merge --ff-only "origin/${BRANCH}"
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX ASCEND_LAUNCH_BLOCKING
+
+bash scripts/run_a5_ccu_local_copy_perf.sh \
+  --devices 2,3 \
+  --sizes 4194304 --copy-mode direct \
+  --warmup 100 --iters 20 \
+  --changed-iters 3 --queued-iters 20 \
+  --timeout-seconds 300 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+)
+```
+
+2、3分别执行自己的local-copy kernel，不互相发送payload。没有ChannelAcquire或
+远端WriteNb；通信域初始化可能有控制面通信，但它在计时/profiling之前完成。
+不需要relay卡。本测试默认有profiling，不要再在外面套msprof采集或另一种profiler。
+源码为`examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc`，沿用第8节
+已通过的同一LocalCopyNb+WaitEvent kernel，不是用ACL D2D替代CCU复制。
+
+### 10.2 明确的测量边界
+
+```text
+图外准备一次：comm -> thread -> kernel register/finish -> device buffers/tokens
+  -> 改变输入/guard/全部queued快照正确性gate
+  -> 准备本次输入（H2D）
+  -> 100次独立CCU LocalCopyNb+WaitEvent，循环外同步
+  -> 再毒化output（H2D），同步                    # 防止warmup结果冒充正式结果
+  -> aclprofStart
+  -> 20次独立CCU LocalCopyNb+WaitEvent，循环外同步 # 正式只有CCU launch
+  -> aclprofStop/Finalize
+  -> D2H回读input/output，检查数据和guard
+  -> 清理资源并退出
+```
+
+输入/输出地址相同，重复注册次数为1；正式阶段没有malloc、H2D、D2H、ACL D2D、
+输出毒化或每次host synchronize。correctness gate中有H2D/D2H快照，但不进入正式
+计时/profiler。warmup与正式是100+20个独立kernel调用，不是一个kernel内循环120次。
+固定输入仅用于稳态计时，前面的变化输入队列gate负责排除旧值/丢调用等错误。
+
+只采当前rank设备：通过当前device调用标准aclprof API。每个rank有独立PROF目录。
+采集配置为`ACL_PROF_TASK_TIME | ACL_PROF_ACL_API`，只在正式阶段开启；依据
+[官方profiling配置API](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_1610.html)。
+硬件是否实际上报完整CCU事件仍由本次导出内容确认，构图/编译成功不算设备计时证据。
+
+### 10.3 看结果与MindStudio文件
+
+脚本自动调用SDK的`msprof --export=on`导出，然后生成性能报告。
+这里是原生aclprof采集，**不是torch_npu的`*_ascend_pt`目录格式**：
+
+```text
+a5_ccu_local_copy_2_3_<时间>.<随机后缀>/
+├── local_copy_report.md                  # 变化输入/guard/cleanup正确性
+├── local_copy_perf_report.md             # host与device计时分别报告
+├── local_copy_perf_summary.tsv
+├── local_copy_device_samples.tsv         # 20个设备CCU duration及来源文件
+└── cases/direct_4194304/
+    ├── rank0.log / rank1.log
+    └── profiling/
+        ├── rank0/PROF_*/mindstudio_profiler_output/msprof_*.json
+        └── rank1/PROF_*/mindstudio_profiler_output/msprof_*.json
+```
+
+将导出的`msprof_*.json`导入MindStudio timeline，看**设备层的Ccu任务**，不是
+`HcclCcuKernelLaunch`/`rtCcuLaunch`的host API事件。具体导出层级以SDK输出为准。
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_local_copy_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -d "${RUN_DIR}"; then
+  python3 scripts/analyze_a5_ccu_local_copy_perf.py --run-dir "${RUN_DIR}"
+  column -s $'\t' -t "${RUN_DIR}/local_copy_perf_summary.tsv"
+  sed -n '1,220p' "${RUN_DIR}/local_copy_perf_report.md"
+  find "${RUN_DIR}/cases" -type f \( -name 'msprof*.json' -o -name 'task_time*.csv' -o -name 'export.log' \) -print
+fi
+```
+
+分析器优先读取明确us单位的`task_time*.csv`中CCU硬件任务，或完整timeline的Ccu
+事件；排除host API、去重重复导出。**每rank必须恰好20个CCU任务且没有正式memcpy
+任务**，否则不接受设备时间：不猜字段单位、不截取“最后20个”掩盖采集边界错误。
+也要求正确性gate、正式后回读及进程清理通过。
+
+报告`DEVICE_TIMING_CAPTURED`表示计时数据完整，不是“性能满足理论”的PASS。
+`INCOMPLETE_OR_FAIL`且正确性PASS时，先检查各rank的`export.log`、原始PROF目录和
+任务字段/数量，不能把host均值作为设备复制时间。如果没有msprof工具或用了
+`--no-export`，保留原始PROF，可在Toolkit环境按
+[官方导出命令](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0021.html)
+解析，再重新分析。也可用`--no-profile`只保留host批时间，但这不能验证设备80us猜测。
+
+### 10.4 判读及可选尺寸对照
+
+重点给出每rank的**CCU min/median/mean/max us**，同时注明大小和copy_mode：
+
+- 单独4MiB CCU local-copy也约80us：支持本地复制成为固定瓶颈的解释，再研究并行
+  GroupCopy/CcuBuffer流水化。仍不能凭这个测试就断言组合时没有资源竞争。
+- 单独local-copy很快，而组合约80us：重点转向local/remote资源争用、提交顺序和peer
+  等待。空Channel独立测试不是“与组合相同活跃资源条件”的性能保证。
+- 只有host批均值大，设备CCU任务很短：优先检查host提交/排队，不归因于复制硬件。
+
+整卡HBM带宽是聚合能力，单条CCU本地复制未必用到全部通道/并行资源。报告payload
+GB/s以真实配置的bytes计算；“read+write GB/s”只是2×bytes的名义流量换算，不是
+采集到的HBM计数。**忽略profiling中`size(Byte)=4294967295`之类的哨兵值。**
+
+可选测1/4/8MiB，减少队列正确性快照数量以限制pinned内存，各尺寸仍各自100+20：
+
+```bash
+bash scripts/run_a5_ccu_local_copy_perf.sh \
+  --devices 2,3 --sizes 1048576,4194304,8388608 --copy-mode direct \
+  --queued-iters 3 --warmup 100 --iters 20 \
+  --timeout-seconds 300 --output-root /home/l00934901/profiling
+```
+
+`chunked`仍是每4KiB后Wait的串行控制，不等于原生GroupCopy，不能当作高性能优化。
+本次无卡开发验证只包含独立程序编译/构图、计时边界及合成CSV/timeline解析回归，
+**没有测得或预设真实NPU复制耗时**。

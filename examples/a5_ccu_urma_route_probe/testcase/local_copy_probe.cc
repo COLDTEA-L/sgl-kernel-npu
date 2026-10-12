@@ -2,6 +2,7 @@
 // ACL D2D memcpy, torch, or DeepEP. H2D/D2H are test setup/verification only.
 #include "local_copy_probe_data.h"
 #include <acl/acl.h>
+#include <acl/acl_prof.h>
 #include <hccl/hccl_comm.h>
 #include <hccl/hccl_res.h>
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 using namespace a5_local_probe;
 namespace CcuRep = hcomm::CcuRep; // required by the target SDK's CCU_WHILE macro
@@ -22,8 +24,9 @@ namespace {
 struct Options {
     uint32_t rank = 0, ranks = 2, changed = 3, queued = 20;
     size_t bytes = 4096;
-    bool chunked = false, builder = false;
-    std::string directory;
+    bool chunked = false, builder = false, benchmark = false;
+    uint32_t warmup = 100, iterations = 20;
+    std::string directory, profileDirectory;
 };
 Options options;
 std::string phase;
@@ -51,9 +54,11 @@ Options Parse(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         if (key == "--builder-check") { result.builder = true; continue; }
+        if (key == "--benchmark") { result.benchmark = true; continue; }
         if (i + 1 >= argc) throw std::runtime_error("missing argument value");
         const char *value = argv[++i];
         if (key == "--case-dir") { result.directory = value; continue; }
+        if (key == "--profile-dir") { result.profileDirectory = value; continue; }
         if (key == "--copy-mode") {
             if (std::string(value) != "direct" && std::string(value) != "chunked")
                 throw std::runtime_error("copy-mode must be direct or chunked");
@@ -66,12 +71,17 @@ Options Parse(int argc, char **argv)
         else if (key == "--bytes") result.bytes = static_cast<size_t>(number);
         else if (key == "--changed-iters") result.changed = static_cast<uint32_t>(number);
         else if (key == "--queued-iters") result.queued = static_cast<uint32_t>(number);
+        else if (key == "--warmup") result.warmup = static_cast<uint32_t>(number);
+        else if (key == "--iters") result.iterations = static_cast<uint32_t>(number);
         else throw std::runtime_error("unknown argument: " + key);
     }
     if (!result.builder && (result.directory.empty() || result.ranks < 1 || result.ranks > 2 || result.rank >= result.ranks))
         throw std::runtime_error("hardware worker requires case-dir and valid rank/ranks (1 or 2)");
     if (result.changed < 1 || result.changed > 1000 || !ValidSize(result.bytes, result.queued, result.chunked))
         throw std::runtime_error("invalid size/count; chunked size must be a multiple of 4096; pinned budget <=256MiB/rank");
+    if (result.warmup > 100000 || result.iterations < 1 || result.iterations > 100000 ||
+        (!result.benchmark && !result.profileDirectory.empty()))
+        throw std::runtime_error("invalid benchmark options; profiling requires --benchmark");
     return result;
 }
 class LocalArg : public hcomm::CcuKernelArg {
@@ -214,6 +224,84 @@ void ShowLibrary(const char *api, void *symbol)
     std::printf("LOCAL_COPY_LIBRARY api=%s path=%s\n", api,
         dladdr(symbol, &info) && info.dli_fname ? info.dli_fname : "unknown");
 }
+class Profile {
+public:
+    ~Profile() { // error-only best effort; never free pending device buffers
+        if (started_) (void)aclprofStop(config_);
+        if (config_) (void)aclprofDestroyConfig(config_);
+        if (initialized_) (void)aclprofFinalize();
+    }
+    void Start()
+    {
+        if (options.profileDirectory.empty()) return;
+        ShowLibrary("aclprofStart", reinterpret_cast<void *>(aclprofStart));
+        Check(aclprofInit(options.profileDirectory.c_str(), options.profileDirectory.size()), "aclprofInit");
+        initialized_ = true;
+        int32_t current = -1;
+        Check(aclrtGetDevice(&current), "aclrtGetDevice(profiler)");
+        if (current < 0) throw std::runtime_error("invalid current device for profiler");
+        uint32_t device = static_cast<uint32_t>(current);
+        config_ = aclprofCreateConfig(&device, 1, ACL_AICORE_NONE, nullptr,
+            ACL_PROF_TASK_TIME | ACL_PROF_ACL_API);
+        if (!config_) throw std::runtime_error("aclprofCreateConfig returned null");
+        std::printf("LOCAL_COPY_PROFILE rank=%u current_device=%u output=%s formal_calls=%u\n",
+            options.rank, device, options.profileDirectory.c_str(), options.iterations);
+        std::fflush(stdout);
+        Check(aclprofStart(config_), "aclprofStart"); started_ = true;
+    }
+    void Stop()
+    {
+        if (!initialized_) return;
+        Check(aclprofStop(config_), "aclprofStop"); started_ = false;
+        Check(aclprofDestroyConfig(config_), "aclprofDestroyConfig"); config_ = nullptr;
+        Check(aclprofFinalize(), "aclprofFinalize"); initialized_ = false;
+    }
+private:
+    aclprofConfig *config_ = nullptr;
+    bool started_ = false, initialized_ = false;
+};
+
+void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalTask &task)
+{
+    const size_t span = options.bytes + 2 * GUARD;
+    const uint32_t epoch = options.changed + options.queued + 1;
+    Mark("benchmark_setup");
+    Fill(r.hostInput, options.bytes, options.rank, epoch, true);
+    Fill(r.hostOutput, options.bytes, options.rank, epoch, false);
+    Check(aclrtMemcpyAsync(r.input, span, r.hostInput, span, ACL_MEMCPY_HOST_TO_DEVICE, r.stream), "benchmark H2D input");
+    Check(aclrtMemcpyAsync(r.output, span, r.hostOutput, span, ACL_MEMCPY_HOST_TO_DEVICE, r.stream), "benchmark H2D poison");
+    Check(aclrtSynchronizeStream(r.stream), "benchmark setup synchronize");
+    Mark("benchmark_warmup");
+    for (uint32_t i = 0; i < options.warmup; ++i)
+        Check(HcclCcuKernelLaunch(r.comm, thread, kernel, &task), "warmup local CCU launch");
+    Check(aclrtSynchronizeStream(r.stream), "warmup batch synchronize");
+    // Re-poison after warmup: a stale warmup output cannot pass formal checks.
+    Check(aclrtMemcpyAsync(r.output, span, r.hostOutput, span, ACL_MEMCPY_HOST_TO_DEVICE, r.stream), "pre-profile poison");
+    Check(aclrtSynchronizeStream(r.stream), "pre-profile synchronize");
+    Profile profile;
+    profile.Start();
+    Mark("benchmark_measure");
+    const auto begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < options.iterations; ++i)
+        Check(HcclCcuKernelLaunch(r.comm, thread, kernel, &task), "formal local CCU launch");
+    Check(aclrtSynchronizeStream(r.stream), "formal batch synchronize");
+    const double totalUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
+    profile.Stop();
+    Mark("benchmark_readback");
+    // All readback is AFTER profile.Stop; none of these copies are timed.
+    Check(aclrtMemcpyAsync(r.hostOutput, span, r.output, span, ACL_MEMCPY_DEVICE_TO_HOST, r.stream), "post-profile output");
+    Check(aclrtMemcpyAsync(r.hostInput, span, r.input, span, ACL_MEMCPY_DEVICE_TO_HOST, r.stream), "post-profile input");
+    Check(aclrtSynchronizeStream(r.stream), "benchmark readback synchronize");
+    VerifyBuffer(r.hostOutput, epoch, false); VerifyBuffer(r.hostInput, epoch, true);
+    std::printf("LOCAL_COPY_PERF_JSON {\"rank\":%u,\"pid\":%d,\"copy_mode\":\"%s\",\"bytes\":%zu,"
+        "\"warmup\":%u,\"iterations\":%u,\"host_batch_total_us\":%.9f,\"host_batch_avg_us\":%.9f,"
+        "\"profile_requested\":%s,\"formal_h2d_d2h\":false,\"remote_write\":false,"
+        "\"engine\":\"CCU\",\"post_check\":\"PASS\"}\n",
+        options.rank, static_cast<int>(getpid()), options.chunked ? "chunked" : "direct", options.bytes, options.warmup,
+        options.iterations, totalUs, totalUs / options.iterations,
+        options.profileDirectory.empty() ? "false" : "true");
+    std::fflush(stdout);
+}
 void Run()
 {
     ShowLibrary("HcclCcuKernelLaunch", reinterpret_cast<void *>(HcclCcuKernelLaunch));
@@ -287,6 +375,7 @@ void Run()
         VerifyBuffer(resources.hostOutput + index * span, options.changed + index, false);
         VerifyBuffer(resources.hostInput + index * span, options.changed + index, true);
     }
+    if (options.benchmark) Benchmark(resources, thread, kernel, task);
     std::printf("LOCAL_COPY_RESULT_JSON {\"rank\":%u,\"copy_mode\":\"%s\",\"bytes\":%zu,"
         "\"changed_calls\":%u,\"queued_calls\":%u,\"guards\":\"PASS\",\"status\":\"PASS\","
         "\"engine\":\"CCU\",\"channel_count\":0,\"acl_d2d\":false}\n",

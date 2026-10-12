@@ -10,6 +10,11 @@ timeout_seconds=300
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 output_root=/home/l00934901/profiling
 builder_only=0
+benchmark=0
+profile=0
+warmup=100
+iterations=20
+export_profile=1
 while (($#)); do
     case "$1" in
         --devices) devices=$2; shift 2;;
@@ -21,18 +26,25 @@ while (($#)); do
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --builder-only) builder_only=1; shift;;
+        --benchmark) benchmark=1; shift;;
+        --profile) profile=1; shift;;
+        --no-profile) profile=0; shift;;
+        --warmup) warmup=$2; shift 2;;
+        --iters) iterations=$2; shift 2;;
+        --no-export) export_profile=0; shift;;
         --help)
             echo 'Isolated CCU LocalCopyNb + WaitEvent diagnostic; no remote writes or ACL D2D.'
             echo 'Example (on NPU): bash scripts/run_a5_ccu_local_copy_probe.sh --devices 2,3 --output-root /home/l00934901/profiling'
             echo '--devices one/two IDs; --sizes 4096,4194304; --copy-mode direct|chunked|both'
             echo '--changed-iters 3 --queued-iters 20 --timeout-seconds 300 --cann-root PATH'
             echo '--builder-only compiles/builds representations without NPU; never counts as hardware PASS.'
+            echo '--benchmark --warmup 100 --iters 20 [--profile] [--no-export]; times CCU-only batch after correctness gate.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
 # Import-safe policy helper only. Reject bad arguments before CANN initialization.
-metadata=$(python3 - "$repo/scripts" "$devices" "$sizes" "$copy_mode" "$changed" "$queued" "$timeout_seconds" "$builder_only" <<'PY'
+metadata=$(python3 - "$repo/scripts" "$devices" "$sizes" "$copy_mode" "$changed" "$queued" "$timeout_seconds" "$builder_only" "$benchmark" "$profile" "$warmup" "$iterations" <<'PY'
 import json, sys
 sys.path.insert(0, sys.argv[1])
 from prepare_a5_ccu_peer_plan import parse_phys_ids
@@ -40,6 +52,9 @@ try:
     devices = parse_phys_ids(sys.argv[2], '--devices')
     sizes = sorted(parse_phys_ids(sys.argv[3], '--sizes'))
     mode, changed, queued, timeout, builder = sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7]), bool(int(sys.argv[8]))
+    benchmark, profile, warmup, iterations = bool(int(sys.argv[9])), bool(int(sys.argv[10])), int(sys.argv[11]), int(sys.argv[12])
+    if not 0 <= warmup <= 100000 or not 1 <= iterations <= 100000 or (profile and not benchmark):
+        raise ValueError('profiling requires --benchmark; warmup 0..100000, iters 1..100000')
     if len(devices) not in (1, 2) or mode not in ('direct', 'chunked', 'both'):
         raise ValueError('one/two devices and direct|chunked|both required')
     if not 1 <= changed <= 1000 or not 1 <= queued <= 32 or timeout < 1:
@@ -54,7 +69,8 @@ try:
     if mode == 'direct': pairs += [('direct', n) for n in sizes]
     elif mode == 'both': pairs += [('direct', n) for n in sizes[1:]]
     print(json.dumps(dict(devices=devices, changed_calls=changed, queued_calls=queued,
-        builder_only=builder, cases=[dict(name=f'{m}_{n}', copy_mode=m, bytes=n) for m,n in pairs])))
+        builder_only=builder, benchmark=benchmark, profile=profile, warmup=warmup, iterations=iterations,
+        cases=[dict(name=f'{m}_{n}', copy_mode=m, bytes=n) for m,n in pairs])))
 except (ValueError, TypeError) as error:
     print(f'ERROR: {error}', file=sys.stderr); sys.exit(2)
 PY
@@ -86,7 +102,7 @@ if ! g++ -std=c++14 -Wall -Wextra -Werror -DHOST_COMPILE -D_GLIBCXX_USE_CXX11_AB
     -I"${cann_root}/pkg_inc" -I"${cann_root}/pkg_inc/hcomm" -I"${cann_root}/pkg_inc/hcomm/ccu" \
     "${repo}/examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc" \
     -L"${cann_root}/lib64" -Wl,-rpath,"${cann_root}/lib64" \
-    -Wl,--no-as-needed -lhccl -lhcomm -lascendcl -Wl,--as-needed -ldl -pthread \
+    -Wl,--no-as-needed -lhccl -lhcomm -lascendcl -lmsprofiler -Wl,--as-needed -ldl -pthread \
     -o "$binary" > "${run_dir}/build.log" 2>&1; then
     echo "BUILD_FAIL: ${run_dir}/build.log" >&2
     tail -n 60 "${run_dir}/build.log"; exit 1
@@ -102,6 +118,7 @@ if ((builder_only)); then
     exit 0
 fi
 export LOCAL_COPY_BINARY="$binary" LOCAL_COPY_RANKS="$ranks" LOCAL_COPY_CHANGED="$changed" LOCAL_COPY_QUEUED="$queued"
+export LOCAL_COPY_BENCHMARK="$benchmark" LOCAL_COPY_PROFILE="$profile" LOCAL_COPY_WARMUP="$warmup" LOCAL_COPY_ITERS="$iterations"
 while IFS=$'\t' read -r name mode bytes; do
     case_dir="${run_dir}/cases/${name}"; mkdir -p "$case_dir"
     export LOCAL_COPY_CASE_DIR="$case_dir" LOCAL_COPY_MODE="$mode" LOCAL_COPY_BYTES="$bytes"
@@ -110,9 +127,18 @@ while IFS=$'\t' read -r name mode bytes; do
         pids=()
         for ((rank=0; rank<LOCAL_COPY_RANKS; rank++)); do
             (
+                extra=()
+                if ((LOCAL_COPY_BENCHMARK)); then
+                    extra+=(--benchmark --warmup "$LOCAL_COPY_WARMUP" --iters "$LOCAL_COPY_ITERS")
+                fi
+                if ((LOCAL_COPY_PROFILE)); then
+                    profile_dir="${LOCAL_COPY_CASE_DIR}/profiling/rank${rank}"
+                    mkdir -p "$profile_dir"
+                    extra+=(--profile-dir "$profile_dir")
+                fi
                 "${LOCAL_COPY_BINARY}" --rank "$rank" --ranks "$LOCAL_COPY_RANKS" \
                     --case-dir "$LOCAL_COPY_CASE_DIR" --copy-mode "$LOCAL_COPY_MODE" \
-                    --bytes "$LOCAL_COPY_BYTES" --changed-iters "$LOCAL_COPY_CHANGED" --queued-iters "$LOCAL_COPY_QUEUED" \
+                    --bytes "$LOCAL_COPY_BYTES" --changed-iters "$LOCAL_COPY_CHANGED" --queued-iters "$LOCAL_COPY_QUEUED" "${extra[@]}" \
                     > "${LOCAL_COPY_CASE_DIR}/rank${rank}.log" 2>&1
                 rc=$?; printf "%s\n" "$rc" > "${LOCAL_COPY_CASE_DIR}/rank${rank}.status"; exit "$rc"
             ) &
@@ -132,4 +158,32 @@ while IFS=$'\t' read -r name mode bytes; do
         break
     fi
 done < "${run_dir}/cases.tsv"
+set +e
 python3 "${repo}/scripts/analyze_a5_ccu_local_copy_probe.py" --run-dir "$run_dir"
+proof_rc=$?
+set -e
+perf_rc=0
+if ((benchmark)); then
+    if ((profile && export_profile)); then
+        msprof="${cann_root}/tools/profiler/bin/msprof"
+        if [[ ! -x "$msprof" ]]; then msprof=$(command -v msprof || true); fi
+        if [[ -n "$msprof" && -x "$msprof" ]]; then
+            while IFS= read -r profile_dir; do
+                set +e
+                timeout --signal=TERM --kill-after=5 "$timeout_seconds" "$msprof" \
+                    --export=on --output="$profile_dir" > "$profile_dir/export.log" 2>&1
+                export_rc=$?
+                set -e
+                printf '%s\n' "$export_rc" > "$profile_dir/export.status"
+                echo "Profiling export: ${profile_dir} status=${export_rc}"
+            done < <(find "${run_dir}/cases" -type d -path '*/profiling/rank*' -name 'rank[0-9]*' | sort)
+        else
+            echo 'MSPROF_EXPORT_UNAVAILABLE: raw PROF data retained; export later on a Toolkit machine.' >&2
+        fi
+    fi
+    set +e
+    python3 "${repo}/scripts/analyze_a5_ccu_local_copy_perf.py" --run-dir "$run_dir"
+    perf_rc=$?
+    set -e
+fi
+if ((proof_rc || perf_rc)); then exit 1; fi
