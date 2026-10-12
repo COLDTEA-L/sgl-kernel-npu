@@ -13,6 +13,7 @@ relay_planes=""
 direct_route=0
 bytes=4194304
 dtype=float32
+self_copy_mode=overlap
 warmup=100
 iterations=20
 repeats=3
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --direct-route) direct_route=$2; shift 2 ;;
         --bytes) bytes=$2; shift 2 ;;
         --dtype) dtype=$2; shift 2 ;;
+        --self-copy-mode) self_copy_mode=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
         --repeats) repeats=$2; shift 2 ;;
@@ -61,6 +63,8 @@ case "${graph_backend}" in
     *) echo "unsupported --graph-backend: ${graph_backend}" >&2; exit 2 ;;
 esac
 case "${dtype}" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --dtype' >&2; exit 2;; esac
+[[ "$self_copy_mode" == overlap || "$self_copy_mode" == serial ]] || exit 2
+export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
 
 case "${graph_backend}" in
     none) measurement_mode=eager_no_graph ;;
@@ -227,7 +231,11 @@ version = lib.A5CcuUrmaPreparedPlanAbiVersion
 version.restype = ctypes.c_int
 value = version()
 print(f"Verified prepared-plan route runtime: {os.environ['ROUTE_PROBE_LIB']} (ABI={value})")
-assert value >= 13, f"route runtime ABI {value}, expected >= 13 (multi-dtype)"
+assert value >= 14, f"route runtime ABI {value}, expected >= 14 (self-copy overlap)"
+overlap = lib.A5CcuCopyOverlapSupported
+overlap.restype = ctypes.c_int
+if os.environ.get('A5_CCU_SELF_COPY_MODE', 'overlap') == 'overlap':
+    assert overlap() == 1, 'aclrtCreateEventExWithFlag required for overlap'
 PY
     route_probe_lib=$(readlink -f "${route_probe_lib}")
     export A5_CCU_ROUTE_PROBE_LIB="${route_probe_lib}"

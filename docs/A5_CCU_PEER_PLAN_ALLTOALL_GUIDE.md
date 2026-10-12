@@ -1,7 +1,9 @@
 # 显式 peer-plan CCU AllToAll：两卡 / 四卡
 
-分支：`feature/a5-ccu-multidtype-alltoall`（基于四卡分支）。本版在已验证的两卡 prepared-plan
+分支：`feature/a5-ccu-copy-comm-overlap`（基于多类型分支）。本版在已验证的两卡 prepared-plan
 数据面上扩展 peer 维度，不改 HCCL、不改 UBUS route table，不加载新 ko。
+本地copy默认独立stream，与远端CCU分支fork/join；`--self-copy-mode serial`为对照。
+构建、正确性与性能A/B优先看 [copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
 
 ## 1. 范围、数据流与约束
@@ -53,7 +55,7 @@ untracked 文件；不需要在内网机器 push，不要恢复旧 stash）。�
 set -e
 cd /home/l00934901/sgl-kernel-npu
 git stash push -m "backup-before-4rank-update-$(date +%Y%m%d_%H%M%S)"
-BRANCH=feature/a5-ccu-multidtype-alltoall
+BRANCH=feature/a5-ccu-copy-comm-overlap
 git fetch origin "${BRANCH}"
 git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
@@ -67,9 +69,9 @@ git status --short
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-git fetch origin feature/a5-ccu-multidtype-alltoall
-git switch feature/a5-ccu-multidtype-alltoall
-git pull --ff-only origin feature/a5-ccu-multidtype-alltoall
+git fetch origin feature/a5-ccu-copy-comm-overlap
+git switch feature/a5-ccu-copy-comm-overlap
+git pull --ff-only origin feature/a5-ccu-copy-comm-overlap
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
 
@@ -78,6 +80,12 @@ HCCL_REPO=/home/l00934901/hccl \
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install --install-path /usr/local/Ascend/cann-9.1.T560
 
+```
+
+**如果已有多类型DeepEP(peer ABI>=2、attr ABI>=12)，不要重编wheel**，直接做第3节。
+只有尚未升级多类型wheel时，再执行：
+
+```bash
 DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu bash build.sh -a deepep Ascend950
 WHEEL=$(ls -t output/deep_ep-*.whl | head -1)
 test -f "${WHEEL}"
@@ -86,10 +94,10 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
 
 若旧仓有未提交修改，先备份/stash，不要直接 reset 或删 untracked。
 构建脚本的 offline cann-cmake 与 UTF-8 源码预检保持原有行为。
-需要重新装 route package 和 wheel；**不需要重编 HCCL**。
+需要重新装route package；wheel是否升级按上面的独立DeepEP版本判断。**不重编HCCL**。
 
-**多类型分支首次升级必须重编/安装 route package 和 wheel**：route peer ABI >=2、
-DeepEP peer ABI >=2，原两卡 prepared route ABI >=13、DeepEP attr ABI >=12。
+**并行copy分支要求**：route peer ABI>=3、prepared ABI>=14、copy ABI>=1；
+DeepEP仍是peer ABI>=2、attr ABI>=12。由正确多类型版本升级只重编route。
 这与 2026-10-09 仅改测试脚本的更新不同，不能使用旧 peer ABI=1 二进制。
 先做无需 NPU 的入口回归，再执行第 4 节：
 
@@ -134,9 +142,9 @@ package, ext = import_deep_ep(extension)
 Buffer = package.Buffer
 
 deep = ctypes.CDLL(str(Path(ext.__file__).resolve()))
-for library, name in [(route, 'A5CcuPeerPlanAbiVersion'), (deep, 'A5DeepEpPeerPlanAbiVersion')]:
+for library, name, minimum in [(route, 'A5CcuPeerPlanAbiVersion', 3), (deep, 'A5DeepEpPeerPlanAbiVersion', 2)]:
     fn = getattr(library, name); fn.restype = ctypes.c_int
-    print(name, fn()); assert fn() >= 2
+    print(name, fn()); assert fn() >= minimum
 assert hasattr(Buffer, 'prepare_ccu_urma_peer_plan')
 for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.int32):
     for k in (2, 4):

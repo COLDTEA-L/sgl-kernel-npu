@@ -4,6 +4,7 @@
 #include "route_kernel.h"
 #include "utils.h"
 #include "data_type.h"
+#include "self_copy_lane.h"
 #include "../common/path_layout.h"
 
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -225,8 +226,8 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
 
 // Production prepared plans deliberately reuse the RouteKernel data plane that
 // was validated by the explicit multi-relay write experiments. The local
-// rank's slice is an ordinary D2D copy on the caller stream; RouteKernel only
-// owns the peer slice and splits that slice across the prepared Channels.
+// rank's self slice uses a separate copy stream with a fork/join dependency;
+// RouteKernel remains unchanged and owns only remote slices.
 HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
     aclrtStream stream, const RouteResources &resources,
@@ -255,17 +256,6 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     const uint64_t totalBytes = layout.totalBytes;
     auto *input = static_cast<unsigned char *>(sendBuf);
     auto *output = static_cast<unsigned char *>(recvBuf);
-    const aclError copyStatus = aclrtMemcpyAsync(
-        output + static_cast<uint64_t>(resources.rank) * bytes, bytes,
-        input + static_cast<uint64_t>(resources.rank) * bytes, bytes,
-        ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
-    if (copyStatus != ACL_SUCCESS) {
-        std::fprintf(stderr,
-            "[A5 CCU URMA A2A][rank=%u] prepared self copy failed: status=%d\n",
-            resources.rank, static_cast<int>(copyStatus));
-        return HCCL_E_RUNTIME;
-    }
-
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
@@ -273,6 +263,10 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     RouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
         inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
+    SelfCopyGuard copy(resources.selfCopy);
+    const auto copyStatus = copy.Begin(output + static_cast<uint64_t>(resources.rank) * bytes,
+        input + static_cast<uint64_t>(resources.rank) * bytes, bytes);
+    if (copyStatus != HCCL_SUCCESS) return copyStatus;
 
     HcclResult status = HCCL_SUCCESS;
     if (resources.routeThread != resources.mainThread) {
@@ -287,13 +281,13 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     status = HcclCcuKernelLaunch(
         comm, resources.routeThread, resources.kernel, &taskArg);
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
-        return status;
+        return copy.Finish(status);
     }
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
         resources.mainThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
     if (status != HCCL_SUCCESS) return status;
-    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
-        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
+    return copy.Finish(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX)));
 }
 
 HcclResult RunMultiRouteAllToAll(void *sendBuf, void *recvBuf,
@@ -363,7 +357,8 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // Version 12 preserves single-candidate legacy baselines. The common
     // layout validator accepts one path; prepared-plan APIs still require >=2.
     // Version 13 infers byte layouts from FP16/BF16/FP32/INT8/INT32.
-    return 13;
+    // Version 14 adds separate self-copy fork/join with reusable Ex events.
+    return 14;
 }
 
 namespace {
@@ -412,6 +407,8 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
         preparedComm, stream, RouteKernelKind::ROUTE_WRITE,
         &created, &request);
     if (status != HCCL_SUCCESS) return status;
+    const auto copyStatus = SelfCopyLane::Create(stream, &created.selfCopy);
+    if (copyStatus != HCCL_SUCCESS) return copyStatus;
     {
         std::lock_guard<std::mutex> lock(g_planMutex);
         const auto found = g_plans.find(planHandle);
@@ -608,6 +605,24 @@ extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanExecuteV2(
     return ExecutePreparedPlan(sendBuf, recvBuf, elementsPerPeer, dataType,
                                comm, stream, planHandle, launchWeights,
                                pathCount, false);
+}
+
+extern "C" HcclResult HcclCcuUrmaExplicitMultipathPlanDestroy(uint64_t handle)
+{
+    std::lock_guard<std::mutex> build(g_planBuildMutex);
+    std::lock_guard<std::mutex> submit(g_submissionMutex);
+    std::lock_guard<std::mutex> lock(g_planMutex);
+    const auto found = g_plans.find(handle);
+    if (found == g_plans.end()) return HCCL_E_NOT_FOUND;
+    for (auto &stream : found->second.resourcesByStream) {
+        if (stream.second.selfCopy) {
+            const auto status = stream.second.selfCopy->Close();
+            if (status != HCCL_SUCCESS) return status;
+        }
+    }
+    g_planIds.erase(MakePlanIdentity(found->second.comm, found->second.planId));
+    g_plans.erase(found);
+    return HCCL_SUCCESS;
 }
 
 extern "C" __attribute__((visibility("default"))) int

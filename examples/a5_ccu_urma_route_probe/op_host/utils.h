@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <memory>
 #include "../common/peer_plan.h"
 
 namespace a5_ccu_urma_probe {
+class SelfCopyLane;
 
 enum class RouteKernelKind {
     ROUTE_WRITE,
@@ -21,6 +23,7 @@ enum class RouteKernelKind {
 };
 
 struct RouteResources {
+    std::shared_ptr<SelfCopyLane> selfCopy;
     ThreadHandle mainThread = 0;
     ThreadHandle routeThread = 0;
     aclrtStream slaveStream = nullptr;

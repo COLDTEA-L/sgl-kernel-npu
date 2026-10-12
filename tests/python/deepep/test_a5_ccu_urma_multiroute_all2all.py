@@ -115,7 +115,7 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 13:
+            if plan_abi() < 14:
                 raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
@@ -595,6 +595,7 @@ def main():
 
     if rank == 0:
         result = {
+            "self_copy_mode": os.environ.get("A5_CCU_SELF_COPY_MODE", "overlap"),
             "dtype": args.dtype,
             "implementation": args.implementation,
             "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
@@ -622,6 +623,19 @@ def main():
             print(f"route_library={ROUTE_LIB}", flush=True)
     mark_phase("reported_barrier")
     file_barrier(sync_dir, "reported", rank, world_size)
+    if args.implementation == "prepared" and args.compile_backend in ("none", "aclgraph"):
+        mark_phase("release_copy_plan")
+        torch.npu.synchronize()
+        if acl_graph is not None:
+            acl_graph.reset()
+            acl_graph = None
+        runtime = ctypes.CDLL(str(ROUTE_LIB))
+        release = runtime.HcclCcuUrmaExplicitMultipathPlanDestroy
+        release.argtypes = [ctypes.c_uint64]
+        release.restype = ctypes.c_int
+        status = release(plan_handle)
+        if status != 0:
+            raise RuntimeError(f"prepared plan destroy failed: status={status}")
     mark_phase("destroy_process_group")
     dist.destroy_process_group()
     faulthandler.cancel_dump_traceback_later()

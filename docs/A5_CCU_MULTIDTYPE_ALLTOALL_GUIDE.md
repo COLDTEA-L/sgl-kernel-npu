@@ -1,6 +1,8 @@
 # CCU 显式多路径 AllToAll：自动 dtype（两卡 / 四卡）
 
-分支：`feature/a5-ccu-multidtype-alltoall`，从四卡分支 `bed7925` 创建。
+当前分支：`feature/a5-ccu-copy-comm-overlap`，基于多类型实现 `2bb77ec`。
+多类型功能保留；新增本地copy与CCU分流，当前构建和A/B测试以
+[copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md) 为准。
 不修改 HCCL、不加载 ko、不修改共享 UB 路由表。本分支保留两卡 prepared-plan，
 以及兼容两卡/四卡的 peer-plan；测试统一推荐 peer-plan 入口。
 
@@ -68,7 +70,7 @@ dtype 后仍能原样 replay；需针对新 dtype 重新捕获/编译。
 set -eo pipefail
 cd /home/l00934901/sgl-kernel-npu
 git stash push -m "backup-before-multidtype-$(date +%Y%m%d_%H%M%S)"
-BRANCH=feature/a5-ccu-multidtype-alltoall
+BRANCH=feature/a5-ccu-copy-comm-overlap
 git fetch origin "${BRANCH}"
 git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
@@ -80,7 +82,17 @@ unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
 HCCL_REPO=/home/l00934901/hccl \
 bash scripts/build_a5_ccu_urma_route_probe.sh \
   --install --install-path /usr/local/Ascend/cann-9.1.T560
+)
+```
 
+仅从旧 FP32/旧四卡 wheel 首次升级时，另外执行下面一段。已有多类型
+DeepEP(peer ABI>=2、attr ABI>=12) 时跳过，直接执行其后的 runtime-check。
+
+```bash
+(
+set -eo pipefail
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu bash build.sh -a deepep Ascend950
 BUILT_SO=$(find output/lib -maxdepth 1 -type f -name 'deep_ep_cpp*.so' -print -quit)
 test -n "${BUILT_SO}"
@@ -89,11 +101,15 @@ WHEEL=$(ls -t output/deep_ep-*.whl | head -1)
 test -f "${WHEEL}"
 echo "Installing wheel: ${WHEEL}"
 python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${WHEEL}"
-python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
 )
 ```
 
-首次升级本分支**必须重编安装两份库**，不是之前的脚本-only更新；无需拉取/编译
+```bash
+python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
+```
+
+从旧FP32实现首次升级多类型需重编安装两份库；已经安装多类型DeepEP>=2时，
+本copy并行升级只重编route，不用重复wheel步骤。无需拉取/编译
 patched HCCL。HCCL_REPO只提供旧对象式custom-op构建框架。
 编译打印的 CANN home 应与实际使用的 CANN 版本一致。
 安装前停止本用户使用旧库的实验；共享挂载上的 CANN/Python 文件更新会影响其他
@@ -103,9 +119,9 @@ patched HCCL。HCCL_REPO只提供旧对象式custom-op构建框架。
 
 | 库 | 符号 | 最低值 |
 |---|---|---:|
-| route | A5CcuPeerPlanAbiVersion | 2 |
+| route | A5CcuPeerPlanAbiVersion | 3 |
 | DeepEP | A5DeepEpPeerPlanAbiVersion | 2 |
-| route（旧两卡接口） | A5CcuUrmaPreparedPlanAbiVersion | 13 |
+| route（旧两卡接口） | A5CcuUrmaPreparedPlanAbiVersion | 14 |
 | DeepEP（旧两卡接口） | A5DeepEpExplicitMultipathAttrAbiVersion | 12 |
 
 build route脚本现在检查 packaged 与 installed 两份库的peer-plan符号和版本，

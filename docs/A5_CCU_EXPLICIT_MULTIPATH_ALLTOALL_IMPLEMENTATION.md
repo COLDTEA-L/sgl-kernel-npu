@@ -1,6 +1,6 @@
 # A5 CCU+URMA prepared-plan 显式多路径 AllToAll 实现说明
 
-当前分支 `feature/a5-ccu-multidtype-alltoall` 自动读取tensor dtype，支持 FP16/BF16/FP32/INT8/INT32。
+当前分支 `feature/a5-ccu-copy-comm-overlap` 基于多类型分支，自动读取tensor dtype，支持 FP16/BF16/FP32/INT8/INT32。新增独立 copy stream 与 CCU 分支的 fork/join，不改 CCU kernel 的 WriteNb/completion 布局；详见 [copy/CCU 并发指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 扩展同时覆盖两卡 prepared-plan 和两卡/四卡 peer-plan；共用按byte搬运的RouteKernel。
 类型映射、字节/元素边界、版本和有卡测试见 [多类型实现指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md)。
 
@@ -73,7 +73,7 @@ host queue 提交；原始 ACL 调用可能抢先读取输入。`stream()` 清�
 让 tensor producer、D2D self-copy、CCU launch 按流顺序提交；它不等待 device 完成。
 这是 PyTorch bridge 的要求，单独 C++ probe 没有这层 torch_npu host queue。
 
-当前 prepared route ABI 为13、DeepEP attr ABI 为12（独立peer ABI均为2），保留上述提交顺序修复。bridge 增加 tensor DeviceGuard、
+当前 prepared route ABI 为14、DeepEP attr ABI 为12（route peer ABI为3、DeepEP peer ABI为2），保留上述 producer 提交顺序修复。默认 fork 本地 copy 和 CCU，再在 caller stream 上 join；不是取消输入/输出依赖。bridge 增加 tensor DeviceGuard、
 同 device/不重叠检查和 caching allocator `recordStream`。后者保证异步访问期间的存储
 生命周期，不代替生产流与执行流的依赖；跨流输入需要调用者先 `wait_stream`。
 
@@ -196,8 +196,7 @@ argument 上限为 48；当前 RouteKernel 固定参数 4 个，每条路径 3 �
 
 ## 6. CCU 数据面
 
-注册阶段生成一个 peer-write RouteKernel。本地 slice 在 caller stream 上通过 D2D copy
-完成，peer slice 切成连续 chunk，CCU kernel 中执行：
+注册阶段生成一个 peer-write RouteKernel。本地 slice 默认在 plan 的 private copy stream 上通过 D2D copy 完成；peer slice 切成连续 chunk，CCU kernel 中执行：
 
 ```text
 for each path:
@@ -206,6 +205,10 @@ for each path:
 for each path:
     Wait(path.completion)
 ```
+
+copy 分支只写 `recv[self]`，remote 分支只写 `recv[peer]`，两者不重叠。caller stream 在输入 producer 后、CCU 前记录 ready event；先提交 CCU，再提交等待该 ready 的 copy，避免小 copy 在 CPU 准备 CCU 时提前结束。最后 caller stream 等 copy-done，同时保留原 CCU 完成依赖。下一次调用/消费者因此不会提前覆盖或读取输出。
+
+资源由 `SelfCopyLane` 按 plan/stream 持有：两个 Ex event 重复记录、不 reset、不逐调用增长；错误后 lane 不再接受提交。图外释放 graph 并同步后显式调用 PlanDestroy 关闭 lane。它不替代 HCCL 自有 Channel/thread cache 的生命周期管理。`serial` copy 模式用于对照；remote schedule 的 `serial/concurrent` 是另一个独立选项。
 
 所有 `WriteNb` 先提交，再等待完成，因此不是 host 上逐条串行调用。默认比例为：
 

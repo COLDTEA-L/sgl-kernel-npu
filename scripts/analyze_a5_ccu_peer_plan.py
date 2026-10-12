@@ -11,6 +11,8 @@ from pathlib import Path
 def valid_result(result, k):
     sizes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}
     dtype = result.get("dtype", "float32")
+    if result.get("self_copy_mode", "serial") not in ("serial", "overlap"):
+        return False
     if not isinstance(dtype, str) or dtype not in sizes:
         return False
     if "element_bytes" in result and result["element_bytes"] != sizes[dtype]:
@@ -87,9 +89,10 @@ def analyze(root):
                  {r.get("rank") for r in results} == set(range(k)) and
                  len({r.get("sync_mode", "per-call") for r in results}) == 1 and
                  len({r.get("dtype", "float32") for r in results}) == 1 and
+                 len({r.get("self_copy_mode", "serial") for r in results}) == 1 and
                  all(all(key not in settings or r.get(key, "per-call" if key == "sync_mode" else
-                             "float32" if key == "dtype" else None) == settings[key]
-                         for key in ("sync_mode", "warmup", "iterations", "bytes_per_peer", "graph_backend", "dtype"))
+                             "float32" if key == "dtype" else "serial" if key == "self_copy_mode" else None) == settings[key]
+                         for key in ("sync_mode", "warmup", "iterations", "bytes_per_peer", "graph_backend", "dtype", "self_copy_mode"))
                      for r in results))
         valid = status == "0" and data_valid
         complete &= valid
@@ -105,11 +108,13 @@ def analyze(root):
         writer = csv.DictWriter(f, fieldnames=("case", "status", "sync_mode", "correctness", "lifecycle",
             "last_phase_by_rank", "slowest_rank_host_avg_us"), delimiter="\t")
         writer.writeheader(); writer.writerows(rows)
-    summary = dict(complete=complete, dtype=settings.get("dtype", "float32"), devices=plan["devices"],
+    summary = dict(complete=complete, self_copy_mode=settings.get("self_copy_mode", "serial"),
+                   dtype=settings.get("dtype", "float32"), devices=plan["devices"],
                    relay_limit_per_peer=plan["relay_limit_per_peer"], cases=rows)
     (root / "peer_plan_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     report = ["# CCU explicit peer-plan AllToAll", "", f"- complete: `{complete}`",
               f"- communicator physical devices: `{plan['devices']}`", f"- dtype: `{settings.get('dtype', 'float32')}`",
+              f"- self-copy scheduling: `{settings.get('self_copy_mode', 'serial')}` (not proof of physical overlap)",
               f"- relay limit per peer: `{plan['relay_limit_per_peer']}`", "",
               "| case | status | sync mode | data correctness | lifecycle | slowest-rank host average (us) |",
               "|---|---|---|---|---|---:|"]

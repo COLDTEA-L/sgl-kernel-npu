@@ -36,6 +36,8 @@ def main():
     p.add_argument("--runtime-check", action="store_true", help="check worker runtime/ABI without initializing devices or communicator")
     p.add_argument("--graph-backend", choices=("none", "aclgraph"), default="none")
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--self-copy-mode", choices=("overlap", "serial"), default="overlap",
+                   help="independent local-copy stream or serialized control")
     args = p.parse_args()
     if args.bytes <= 0 or args.bytes % PAYLOAD_DTYPES[args.dtype] or args.warmup < 0 or args.iters < 1:
         p.error("positive dtype-element-aligned byte count and iterations required")
@@ -50,6 +52,7 @@ def main():
         if k not in (2, 4) or not 0 <= rank < k:
             p.error("initial implementation supports valid ranks in WORLD_SIZE=2 or 4")
     # This marker does not imply native/static destructors have finished.
+    os.environ["A5_CCU_SELF_COPY_MODE"] = args.self_copy_mode
     atexit.register(lambda: phase("python_atexit"))
     # Parse this entry point's arguments before loading any NPU runtime. Never
     # import an executable benchmark for helpers: its module initialization can
@@ -62,19 +65,29 @@ def main():
     import torch_npu
     deep_ep, ext = import_deep_ep(extension_path)
     Buffer = deep_ep.Buffer
+    if args.graph_backend == "aclgraph" and not hasattr(torch.npu.NPUGraph, "reset"):
+        raise RuntimeError("graph overlap validation requires NPUGraph.reset before releasing copy resources")
 
     if Path(ext.__file__).resolve() != extension_path:
         raise RuntimeError(f"worker extension differs from bootstrap: {ext.__file__} != {extension_path}")
     route_library = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     deep_library = ctypes.CDLL(str(extension_path))
     abi_versions = {}
-    for library, symbol in ((route_library, "A5CcuPeerPlanAbiVersion"),
-                            (deep_library, "A5DeepEpPeerPlanAbiVersion")):
+    for library, symbol, minimum in ((route_library, "A5CcuPeerPlanAbiVersion", 3),
+                                    (deep_library, "A5DeepEpPeerPlanAbiVersion", 2),
+                                    (route_library, "A5CcuCopyOverlapAbiVersion", 1)):
         version = getattr(library, symbol)
         version.restype = ctypes.c_int
         abi_versions[symbol] = version()
-        if abi_versions[symbol] < 2:
-            raise RuntimeError(f"stale worker ABI {symbol}={abi_versions[symbol]}; rebuild/install multi-dtype branch (>=2)")
+        if abi_versions[symbol] < minimum:
+            raise RuntimeError(f"stale worker ABI {symbol}={abi_versions[symbol]}; expected >= {minimum} for overlap branch")
+    overlap_supported = route_library.A5CcuCopyOverlapSupported
+    overlap_supported.restype = ctypes.c_int
+    if args.self_copy_mode == "overlap" and overlap_supported() != 1:
+        raise RuntimeError("copy overlap requires aclrtCreateEventExWithFlag; no unsafe event fallback")
+    destroy_plan = route_library.HcclCcuUrmaPeerPlanDestroy
+    destroy_plan.argtypes = [ctypes.c_uint64]
+    destroy_plan.restype = ctypes.c_int
     for api in ("prepare_ccu_urma_peer_plan", "bind_ccu_urma_peer_plan", "ccu_urma_peer_plan_alltoall_out"):
         if not hasattr(Buffer, api):
             raise RuntimeError(f"missing peer-plan Buffer API: {api}")
@@ -82,7 +95,8 @@ def main():
         raise RuntimeError("missing peer-plan torch operator")
     print(f"PEER_RUNTIME_VERIFIED route={route_path} extension={extension_path} "
           f"route_ABI={abi_versions['A5CcuPeerPlanAbiVersion']} "
-          f"deep_ABI={abi_versions['A5DeepEpPeerPlanAbiVersion']}", flush=True)
+          f"deep_ABI={abi_versions['A5DeepEpPeerPlanAbiVersion']} "
+          f"self_copy_mode={args.self_copy_mode}", flush=True)
     if args.runtime_check:
         return
 
@@ -179,9 +193,10 @@ def main():
             graph_output = torch.ops.deep_ep.ccu_urma_peer_plan_alltoall(send, handle, [])
         torch.npu.synchronize()
         barrier("capture_done")
-        for index in range(2):
+        for index in range(4):
             epoch += 1
             send.copy_(input_for(epoch))
+            graph_output.fill_(-128)
             torch.npu.synchronize()
             barrier(f"replay_{index}")
             graph.replay()
@@ -211,7 +226,7 @@ def main():
     barrier("measured")
     result = dict(rank=rank, ranks=k, correctness="PASS",
         bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, dtype=args.dtype,
-        element_bytes=send.element_size(), warmup=args.warmup,
+        element_bytes=send.element_size(), self_copy_mode=args.self_copy_mode, warmup=args.warmup,
         iterations=args.iters, graph_backend=args.graph_backend, **timing,
         batch_validation=batch_validation, measurement_start_lateness_us=start_lateness_us,
         manifest=str(args.manifest))
@@ -230,6 +245,16 @@ def main():
     phase("reported_barrier_begin")
     barrier("reported")
     phase("reported_barrier_done")
+    phase("release_copy_plan_begin")
+    # Graph nodes reference the copy lane's events/stream. Drop the bound replay
+    # method and reset the graph before destroying the graph-outside plan.
+    launch = eager
+    if args.graph_backend == "aclgraph":
+        graph.reset()
+    status = destroy_plan(handle)
+    if status != 0:
+        raise RuntimeError(f"peer plan destroy failed: status={status}")
+    phase("release_copy_plan_done")
     phase("destroy_process_group_begin")
     dist.destroy_process_group()
     phase("destroy_process_group_done")

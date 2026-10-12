@@ -1,6 +1,6 @@
 # 两卡显式多路径 AllToAll：当前实现设计
 
-本文在 `feature/a5-ccu-multidtype-alltoall` 更新：旧两卡 prepared-plan 的 DeepEP attr ABI >=12、route prepared ABI >=13，两卡/四卡 peer-plan 的独立 ABI 均 >=2。原接口保留，不是早期修改 libhccl 的标准 Ascend C 实验。拉取、构建及多类型验证以 [多类型指南](A5_CCU_MULTIDTYPE_ALLTOALL_GUIDE.md) 为准。
+本文在 `feature/a5-ccu-copy-comm-overlap` 更新，基于多类型分支：DeepEP attr ABI >=12、route prepared ABI >=14；peer-plan 的 route ABI >=3、DeepEP ABI >=2。原接口保留，不是早期修改 libhccl 的标准 Ascend C 实验。拉取、构建及 copy/CCU 并发验证以 [并发指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md) 为准。
 
 ## 1. 输入输出与数据量
 
@@ -33,14 +33,17 @@
   -> HcclCcuUrmaExplicitMultipathPlanExecute[ V2 ]
   -> LookupPreparedPlan（不重新枚举、建链或注册）
   -> BuildTwoRankPathLayout，校验大小与输入输出不重叠
-  -> aclrtMemcpyAsync：本地分片，当前执行 stream
   -> GetTokenInfo：输入、输出整个 tensor 的访问 token
   -> RouteTaskArg：地址、token、每路径 offset/bytes
+  -> SelfCopyLane.Begin：在当前 stream 记录输入就绪 event
   -> HcclCcuKernelLaunch：已注册的 RouteKernel
-  -> 当前 stream 上的完成依赖
+  -> SelfCopyLane.Join：private copy stream 等输入 event，复制本地分片
+  -> 当前 stream 等 copy 完成（此 wait 排在 CCU 完成依赖之后）
 ```
 
-**生产 prepared-plan 使用 `RouteKernel`，不是 `AllToAllMultiRouteKernel`。** 后者是旧的合并本地复制实验。`all_to_all_multiroute.cc` 的 `LaunchPreparedRouteAllToAll()` 明确用 stream-ordered D2D copy 处理 self slice，再用已验证的多路径 write kernel 处理 peer slice。
+**生产 prepared-plan 使用 `RouteKernel`，不是 `AllToAllMultiRouteKernel`。** 后者是旧的合并本地复制实验，本分支不恢复它。`LaunchPreparedRouteAllToAll()` 用独立 copy stream 处理 self slice，已验证的多路径 write kernel 处理 peer slice；两条分支写入不同接收行。输入 event 在 CCU 前记录，因此 copy 不等待本次 CCU；最后 join 保证输出消费者同时等待两者。`--self-copy-mode serial` 保留原 caller-stream copy 对照。
+
+每个 plan/stream 在图外创建一个 `SelfCopyLane`（copy stream + 两个可重复记录的 Ex event）。不在每次执行时分配或 reset event。调用者释放图、同步任务后，调用 `HcclCcuUrmaExplicitMultipathPlanDestroy` 关闭 lane；不能在图仍引用它时释放。实际设备重叠、连续执行和 graph replay 必须按并发指南验证，不能由 CPU 编译替代。
 
 ## 3. relay CommLink / ChannelDesc 如何构造
 

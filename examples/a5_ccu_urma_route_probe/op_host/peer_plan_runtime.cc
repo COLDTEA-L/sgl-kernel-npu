@@ -1,6 +1,7 @@
 #include "a5_ccu_urma_route_probe.h"
 #include "utils.h"
 #include "data_type.h"
+#include "self_copy_lane.h"
 #include "route_kernel.h"
 #include <hcomm/ccu/hccl_ccu_res.h>
 #include <hcomm/hcomm_res.h>
@@ -109,6 +110,8 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
     PeerPlanResources resources;
     const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources);
     if (status != HCCL_SUCCESS) return status;
+    const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
+    if (copyStatus != HCCL_SUCCESS) return copyStatus;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         plans.at(handle).streams.emplace(reinterpret_cast<uintptr_t>(stream), resources);
@@ -121,7 +124,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
 }
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 2; }
+extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 3; }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
@@ -207,8 +210,9 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), layout.totalBytes);
     auto *input = static_cast<unsigned char *>(send);
     auto *output = static_cast<unsigned char *>(recv);
-    if (aclrtMemcpyAsync(output + layout.selfOffset, layout.peerBytes, input + layout.selfOffset,
-        layout.peerBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream) != ACL_SUCCESS) return HCCL_E_RUNTIME;
+    SelfCopyGuard copy(r.selfCopy);
+    const auto copyStatus = copy.Begin(output + layout.selfOffset, input + layout.selfOffset, layout.peerBytes);
+    if (copyStatus != HCCL_SUCCESS) return copyStatus;
     auto status = HCCL_SUCCESS;
     if (r.routeThread != r.mainThread) {
         status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0));
@@ -219,8 +223,25 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     RouteTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
     status = HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task);
-    if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
+    if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return copy.Finish(status);
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));
     if (status != HCCL_SUCCESS) return status;
-    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0));
+    return copy.Finish(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)));
+}
+
+extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)
+{
+    std::lock_guard<std::mutex> build(buildMutex);
+    std::lock_guard<std::mutex> submit(submitMutex);
+    std::lock_guard<std::mutex> lock(registryMutex);
+    const auto found = plans.find(handle);
+    if (found == plans.end()) return HCCL_E_NOT_FOUND;
+    for (auto &stream : found->second.streams) {
+        if (stream.second.route.selfCopy) {
+            const auto status = stream.second.route.selfCopy->Close();
+            if (status != HCCL_SUCCESS) return status;
+        }
+    }
+    plans.erase(found);
+    return HCCL_SUCCESS;
 }

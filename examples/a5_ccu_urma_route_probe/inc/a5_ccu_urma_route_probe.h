@@ -66,11 +66,20 @@ HcclResult HcclCcuUrmaExplicitMultipathAllToAll(
 /** ABI marker for the prepared-plan API below.  ABI 5 adds explicit
  * stream binding and per-launch host path weights. */
 int A5CcuUrmaPreparedPlanAbiVersion(void);
+/** Overlap ABI 1: reusable Ex events, independent self-copy branch, explicit join.
+ * Supported() checks an API symbol only, not hardware/capture functionality. */
+int A5CcuCopyOverlapAbiVersion(void);
+int A5CcuCopyOverlapSupported(void);
 
 /** Independent peer-plan ABI: version 2 supports inferred FP16/BF16/FP32/INT8/INT32;
  * complete canonical peer manifest, 2/4 ranks,
  * direct-only or explicit communicator-external relay paths. */
 int A5CcuPeerPlanAbiVersion(void);
+/** Destroy only outside capture, after synchronizing and releasing all graphs
+ * using this handle. Reclaims owned self-copy streams/events; HCCL channel
+ * cache lifetime remains owned by the existing communication runtime. */
+HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle);
+HcclResult HcclCcuUrmaExplicitMultipathPlanDestroy(uint64_t handle);
 HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle);
 HcclResult HcclCcuUrmaPeerPlanBindStream(uint64_t handle, HcclComm comm, aclrtStream stream);
