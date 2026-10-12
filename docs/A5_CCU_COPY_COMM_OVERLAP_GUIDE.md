@@ -312,3 +312,119 @@ python3 tests/python/deepep/test_a5_ccu_copy_overlap_cpu.py
 
 开发容器cam_lyw_dev_91/CANN9.1.0-beta.1已编译route package、通过上述CPU队列模型。
 没有NPU；目标T560的实际正确性、物理重叠、性能和ACLGraph replay尚需按4~6节验证。
+
+## 8. 独立 CCU 本地 copy 穿刺（先证实，再考虑组合 kernel）
+
+普通四卡分支的串行copy较稳定，新分支 `--self-copy-mode serial` 对照也较稳定，
+因此现在优先隔离 CCU 本地copy能力，而不是修改relay或删掉输出完成依赖。
+本节测试不恢复组合kernel，不修改生产算子，不安装新的SO/wheel，不编译系统HCCL。
+**拉取本次代码后直接执行下面脚本即可**；脚本自动把独立C++程序编译到结果目录。
+需有目标CANN的开发头文件（包括pkg_inc）和g++，不是只有运行时SO的环境。
+
+### 8.1 有卡执行命令
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_local_copy_probe.sh \
+  --devices 2,3 \
+  --sizes 4096,4194304 --copy-mode both \
+  --changed-iters 3 --queued-iters 20 \
+  --timeout-seconds 300 \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /home/l00934901/profiling
+```
+
+修改 `--devices` 即可换计算卡；接受一张或两张卡，默认两卡使用已知通信域初始化
+流程，但每个rank只在自己的HBM上copy。单卡后端若在初始化/注册阶段拒绝请求，
+不能据此判断本地copy不支持，可用上述两卡上下文继续隔离。
+没有relay参数，不使用其他六张卡做数据转发。通信域初始化可能有控制面通信。
+这是新CCU kernel的设备验证，不能承诺零风险；仅在获准测试的卡上执行，遇到
+驱动错误/超时立即停止，不reset公共设备。
+
+默认依次测试：
+
+| case | CCU本地数据面 |
+|---|---|
+| direct_4096 | 单次 `LocalCopyNb(LocalAddr, LocalAddr, 4096) + WaitEvent` |
+| chunked_4096 | 4KB分块对照（一个块） |
+| chunked_4194304 | CCU内部循环，1024个4KB块，每块copy后Wait，累积复制4MB |
+| direct_4194304 | 单次 `LocalCopyNb(LocalAddr, LocalAddr, 4194304) + WaitEvent` |
+
+先跑分块大尺寸，再跑单次大尺寸，保留对长度限制的区分。没有引入CCU buffer/
+GroupCopy的另一套资源，不宣称该分块控制就是原生GroupCopy的实现。
+若失败或超时，脚本停止后续硬件case，不自动reset设备。每case每rank独立进程，
+外层timeout覆盖初始化、执行及退出；不能用程序打印过数据PASS就忽略退出失败。
+
+### 8.2 测试如何排除假阳性
+
+独立入口：`examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc`。
+
+```text
+aclInit / SetDevice / HcclCommInitRootInfo
+  -> HcclThreadAcquireWithStream(COMM_ENGINE_CCU)
+  -> HcclCcuKernelRegister / RegisterFinish（图外各一次，channels为空）
+  -> H2D输入 + H2D污染输出（同一执行stream）
+  -> HcclCcuKernelLaunch：只有LocalCopyNb + WaitEvent
+  -> D2H输出快照
+  -> 同步后逐字节检查 + guard检查
+  -> 清理通信域、stream、device/pinned host缓冲区
+```
+
+不调用 `HcclChannelAcquire`、远端 `WriteNb` 或 `ACL_MEMCPY_DEVICE_TO_DEVICE`。
+H2D只准备输入/污染输出，D2H只读取结果，因此不存在ACL D2D代替CCU把输入搬到输出。
+输入/输出有各自的token、独立allocation，copy只覆盖payload；前后各4KB guard。
+污染值为对应期望字节取反，任何未写字节都不能碰巧通过。input也检查未被修改。
+
+先3次改变输入、每次同步校验，用于确认首次/独立调用；再20次改变输入并连续排队，
+复用device input/output，每次保存独立D2H快照，**循环外同步后检查全部20个快照**。
+Pinned host源/目的区间保留到同步完成，避免异步H2D读取被CPU提前覆盖。
+资源只注册一次；不能靠每轮重新注册或host同步掩盖连续复用问题。
+这是正确性诊断，不是性能benchmark：不要把混合H2D/D2H的耗时当本地copy带宽。
+
+### 8.3 PASS、失败与分析文件
+
+全部rank、全部请求case的数据、guard、连续快照及进程清理均成功，最后才打印：
+
+```text
+PASS: LocalCopyNb + WaitEvent completed on device; changed payload, every queued snapshot, guards and cleanup verified.
+```
+
+各case也单独打印 `direct_4096: PASS` 等。只有小尺寸或分块PASS、单次4MB失败时，
+说明已有对应case的本地copy实测证据；不应推断“CCU完全不能本地copy”，也不能
+把单次4MB模式用于生产。若卡在kernel_register等阶段，结论仅为该上下文/接口未
+验证通过，而不是硬件复制失败。注册返回0、构图通过都不算数据PASS。
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_local_copy_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -d "${RUN_DIR}"; then
+  python3 scripts/analyze_a5_ccu_local_copy_probe.py --run-dir "${RUN_DIR}"
+  column -s $'\t' -t "${RUN_DIR}/local_copy_summary.tsv"
+  sed -n '1,220p' "${RUN_DIR}/local_copy_report.md"
+  grep -RHnE 'LOCAL_COPY_PHASE|LOCAL_COPY_LIBRARY|LOCAL_COPY_FAILURE|LOCAL_COPY_WORKER_PASS' \
+    "${RUN_DIR}/cases" --include='rank*.log'
+fi
+```
+
+分析脚本要求worker和case退出状态均为0，逐rank严格校验JSON与cleanup完成标记；
+缺文件、半轮、损坏JSON、超时或纯builder结果均不能生成整体PASS。
+编译失败看 `build.log`；执行失败看 `cases/<case>/rank0.log`、`rank1.log` 的最后phase。
+
+### 8.4 无卡开发验证（不是硬件证明）
+
+```bash
+bash scripts/run_a5_ccu_local_copy_probe.sh --builder-only \
+  --cann-root /usr/local/Ascend/cann-9.1.T560 \
+  --output-root /tmp/a5_local_copy_builder
+```
+
+只编译并调用 `CcuKernel::Init()` 构建direct/chunked指令表示，不创建通信域或launch。
+输出 `BUILD_ONLY_PASS` / `hardware_copy_executed=0`，**不等同第8.3节的硬件PASS**。
+开发容器没有NPU；独立程序的目标SDK编译、构图和CPU校验只能证明软件链路，
+实际结论以8.1的有卡数据为准。
+
+补充纠正：SDK的CompletedEvent按值传递，内部持有资源表示。旧版本增加reserve
+是防御性修改，不能仅凭vector扩容就声称已证实悬挂引用；过去组合失败还涉及bridge
+生产任务提交顺序、通知布局和逐Channel结束握手，尚无LocalCopyNb本身失败的定论。
