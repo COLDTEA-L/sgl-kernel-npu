@@ -110,8 +110,10 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
     PeerPlanResources resources;
     const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources);
     if (status != HCCL_SUCCESS) return status;
-    const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
-    if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    if (!resources.route.ccuSelfCopy) {
+        const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
+        if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    }
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         plans.at(handle).streams.emplace(reinterpret_cast<uintptr_t>(stream), resources);
@@ -120,11 +122,15 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         static_cast<unsigned long>(handle), resources.route.rank, resources.route.rankSize,
         resources.peers.size(), stream, resources.route.dieId);
     std::fflush(stdout);
+    std::printf("CCU_LOCAL_REMOTE_PLAN handle=%lu rank=%u enabled=%u self_copy=%s\n",
+        static_cast<unsigned long>(handle), resources.route.rank, resources.route.ccuSelfCopy ? 1U : 0U,
+        resources.route.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
+    std::fflush(stdout);
     return HCCL_SUCCESS;
 }
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 3; }
+extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 4; }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
@@ -211,8 +217,10 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     auto *input = static_cast<unsigned char *>(send);
     auto *output = static_cast<unsigned char *>(recv);
     SelfCopyGuard copy(r.selfCopy);
-    const auto copyStatus = copy.Begin(output + layout.selfOffset, input + layout.selfOffset, layout.peerBytes);
-    if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    if (!r.ccuSelfCopy) {
+        const auto copyStatus = copy.Begin(output + layout.selfOffset, input + layout.selfOffset, layout.peerBytes);
+        if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    }
     auto status = HCCL_SUCCESS;
     if (r.routeThread != r.mainThread) {
         status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0));
@@ -221,7 +229,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
         if (status != HCCL_SUCCESS) return status;
     }
     RouteTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
-        inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
+        inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes,
+        layout.selfOffset, layout.peerBytes);
     status = HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task);
     if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return copy.Finish(status);
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));

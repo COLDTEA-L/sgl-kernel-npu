@@ -36,8 +36,8 @@ def main():
     p.add_argument("--runtime-check", action="store_true", help="check worker runtime/ABI without initializing devices or communicator")
     p.add_argument("--graph-backend", choices=("none", "aclgraph"), default="none")
     p.add_argument("--profile", action="store_true")
-    p.add_argument("--self-copy-mode", choices=("overlap", "serial"), default="overlap",
-                   help="independent local-copy stream or serialized control")
+    p.add_argument("--self-copy-mode", choices=("ccu", "overlap", "serial"), default="overlap",
+                   help="combined CCU local+remote graph, independent D2D stream, or serial D2D")
     args = p.parse_args()
     if args.bytes <= 0 or args.bytes % PAYLOAD_DTYPES[args.dtype] or args.warmup < 0 or args.iters < 1:
         p.error("positive dtype-element-aligned byte count and iterations required")
@@ -85,6 +85,11 @@ def main():
     overlap_supported.restype = ctypes.c_int
     if args.self_copy_mode == "overlap" and overlap_supported() != 1:
         raise RuntimeError("copy overlap requires aclrtCreateEventExWithFlag; no unsafe event fallback")
+    if args.self_copy_mode == "ccu":
+        combined_version = route_library.A5CcuLocalRemoteAbiVersion
+        combined_version.restype = ctypes.c_int
+        if abi_versions["A5CcuPeerPlanAbiVersion"] < 4 or combined_version() < 1:
+            raise RuntimeError("ccu self-copy requires peer-plan ABI>=4 and local+remote ABI>=1; rebuild route probe")
     destroy_plan = route_library.HcclCcuUrmaPeerPlanDestroy
     destroy_plan.argtypes = [ctypes.c_uint64]
     destroy_plan.restype = ctypes.c_int

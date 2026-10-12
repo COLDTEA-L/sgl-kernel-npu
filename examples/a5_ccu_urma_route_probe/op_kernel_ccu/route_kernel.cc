@@ -21,8 +21,8 @@ constexpr size_t MAX_ROUTE_PATHS = 64U;
 } // namespace
 
 RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
-                               const std::vector<uint32_t> &routeIndices)
-    : routeIndices_(routeIndices)
+                               const std::vector<uint32_t> &routeIndices, bool localCopy)
+    : routeIndices_(routeIndices), localCopy_(localCopy)
 {
     channels = inputChannels;
 }
@@ -30,13 +30,15 @@ RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
 hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 {
     hcomm::CcuKernelSignature signature;
-    signature.Append(MakePathKernelSignature("A5CcuUrmaMultiRouteV2", routeIndices_, channels));
+    signature.Append(MakePathKernelSignature(localCopy_ ? "A5CcuUrmaLocalAndRemoteV1" :
+        "A5CcuUrmaMultiRouteV2", routeIndices_, channels));
     return signature;
 }
 
 HcclResult RouteKernel::Algorithm()
 {
-    if (channels_.empty() || channels_.size() > MAX_ROUTE_PATHS) {
+    if (channels_.empty() || channels_.size() > MAX_ROUTE_PATHS ||
+        (localCopy_ ? 6U : 4U) + 3U * channels_.size() > 48U) {
         return HCCL_E_PARA;
     }
 
@@ -48,6 +50,15 @@ HcclResult RouteKernel::Algorithm()
     Load(localOutput);
     Load(localInputToken);
     Load(localOutputToken);
+
+    hcomm::CcuRep::Variable selfOffset;
+    hcomm::CcuRep::Variable selfBytes;
+    if (localCopy_) {
+        selfOffset = CreateVariable();
+        selfBytes = CreateVariable();
+        Load(selfOffset);
+        Load(selfBytes);
+    }
 
     std::vector<hcomm::CcuRep::Variable> sourceOffsets;
     std::vector<hcomm::CcuRep::Variable> remoteOffsets;
@@ -75,6 +86,18 @@ HcclResult RouteKernel::Algorithm()
         CCU_KERNEL_CHECK(NotifyRecord(channels_[i], TOKEN_NOTIFY_INDEX, TOKEN_VAR_INDEX,
                                       localOutputToken, NOTIFY_MASK));
     }
+    // Separate local completion resource; not a Channel notify slot. Submit
+    // before peer waits, but DO NOT wait for it before submitting WriteNb.
+    // The host validated self row vs incoming peer rows are disjoint.
+    hcomm::CcuRep::CompletedEvent localEvent;
+    if (localCopy_) {
+        localEvent = CreateCompletedEvent();
+        hcomm::CcuRep::LocalAddr src = CreateLocalAddr();
+        hcomm::CcuRep::LocalAddr dst = CreateLocalAddr();
+        src.addr = localInput; src.addr += selfOffset; src.token = localInputToken;
+        dst.addr = localOutput; dst.addr += selfOffset; dst.token = localOutputToken;
+        CCU_KERNEL_CHECK(LocalCopyNb(dst, src, selfBytes, localEvent));
+    }
     for (size_t i = 0; i < channels_.size(); ++i) {
         CCU_KERNEL_CHECK(NotifyWait(channels_[i], OUTPUT_NOTIFY_INDEX, NOTIFY_MASK));
         CCU_KERNEL_CHECK(NotifyWait(channels_[i], TOKEN_NOTIFY_INDEX, NOTIFY_MASK));
@@ -94,6 +117,9 @@ HcclResult RouteKernel::Algorithm()
         events.push_back(CreateCompletedEvent());
         CCU_KERNEL_CHECK(WriteNb(channels_[i], destination, source, pathBytes[i], events.back()));
     }
+    // Every remote WriteNb has now been issued. Local and remote work may
+    // overlap; waiting here does not serialize their submission.
+    if (localCopy_) CCU_KERNEL_CHECK(WaitEvent(localEvent));
     for (auto &event : events) {
         CCU_KERNEL_CHECK(WaitEvent(event));
     }
@@ -112,11 +138,16 @@ std::vector<uint64_t> RouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
     if (taskArg == nullptr || taskArg->pathBytes.size() != channels_.size() ||
         taskArg->sourceOffsets.size() != channels_.size() ||
         taskArg->remoteOffsets.size() != channels_.size() ||
-        4 + 3 * channels_.size() > 48) {
+        (localCopy_ && taskArg->selfBytes == 0) ||
+        (localCopy_ ? 6 : 4) + 3 * channels_.size() > 48) {
         return {};
     }
     std::vector<uint64_t> args = {taskArg->inputAddr, taskArg->outputAddr,
                                   taskArg->inputToken, taskArg->outputToken};
+    if (localCopy_) {
+        args.push_back(taskArg->selfOffset);
+        args.push_back(taskArg->selfBytes);
+    }
     for (size_t i = 0; i < taskArg->pathBytes.size(); ++i) {
         args.push_back(taskArg->sourceOffsets[i]);
         args.push_back(taskArg->remoteOffsets[i]);

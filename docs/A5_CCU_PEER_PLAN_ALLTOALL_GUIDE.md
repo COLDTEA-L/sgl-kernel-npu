@@ -3,6 +3,10 @@
 分支：`feature/a5-ccu-copy-comm-overlap`（基于多类型分支）。本版在已验证的两卡 prepared-plan
 数据面上扩展 peer 维度，不改 HCCL、不改 UBUS route table，不加载新 ko。
 本地copy默认独立stream，与远端CCU分支fork/join；`--self-copy-mode serial`为对照。
+新增`--self-copy-mode ccu`：同一CCU kernel提交LocalCopyNb+所有WriteNb后再等待，
+不使用独立self D2D stream。更新要求、两/四卡短测、2/4/6 relay profiling及PASS分析
+见 [并行指南第9节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#9-已通过-local-copy-穿刺后的组合-alltoall-算子)。
+ccu模式需要route peer ABI>=4/local+remote ABI>=1；已有多类型DeepEP wheel不必重编。
 构建、正确性与性能A/B优先看 [copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
 两卡现在可直接用 `--devices 2,3 --relay-phys 0,1` 选择relay，无需修改JSON；

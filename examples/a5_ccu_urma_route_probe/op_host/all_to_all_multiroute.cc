@@ -224,10 +224,8 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
         resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
 }
 
-// Production prepared plans deliberately reuse the RouteKernel data plane that
-// was validated by the explicit multi-relay write experiments. The local
-// rank's self slice uses a separate copy stream with a fork/join dependency;
-// RouteKernel remains unchanged and owns only remote slices.
+// ccu mode integrates the disjoint self slice with the proven RouteKernel
+// remote graph. serial/overlap retain ACL D2D controls. No per-execute register.
 HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     uint64_t elementsPerPeer, HcclDataType dataType, HcclComm comm,
     aclrtStream stream, const RouteResources &resources,
@@ -262,11 +260,14 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
     RouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
-        inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes);
+        inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes,
+        static_cast<uint64_t>(resources.rank) * bytes, bytes);
     SelfCopyGuard copy(resources.selfCopy);
-    const auto copyStatus = copy.Begin(output + static_cast<uint64_t>(resources.rank) * bytes,
-        input + static_cast<uint64_t>(resources.rank) * bytes, bytes);
-    if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    if (!resources.ccuSelfCopy) {
+        const auto copyStatus = copy.Begin(output + static_cast<uint64_t>(resources.rank) * bytes,
+            input + static_cast<uint64_t>(resources.rank) * bytes, bytes);
+        if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    }
 
     HcclResult status = HCCL_SUCCESS;
     if (resources.routeThread != resources.mainThread) {
@@ -358,7 +359,8 @@ extern "C" __attribute__((visibility("default"))) int A5CcuUrmaPreparedPlanAbiVe
     // layout validator accepts one path; prepared-plan APIs still require >=2.
     // Version 13 infers byte layouts from FP16/BF16/FP32/INT8/INT32.
     // Version 14 adds separate self-copy fork/join with reusable Ex events.
-    return 14;
+    // Version 15 adds opt-in combined LocalCopyNb + WriteNb (no ACL D2D).
+    return 15;
 }
 
 namespace {
@@ -403,12 +405,21 @@ HcclResult BindPreparedPlanStreamLocked(uint64_t planHandle, HcclComm comm,
                 static_cast<unsigned long>(planHandle), stream);
     std::fflush(stdout);
     RouteResources created;
+    bool ccuCopy = false;
+    const auto modeStatus = GetCcuSelfCopyMode(&ccuCopy);
+    if (modeStatus != HCCL_SUCCESS) return modeStatus;
     const HcclResult status = GetRouteResources(
-        preparedComm, stream, RouteKernelKind::ROUTE_WRITE,
+        preparedComm, stream, ccuCopy ? RouteKernelKind::ROUTE_WRITE_LOCAL : RouteKernelKind::ROUTE_WRITE,
         &created, &request);
     if (status != HCCL_SUCCESS) return status;
-    const auto copyStatus = SelfCopyLane::Create(stream, &created.selfCopy);
-    if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    if (!created.ccuSelfCopy) {
+        const auto copyStatus = SelfCopyLane::Create(stream, &created.selfCopy);
+        if (copyStatus != HCCL_SUCCESS) return copyStatus;
+    }
+    std::printf("CCU_LOCAL_REMOTE_PLAN handle=%lu rank=%u enabled=%u self_copy=%s\n",
+        static_cast<unsigned long>(planHandle), created.rank, created.ccuSelfCopy ? 1U : 0U,
+        created.ccuSelfCopy ? "LocalCopyNb" : "ACL_D2D");
+    std::fflush(stdout);
     {
         std::lock_guard<std::mutex> lock(g_planMutex);
         const auto found = g_plans.find(planHandle);

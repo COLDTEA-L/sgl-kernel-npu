@@ -20,9 +20,11 @@ enum class RouteKernelKind {
     ALLTOALL_CONCURRENT,
     ALLTOALL_SERIAL,
     COMMAND_BLOCK_WORKER,
+    ROUTE_WRITE_LOCAL,
 };
 
 struct RouteResources {
+    bool ccuSelfCopy = false; // frozen when registered, never changed per execute
     std::shared_ptr<SelfCopyLane> selfCopy;
     ThreadHandle mainThread = 0;
     ThreadHandle routeThread = 0;

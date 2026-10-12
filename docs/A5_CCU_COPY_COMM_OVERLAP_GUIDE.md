@@ -3,7 +3,9 @@
 分支 `feature/a5-ccu-copy-comm-overlap`，基于多类型分支 `2bb77ec`。
 支持两卡 prepared-plan、两/四卡 peer-plan、FP16/BF16/FP32/INT8/INT32。
 默认 `--self-copy-mode overlap`；`serial` 保留原本本地copy后再CCU的对照。
-不是恢复旧组合CCU kernel，不修改系统HCCL、不加载ko、不改变UB路由表。
+新增 `--self-copy-mode ccu`：同一个已注册CCU kernel内提交本地LocalCopyNb和远端WriteNb，
+不再创建D2D copy stream/Event；执行和验收指令见**第9节**。
+不是直接恢复旧组合CCU kernel，不修改系统HCCL、不加载ko、不改变UB路由表。
 
 ## 1. 数据区域与 fork/join
 
@@ -102,7 +104,8 @@ python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py --runtime-check
 
 需要重编安装route package。若已装多类型版DeepEP(peer ABI>=2、attr ABI>=12)，
 **无需重编DeepEP/wheel**；如果仍是旧FP32/旧四卡wheel，按多类型指南先升级wheel。
-不编译/替换系统libhccl。当前route版本要求：prepared ABI>=14、peer ABI>=3、
+不编译/替换系统libhccl。新版route产物：prepared ABI=15、peer ABI=4、
+local+remote ABI=1。旧serial/overlap最低要求仍为prepared ABI>=14、peer ABI>=3、
 copy-overlap ABI>=1。Supported()=1只说明找到Ex Event符号，不表示硬件/capture已验证。
 缺少该接口时overlap模式明确失败，不默默换不安全event；可选serial模式作对照。
 安装前停止本用户使用旧库的进程；共享CANN目录仍有公共文件覆盖风险。
@@ -428,3 +431,190 @@ bash scripts/run_a5_ccu_local_copy_probe.sh --builder-only \
 补充纠正：SDK的CompletedEvent按值传递，内部持有资源表示。旧版本增加reserve
 是防御性修改，不能仅凭vector扩容就声称已证实悬挂引用；过去组合失败还涉及bridge
 生产任务提交顺序、通知布局和逐Channel结束握手，尚无LocalCopyNb本身失败的定论。
+
+## 9. 已通过 local-copy 穿刺后的组合 AllToAll 算子
+
+### 9.1 实现与边界
+
+用户反馈第8节local-copy有卡矩阵全部PASS，包括单次4MB和连续快照。基于这个
+前提，本版本在**现有prepared-plan算子**中增加CCU本地+远端数据面，而不是仅增加
+另一个独立测试程序。开发容器编译/CPU回归不代替目标机器上的组合验收。
+`ccu`仍为显式选择项，没有静默回退D2D；旧默认overlap保持不变。
+本版本仍是已有Buffer/torch.ops prepared-plan封装，不宣称新增了Ascend C tiling标准外壳。
+
+调用入口不变：
+
+```text
+图外：prepare_ccu_urma_peer_plan / bind_ccu_urma_peer_plan
+  -> topology/EID -> explicit ChannelDesc -> ChannelAcquire
+  -> RouteKernelArg(localCopy=true) -> Register -> RegisterFinish -> handle
+
+每次：buffer.ccu_urma_peer_plan_alltoall_out(input, output, handle, policy)
+  -> HcclCcuUrmaPeerPlanExecute
+  -> 推断dtype并计算字节布局/完整token
+  -> HcclCcuKernelLaunch（缓存kernel，不重新注册）
+  -> caller stream上完成；必要的IO die线程汇合保留
+```
+
+旧两卡 `ccu_urma_prepared_multipath_alltoall_policy_out` prepared-plan入口也支持ccu模式；
+推荐下面统一的peer-plan测试，两卡/四卡共用同一份环境和计时逻辑。
+
+组合CCU指令次序：
+
+```text
+Load input/output/tokens/selfOffset/selfBytes/path offsets
+  -> 每条Channel发布本rank的output/token
+  -> LocalCopyNb(recv[r], send[r], peerBytes, localEvent)  # dst在前，提交不等待
+  -> 等待各对端output/token
+  -> WriteNb(channel0, chunk0, remoteEvent0)             # 提交，不等待
+  -> WriteNb(channel1, chunk1, remoteEvent1)
+  -> ...所有远端分片均提交...
+  -> WaitEvent(localEvent)
+  -> WaitEvent(remoteEvent0/1/...)
+  -> 每条Channel completion NotifyRecord + NotifyWait
+  -> 下游使用output / 下一次覆写input
+```
+
+LocalCopyNb使用`LocalAddr -> LocalAddr`，与第8节direct模式相同，不在这里按4KB
+串行分块。本地复制与远端write**允许并行**，不保证任意硬件资源下时间完全重叠。
+本地任务可能在对端等待期间已完成，因此不能只凭API名宣称性能必然提升。
+
+正确性约束：
+
+- 自复制只写`recv[r]`；来自rank s的数据只写`recv[s]`，s!=r。
+- 每个对端的direct/relay chunk覆盖该peer行，互不重叠；dtype元素边界保持。
+- self输入/输出使用完整buffer token，不用某个Channel的remote token。
+- 一个独立local CompletedEvent，远端每条Channel各自独立event；不占用Channel通知槽。
+- **所有WriteNb都在第一次WaitEvent之前提交**；逐Channel后置握手防止前一轮接收未完
+  就返回、下一轮覆写buffer。保留bridge的输入任务flush、DeviceGuard、recordStream。
+- 内核签名包含local模式和实际Channel集合；旧remote-only注册缓存不可能冒充组合kernel。
+- 共6+3×Channel数个uint64 launch参数，仍受48个参数限制（最多14 Channels）。
+  两卡direct+6relay为7条，四卡每peer direct+1relay为6条；不是无限资源承诺。
+- 模式在图外绑定时固定；想换serial/overlap/ccu请建立新plan或用独立进程，不在同一
+  plan执行中途改环境变量。不同stream须图外绑定，各rank策略匹配。
+
+源码：`op_kernel_ccu/route_kernel.{h,cc}`、`op_host/peer_plan_runtime.cc`、
+`op_host/all_to_all_multiroute.cc`、`op_host/utils.cc`（路径前缀均为
+`examples/a5_ccu_urma_route_probe/`）。本版本没有恢复历史AllToAllMultiRouteKernel。
+
+### 9.2 更新、安装与ABI预检
+
+按第3节拉取当前overlap分支并**重编/安装route自定义包**。DeepEP若已有多类型
+peer ABI>=2 / attr ABI>=12，不需要重新编译wheel；不改/安装系统libhccl或ko。
+共享CANN安装目录存在覆盖旧custom SO的风险，先停止使用该库的本用户进程，并遵守
+机器管理权限；本版本运行时不修改UB路由表。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX A5_CCU_PREPARED_ALLOW_LAZY_STREAM
+HCCL_REPO=/home/l00934901/hccl \
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --install --install-path /usr/local/Ascend/cann-9.1.T560
+
+python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py \
+  --runtime-check --self-copy-mode ccu
+```
+
+要求route peer ABI>=4且`A5CcuLocalRemoteAbiVersion()>=1`；旧两卡入口要求prepared
+ABI>=15。检查通过只证明正确库已加载，不证明有卡数据正确。此预检会拒绝旧库。
+
+### 9.3 先验证direct-only，再验证显式relay
+
+```bash
+# 两卡direct-only：不加relay参数。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --self-copy-mode ccu \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+
+# 同两张计算卡，relay 0/1由命令行指定。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-phys 0,1 --self-copy-mode ccu \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+
+# 四卡：逐peer显式分配通信域外的relay，沿用已有JSON。
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 0,1,2,3 --relay-map docs/topology/a5_peer_plan_4rank_example.json \
+  --self-copy-mode ccu --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+```
+
+四卡direct-only只需省略relay-map。relay数量/实际port/EID仍由原拓扑解析处理，
+没有写死relay0/1或固定端口。五种dtype用`--dtype float16|bfloat16|float32|int8|int32`。
+每目的rank的数据4MB，tensor总大小k×4MB，含self行；direct:每条relay=2:1。
+
+batch模式在warmup前自动做两轮改变输入/毒化输出的排队验证，保存并检查**每次**
+结果，包括本地行和所有对端行。不能仅检查最后一轮，不能用固定输入掩盖重复写旧值。
+如果组合数据有任何错误/资源超时，停止性能测试，不自动fallback、不reset公共卡。
+
+### 9.4 两卡2/4/6 relay profiling：一轮warmup100+正式20
+
+下面每个relay列表为一个独立进程组，只采正式20次；warmup及正确性gate不入profiler。
+warmup100循环后同步一次，正式20循环后同步一次。第9.3节先PASS后再执行。
+
+```bash
+for RELAYS in 0,1 0,1,4,5 0,1,4,5,6,7; do
+  bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+    --devices 2,3 --relay-phys "${RELAYS}" --self-copy-mode ccu \
+    --sync-mode batch --graph-backend none \
+    --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+    --output-root /home/l00934901/profiling || break
+done
+```
+
+四卡profiling把第9.3四卡命令改为`--warmup 100 --iters 20 --repeats 1 --profile`即可。
+serial对照用完全相同卡/路径/大小/计时模式，只改`--self-copy-mode serial`。
+组合模式正式区域预期主要是一个CCU任务，不再有算子self行的ACL D2D MemcpyAsync；
+输入构造、正确性快照、profiler自身仍可能产生其他memcpy，勿据名称一概判错。
+CCU任务含本地复制、远端通信及peer等待；它的时长不是纯链路write时间。系统仍可能
+出现rank起始偏差或资源争用，不能承诺全部消除历史波动。
+
+### 9.5 组合PASS提示与分析
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_peer_plan_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -d "${RUN_DIR}"; then
+  python3 scripts/analyze_a5_ccu_peer_plan.py --run-dir "${RUN_DIR}"
+  sed -n '1,220p' "${RUN_DIR}/peer_plan_report.md"
+  grep -HnE 'CCU_LOCAL_REMOTE_PLAN|PEER_CASE_FAILURE|PASS|RESULT_JSON' \
+    "${RUN_DIR}"/cases/*.log
+fi
+```
+
+所有rank结果、改变输入batch gate、case退出清理均正确，且每个rank明确注册了
+LocalCopyNb组合模式，分析脚本才输出：
+
+```text
+PASS: combined LocalCopyNb + peer WriteNb AllToAll; data, queued snapshots and lifecycle verified.
+```
+
+缺rank、缺组合标记、退出失败、数据错误不会给整体PASS。这个PASS验证本次算子功能，
+不是周期级重叠/带宽收益/指定relay硬件转发的新证明；后者结合profiler与HCCN。
+
+图验证需另测，不能由旧D2D模式的capture PASS直接推出：
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --relay-phys 0,1 --self-copy-mode ccu \
+  --sync-mode per-call --graph-backend aclgraph \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 \
+  --output-root /home/l00934901/profiling
+```
+
+图模式是功能验收，不与batch性能混比。Destroy仍在同步并释放图之后调用。
+
+### 9.6 开发回归
+
+```bash
+python3 tests/python/deepep/test_a5_ccu_local_remote_cpu.py
+```
+
+此测试用CPU表示记录器编译**实际生产RouteKernel源码**，验证所有WriteNb在完成等待
+前提交、local/remote独立事件、逐Channel结束握手、参数Load/GeneArgs匹配，并模拟
+2/4卡、1/2/4字节、不同path数、40次新输入复用/乱序copy完成、source和guard保护。
+它不是设备并行模拟器，不验证目标固件资源、DMA/CCU性能或真实graph capture。

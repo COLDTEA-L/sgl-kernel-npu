@@ -11,7 +11,7 @@ from pathlib import Path
 def valid_result(result, k):
     sizes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}
     dtype = result.get("dtype", "float32")
-    if result.get("self_copy_mode", "serial") not in ("serial", "overlap"):
+    if result.get("self_copy_mode", "serial") not in ("ccu", "serial", "overlap"):
         return False
     if not isinstance(dtype, str) or dtype not in sizes:
         return False
@@ -82,6 +82,15 @@ def analyze(root):
                         results.append(result)
                 except (OSError, ValueError):
                     pass
+        ccu_ranks = set()
+        for line in (log.read_text(errors="replace").splitlines() if log.exists() else []):
+            if line.startswith("CCU_LOCAL_REMOTE_PLAN "):
+                fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
+                if fields.get("enabled") == "1" and fields.get("self_copy") == "LocalCopyNb":
+                    try:
+                        ccu_ranks.add(int(fields["rank"]))
+                    except (KeyError, ValueError):
+                        pass
         status_file = log.with_suffix(".status")
         status = status_file.read_text().strip() if status_file.exists() else "INTERRUPTED"
         data_valid = (len(results) == k and
@@ -94,6 +103,10 @@ def analyze(root):
                              "float32" if key == "dtype" else "serial" if key == "self_copy_mode" else None) == settings[key]
                          for key in ("sync_mode", "warmup", "iterations", "bytes_per_peer", "graph_backend", "dtype", "self_copy_mode"))
                      for r in results))
+        combined_requested = settings.get("self_copy_mode") == "ccu" or any(
+            r.get("self_copy_mode") == "ccu" for r in results)
+        if combined_requested and ccu_ranks != set(range(k)):
+            data_valid = False  # never accept a silent D2D fallback as CCU PASS
         valid = status == "0" and data_valid
         complete &= valid
         rows.append(dict(case=log.stem, status=status,
@@ -141,6 +154,12 @@ def analyze(root):
         "New runs use r*/results/rank*.json as authoritative; old stdout-only runs remain supported.",
         "A correct result does not independently identify the physical relay. Correlate topology ports with HCCN deltas."])
     (root / "peer_plan_report.md").write_text("\n".join(report) + "\n")
+    if summary["self_copy_mode"] == "ccu":
+        verified = ("data, queued snapshots and lifecycle verified." if
+                    all(r["sync_mode"] == "batch" for r in rows) else
+                    "data and lifecycle verified (queued validation not requested).")
+        print("PASS: combined LocalCopyNb + peer WriteNb AllToAll; " + verified
+              if complete else "FAIL_OR_INCOMPLETE: combined CCU AllToAll is not validated by this run.")
     return summary
 
 
