@@ -1073,3 +1073,173 @@ bash scripts/run_a5_ccu_local_copy_probe.sh \
 开发验证：无卡容器完成三档standalone编译/构图、60项CPU回归；包括各geometry的
 bulk/tail覆盖、2GiB边界、默认32KiB生产布局和错误geometry拒绝。
 **构图PASS不是设备正确性或性能PASS**，最终以本节有卡结果为准。
+
+## 13. 两项控制开销优化：direct + 6 relay A/B/C
+
+本次仍在 `feature/a5-ccu-copy-comm-overlap` 分支，不改系统HCCL、驱动或全局路由。
+当前计算卡为 **6、7**，显式relay为 **0、1、2、3、4、5**。只在6、7启动两个rank，
+relay卡不运行用户rank。EID/端口继续由拓扑解析，不能硬编码旧2、3卡的EID。
+这些relay可达不等于空闲；其他用户占用其IO/带宽仍可能干扰性能。
+
+保持每peer 4MiB、direct : 每一条relay = 2:1，权重为 `2,1,1,1,1,1,1`。
+本地复制仍是已验证的8路×32KiB GroupCopy。64KiB实验出现changed-payload正确性失败，
+未推广到生产；这次不再增大slice，也不改变流量布局。
+
+### 13.1 三组模式及实际改动
+
+通过 `--channel-sync-mode` 选择，默认 `baseline` 保留旧行为：
+
+| 模式 | 地址/token通知 | 远端WriteNb提交 |
+|---|---|---|
+| baseline | slot0、slot1各等一次 | 等完所有Channel元数据，再提交所有WriteNb |
+| packed | 同一slot0，地址bit1、token bit2；等mask3一次 | 等完所有Channel元数据，再提交所有WriteNb |
+| packed-ready | 同packed | 依次等当前Channel元数据，然后立即提交它的WriteNb |
+
+`packed`不是把两条元数据消息变成一条：仍分别发布地址和token，只合并等待。
+7个Channel的元数据等待从14次变7次；包括结束握手在内的NotifyRecord/NotifyWait
+调用数从42变35。真实硬件指令数仍以构图/profiling为准。
+原生 `ccu_kernel_all_to_all_mesh1d_multi_jetty.cc::PreSync` 也采用同槽不同bit、合并mask等待。
+我们的旧对象接口使用 `NotifyRecord(Channel, slot, variable, value, mask)` 和
+`NotifyWait(Channel, slot, mask)`；不依赖之前缺失的新CCU开发符号。
+
+控制流程：
+
+```text
+图外 prepare/bind
+  解析ChannelSyncMode -> 显式direct/relay Channel -> 注册对应协议的RouteKernel
+执行
+  所有Channel先发布output/token
+    baseline/packed: 等所有Channel元数据 -> 全部WriteNb
+    packed-ready:   等Channel0 -> WriteNb0 -> 等Channel1 -> WriteNb1 -> ...
+  GroupCopy本地self行
+  等待所有WriteNb CompletedEvent
+  每个Channel单独结束NotifyRecord/NotifyWait
+```
+
+安全边界：所有元数据先发后等；地址与token必须同时就绪；先提交所有远端写再等完成；
+self和incoming peer写不同输出行；保留每个Channel独立完成事件和结束握手。
+`packed-ready`是顺序解释器，若前面的Channel慢仍会阻塞后面；不是乱序就绪调度。
+模式在plan创建时固定，不允许同一plan后续bind换协议。所有rank必须使用相同模式。
+RouteKernel签名和旧route资源cache key包含模式，不会复用另一个协议的kernel。
+
+实现位置：`common/channel_sync_policy.h`、`op_kernel_ccu/route_kernel.{h,cc}`、
+`op_host/utils.cc`、`op_host/peer_plan_runtime.cc`（均在`examples/a5_ccu_urma_route_probe/`内）。
+本次只优化元数据同步与提交次序，不改变EID选路能力，也不声称一定更快。
+
+### 13.2 拉取、编译安装与ABI确认
+
+**必须重编并安装route自定义通信包；已有可用的多类型DeepEP wheel不需重装。**
+HCCL仓只是构建框架，本次不需拉取/修改它，不替换`libhccl.so`。
+以下在当前Docker shell中执行；括号限制`set -e`范围，失败不会退出交互容器：
+
+```bash
+(
+  set -e
+  cd /home/l00934901/sgl-kernel-npu
+  git fetch origin feature/a5-ccu-copy-comm-overlap
+  git switch feature/a5-ccu-copy-comm-overlap
+  git pull --ff-only origin feature/a5-ccu-copy-comm-overlap
+  source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+  unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX A5_CCU_CHANNEL_SYNC_MODE
+  HCCL_REPO=/home/l00934901/hccl \
+    bash scripts/build_a5_ccu_urma_route_probe.sh \
+      --install --install-path /usr/local/Ascend/cann-9.1.T560
+  python3 tests/python/deepep/test_a5_ccu_peer_plan_alltoall.py \
+    --runtime-check --self-copy-mode ccu --channel-sync-mode packed-ready
+)
+```
+
+构建与安装末尾应新增 `Verified Channel-sync ABI: 1`；runtime-check应显示
+`channel_sync_mode=packed-ready`。若缺少`A5CcuChannelSyncAbiVersion`，是旧SO，
+不能用它进行A/B。原peer ABI仍为5、prepared ABI仍为16，新增的是独立特性ABI。
+若Git提示本地修改冲突，停止按现有拉取恢复流程处理，不自动丢弃文件。
+
+### 13.3 先一次跑完三种模式的短正确性测试
+
+默认计算6、7，默认relay 0～5；此处明确写出，未来换卡可直接改命令行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_channel_sync_perf.sh \
+  --devices 6,7 --relay-phys 0,1,2,3,4,5 \
+  --bytes 4194304 --warmup 1 --iters 3 --repeats 1 --no-profile \
+  --timeout-seconds 300 \
+  --output-root /home/l00934901/profiling
+```
+
+脚本串行启动baseline、packed、packed-ready三个独立进程组。
+每组都先做三次changed-payload检查、两轮批量逐次snapshot检查；通过后才warmup/正式运行。
+其中一组失败立即停止，保留日志，不reset卡或改公共环境。
+短测无profiling，报告`device_profile_complete=False`正常；三组应
+`functional_complete=True`，不能据此判断性能。
+
+### 13.4 正式性能：warmup100 + 正式20，只采正式20，一轮
+
+```bash
+bash scripts/run_a5_ccu_channel_sync_perf.sh \
+  --devices 6,7 --relay-phys 0,1,2,3,4,5 \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 \
+  --timeout-seconds 600 \
+  --output-root /home/l00934901/profiling
+```
+
+默认开启profiling，三个模式各跑一轮。不做graph capture；两段循环各自在循环外同步，
+正式20次是20次独立算子调用。资源初始化、正确性检查和100次warmup都不在采集窗口。
+以后单独测试某个模式可用现有launcher：
+
+```bash
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 6,7 --relay-phys 0,1,2,3,4,5 \
+  --self-copy-mode ccu --channel-sync-mode packed-ready \
+  --sync-mode batch --graph-backend none \
+  --bytes 4194304 --warmup 100 --iters 20 --repeats 1 --profile \
+  --timeout-seconds 600 --output-root /home/l00934901/profiling
+```
+
+4卡的数据面同样支持三种模式；当前先只测6、7两卡，不自动生成4卡relay分配。
+
+### 13.5 看什么、如何重跑分析
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_channel_sync_6_7_* | head -1)
+test -n "${RUN_DIR}" && test -f "${RUN_DIR}/runs.tsv" && {
+  column -s $'\t' -t "${RUN_DIR}/runs.tsv"
+  python3 scripts/analyze_a5_ccu_channel_sync.py --run-dir "${RUN_DIR}"
+  sed -n '1,240p' "${RUN_DIR}/channel_sync_report.md"
+  find "${RUN_DIR}" -type f -name trace_view.json -print
+}
+```
+
+`runs.tsv`保存每组准确的结果目录，不把其他实验的最新目录混入。
+`channel_sync_report.md`与`channel_sync_summary.json`分开给出：
+
+- 正确性/进程退出是否完整，每rank是否有实际注册模式marker。
+- 每rank正式20个设备Ccu任务的min/median/mean/max；缺失/多出任务不接受为性能样本。
+- host batch平均值单独展示，不能替代设备CCU时长。
+- baseline/packed/packed-ready相同卡、EID计划、bytes、dtype、权重及采样设置下的比较。
+
+打开`runs.tsv`中每个子目录的`r1/profiling/rank0/*_ascend_pt`和`rank1/*_ascend_pt`，
+即可在MindStudio比较泳道。自动分析优先读取`task_time*.csv`，否则`trace_view.json`
+或`msprof*.json`，只接受设备Ccu，不把`HcclCcuKernelLaunch` host API算入。
+不支持的导出格式不会猜单位：保留原profile，报告设备样本不完整，人工看MindStudio。
+
+先确认两rank都PASS，再比较同rank与较慢rank的CCU中位数、最大值及开始/结束时间偏差。
+如果仅提前开始、结束不提前，可能只是peer等待增加，不算真实收益。
+最后确认实际使用7个Channel：
+
+```bash
+grep -RHnE \
+  'CHANNEL_SYNC_PLAN|PEER_PATH_CHANNEL|PEER_BATCH_VALIDATION|PEER_MEASUREMENT|RESULT_JSON|PEER_CASE_FAILURE' \
+  "${RUN_DIR}"/*/a5_ccu_peer_plan_*/cases/*.log
+```
+
+期望每rank `CHANNEL_SYNC_PLAN ... channels=7`，index0～6各有Channel，且三组mode不同。
+正确性PASS不是性能收益PASS；若三组没有显著收益，应继续研究共享数据面/peer等待，
+而不是把这两项优化写成已证实瓶颈。
+
+开发验证：生产RouteKernel的CPU指令模型覆盖三种模式、2/4 rank、多类型字节布局、
+换epoch及guard、发布/等待顺序、独立完成事件；无NPU Docker完成SDK编译和打包。
+这些验证不能替代有卡机的mask通知复用、数据正确性、capture/replay或性能验证。

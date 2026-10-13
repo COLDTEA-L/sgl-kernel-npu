@@ -37,6 +37,7 @@ struct Instruction {
     std::string op;
     ChannelHandle channel = 0;
     uint32_t slot = 0;
+    uint32_t mask = 0, variable = UINT32_MAX;
     int event = -1;
     CcuRep::Variable dst, src, len;
 };
@@ -63,13 +64,16 @@ protected:
     CcuRep::LocalAddr CreateLocalAddr() { return {}; }
     CcuRep::RemoteAddr CreateRemoteAddr() { return {}; }
     CcuRep::CompletedEvent CreateCompletedEvent() { return {nextEvent_++}; }
-    HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t,
-        const CcuRep::Variable &, uint32_t) { return NotifyRecord(ch, slot, 1); }
-    HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t) {
-        Instruction i; i.op = "record"; i.channel = ch; i.slot = slot; instructions.push_back(i); return 0;
+    HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t variable,
+        const CcuRep::Variable &, uint32_t mask) {
+        Instruction i; i.op="record"; i.channel=ch; i.slot=slot; i.mask=mask; i.variable=variable;
+        instructions.push_back(i); return 0;
     }
-    HcclResult NotifyWait(ChannelHandle ch, uint32_t slot, uint32_t) {
-        Instruction i; i.op = "notify_wait"; i.channel = ch; i.slot = slot; instructions.push_back(i); return 0;
+    HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t mask) {
+        Instruction i; i.op = "record"; i.channel = ch; i.slot = slot; i.mask=mask; instructions.push_back(i); return 0;
+    }
+    HcclResult NotifyWait(ChannelHandle ch, uint32_t slot, uint32_t mask) {
+        Instruction i; i.op = "notify_wait"; i.channel = ch; i.slot = slot; i.mask=mask; instructions.push_back(i); return 0;
     }
     HcclResult LocalCopyNb(CcuRep::LocalAddr dst, CcuRep::LocalAddr src,
         CcuRep::Variable len, CcuRep::CompletedEvent e) {

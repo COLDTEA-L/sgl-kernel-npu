@@ -23,6 +23,7 @@ struct PeerPreparedPlan {
     uint32_t rankSize = 0;
     std::string id, content;
     uint32_t availableCards = 0;
+    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE;
     std::vector<PeerPathSpec> specs;
     std::map<uintptr_t, PeerPlanResources> streams;
 };
@@ -95,6 +96,8 @@ HcclResult Load(const char *path, uint32_t rankSize, uint32_t availableCards,
 HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
 {
     if (handle == 0 || stream == nullptr) return HCCL_E_PARA;
+    ChannelSyncMode requested;
+    if (!ReadChannelSyncMode(&requested)) return HCCL_E_PARA;
     std::lock_guard<std::mutex> build(buildMutex);
     PeerPreparedPlan snapshot;
     {
@@ -102,13 +105,16 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         const auto found = plans.find(handle);
         int32_t device = -1;
         if (found == plans.end()) return HCCL_E_NOT_FOUND;
+        // The registered notification protocol is immutable for this plan,
+        // including additional graph streams. Never silently reuse another mode.
+        if (requested != found->second.syncMode) return HCCL_E_PARA;
         if ((comm && comm != found->second.comm) || aclrtGetDevice(&device) != ACL_SUCCESS ||
             device != found->second.device) return HCCL_E_PARA;
         if (found->second.streams.count(reinterpret_cast<uintptr_t>(stream))) return HCCL_SUCCESS;
         snapshot = found->second;
     }
     PeerPlanResources resources;
-    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources);
+    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode);
     if (status != HCCL_SUCCESS) return status;
     if (!resources.route.ccuSelfCopy) {
         const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
@@ -131,6 +137,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
 } // namespace
 
 extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 5; }
+extern "C" __attribute__((visibility("default"))) int A5CcuChannelSyncAbiVersion() { return 1; }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
@@ -138,6 +145,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
     if (!comm || !stream || !planId || !manifest || !handle) return HCCL_E_PTR;
     *handle = 0;
     PeerPreparedPlan plan;
+    if (!ReadChannelSyncMode(&plan.syncMode)) return HCCL_E_PARA;
     if (!*planId || HcclGetRankSize(comm, &plan.rankSize) != HCCL_SUCCESS ||
         aclrtGetDevice(&plan.device) != ACL_SUCCESS) return HCCL_E_PARA;
     plan.comm = comm; plan.id = planId; plan.availableCards = availableCards;
@@ -150,7 +158,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
         for (const auto &entry : plans) {
             const auto &p = entry.second;
             if (p.comm == comm && p.id == plan.id) {
-                if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards)
+                if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards ||
+                    p.syncMode != plan.syncMode)
                     return HCCL_E_PARA;
                 id = entry.first;
                 break;

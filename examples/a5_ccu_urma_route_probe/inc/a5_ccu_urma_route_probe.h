@@ -75,6 +75,8 @@ int A5CcuCopyOverlapSupported(void);
  * complete canonical peer manifest, 2/4 ranks,
  * direct-only or explicit communicator-external relay paths. */
 int A5CcuPeerPlanAbiVersion(void);
+// Channel metadata mask/submission protocol capability, not hardware route ID.
+int A5CcuChannelSyncAbiVersion(void);
 /** Destroy only outside capture, after synchronizing and releasing all graphs
  * using this handle. Reclaims owned self-copy streams/events; HCCL channel
  * cache lifetime remains owned by the existing communication runtime. */

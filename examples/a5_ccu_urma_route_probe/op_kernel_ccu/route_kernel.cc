@@ -21,8 +21,9 @@ constexpr size_t MAX_ROUTE_PATHS = 64U;
 } // namespace
 
 RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
-                               const std::vector<uint32_t> &routeIndices, bool localCopy, bool groupCopy)
-    : routeIndices_(routeIndices), localCopy_(localCopy), groupCopy_(groupCopy)
+                               const std::vector<uint32_t> &routeIndices, bool localCopy, bool groupCopy,
+                               ChannelSyncMode syncMode)
+    : routeIndices_(routeIndices), localCopy_(localCopy), groupCopy_(groupCopy), syncMode_(syncMode)
 {
     channels = inputChannels;
 }
@@ -33,6 +34,7 @@ hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
     signature.Append(MakePathKernelSignature(groupCopy() ? "A5CcuUrmaGroupedSelf8x32KV1" :
         localCopy_ ? "A5CcuUrmaLocalAndRemoteV1" :
         "A5CcuUrmaMultiRouteV2", routeIndices_, channels));
+    signature.Append(std::string(":channel-sync-v1:") + ChannelSyncName(syncMode_));
     return signature;
 }
 
@@ -86,8 +88,11 @@ HcclResult RouteKernel::Algorithm()
         CCU_KERNEL_CHECK(CreateVariable(channels_[i], TOKEN_VAR_INDEX, &remoteTokens.back()));
         CCU_KERNEL_CHECK(NotifyRecord(channels_[i], OUTPUT_NOTIFY_INDEX, OUTPUT_VAR_INDEX,
                                       localOutput, NOTIFY_MASK));
-        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], TOKEN_NOTIFY_INDEX, TOKEN_VAR_INDEX,
-                                      localOutputToken, NOTIFY_MASK));
+        // Distinct bits in the SAME notify slot; readiness requires BOTH.
+        // Publish all Channels before any wait to avoid reciprocal wait cycles.
+        const bool packed = syncMode_ != ChannelSyncMode::BASELINE;
+        CCU_KERNEL_CHECK(NotifyRecord(channels_[i], packed ? OUTPUT_NOTIFY_INDEX : TOKEN_NOTIFY_INDEX,
+                                      TOKEN_VAR_INDEX, localOutputToken, packed ? 2U : NOTIFY_MASK));
     }
     // Separate local completion resource; not a Channel notify slot. Submit
     // before peer waits, but DO NOT wait for it before submitting WriteNb.
@@ -101,14 +106,22 @@ HcclResult RouteKernel::Algorithm()
         dst.addr = localOutput; dst.addr += selfOffset; dst.token = localOutputToken;
         CCU_KERNEL_CHECK(LocalCopyNb(dst, src, selfBytes, localEvent));
     }
-    for (size_t i = 0; i < channels_.size(); ++i) {
+    auto waitMetadata = [&](size_t i) -> HcclResult {
+        if (syncMode_ != ChannelSyncMode::BASELINE)
+            return NotifyWait(channels_[i], OUTPUT_NOTIFY_INDEX, 3U);
         CCU_KERNEL_CHECK(NotifyWait(channels_[i], OUTPUT_NOTIFY_INDEX, NOTIFY_MASK));
-        CCU_KERNEL_CHECK(NotifyWait(channels_[i], TOKEN_NOTIFY_INDEX, NOTIFY_MASK));
+        return NotifyWait(channels_[i], TOKEN_NOTIFY_INDEX, NOTIFY_MASK);
+    };
+    if (syncMode_ != ChannelSyncMode::PACKED_READY) {
+        for (size_t i = 0; i < channels_.size(); ++i) CCU_KERNEL_CHECK(waitMetadata(i));
     }
 
     std::vector<hcomm::CcuRep::CompletedEvent> events;
     events.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
+        // Ordered interpreter, NOT an out-of-order readiness scheduler.
+        // Do not wait for write completion here: submit every path first.
+        if (syncMode_ == ChannelSyncMode::PACKED_READY) CCU_KERNEL_CHECK(waitMetadata(i));
         hcomm::CcuRep::LocalAddr source = CreateLocalAddr();
         source.addr = localInput;
         source.addr += sourceOffsets[i];

@@ -38,6 +38,8 @@ def main():
     p.add_argument("--profile", action="store_true")
     p.add_argument("--self-copy-mode", choices=("ccu", "ccu-direct", "overlap", "serial"), default="overlap",
                    help="combined CCU local+remote graph, independent D2D stream, or serial D2D")
+    p.add_argument("--channel-sync-mode", choices=("baseline", "packed", "packed-ready"), default="baseline",
+                   help="registered metadata notification/submission protocol; identical on all ranks")
     args = p.parse_args()
     if args.bytes <= 0 or args.bytes % PAYLOAD_DTYPES[args.dtype] or args.warmup < 0 or args.iters < 1:
         p.error("positive dtype-element-aligned byte count and iterations required")
@@ -53,6 +55,7 @@ def main():
             p.error("initial implementation supports valid ranks in WORLD_SIZE=2 or 4")
     # This marker does not imply native/static destructors have finished.
     os.environ["A5_CCU_SELF_COPY_MODE"] = args.self_copy_mode
+    os.environ["A5_CCU_CHANNEL_SYNC_MODE"] = args.channel_sync_mode
     atexit.register(lambda: phase("python_atexit"))
     # Parse this entry point's arguments before loading any NPU runtime. Never
     # import an executable benchmark for helpers: its module initialization can
@@ -82,6 +85,12 @@ def main():
         if abi_versions[symbol] < minimum:
             raise RuntimeError(f"stale worker ABI {symbol}={abi_versions[symbol]}; expected >= {minimum} for overlap branch")
     overlap_supported = route_library.A5CcuCopyOverlapSupported
+    # Explicit mode, including the controlled baseline, must never silently use
+    # a stale SO. No DeepEP wheel ABI change is required by this route-only feature.
+    sync_version = route_library.A5CcuChannelSyncAbiVersion
+    sync_version.restype = ctypes.c_int
+    if sync_version() < 1:
+        raise RuntimeError("channel sync ABI>=1 required; rebuild/install route probe")
     overlap_supported.restype = ctypes.c_int
     if args.self_copy_mode == "overlap" and overlap_supported() != 1:
         raise RuntimeError("copy overlap requires aclrtCreateEventExWithFlag; no unsafe event fallback")
@@ -101,7 +110,7 @@ def main():
     print(f"PEER_RUNTIME_VERIFIED route={route_path} extension={extension_path} "
           f"route_ABI={abi_versions['A5CcuPeerPlanAbiVersion']} "
           f"deep_ABI={abi_versions['A5DeepEpPeerPlanAbiVersion']} "
-          f"self_copy_mode={args.self_copy_mode}", flush=True)
+          f"self_copy_mode={args.self_copy_mode} channel_sync_mode={args.channel_sync_mode}", flush=True)
     if args.runtime_check:
         return
 
@@ -232,6 +241,7 @@ def main():
     result = dict(rank=rank, ranks=k, correctness="PASS",
         bytes_per_peer=args.bytes, tensor_bytes=k * args.bytes, dtype=args.dtype,
         element_bytes=send.element_size(), self_copy_mode=args.self_copy_mode, warmup=args.warmup,
+        channel_sync_mode=args.channel_sync_mode, pid=os.getpid(),
         iterations=args.iters, graph_backend=args.graph_backend, **timing,
         batch_validation=batch_validation, measurement_start_lateness_us=start_lateness_us,
         manifest=str(args.manifest))

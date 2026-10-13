@@ -802,6 +802,10 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     CommandWorkerRegisterMode commandRegisterMode = CommandWorkerRegisterMode::FULL;
     std::string commandRegisterModeName = "full";
     HcclResult status = HCCL_SUCCESS;
+    ChannelSyncMode syncMode;
+    if (!ReadChannelSyncMode(&syncMode)) return HCCL_E_PARA;
+    if (syncMode != ChannelSyncMode::BASELINE && kernelKind != RouteKernelKind::ROUTE_WRITE &&
+        !localCopy) return HCCL_E_PARA;
     if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
         status = GetCommandWorkerRegisterMode(&commandRegisterMode,
                                               &commandRegisterModeName);
@@ -859,6 +863,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         routeKey += ":weights=" + std::string(weightKeyValue == nullptr ? "default" : weightKeyValue);
     }
     routeKey += ":kernel=" + std::to_string(static_cast<int>(kernelKind));
+    routeKey += std::string(":channel-sync=") + ChannelSyncName(syncMode);
     if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
         if (!explicitPlan || plan->commandBlockAddress == 0U) return HCCL_E_PARA;
         routeKey += ":command_block=" + std::to_string(plan->commandBlockAddress);
@@ -1176,7 +1181,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     if (kernelKind == RouteKernelKind::ROUTE_WRITE || localCopy) {
         created.ccuSelfCopy = localCopy; created.ccuGroupCopy=groupCopy;
         kernelName = created.ccuSelfCopy ? "local_and_remote" : "route_write";
-        RouteKernelArg kernelArg(created.channels, routeIndices, localCopy, groupCopy);
+        RouteKernelArg kernelArg(created.channels, routeIndices, localCopy, groupCopy, syncMode);
         hcomm::KernelCreator creator = CreateRouteKernel;
         registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
     } else if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
@@ -1221,7 +1226,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
 }
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
-    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources)
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode)
 {
     if (!comm || !stream || !resources) return HCCL_E_PTR;
     PeerPlanResources result;
@@ -1312,12 +1317,15 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             r.rank, result.peers[i], i, r.weights[i], states[i], static_cast<unsigned long>(r.channels[i]));
         if (states[i] != 0 || !handles.insert(r.channels[i]).second) return HCCL_E_RUNTIME;
     }
-    RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy);
+    RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy, syncMode);
     hcomm::KernelCreator creator = CreateRouteKernel;
     status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
     if (status != HCCL_SUCCESS) return status;
     status = HcclCcuKernelRegisterFinish(comm);
     if (status != HCCL_SUCCESS) return status;
+    std::printf("CHANNEL_SYNC_PLAN rank=%u mode=%s channels=%zu\n",
+        r.rank, ChannelSyncName(syncMode), r.channels.size());
+    std::fflush(stdout);
     *resources = result;
     return HCCL_SUCCESS;
 }

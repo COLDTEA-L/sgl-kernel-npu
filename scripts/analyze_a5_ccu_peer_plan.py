@@ -84,7 +84,19 @@ def analyze(root):
                     pass
         ccu_ranks = set()
         group_ranks = set()
+        sync_ranks = set()
         for line in (log.read_text(errors="replace").splitlines() if log.exists() else []):
+            if line.startswith("CHANNEL_SYNC_PLAN "):
+                fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
+                if fields.get("mode") == settings.get("channel_sync_mode"):
+                    try:
+                        rank = int(fields["rank"])
+                        counts = plan.get("channels_per_rank")
+                        if (counts is None or (0 <= rank < k and len(counts) == k and
+                                int(fields["channels"]) == counts[rank])):
+                            sync_ranks.add(rank)
+                    except (KeyError, ValueError):
+                        pass
             if line.startswith("CCU_LOCAL_REMOTE_PLAN "):
                 fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
                 if fields.get("enabled") == "1" and fields.get("self_copy") in ("LocalCopyNb", "GroupCopy8x32K"):
@@ -107,6 +119,10 @@ def analyze(root):
                      for r in results))
         combined_requested = settings.get("self_copy_mode") in ("ccu", "ccu-direct") or any(
             r.get("self_copy_mode") in ("ccu", "ccu-direct") for r in results)
+        if "channel_sync_mode" in settings:
+            if sync_ranks != set(range(k)) or any(
+                r.get("channel_sync_mode") != settings["channel_sync_mode"] for r in results):
+                data_valid = False
         if combined_requested and ccu_ranks != set(range(k)):
             data_valid = False  # never accept a silent D2D fallback as CCU PASS
         if settings.get("self_copy_mode") == "ccu" or any(r.get("self_copy_mode") == "ccu" for r in results):
@@ -128,12 +144,14 @@ def analyze(root):
             "last_phase_by_rank", "slowest_rank_host_avg_us"), delimiter="\t")
         writer.writeheader(); writer.writerows(rows)
     summary = dict(complete=complete, self_copy_mode=settings.get("self_copy_mode", "serial"),
+                   channel_sync_mode=settings.get("channel_sync_mode", "baseline"),
                    dtype=settings.get("dtype", "float32"), devices=plan["devices"],
                    relay_limit_per_peer=plan["relay_limit_per_peer"], cases=rows)
     (root / "peer_plan_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     report = ["# CCU explicit peer-plan AllToAll", "", f"- complete: `{complete}`",
               f"- communicator physical devices: `{plan['devices']}`", f"- dtype: `{settings.get('dtype', 'float32')}`",
               f"- self-copy scheduling: `{settings.get('self_copy_mode', 'serial')}` (not proof of physical overlap)",
+              f"- Channel metadata protocol: `{settings.get('channel_sync_mode', 'baseline')}`",
               f"- relay limit per peer: `{plan['relay_limit_per_peer']}`", "",
               "| case | status | sync mode | data correctness | lifecycle | slowest-rank host average (us) |",
               "|---|---|---|---|---|---:|"]

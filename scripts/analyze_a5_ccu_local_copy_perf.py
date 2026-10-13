@@ -51,7 +51,10 @@ def parse_device(root, pid):
                 sources.append(str(file))
     if records:
         return list(records.values()), len(copies), sorted(set(sources))
-    for file in sorted(root.rglob('msprof*.json')):
+    # torch_npu's MindStudio export uses trace_view.json. Prefer that export
+    # over raw msprof JSON to avoid counting the same task in two schemas.
+    trace_files = sorted(root.rglob('trace_view.json'))
+    for file in trace_files or sorted(root.rglob('msprof*.json')):
         try:
             data = json.loads(file.read_text())
             events = data.get('traceEvents', []) if isinstance(data, dict) else data

@@ -11,6 +11,10 @@ ccu模式需要route peer ABI>=5/local+remote ABI>=2；需重编安装route自�
 已有多类型DeepEP wheel不必重编。
 构建、正确性与性能A/B优先看 [copy/CCU并行指南](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md)。
 两卡原接口保留；四卡和 direct-only 使用新增 peer-plan API。
+通知/提交顺序A/B/C新增`--channel-sync-mode baseline|packed|packed-ready`，默认baseline。
+当前计算卡6、7，显式relay0～5的拉取、route重编安装、短正确性及正式20次profiling命令，
+见 [并行指南第13节](A5_CCU_COPY_COMM_OVERLAP_GUIDE.md#13-两项控制开销优化direct--6-relay-abc)。
+本特性需Channel-sync ABI>=1，不需更新已有多类型DeepEP wheel。
 两卡现在可直接用 `--devices 2,3 --relay-phys 0,1` 选择relay，无需修改JSON；
 两参数 `--relay-phys` / `--relay-map` 互斥，省略二者为direct-only。
 支持1、2、3等任意合法relay数量；四卡逐对策略仍用JSON，避免自动分配错误。

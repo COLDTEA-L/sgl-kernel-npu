@@ -11,6 +11,7 @@
 #include <vector>
 #include <memory>
 #include "../common/peer_plan.h"
+#include "../common/channel_sync_policy.h"
 
 namespace a5_ccu_urma_probe {
 class SelfCopyLane;
@@ -47,7 +48,8 @@ struct PeerPlanResources {
 };
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
-    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources);
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources,
+    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE);
 
 // Normalized two-rank control-plane request used by the production-facing
 // explicit multipath API.  The discovered route is always channel 0 and the

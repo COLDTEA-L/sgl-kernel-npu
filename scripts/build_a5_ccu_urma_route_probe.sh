@@ -183,6 +183,7 @@ required_symbols=(
     HcclCcuUrmaExplicitMultipathPlanExecuteV2
     A5CcuUrmaPreparedPlanAbiVersion
     A5CcuPeerPlanAbiVersion
+    A5CcuChannelSyncAbiVersion
     A5CcuCopyOverlapAbiVersion
     A5CcuCopyOverlapSupported
     HcclCcuUrmaPeerPlanDestroy
@@ -222,6 +223,12 @@ peer_actual = peer_version()
 print(f"Verified peer-plan ABI: {peer_actual} ({library_path})")
 if peer_actual < 3:
     raise SystemExit(f"peer-plan ABI {peer_actual} is stale; expected >= 3 (self-copy overlap)")
+sync_version = library.A5CcuChannelSyncAbiVersion
+sync_version.restype = ctypes.c_int
+sync_actual = sync_version()
+print(f"Verified Channel-sync ABI: {sync_actual} ({library_path})")
+if sync_actual < 1:
+    raise SystemExit("channel sync ABI is stale; expected >= 1")
 PY
 }
 verify_prepared_plan_abi "${built_library}"
