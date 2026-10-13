@@ -179,7 +179,9 @@ def main():
         f"- complete: `{complete}`",
         f"- physical devices: `{settings['devices']}`",
         f"- pinned host memory: `{all(item.get('pinned_host') for item in rank_results)}`",
+        f"- bytes per copy: `{settings['sizes']}`",
         f"- warmup / measured calls / repeats: `{settings['warmup']} / {settings['iterations']} / {settings['repeats']}`",
+        "- measured calls are submitted back-to-back, then synchronized once; reported time is the batch total divided by call count.",
         "- device time is measured by NPU events on the copy stream; host time additionally includes submission and synchronize.",
         "- H2D means host read + device HBM write; D2H means device HBM read + host write.", "",
     ]

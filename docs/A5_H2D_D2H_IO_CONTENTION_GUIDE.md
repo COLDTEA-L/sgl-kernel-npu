@@ -1,8 +1,9 @@
-# Atlas 950 两卡 H2D/D2H 主机 I/O 拥塞实验
+# Atlas 950 两卡 1KiB H2D/D2H 主机 I/O 实验
 
 分支：`feature/a5-h2d-io-contention`。本实验只使用两张计算卡，默认物理卡
-`2、3`，测量单卡和双卡同时进行 pinned-host H2D/D2H 拷贝时的
-“每次数据量—完成时间膨胀”关系。
+`2、3`，默认固定每次拷贝为 `1024 Byte`，测量单卡和双卡同时进行
+pinned-host H2D/D2H 拷贝时的完成时间和膨胀比。这个尺寸用于近似未来
+Host 调度器更新 HBM 路径控制块的开销。
 
 这是独立的主机 I/O 诊断，不初始化 HCCL communicator，不加载 DeepEP 或自定义
 route library，不执行 CCU/UB relay，不修改系统路由、不加载 ko。它回答的是卡2、3
@@ -43,6 +44,12 @@ tensor。所有计时拷贝均设置`non_blocking=True`，若host tensor没有�
 
 正式数据使用NPU event时间为主，同时保留host时间。小数据容易由host提交和event开销
 主导，因此必须同时查看绝对微秒数，不能只看百分比。
+
+`1024 Byte` 在本实验中对应 `1024` 个 `uint8`，不表示 1024 个文字。
+每个计时 batch 默认连续提交 1000 次拷贝，只在 batch 末尾同步一次，
+最后用总时间除以 1000 得到单次平均时间。这样能降低 event 分辨率和同步开销对
+1KiB 结果的扰动，但它仍是连续 copy 的均摊延迟，不是“每次 H2D 后立即启动算子”
+的端到端延迟。
 
 ## 2. 开发机发布分支
 
@@ -97,14 +104,15 @@ CPU测试只检查参数、case方向、带宽和区间计算，不代表pinned 
 
 ## 5. 首次短测
 
-先确认物理卡2、3在当前共享机器上确实空闲。短测只扫三个尺寸：
+先确认物理卡2、3在当前共享机器上确实空闲。短测仍只测 1KiB，
+但减少迭代次数：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_h2d_io_contention.sh \
   --devices 2,3 \
-  --sizes 65536,1048576,4194304 \
-  --warmup 2 --iters 5 --repeats 1 \
+  --sizes 1024 \
+  --warmup 10 --iters 100 --repeats 1 \
   --output-root /home/l00934901/profiling
 ```
 
@@ -119,34 +127,41 @@ bash scripts/run_a5_h2d_io_contention.sh \
 若pinned allocation失败，保留日志并停止，不要删除严格检查或改成普通CPU tensor继续测；
 pageable拷贝会引入隐式staging/同步，结果不再是同一实验。
 
-## 6. 正式数据量扫描
+## 6. 1KiB 正式测试
 
-默认命令仅使用卡2、3，最大buffer为16MiB/rank：
+默认命令仅使用卡2、3，每张卡只分配 1KiB pinned host buffer 和 1KiB NPU buffer：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_h2d_io_contention.sh \
   --devices 2,3 \
-  --sizes 65536,262144,1048576,4194304,16777216 \
-  --warmup 5 --iters 20 --repeats 3 \
+  --sizes 1024 \
+  --warmup 100 --iters 1000 --repeats 5 \
   --output-root /home/l00934901/profiling
 ```
 
-默认在同一对torchrun进程中完成全部size/case，避免为每个数据点重新初始化runtime，
+不带参数直接运行也是同一组默认值：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_h2d_io_contention.sh
+```
+
+默认在同一对torchrun进程中完成全部case，避免重复初始化runtime，
 也减少共享机器占用时间。warmup、correctness和case间barrier均不计入正式copy时间。
 
-如果16MiB仍未看到带宽平台，可在确认显存、pinned host内存和共享机器窗口允许后单独扩展：
+如果需要确认 1KiB 附近的拐点，可以补充一组小控制块尺寸：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_h2d_io_contention.sh \
   --devices 2,3 \
-  --sizes 16777216,33554432,67108864 \
-  --warmup 5 --iters 20 --repeats 3 \
+  --sizes 64,128,256,512,1024,2048,4096 \
+  --warmup 100 --iters 1000 --repeats 5 \
   --output-root /home/l00934901/profiling
 ```
 
-不要一开始就增加大尺寸、iters和repeats；先用默认扫描定位拐点，再只复测拐点上下的数据量。
+这组扫描研究的是小控制块延迟，不用它推断大块 H2D/D2H 带宽平台。
 
 ## 7. 输出与判读
 

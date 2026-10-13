@@ -71,13 +71,13 @@ def verify_payload(torch, direction, host_tensor, device_tensor, value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sizes", default="65536,262144,1048576,4194304,16777216",
+    parser.add_argument("--sizes", default="1024",
                         help="comma-separated bytes per copy")
     parser.add_argument("--cases", default=",".join(DEFAULT_CASES),
                         help="comma-separated experiment case names")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=1000)
+    parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--run-dir", required=True, type=Path)
     args = parser.parse_args()
     try:

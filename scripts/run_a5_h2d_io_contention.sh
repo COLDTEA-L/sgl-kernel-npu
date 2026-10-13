@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Two-card pinned-host H2D/D2H contention sweep; no HCCL/DeepEP/route package.
+# Two-card pinned-host 1 KiB H2D/D2H contention test; no HCCL/DeepEP/route package.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 devices=2,3
-sizes=65536,262144,1048576,4194304,16777216
+sizes=1024
 cases=h2d_solo_rank0,h2d_solo_rank1,h2d_both,d2h_solo_rank0,d2h_solo_rank1,d2h_both,mixed_rank0_h2d_rank1_d2h,mixed_rank0_d2h_rank1_h2d
-warmup=5
-iterations=20
-repeats=3
+warmup=100
+iterations=1000
+repeats=5
 timeout_seconds=600
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 output_root=/home/l00934901/profiling
@@ -23,7 +23,7 @@ while (($#)); do
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
         --help)
-            echo 'Pinned-host H2D/D2H contention test. Defaults: --devices 2,3 --sizes 65536,262144,1048576,4194304,16777216 --warmup 5 --iters 20 --repeats 3.'
+            echo 'Pinned-host 1 KiB H2D/D2H contention test. Defaults: --devices 2,3 --sizes 1024 --warmup 100 --iters 1000 --repeats 5.'
             echo 'Runs solo, same-direction concurrent, and mixed-direction controls in one two-worker process lifetime.'
             echo 'No HCCL communicator, DeepEP extension, custom route library, relay card, profiler, or system route change is used.'
             exit 0;;
@@ -58,6 +58,7 @@ import json, pathlib, sys
 root, devices, sizes, cases, warmup, iterations, repeats, cann = sys.argv[1:]
 settings = dict(
     implementation='torch_npu_pinned_host_copy',
+    experiment='1KiB_control_block_copy',
     devices=list(map(int, devices.split(','))),
     sizes=list(map(int, sizes.split(','))),
     cases=cases.split(','),
