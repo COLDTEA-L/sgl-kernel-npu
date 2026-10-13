@@ -6,6 +6,7 @@
 #include <torch/library.h>
 
 #include "deep_ep.hpp"
+#include "a5_value_wait_callback.hpp"
 #include "config.hpp"
 #include "event.hpp"
 
@@ -55,6 +56,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+
+    pybind11::class_<deep_ep::A5ValueWaitCallbackScheduler,
+                     std::shared_ptr<deep_ep::A5ValueWaitCallbackScheduler>>(
+        m, "A5ValueWaitCallbackScheduler")
+        .def(pybind11::init<const torch::Tensor &>(), py::arg("path_policy"))
+        .def("arm", &deep_ep::A5ValueWaitCallbackScheduler::arm,
+             py::arg("release_word"))
+        .def("enqueue_arrived_callback",
+             &deep_ep::A5ValueWaitCallbackScheduler::enqueue_arrived_callback)
+        .def("enqueue_done_callback",
+             &deep_ep::A5ValueWaitCallbackScheduler::enqueue_done_callback)
+        .def("enqueue_value_wait",
+             &deep_ep::A5ValueWaitCallbackScheduler::enqueue_value_wait,
+             py::arg("ready_mask"))
+        .def("enqueue_value_write",
+             &deep_ep::A5ValueWaitCallbackScheduler::enqueue_value_write,
+             py::arg("value"))
+        .def("wait_done", &deep_ep::A5ValueWaitCallbackScheduler::wait_done,
+             py::arg("timeout_ms"), py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("state", &deep_ep::A5ValueWaitCallbackScheduler::state)
+        .def_property_readonly("arrival_count", &deep_ep::A5ValueWaitCallbackScheduler::arrival_count)
+        .def_property_readonly("release_count", &deep_ep::A5ValueWaitCallbackScheduler::release_count)
+        .def_property_readonly("done_count", &deep_ep::A5ValueWaitCallbackScheduler::done_count)
+        .def_property_readonly("last_release_word", &deep_ep::A5ValueWaitCallbackScheduler::last_release_word);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, std::string>())

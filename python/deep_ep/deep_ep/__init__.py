@@ -22,6 +22,7 @@ except ImportError:
 
 sys.modules.setdefault("deep_ep_cpp", deep_ep_cpp)
 Config = deep_ep_cpp.Config
+A5ValueWaitCallbackScheduler = deep_ep_cpp.A5ValueWaitCallbackScheduler
 
 # Import strategies to register them
 from . import strategies
