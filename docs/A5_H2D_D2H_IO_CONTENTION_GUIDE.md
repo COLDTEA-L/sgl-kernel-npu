@@ -51,31 +51,19 @@ tensor。所有计时拷贝均设置`non_blocking=True`，若host tensor没有�
 1KiB 结果的扰动，但它仍是连续 copy 的均摊延迟，不是“每次 H2D 后立即启动算子”
 的端到端延迟。
 
-## 2. 开发机发布分支
+## 2. 有卡机器拉取
 
-新分支位于开发机独立worktree：
-
-```bash
-cd /home/liuyuanwen/sgl-kernel-npu-h2d-contention
-git branch --show-current
-git status --short
-git push -u origin feature/a5-h2d-io-contention
-```
-
-预期分支名必须是`feature/a5-h2d-io-contention`。push前不要清理其他worktree的
-未知untracked文件。
-
-## 3. 有卡机器拉取
-
-下面只备份tracked修改；未知untracked文件保留原位。若某个untracked文件与新分支
-同名导致`git switch`拒绝，先单独备份那个冲突文件，不要运行`git clean`。
+有卡机器只拉取和运行实验。切换前要求tracked工作区干净；如果检测到本地修改就立即
+停止，不在共享机器上自动备份或清理。未知untracked文件保留原位；若它与新分支同名
+导致`git switch`拒绝，停止并由机器管理者处理，不要运行`git clean`。
 
 ```bash
 (
 set -e
 cd /home/l00934901/sgl-kernel-npu
 git status --short
-git stash push -m "backup-before-h2d-contention-$(date +%Y%m%d_%H%M%S)"
+git diff --quiet
+git diff --cached --quiet
 BRANCH=feature/a5-h2d-io-contention
 git fetch origin "${BRANCH}"
 git switch "${BRANCH}"
@@ -90,7 +78,7 @@ test -f tests/python/deepep/test_a5_h2d_io_contention.py
 本实验没有C++或自定义算子改动：**无需重新编译route package、DeepEP wheel或HCCL，
 也不需要pip install**。只需当前Python中的PyTorch/Torch-NPU与CANN环境可用。
 
-## 4. CPU侧入口检查
+## 3. CPU侧入口检查
 
 不初始化NPU：
 
@@ -102,7 +90,7 @@ bash scripts/run_a5_h2d_io_contention.sh --help
 
 CPU测试只检查参数、case方向、带宽和区间计算，不代表pinned allocator或NPU DMA通过。
 
-## 5. 首次短测
+## 4. 首次短测
 
 先确认物理卡2、3在当前共享机器上确实空闲。短测仍只测 1KiB，
 但减少迭代次数：
@@ -127,7 +115,7 @@ bash scripts/run_a5_h2d_io_contention.sh \
 若pinned allocation失败，保留日志并停止，不要删除严格检查或改成普通CPU tensor继续测；
 pageable拷贝会引入隐式staging/同步，结果不再是同一实验。
 
-## 6. 1KiB 正式测试
+## 5. 1KiB 正式测试
 
 默认命令仅使用卡2、3，每张卡只分配 1KiB pinned host buffer 和 1KiB NPU buffer：
 
@@ -163,7 +151,7 @@ bash scripts/run_a5_h2d_io_contention.sh \
 
 这组扫描研究的是小控制块延迟，不用它推断大块 H2D/D2H 带宽平台。
 
-## 7. 输出与判读
+## 6. 输出与判读
 
 运行目录包含：
 
@@ -199,7 +187,7 @@ NUMA或HBM等并非全双工链路方向独立的共享资源。
 `overlap_shorter_fraction`应接近1，表示较短作业基本处于并发窗口内；还需查看
 `overlap_longer_fraction`和`start_skew_us`。窗口严重错位的样本不应用于拥塞结论。
 
-## 8. 实验边界
+## 7. 实验边界
 
 - 测量单位是每张卡、每次copy的bytes，不是两卡合计。
 - NPU event时间反映同一NPU stream上的copy区间，不是PCIe线速的独立硬件计数。
