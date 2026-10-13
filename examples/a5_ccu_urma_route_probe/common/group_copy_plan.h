@@ -9,17 +9,22 @@ namespace a5_ccu_urma_probe {
 constexpr uint64_t GROUP_LANES = 8, GROUP_MS_BYTES = 4096, GROUP_MS_STRIDE = 8;
 constexpr uint64_t GROUP_SLICE = GROUP_MS_BYTES * GROUP_MS_STRIDE;
 constexpr uint64_t GROUP_BATCH = GROUP_SLICE * GROUP_LANES;
+constexpr uint64_t GROUP_TOTAL_MS = GROUP_LANES * GROUP_MS_STRIDE; // tested native budget, not a hardware maximum
 constexpr uint64_t GROUP_MAX_ITER = 8191;
 constexpr uint64_t GROUP_MAX_BYTES = GROUP_BATCH * (GROUP_MAX_ITER + 1);
 
 // Geometry sweep is restricted to the isolated local-copy diagnostic.
 // Production callers omit this argument and retain native 8 x 32KiB.
 struct GroupCopyConfig {
-    uint64_t sliceBytes;
-    constexpr explicit GroupCopyConfig(uint64_t slice = GROUP_SLICE) : sliceBytes(slice) {}
-    bool Valid() const { return sliceBytes == 32768 || sliceBytes == 65536 || sliceBytes == 131072; }
+    uint64_t sliceBytes, lanes;
+    constexpr explicit GroupCopyConfig(uint64_t slice = GROUP_SLICE)
+        : sliceBytes(slice), lanes(slice >= GROUP_MS_BYTES ? GROUP_TOTAL_MS / (slice / GROUP_MS_BYTES) : 0) {}
+    bool Valid() const {
+        return (sliceBytes == 32768 || sliceBytes == 65536 || sliceBytes == 131072) &&
+            lanes >= 2 && lanes <= GROUP_LANES && lanes * MsStride() == GROUP_TOTAL_MS;
+    }
     uint64_t MsStride() const { return sliceBytes / GROUP_MS_BYTES; }
-    uint64_t BatchBytes() const { return sliceBytes * GROUP_LANES; }
+    uint64_t BatchBytes() const { return sliceBytes * lanes; }
 };
 
 // Same parameter packing as HCCL ccu_kernel_utils.cc; verified against the
@@ -39,7 +44,7 @@ inline bool BuildGroupCopyPlan(uint64_t bytes, std::array<uint64_t,4> *out,
     if (!out || !config.Valid() || !bytes || bytes > GROUP_MAX_BYTES) return false;
     const uint64_t slice=config.sliceBytes, batch=config.BatchBytes();
     uint64_t m=bytes/batch, n=(bytes%batch)/slice, p=bytes%slice;
-    if (m > GROUP_MAX_ITER) { m=GROUP_MAX_ITER; n=GROUP_LANES-1; p=slice; }
+    if (m > GROUP_MAX_ITER) { m=GROUP_MAX_ITER; n=config.lanes-1; p=slice; }
     uint64_t parallel=0, residual=0;
     if (n && !p) { parallel=GroupParallelParam(n-1,0,1); residual=slice; }
     else if (!n && p) { parallel=GroupParallelParam(0,0,1); residual=p; }

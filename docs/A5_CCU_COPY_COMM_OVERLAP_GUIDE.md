@@ -884,7 +884,7 @@ bash scripts/run_a5_ccu_local_copy_perf.sh \
 ```
 
 查看第10.3节的`local_copy_perf_summary.tsv`和MindStudio文件。本次case名为
-`group_s32k_4194304`（旧结果目录为`group_4194304`）。每rank必须有20个设备CCU任务、无正式memcpy，比较min/median/mean/max，
+`group_l8_s32k_4194304`（旧结果目录为`group_s32k_4194304`或`group_4194304`）。每rank必须有20个设备CCU任务、无正式memcpy，比较min/median/mean/max，
 不要用host均值或profiler size哨兵当作复制性能。旧控制仍可用`--copy-mode direct`重测。
 新版group不会回退到ACL D2D或整块LocalCopyNb；失败就保留日志停止，不能报性能成功。
 
@@ -960,17 +960,24 @@ CPU模型不模拟MS硬件调度，**新group的设备正确性和吞吐尚待�
 
 ## 12. 独立 local-copy：更大的 slice 性能对照
 
-本节只改变独立诊断程序的GroupCopy参数：**8路固定，slice可选32/64/128KiB**。
+本节只改变独立诊断程序的GroupCopy参数：**总MS预算固定64，slice可选32/64/128KiB，
+并行路数对应8/4/2**。当前优先只测32/64KiB；128KiB保留为可选项，不默认测试。
 生产两/四卡算子的`--self-copy-mode ccu`仍默认8×32KiB；先获得独立性能结果再决定是否推广。
 没有改变任何direct/relay EID、权重、通知协议或系统HCCL。
 
-| slice | 每路MS数/偏移 | 总MS数 | 4MiB每路循环次数 |
-|---:|---:|---:|---:|
-| 32KiB（对照） | 8 | 64 | 16 |
-| 64KiB | 16 | 128 | 8 |
-| 128KiB | 32 | 256 | 4 |
+| slice | 并行路数 | 每路MS数/偏移 | 总MS数 | 4MiB每路循环次数 |
+|---:|---:|---:|---:|---:|
+| 32KiB（对照） | 8 | 8 | 64 | 16 |
+| 64KiB（本次测试） | 4 | 16 | 64 | 16 |
+| 128KiB（可选） | 2 | 32 | 64 | 16 |
 
-更大的slice可能减少循环/等待成本，但也需要更多连续MS；不保证更快。
+旧版本固定8路，在64/128KiB时请求128/256个MS，有卡反馈
+`HcclCcuKernelRegister status=7`（HCCL_E_UNAVAIL，资源不可用），尚未进入数据复制。
+最可疑是新增连续MS需求，但该错误码本身不能区分MS和其他注册资源，
+更不能当作硬件MS上限为64的证据。新版保持已通过配置的64个MS预算，
+并相应减少事件/执行器数量，以移除额外的资源需求；不保证注册一定通过或更快。
+更大slice、较少lane的读写操作次数较少，但每路复制量增加；本次所有配置每批仍256KiB，
+每路循环仍16次，**不再宣称64KiB让每路循环次数减半**。
 代码同步调整MS块容量、lane偏移、内存步长、bulk/tail参数及kernel signature，
 不是只把length改大而让相邻lane共享缓冲。每档仍有独立读/写Wait，不能删掉它们。
 若目标SDK/设备拒绝该资源配置，报告FAIL，不回退32KiB，不扩大为任意资源请求。
@@ -997,7 +1004,7 @@ git log -1 --oneline
 编译器及旧对象式CCU SDK；构建失败会显示`build.log`末尾，不会安装/覆盖生产SO。
 子shell错误不会主动退出外层docker交互shell。
 
-### 12.2 一条命令测32/64/128KiB：warmup100，正式20，只采正式阶段
+### 12.2 一条命令测8×32 / 4×64KiB：warmup100，正式20，只采正式阶段
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -1005,7 +1012,7 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
 
 bash scripts/run_a5_ccu_local_copy_perf.sh \
-  --devices 2,3 --copy-mode group --group-slices-kib 32,64,128 \
+  --devices 2,3 --copy-mode group --group-slices-kib 32,64 \
   --sizes 4194304 --warmup 100 --iters 20 \
   --timeout-seconds 300 --output-root /home/l00934901/profiling
 ```
@@ -1013,11 +1020,13 @@ bash scripts/run_a5_ccu_local_copy_perf.sh \
 每档各自初始化一次、注册该geometry的kernel、变化输入/guard及20次排队快照正确性gate，
 再warmup100，随后只采正式20。两侧是各自本地复制，无remote WriteNb或relay进程。
 warmup和正式循环都只在循环外同步；正式区域无H2D/D2H/D2D/malloc。
-默认依次跑三档，不跑三轮；每档两rank各20个设备CCU任务。
+上面命令依次跑两档，不跑三轮；每档两rank各20个设备CCU任务。
 输出`PASS: GroupCopy ... all requested slices`说明所有请求档位的数据与清理通过，
 性能报告`DEVICE_TIMING_CAPTURED`说明采集完整；它们都不自动代表性能提升。
 
-若只想先测64KiB，将`--group-slices-kib`改为`64`；只测128KiB则改为`128`。
+若只想先测64KiB，将`--group-slices-kib`改为`64`，自动采用4路、64个MS。
+不需要单独指定lane数；也无需编译安装route包或wheel。
+若以后选128KiB则自动采用2路、64个MS，仍属于未验证的可选实验。
 32KiB应同一次对照测量，避免把其他时间段/负载的30us当作唯一基准。
 
 ### 12.3 查看分析和MindStudio文件
@@ -1033,12 +1042,15 @@ if test -n "${RUN_DIR}" && test -d "${RUN_DIR}"; then
 fi
 ```
 
-三个case分别是`group_s32k_4194304`、`group_s64k_4194304`、`group_s128k_4194304`。
+本次两个case分别是`group_l8_s32k_4194304`、`group_l4_s64k_4194304`。
+可选128KiB为`group_l2_s128k_4194304`，不能与旧的8路128KiB结果混淆。
 MindStudio导入每个case下`profiling/rank*/PROF_*/.../msprof_*.json`，不是torch的ascend_pt格式。
 每rank比较设备CCU的min/median/mean/max，重点看64/128KiB是否稳定低于同次32KiB。
-报告有`group_slice_bytes`/`group_lanes`，并核对worker JSON实际参数；旧32KiB日志缺少
+报告有`group_slice_bytes`/`group_lanes`/`group_ms_budget`，并核对worker JSON实际参数；旧32KiB日志缺少
 新geometry字段时不能冒充64/128KiB采集。不要用host平均值替代设备复制耗时。
 
+注册之前就打印`LOCAL_COPY_GEOMETRY`；64KiB应显示`lanes=4 slice_bytes=65536 ms_stride=16 total_ms=64`。
+若仍有status=7，保留该marker和失败API；不要重试原8路64KiB，也不要reset设备。
 失败时保留本case的`rank*.log`和`build.log`。资源注册失败仅说明该配置不可用，
 不等于“CCU不能本地复制”。某档FAIL时仍保留其他档的报告，不reset公共设备。
 
@@ -1048,15 +1060,15 @@ MindStudio导入每个case下`profiling/rank*/PROF_*/.../msprof_*.json`，不是
 
 ```bash
 bash scripts/run_a5_ccu_local_copy_probe.sh \
-  --devices 2,3 --copy-mode group --group-slices-kib 64,128 \
-  --sizes 65792,131328,1048832 \
+  --devices 2,3 --copy-mode group --group-slices-kib 64 \
+  --sizes 65792,262400,4194304 \
   --changed-iters 3 --queued-iters 20 --timeout-seconds 300 \
   --output-root /home/l00934901/profiling
 ```
 
 只有独立测试正确且更快后，才考虑升级生产kernel和组合算子资源配置。
 本次不改生产默认，不需要更新installed route ABI；尚未证明64/128KiB在remote活跃时
-也能更快，或保证更多MS不与通信资源竞争。
+也能更快；固定MS预算不等于与通信资源完全隔离。
 
 开发验证：无卡容器完成三档standalone编译/构图、60项CPU回归；包括各geometry的
 bulk/tail覆盖、2GiB边界、默认32KiB生产布局和错误geometry拒绝。

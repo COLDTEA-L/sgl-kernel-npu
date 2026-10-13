@@ -10,7 +10,7 @@ static void Check(uint64_t bytes,const GroupCopyConfig &config=GroupCopyConfig()
     uint64_t covered=g[0];
     if(g[2]) {
         auto repeat=(g[2]>>55)&0xff, index=(g[2]>>48)&0x7f, total=(g[2]>>41)&0x7f;
-        auto lanes=repeat+total; assert(lanes<=GROUP_LANES && total>=1 && total<=2);
+        auto lanes=repeat+total; assert(lanes<=config.lanes && total>=1 && total<=2);
         assert(index==(total==2?1U:0U));
         // No overlaps/gaps: residual is first, the remaining lanes are full.
         covered+=g[3]+(total==2?repeat+1:repeat)*config.sliceBytes;
@@ -34,9 +34,10 @@ int main()
     for(uint64_t slice:{32768ULL,65536ULL,131072ULL}) {
         GroupCopyConfig config(slice);
         assert(config.Valid() && config.MsStride()*GROUP_MS_BYTES==slice);
+        assert(config.MsStride()*config.lanes==64 && config.BatchBytes()==GROUP_BATCH);
         assert(GroupOffsetParam(slice)==(slice<<21)+(config.MsStride()<<10)+1);
         for(uint64_t m:{0ULL,1ULL,4ULL,16ULL})
-            for(uint64_t n=0;n<8;++n)
+            for(uint64_t n=0;n<config.lanes;++n)
                 for(uint64_t p:std::vector<uint64_t>{0,1,256,slice-256,slice-1}) {
                     uint64_t bytes=m*config.BatchBytes()+n*slice+p;
                     if(bytes) Check(bytes,config);
@@ -47,5 +48,6 @@ int main()
     }
     for(uint64_t bad:{0ULL,16384ULL,65535ULL,262144ULL})
         assert(!BuildGroupCopyPlan(4194304,&go,GroupCopyConfig(bad)));
-    std::cout<<"GROUP_PLAN_CPU_PASS: bulk/tail coverage, boundaries and 4MiB=8 lanes x16x32KiB; not hardware proof\n";
+    assert(GroupCopyConfig(65536).lanes==4 && GroupCopyConfig(131072).lanes==2);
+    std::cout<<"GROUP_PLAN_CPU_PASS: fixed64 MS, 8x32/4x64/2x128 KiB, bulk/tail coverage; not hardware proof\n";
 }

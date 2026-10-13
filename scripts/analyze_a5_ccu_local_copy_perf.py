@@ -100,6 +100,7 @@ def analyze(root):
                 copy_mode=case['copy_mode'], bytes=case['bytes'], host_batch_avg_us=None,
                 group_slice_bytes=case.get('group_slice_bytes',0),
                 group_lanes=case.get('group_lanes',0),
+                group_ms_budget=case.get('group_ms_budget',0),
                 ccu_samples=0, expected_samples=settings['iterations'], ccu_min_us=None,
                 ccu_median_us=None, ccu_mean_us=None, ccu_max_us=None, payload_GB_s=None,
                 nominal_read_write_GB_s=None, formal_memcpy_tasks=0, result='INCOMPLETE', reason='')
@@ -111,7 +112,9 @@ def analyze(root):
                     raise ValueError('missing/duplicate performance result')
                 event = events[0]
                 if 'group_slice_bytes' in case:
-                    for key,expected in (('group_slice_bytes',case['group_slice_bytes']),('group_lanes',8)):
+                    geometry = dict(group_slice_bytes=case['group_slice_bytes'],group_lanes=case.get('group_lanes',8))
+                    if 'group_ms_budget' in case: geometry['group_ms_budget']=case['group_ms_budget']
+                    for key,expected in geometry.items():
                         if type(event.get(key)) is not int or event[key] != expected:
                             raise ValueError(f'wrong/missing {key}; do not compare mislabeled slice timings')
                 for key, expected in (('rank', rank), ('bytes', case['bytes']),

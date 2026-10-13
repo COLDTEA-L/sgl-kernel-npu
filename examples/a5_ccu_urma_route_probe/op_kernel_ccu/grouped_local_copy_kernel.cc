@@ -12,10 +12,10 @@ HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(CcuRep::LocalAddr dst,
 {
     if (!config.Valid()) return HCCL_E_PARA;
     const uint64_t msStride=config.MsStride();
-    moConfig_={static_cast<uint32_t>(msStride),static_cast<uint32_t>(GROUP_LANES),config.sliceBytes};
-    std::vector<CcuRep::CcuBuf> buffers(GROUP_LANES*msStride);
-    std::vector<CcuRep::CompletedEvent> events(GROUP_LANES);
-    std::vector<CcuRep::Executor> executors(GROUP_LANES);
+    moConfig_={static_cast<uint32_t>(msStride),static_cast<uint32_t>(config.lanes),config.sliceBytes};
+    std::vector<CcuRep::CcuBuf> buffers(config.lanes*msStride);
+    std::vector<CcuRep::CompletedEvent> events(config.lanes);
+    std::vector<CcuRep::Executor> executors(config.lanes);
     // Contiguous blocks are required: hardware loop expansion shifts MS/event
     // resource IDs by lane. Individual noncontiguous allocations are unsafe.
     GROUP_CHECK(CreateBlockCcuBuf(static_cast<uint32_t>(buffers.size()),buffers.data()));
@@ -44,7 +44,7 @@ HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(CcuRep::LocalAddr dst,
         auto call=Loop(labels[0]); call(bodySrc[0],bodyDst[0],bodyBytes[0]);
         auto cfg=CreateVariable(), parallel=CreateVariable();
         cfg=GroupLoopParam(config.BatchBytes(),0); cfg+=go[1];
-        parallel=GroupParallelParam(GROUP_LANES-1,0,1);
+        parallel=GroupParallelParam(config.lanes-1,0,1);
         CcuRep::LoopGroupCall(this).Run({call},{cfg},executors,parallel,offset);
     }
     CCU_IF(go[2]!=0) {

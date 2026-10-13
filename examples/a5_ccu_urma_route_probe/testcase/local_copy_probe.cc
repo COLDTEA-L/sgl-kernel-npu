@@ -95,7 +95,9 @@ const char *ModeName() { return options.grouped ? "group" : options.chunked ? "c
 std::string GeometryJson()
 {
     if (!options.grouped) return "";
-    return ",\"group_slice_bytes\":" + std::to_string(options.groupSliceBytes) + ",\"group_lanes\":8";
+    const a5_ccu_urma_probe::GroupCopyConfig config(options.groupSliceBytes);
+    return ",\"group_slice_bytes\":" + std::to_string(config.sliceBytes) +
+        ",\"group_lanes\":" + std::to_string(config.lanes) + ",\"group_ms_budget\":64";
 }
 class LocalArg : public hcomm::CcuKernelArg {
 public:
@@ -105,7 +107,8 @@ public:
     hcomm::CcuKernelSignature GetKernelSignature() const override
     {
         hcomm::CcuKernelSignature signature;
-        signature.Append(group ? "A5LocalGroup8xSliceV2:" + std::to_string(config.sliceBytes) :
+        signature.Append(group ? "A5LocalGroupFixed64MsV3:slice=" + std::to_string(config.sliceBytes) +
+            ":lanes=" + std::to_string(config.lanes) :
             chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
         return signature;
     }
@@ -358,14 +361,16 @@ void Run()
     LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); // channels intentionally empty
     hcomm::KernelCreator creator = CreateKernel;
     CcuKernelHandle kernel = 0;
+    if (options.grouped) {
+        const a5_ccu_urma_probe::GroupCopyConfig config(options.groupSliceBytes);
+        std::printf("LOCAL_COPY_GEOMETRY rank=%u lanes=%lu slice_bytes=%u ms_stride=%lu total_ms=%lu\n",
+            options.rank,static_cast<unsigned long>(config.lanes),options.groupSliceBytes,
+            static_cast<unsigned long>(config.MsStride()),static_cast<unsigned long>(config.lanes*config.MsStride()));
+        std::fflush(stdout); // retain requested geometry even if registration fails
+    }
     Mark("kernel_register");
     Check(HcclCcuKernelRegister(resources.comm, &kernel, &creator, &arg), "HcclCcuKernelRegister");
     Check(HcclCcuKernelRegisterFinish(resources.comm), "HcclCcuKernelRegisterFinish");
-    if (options.grouped) {
-        const uint64_t ms=options.groupSliceBytes/4096;
-        std::printf("LOCAL_COPY_GEOMETRY rank=%u lanes=8 slice_bytes=%u ms_stride=%lu total_ms=%lu\n",
-            options.rank,options.groupSliceBytes,static_cast<unsigned long>(ms),static_cast<unsigned long>(8*ms));
-    }
     std::printf("LOCAL_COPY_KERNEL_REGISTERED rank=%u mode=%s channels=0\n", options.rank,
                 ModeName());
     const size_t span = options.bytes + 2 * GUARD, hostSpan = span * options.queued;
@@ -429,8 +434,10 @@ int main(int argc, char **argv)
         if (options.builder) {
             LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); LocalKernel kernel(arg);
             Check(kernel.Init(), "CcuKernel::Init");
-            std::printf("LOCAL_COPY_BUILDER_PASS mode=%s slice_bytes=%u graph_only=1 hardware_copy_executed=0\n",
-                ModeName(),options.grouped ? options.groupSliceBytes : 0);
+            std::printf("LOCAL_COPY_BUILDER_PASS mode=%s slice_bytes=%u lanes=%lu total_ms=%lu graph_only=1 hardware_copy_executed=0\n",
+                ModeName(),options.grouped ? options.groupSliceBytes : 0,
+                static_cast<unsigned long>(options.grouped ? arg.config.lanes : 0),
+                static_cast<unsigned long>(options.grouped ? arg.config.lanes*arg.config.MsStride() : 0));
         } else Run();
         return 0;
     } catch (const std::exception &error) {

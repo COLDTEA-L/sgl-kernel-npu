@@ -38,7 +38,7 @@ while (($#)); do
             echo 'Isolated CCU LocalCopyNb + WaitEvent diagnostic; no remote writes or ACL D2D.'
             echo 'Example (on NPU): bash scripts/run_a5_ccu_local_copy_probe.sh --devices 2,3 --output-root /home/l00934901/profiling'
             echo '--devices one/two IDs; --sizes 4096,4194304; --copy-mode direct|chunked|both|group (native-style parallel MS copy)'
-            echo '--group-slices-kib 32,64,128 (group mode only; 8 lanes, geometry-specific contiguous MS blocks)'
+            echo '--group-slices-kib 32,64,128 (group only; fixed 64 MS budget: 8x32 / 4x64 / 2x128 KiB)'
             echo '--changed-iters 3 --queued-iters 20 --timeout-seconds 300 --cann-root PATH'
             echo '--builder-only compiles/builds representations without NPU; never counts as hardware PASS.'
             echo '--benchmark --warmup 100 --iters 20 [--profile] [--no-export]; times CCU-only batch after correctness gate.'
@@ -76,8 +76,8 @@ try:
     elif mode == 'both': pairs += [('direct', n) for n in sizes[1:]]
     cases = [dict(name=f'{m}_{n}', copy_mode=m, bytes=n) for m,n in pairs]
     if mode == 'group':
-        cases = [dict(name=f'group_s{s}k_{n}', copy_mode='group', bytes=n,
-            group_slice_bytes=s*1024, group_lanes=8) for s in slices for n in sizes]
+        cases = [dict(name=f'group_l{256//s}_s{s}k_{n}', copy_mode='group', bytes=n,
+            group_slice_bytes=s*1024, group_lanes=256//s, group_ms_budget=64) for s in slices for n in sizes]
     print(json.dumps(dict(devices=devices, changed_calls=changed, queued_calls=queued,
         builder_only=builder, benchmark=benchmark, profile=profile, warmup=warmup, iterations=iterations,
         group_slices_bytes=[s*1024 for s in slices],cases=cases)))
