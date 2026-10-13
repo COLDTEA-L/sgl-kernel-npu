@@ -8,10 +8,12 @@ namespace a5_ccu_urma_probe {
 namespace CcuRep = hcomm::CcuRep;
 #define GROUP_CHECK(call) do { const auto s=(call); if(s!=HCCL_SUCCESS) return s; } while(0)
 HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(CcuRep::LocalAddr dst,
-    CcuRep::LocalAddr src, const std::array<CcuRep::Variable,4> &go)
+    CcuRep::LocalAddr src, const std::array<CcuRep::Variable,4> &go, const GroupCopyConfig &config)
 {
-    moConfig_={static_cast<uint32_t>(GROUP_MS_STRIDE),static_cast<uint32_t>(GROUP_LANES),GROUP_SLICE};
-    std::vector<CcuRep::CcuBuf> buffers(GROUP_LANES*GROUP_MS_STRIDE);
+    if (!config.Valid()) return HCCL_E_PARA;
+    const uint64_t msStride=config.MsStride();
+    moConfig_={static_cast<uint32_t>(msStride),static_cast<uint32_t>(GROUP_LANES),config.sliceBytes};
+    std::vector<CcuRep::CcuBuf> buffers(GROUP_LANES*msStride);
     std::vector<CcuRep::CompletedEvent> events(GROUP_LANES);
     std::vector<CcuRep::Executor> executors(GROUP_LANES);
     // Contiguous blocks are required: hardware loop expansion shifts MS/event
@@ -26,9 +28,9 @@ HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(CcuRep::LocalAddr dst,
         bodySrc[i]=CreateLocalAddr(); bodyDst[i]=CreateLocalAddr(); bodyBytes[i]=CreateVariable();
         CcuRep::LoopBlock block(this,labels[i]);
         block(bodySrc[i],bodyDst[i],bodyBytes[i]);
-        GROUP_CHECK(LocalCopyNb(buffers[i*GROUP_MS_STRIDE],bodySrc[i],bodyBytes[i],events[i]));
+        GROUP_CHECK(LocalCopyNb(buffers[i*msStride],bodySrc[i],bodyBytes[i],events[i]));
         GROUP_CHECK(WaitEvent(events[i])); // MS must contain input before writing HBM
-        GROUP_CHECK(LocalCopyNb(bodyDst[i],buffers[i*GROUP_MS_STRIDE],bodyBytes[i],events[i]));
+        GROUP_CHECK(LocalCopyNb(bodyDst[i],buffers[i*msStride],bodyBytes[i],events[i]));
         GROUP_CHECK(WaitEvent(events[i])); // no MS reuse before write completes
     }
     auto set=[&](size_t i,const CcuRep::Variable &len) {
@@ -36,12 +38,12 @@ HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(CcuRep::LocalAddr dst,
         bodyDst[i].addr=dst.addr; bodyDst[i].token=dst.token; bodyBytes[i]=len;
     };
     auto slice=CreateVariable(), offset=CreateVariable();
-    slice=GROUP_SLICE; offset=GroupOffsetParam();
+    slice=config.sliceBytes; offset=GroupOffsetParam(config.sliceBytes);
     CCU_IF(go[0]!=0) {
         set(0,slice);
         auto call=Loop(labels[0]); call(bodySrc[0],bodyDst[0],bodyBytes[0]);
         auto cfg=CreateVariable(), parallel=CreateVariable();
-        cfg=GroupLoopParam(GROUP_BATCH,0); cfg+=go[1];
+        cfg=GroupLoopParam(config.BatchBytes(),0); cfg+=go[1];
         parallel=GroupParallelParam(GROUP_LANES-1,0,1);
         CcuRep::LoopGroupCall(this).Run({call},{cfg},executors,parallel,offset);
     }

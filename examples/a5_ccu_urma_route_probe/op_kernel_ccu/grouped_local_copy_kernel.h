@@ -10,7 +10,8 @@ protected:
     // Synchronous group join in the CCU graph, NOT a CPU synchronization.
     // Issue remote WriteNb BEFORE this, like native HCCL DoAllToAll.
     HcclResult GroupedLocalCopy(hcomm::CcuRep::LocalAddr destination,
-        hcomm::CcuRep::LocalAddr source, const std::array<hcomm::CcuRep::Variable,4> &go);
+        hcomm::CcuRep::LocalAddr source, const std::array<hcomm::CcuRep::Variable,4> &go,
+        const GroupCopyConfig &config = GroupCopyConfig());
 };
 } // namespace a5_ccu_urma_probe
 #endif

@@ -873,7 +873,7 @@ bash scripts/run_a5_ccu_local_copy_probe.sh \
 ```
 
 所有case正确性PASS、guard/source未改变、正常退出才继续。`--builder-only`只是构图，
-不是设备PASS。整体通过时输出`PASS: GroupCopy8x32K (HBM-MS-HBM) completed on device`。
+不是设备PASS。整体通过时输出`PASS: GroupCopy (HBM-MS-HBM, all requested slices) completed on device`。
 再只测4MiB，100次warmup、20次正式，只采正式20：
 
 ```bash
@@ -884,7 +884,7 @@ bash scripts/run_a5_ccu_local_copy_perf.sh \
 ```
 
 查看第10.3节的`local_copy_perf_summary.tsv`和MindStudio文件。本次case名为
-`group_4194304`。每rank必须有20个设备CCU任务、无正式memcpy，比较min/median/mean/max，
+`group_s32k_4194304`（旧结果目录为`group_4194304`）。每rank必须有20个设备CCU任务、无正式memcpy，比较min/median/mean/max，
 不要用host均值或profiler size哨兵当作复制性能。旧控制仍可用`--copy-mode direct`重测。
 新版group不会回退到ACL D2D或整块LocalCopyNb；失败就保留日志停止，不能报性能成功。
 
@@ -957,3 +957,107 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 旧libhccl编码函数数值比对、58项CPU回归（含2/4rank、4MiB/尾块/guard/容量）。
 CPU模型不模拟MS硬件调度，**新group的设备正确性和吞吐尚待上述有卡实验确认**；
 目前不承诺达到D2D的6–7us或恢复任何理论带宽。
+
+## 12. 独立 local-copy：更大的 slice 性能对照
+
+本节只改变独立诊断程序的GroupCopy参数：**8路固定，slice可选32/64/128KiB**。
+生产两/四卡算子的`--self-copy-mode ccu`仍默认8×32KiB；先获得独立性能结果再决定是否推广。
+没有改变任何direct/relay EID、权重、通知协议或系统HCCL。
+
+| slice | 每路MS数/偏移 | 总MS数 | 4MiB每路循环次数 |
+|---:|---:|---:|---:|
+| 32KiB（对照） | 8 | 64 | 16 |
+| 64KiB | 16 | 128 | 8 |
+| 128KiB | 32 | 256 | 4 |
+
+更大的slice可能减少循环/等待成本，但也需要更多连续MS；不保证更快。
+代码同步调整MS块容量、lane偏移、内存步长、bulk/tail参数及kernel signature，
+不是只把length改大而让相邻lane共享缓冲。每档仍有独立读/写Wait，不能删掉它们。
+若目标SDK/设备拒绝该资源配置，报告FAIL，不回退32KiB，不扩大为任意资源请求。
+
+### 12.1 拉取代码；本实验无需编译安装算子包或wheel
+
+推送后在有卡容器中执行：
+
+```bash
+(
+set -eo pipefail
+cd /home/l00934901/sgl-kernel-npu
+BRANCH=feature/a5-ccu-copy-comm-overlap
+git fetch origin "${BRANCH}"
+git switch "${BRANCH}"
+git merge --ff-only "origin/${BRANCH}"
+git log -1 --oneline
+)
+```
+
+若本地修改阻止更新，按第3节备份处理，不要删除整个仓。
+**这里不用执行第3节的route package构建安装，也不用装DeepEP wheel或改libhccl。**
+第12.2节脚本会自行编译standalone可执行文件到本次结果目录，需要当前CANN头文件、
+编译器及旧对象式CCU SDK；构建失败会显示`build.log`末尾，不会安装/覆盖生产SO。
+子shell错误不会主动退出外层docker交互shell。
+
+### 12.2 一条命令测32/64/128KiB：warmup100，正式20，只采正式阶段
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+unset LD_PRELOAD A5_URMA_TP_TRACE_PREFIX
+
+bash scripts/run_a5_ccu_local_copy_perf.sh \
+  --devices 2,3 --copy-mode group --group-slices-kib 32,64,128 \
+  --sizes 4194304 --warmup 100 --iters 20 \
+  --timeout-seconds 300 --output-root /home/l00934901/profiling
+```
+
+每档各自初始化一次、注册该geometry的kernel、变化输入/guard及20次排队快照正确性gate，
+再warmup100，随后只采正式20。两侧是各自本地复制，无remote WriteNb或relay进程。
+warmup和正式循环都只在循环外同步；正式区域无H2D/D2H/D2D/malloc。
+默认依次跑三档，不跑三轮；每档两rank各20个设备CCU任务。
+输出`PASS: GroupCopy ... all requested slices`说明所有请求档位的数据与清理通过，
+性能报告`DEVICE_TIMING_CAPTURED`说明采集完整；它们都不自动代表性能提升。
+
+若只想先测64KiB，将`--group-slices-kib`改为`64`；只测128KiB则改为`128`。
+32KiB应同一次对照测量，避免把其他时间段/负载的30us当作唯一基准。
+
+### 12.3 查看分析和MindStudio文件
+
+```bash
+RUN_DIR=$(ls -dt /home/l00934901/profiling/a5_ccu_local_copy_* 2>/dev/null | head -1)
+if test -n "${RUN_DIR}" && test -d "${RUN_DIR}"; then
+  column -s $'\t' -t "${RUN_DIR}/local_copy_summary.tsv"
+  column -s $'\t' -t "${RUN_DIR}/local_copy_perf_summary.tsv"
+  sed -n '1,240p' "${RUN_DIR}/local_copy_perf_report.md"
+  grep -HnE 'LOCAL_COPY_GEOMETRY|LOCAL_COPY_FAILURE' "${RUN_DIR}"/cases/*/rank*.log
+  find "${RUN_DIR}/cases" -type f -name 'msprof*.json' -print
+fi
+```
+
+三个case分别是`group_s32k_4194304`、`group_s64k_4194304`、`group_s128k_4194304`。
+MindStudio导入每个case下`profiling/rank*/PROF_*/.../msprof_*.json`，不是torch的ascend_pt格式。
+每rank比较设备CCU的min/median/mean/max，重点看64/128KiB是否稳定低于同次32KiB。
+报告有`group_slice_bytes`/`group_lanes`，并核对worker JSON实际参数；旧32KiB日志缺少
+新geometry字段时不能冒充64/128KiB采集。不要用host平均值替代设备复制耗时。
+
+失败时保留本case的`rank*.log`和`build.log`。资源注册失败仅说明该配置不可用，
+不等于“CCU不能本地复制”。某档FAIL时仍保留其他档的报告，不reset公共设备。
+
+### 12.4 推广到组合算子前，再补尾块正确性
+
+若某档4MiB明显更快，先用相同geometry测非整批/非整slice：
+
+```bash
+bash scripts/run_a5_ccu_local_copy_probe.sh \
+  --devices 2,3 --copy-mode group --group-slices-kib 64,128 \
+  --sizes 65792,131328,1048832 \
+  --changed-iters 3 --queued-iters 20 --timeout-seconds 300 \
+  --output-root /home/l00934901/profiling
+```
+
+只有独立测试正确且更快后，才考虑升级生产kernel和组合算子资源配置。
+本次不改生产默认，不需要更新installed route ABI；尚未证明64/128KiB在remote活跃时
+也能更快，或保证更多MS不与通信资源竞争。
+
+开发验证：无卡容器完成三档standalone编译/构图、60项CPU回归；包括各geometry的
+bulk/tail覆盖、2GiB边界、默认32KiB生产布局和错误geometry拒绝。
+**构图PASS不是设备正确性或性能PASS**，最终以本节有卡结果为准。

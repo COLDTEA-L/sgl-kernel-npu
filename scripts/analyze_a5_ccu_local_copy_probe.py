@@ -21,13 +21,17 @@ def analyze(root):
                 events = [json.loads(line.split(' ', 1)[1])
                           for line in log.splitlines() if line.startswith('LOCAL_COPY_RESULT_JSON ')]
                 marker = re.search(rf'^LOCAL_COPY_WORKER_PASS rank={rank} ', log, re.MULTILINE)
+                expected = dict(rank=rank,copy_mode=case['copy_mode'],bytes=case['bytes'],
+                    changed_calls=settings['changed_calls'],queued_calls=settings['queued_calls'],
+                    guards='PASS',status='PASS',engine='CCU',channel_count=0,acl_d2d=False)
+                if 'group_slice_bytes' in case:
+                    expected.update(group_slice_bytes=case['group_slice_bytes'],group_lanes=8)
                 valid = (len(events) == 1 and isinstance(events[0], dict) and
                     all(type(events[0].get(key)) is int for key in
                         ('rank', 'bytes', 'changed_calls', 'queued_calls', 'channel_count')) and
-                    events[0].get('acl_d2d') is False and events[0] == dict(rank=rank,
-                    copy_mode=case['copy_mode'], bytes=case['bytes'],
-                    changed_calls=settings['changed_calls'], queued_calls=settings['queued_calls'],
-                    guards='PASS', status='PASS', engine='CCU', channel_count=0, acl_d2d=False))
+                    events[0].get('acl_d2d') is False and events[0] == expected and
+                    all(type(events[0].get(key)) is int for key in ('group_slice_bytes','group_lanes')
+                        if key in expected))
                 if status != 0 or not marker or not valid or 'LOCAL_COPY_FAILURE' in log:
                     raise ValueError(f'status={status}, result/cleanup evidence incomplete')
                 checked.append(rank)
@@ -40,13 +44,14 @@ def analyze(root):
         passed = (not settings.get('builder_only', False) and process_status == 0 and
                   checked == list(range(ranks)) and not reasons)
         rows.append(dict(case=case['name'], copy_mode=case['copy_mode'], bytes=case['bytes'],
+            group_slice_bytes=case.get('group_slice_bytes',0),
             status=process_status, result='PASS' if passed else 'FAIL_OR_INCOMPLETE',
             checked_ranks=','.join(map(str, checked)), reason='; '.join(reasons)))
     complete = bool(rows) and not settings.get('builder_only', False) and all(row['result'] == 'PASS' for row in rows)
     summary = dict(complete=complete, conclusion='PASS' if complete else 'FAIL_OR_INCOMPLETE',
         hardware_data_pass_cases=[row['case'] for row in rows if row['result'] == 'PASS'], cases=rows)
     with (root / 'local_copy_summary.tsv').open('w', newline='') as output:
-        writer = csv.DictWriter(output, fieldnames=('case', 'copy_mode', 'bytes', 'status', 'result', 'checked_ranks', 'reason'), delimiter='\t')
+        writer = csv.DictWriter(output, fieldnames=('case', 'copy_mode', 'bytes', 'group_slice_bytes', 'status', 'result', 'checked_ranks', 'reason'), delimiter='\t')
         writer.writeheader(); writer.writerows(rows)
     (root / 'local_copy_summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     report = ['# Isolated CCU LocalCopyNb + WaitEvent proof', '',
@@ -76,7 +81,7 @@ def main():
     for row in result['cases']:
         print(f'{row["case"]}: {row["result"]} (process status={row["status"]})')
     if result['complete']:
-        label = ('GroupCopy8x32K (HBM-MS-HBM)' if all(row['copy_mode'] == 'group' for row in result['cases'])
+        label = ('GroupCopy (HBM-MS-HBM, all requested slices)' if all(row['copy_mode'] == 'group' for row in result['cases'])
                  else 'LocalCopyNb + WaitEvent')
         print(f'PASS: {label} completed on device; changed payload, every queued snapshot, guards and cleanup verified.')
     else:

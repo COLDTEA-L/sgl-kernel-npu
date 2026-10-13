@@ -27,6 +27,7 @@ struct Options {
     size_t bytes = 4096;
     bool chunked = false, grouped = false, builder = false, benchmark = false;
     uint32_t warmup = 100, iterations = 20;
+    uint32_t groupSliceBytes = 32768;
     std::string directory, profileDirectory;
 };
 Options options;
@@ -75,6 +76,7 @@ Options Parse(int argc, char **argv)
         else if (key == "--queued-iters") result.queued = static_cast<uint32_t>(number);
         else if (key == "--warmup") result.warmup = static_cast<uint32_t>(number);
         else if (key == "--iters") result.iterations = static_cast<uint32_t>(number);
+        else if (key == "--group-slice-bytes") result.groupSliceBytes = static_cast<uint32_t>(number);
         else throw std::runtime_error("unknown argument: " + key);
     }
     if (!result.builder && (result.directory.empty() || result.ranks < 1 || result.ranks > 2 || result.rank >= result.ranks))
@@ -84,17 +86,27 @@ Options Parse(int argc, char **argv)
     if (result.warmup > 100000 || result.iterations < 1 || result.iterations > 100000 ||
         (!result.benchmark && !result.profileDirectory.empty()))
         throw std::runtime_error("invalid benchmark options; profiling requires --benchmark");
+    if (!a5_ccu_urma_probe::GroupCopyConfig(result.groupSliceBytes).Valid() ||
+        (!result.grouped && result.groupSliceBytes != 32768))
+        throw std::runtime_error("group slice must be 32768/65536/131072 bytes; non-default requires group mode");
     return result;
 }
 const char *ModeName() { return options.grouped ? "group" : options.chunked ? "chunked" : "direct"; }
+std::string GeometryJson()
+{
+    if (!options.grouped) return "";
+    return ",\"group_slice_bytes\":" + std::to_string(options.groupSliceBytes) + ",\"group_lanes\":8";
+}
 class LocalArg : public hcomm::CcuKernelArg {
 public:
-    LocalArg(bool chunked,bool group) : chunked(chunked),group(group) {}
+    LocalArg(bool chunked,bool group,uint32_t sliceBytes) : chunked(chunked),group(group),config(sliceBytes) {}
     bool chunked,group;
+    a5_ccu_urma_probe::GroupCopyConfig config;
     hcomm::CcuKernelSignature GetKernelSignature() const override
     {
         hcomm::CcuKernelSignature signature;
-        signature.Append(group ? "A5LocalGroup8x32KV1" : chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
+        signature.Append(group ? "A5LocalGroup8xSliceV2:" + std::to_string(config.sliceBytes) :
+            chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
         return signature;
     }
 };
@@ -112,6 +124,7 @@ public:
         if (!local) throw std::runtime_error("wrong kernel argument type");
         chunked_ = local->chunked;
         grouped_ = local->group;
+        config_ = local->config;
     }
 protected:
     HcclResult Algorithm() override
@@ -125,7 +138,7 @@ protected:
         if(grouped_) {
             std::array<hcomm::CcuRep::Variable,4> go;
             for(auto &v:go) {v=CreateVariable(); Load(v);}
-            return GroupedLocalCopy(destination,source,go);
+            return GroupedLocalCopy(destination,source,go,config_);
         }
         Load(bytes);
         auto done = CreateCompletedEvent(); // one event, stable lifetime, reused only after Wait
@@ -155,7 +168,7 @@ protected:
         std::vector<uint64_t> values={task->input,task->output,task->inputToken,task->outputToken};
         if(grouped_) {
             std::array<uint64_t,4> go;
-            if(!a5_ccu_urma_probe::BuildGroupCopyPlan(task->bytes,&go)) return {};
+            if(!a5_ccu_urma_probe::BuildGroupCopyPlan(task->bytes,&go,config_)) return {};
             values.insert(values.end(),go.begin(),go.end());
         } else values.push_back(task->bytes);
         return values;
@@ -163,6 +176,7 @@ protected:
 private:
     bool chunked_ = false;
     bool grouped_ = false;
+    a5_ccu_urma_probe::GroupCopyConfig config_;
 };
 std::unique_ptr<hcomm::CcuKernel> CreateKernel(const hcomm::CcuKernelArg &arg)
 {
@@ -313,10 +327,10 @@ void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalT
     std::printf("LOCAL_COPY_PERF_JSON {\"rank\":%u,\"pid\":%d,\"copy_mode\":\"%s\",\"bytes\":%zu,"
         "\"warmup\":%u,\"iterations\":%u,\"host_batch_total_us\":%.9f,\"host_batch_avg_us\":%.9f,"
         "\"profile_requested\":%s,\"formal_h2d_d2h\":false,\"remote_write\":false,"
-        "\"engine\":\"CCU\",\"post_check\":\"PASS\"}\n",
+        "\"engine\":\"CCU\",\"post_check\":\"PASS\"%s}\n",
         options.rank, static_cast<int>(getpid()), ModeName(), options.bytes, options.warmup,
         options.iterations, totalUs, totalUs / options.iterations,
-        options.profileDirectory.empty() ? "false" : "true");
+        options.profileDirectory.empty() ? "false" : "true", GeometryJson().c_str());
     std::fflush(stdout);
 }
 void Run()
@@ -341,12 +355,17 @@ void Run()
     Mark("thread_acquire");
     Check(HcclThreadAcquireWithStream(resources.comm, COMM_ENGINE_CCU, resources.stream, 1, &thread),
           "HcclThreadAcquireWithStream");
-    LocalArg arg(options.chunked,options.grouped); // channels intentionally empty
+    LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); // channels intentionally empty
     hcomm::KernelCreator creator = CreateKernel;
     CcuKernelHandle kernel = 0;
     Mark("kernel_register");
     Check(HcclCcuKernelRegister(resources.comm, &kernel, &creator, &arg), "HcclCcuKernelRegister");
     Check(HcclCcuKernelRegisterFinish(resources.comm), "HcclCcuKernelRegisterFinish");
+    if (options.grouped) {
+        const uint64_t ms=options.groupSliceBytes/4096;
+        std::printf("LOCAL_COPY_GEOMETRY rank=%u lanes=8 slice_bytes=%u ms_stride=%lu total_ms=%lu\n",
+            options.rank,options.groupSliceBytes,static_cast<unsigned long>(ms),static_cast<unsigned long>(8*ms));
+    }
     std::printf("LOCAL_COPY_KERNEL_REGISTERED rank=%u mode=%s channels=0\n", options.rank,
                 ModeName());
     const size_t span = options.bytes + 2 * GUARD, hostSpan = span * options.queued;
@@ -395,8 +414,8 @@ void Run()
     if (options.benchmark) Benchmark(resources, thread, kernel, task);
     std::printf("LOCAL_COPY_RESULT_JSON {\"rank\":%u,\"copy_mode\":\"%s\",\"bytes\":%zu,"
         "\"changed_calls\":%u,\"queued_calls\":%u,\"guards\":\"PASS\",\"status\":\"PASS\","
-        "\"engine\":\"CCU\",\"channel_count\":0,\"acl_d2d\":false}\n",
-        options.rank, ModeName(), options.bytes, options.changed, options.queued);
+        "\"engine\":\"CCU\",\"channel_count\":0,\"acl_d2d\":false%s}\n",
+        options.rank, ModeName(), options.bytes, options.changed, options.queued, GeometryJson().c_str());
     std::fflush(stdout);
     Mark("cleanup_barrier"); CleanupBarrier(); resources.Close();
     std::printf("LOCAL_COPY_WORKER_PASS rank=%u LocalCopyNb+WaitEvent data+guards+cleanup=PASS\n", options.rank);
@@ -408,10 +427,10 @@ int main(int argc, char **argv)
     try {
         options = Parse(argc, argv);
         if (options.builder) {
-            LocalArg arg(options.chunked,options.grouped); LocalKernel kernel(arg);
+            LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); LocalKernel kernel(arg);
             Check(kernel.Init(), "CcuKernel::Init");
-            std::printf("LOCAL_COPY_BUILDER_PASS mode=%s graph_only=1 hardware_copy_executed=0\n",
-                ModeName());
+            std::printf("LOCAL_COPY_BUILDER_PASS mode=%s slice_bytes=%u graph_only=1 hardware_copy_executed=0\n",
+                ModeName(),options.grouped ? options.groupSliceBytes : 0);
         } else Run();
         return 0;
     } catch (const std::exception &error) {
