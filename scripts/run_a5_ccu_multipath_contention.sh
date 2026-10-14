@@ -18,6 +18,7 @@ iterations=100
 repeats=1
 mindstudio_profile=1
 timeout_seconds=900
+hccl_buffsize_mb=auto
 topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 output_root=/home/l00934901/profiling
@@ -39,6 +40,7 @@ while (($#)); do
         --mindstudio-profile) mindstudio_profile=1; shift;;
         --no-mindstudio-profile) mindstudio_profile=0; shift;;
         --timeout-seconds) timeout_seconds=$2; shift 2;;
+        --hccl-buffsize-mb) hccl_buffsize_mb=$2; shift 2;;
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
@@ -46,6 +48,7 @@ while (($#)); do
         --help)
             echo 'A5 direct+relay contention: P=2,3 relay4; Q=4,5 relay2.'
             echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=10 iters=100 repeats=1.'
+            echo 'HCCL buffer defaults to auto: max(200MB, two-rank payload in MiB + 64MB); override with --hccl-buffsize-mb N.'
             echo 'MindStudio profiling is enabled by default and starts only after warmup; use --no-mindstudio-profile for timing-only runs.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
@@ -54,11 +57,11 @@ done
 
 python3 - "$repo_root" "$p_devices" "$p_relay" "$q_devices" "$q_relay" \
     "$p_relay_plane" "$q_relay_plane" "$sizes" "$weights" \
-    "$warmup" "$iterations" "$repeats" "$timeout_seconds" <<'PY'
+    "$warmup" "$iterations" "$repeats" "$timeout_seconds" "$hccl_buffsize_mb" <<'PY'
 import sys
-repo, p_devices, p_relay, q_devices, q_relay, p_plane, q_plane, sizes, weights, warmup, iters, repeats, timeout = sys.argv[1:]
+repo, p_devices, p_relay, q_devices, q_relay, p_plane, q_plane, sizes, weights, warmup, iters, repeats, timeout, hccl_buffer = sys.argv[1:]
 sys.path.insert(0, repo + "/tests/python/deepep")
-from a5_ccu_path_contention_support import parse_sizes
+from a5_ccu_path_contention_support import parse_sizes, resolve_hccl_buffer_mb
 
 def pair(text, name):
     items = text.split(',')
@@ -76,7 +79,9 @@ if p != (2, 3) or q != (4, 5) or int(p_relay) != 4 or int(q_relay) != 2:
     raise SystemExit("this first experiment is intentionally pinned to P=2,3/relay4 and Q=4,5/relay2")
 if p_plane not in ("all", "0", "1") or q_plane not in ("all", "0", "1"):
     raise SystemExit("relay plane must be all, 0 or 1")
-parse_sizes(sizes)
+parsed_sizes = parse_sizes(sizes)
+for size in parsed_sizes:
+    resolve_hccl_buffer_mb(size, hccl_buffer)
 weight_values = weights.split(',')
 if len(weight_values) != 2 or any(not value.isdecimal() or int(value) <= 0 for value in weight_values):
     raise SystemExit("--weights must contain positive direct,relay weights")
@@ -96,7 +101,6 @@ source "${cann_root}/set_env.sh"
 # tracked source-tree file.  Each worker's a5_ccu_test_runtime bootstrap finds
 # that wheel, adds its OPP/library paths, and re-execs before importing torch.
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
-export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
 export PYTHONUNBUFFERED=1
 unset ASCEND_LAUNCH_BLOCKING A5_CCU_SOURCE_ROUTE_MANIFEST A5_CCU_SOURCE_ROUTE_PROVIDER
 unset A5_CCU_SYNTHETIC_ROUTE_MANIFEST A5_CCU_PATH_UIDS A5_CCU_ROUTE_INDICES A5_CCU_ROUTE_INDEX
@@ -116,6 +120,19 @@ format_size_label() {
     fi
 }
 
+resolve_hccl_buffsize_mb() {
+    local byte_count=$1
+    if [[ "$hccl_buffsize_mb" != auto ]]; then
+        printf '%d' "$hccl_buffsize_mb"
+        return
+    fi
+    local mib=$((1024 * 1024))
+    local rank_payload_mb=$(((2 * byte_count + mib - 1) / mib))
+    local value=$((rank_payload_mb + 64))
+    ((value < 200)) && value=200
+    printf '%d' "$value"
+}
+
 resolve_manifest() {
     local src=$1 dst=$2 relay=$3 plane=$4 output=$5
     python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py" \
@@ -127,9 +144,13 @@ resolve_manifest 2 3 "$p_relay" "$p_relay_plane" "$run_dir/manifests/P.tsv"
 resolve_manifest 4 5 "$q_relay" "$q_relay_plane" "$run_dir/manifests/Q.tsv"
 
 python3 - "$run_dir" "$sizes" "$warmup" "$iterations" "$repeats" \
-    "$weights" "$mindstudio_profile" "$p_relay_plane" "$q_relay_plane" <<'PY'
+    "$weights" "$mindstudio_profile" "$p_relay_plane" "$q_relay_plane" \
+    "$hccl_buffsize_mb" "$repo_root" <<'PY'
 import json, pathlib, sys
-root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane = sys.argv[1:]
+root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo = sys.argv[1:]
+sys.path.insert(0, repo + "/tests/python/deepep")
+from a5_ccu_path_contention_support import resolve_hccl_buffer_mb
+size_values = list(map(int, sizes.split(',')))
 settings = dict(
     experiment="two_prepared_multipath_jobs_shared_directed_hops",
     jobs={
@@ -137,10 +158,17 @@ settings = dict(
         "Q": {"endpoints": [4, 5], "relay": 2, "relay_plane": q_plane},
     },
     expected_shared_physical_directions=["2->4", "4->2"],
-    sizes=list(map(int, sizes.split(','))), weights=list(map(int, weights.split(','))),
+    sizes=size_values, weights=list(map(int, weights.split(','))),
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
     mindstudio_profile=bool(int(profile)), implementation="prepared",
     completion_mode="batch",
+    hccl_buffsize_policy=dict(
+        setting=hccl_buffer,
+        unit="MB",
+        auto_formula="max(200, ceil(2 * bytes_per_peer / MiB) + 64)",
+        per_size_mb={str(size): resolve_hccl_buffer_mb(size, hccl_buffer)
+                     for size in size_values},
+    ),
     size_semantics="bytes_per_peer_slice",
     profile_scope={
         "warmup_excluded": True,
@@ -157,8 +185,9 @@ test_script=tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py
 
 run_job() {
     local job=$1 phase=$2 size=$3 repeat=$4 sync_dir=$5 log=$6
-    local devices manifest profile_args=() case_path size_label
+    local devices manifest profile_args=() case_path size_label case_hccl_buffsize_mb
     size_label=$(format_size_label "$size")
+    case_hccl_buffsize_mb=$(resolve_hccl_buffsize_mb "$size")
     if [[ "$phase" == concurrent ]]; then
         case_path="concurrent_PQ/${job}"
     else
@@ -179,6 +208,8 @@ run_job() {
     [[ -z "$sync_dir" ]] || sync_args=(--contention-sync-dir "$sync_dir")
     (
         export ASCEND_RT_VISIBLE_DEVICES="$devices"
+        export HCCL_BUFFSIZE="$case_hccl_buffsize_mb"
+        echo "CASE_MEMORY_PLAN size=${size_label} bytes_per_peer=${size} HCCL_BUFFSIZE_MB=${HCCL_BUFFSIZE}" >&2
         timeout --signal=TERM --kill-after=10 "$timeout_seconds" \
             python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
             "$test_script" --implementation prepared --relay-manifest "$manifest" \

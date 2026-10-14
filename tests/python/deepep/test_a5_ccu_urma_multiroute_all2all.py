@@ -366,20 +366,19 @@ def main():
 
     dtype = getattr(torch, args.dtype)
     elements = args.bytes // torch.empty((), dtype=dtype).element_size()
-    send = torch.stack([
-        torch.full((elements,), float(rank * 100 + dst + 1),
-                   dtype=dtype, device="npu")
-        for dst in range(world_size)
-    ])
+    # Allocate the final two-rank tensors directly.  Building a list of peer
+    # tensors and stacking it adds a temporary bytes_per_peer * world_size
+    # peak, which is avoidable at the 256 MiB endpoint.
+    send = torch.empty((world_size, elements), dtype=dtype, device="npu")
+    for dst in range(world_size):
+        send[dst].fill_(float(rank * 100 + dst + 1))
     recv = torch.empty_like(send)
     path_policy = torch.tensor(
         [encode_path_policy(explicit_weights)], dtype=torch.int64, device="npu"
     ) if args.implementation == "standard" else None
-    expected = torch.stack([
-        torch.full((elements,), float(src * 100 + rank + 1),
-                   dtype=dtype, device="npu")
-        for src in range(world_size)
-    ])
+    expected = torch.empty_like(send)
+    for src in range(world_size):
+        expected[src].fill_(float(src * 100 + rank + 1))
 
     def check_result():
         try:

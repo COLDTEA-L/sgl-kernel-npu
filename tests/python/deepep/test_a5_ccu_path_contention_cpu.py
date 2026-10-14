@@ -9,6 +9,7 @@ from a5_ccu_path_contention_support import (
     format_size_label,
     overlap_ns,
     parse_sizes,
+    resolve_hccl_buffer_mb,
     safe_name,
 )
 
@@ -26,6 +27,15 @@ class PathContentionSupportTest(unittest.TestCase):
         self.assertEqual(format_size_label(1024 * 1024), "1MB")
         self.assertEqual(format_size_label(256 * 1024 * 1024), "256MB")
         self.assertEqual(format_size_label(768), "768B")
+
+    def test_hccl_buffer_budget(self):
+        self.assertEqual(resolve_hccl_buffer_mb(16 * 1024), 200)
+        self.assertEqual(resolve_hccl_buffer_mb(64 * 1024 * 1024), 200)
+        self.assertEqual(resolve_hccl_buffer_mb(256 * 1024 * 1024), 576)
+        self.assertEqual(resolve_hccl_buffer_mb(256 * 1024 * 1024, "768"), 768)
+        for setting in ("", "0", "bad"):
+            with self.assertRaises(ValueError):
+                resolve_hccl_buffer_mb(16 * 1024, setting)
 
     def test_names_and_overlap(self):
         self.assertEqual(safe_name("P"), "P")

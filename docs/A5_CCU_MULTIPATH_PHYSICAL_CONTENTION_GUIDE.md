@@ -24,7 +24,20 @@ MindStudio device timeline统计，不用host提交区间代替device执行区�
 
 两 rank AllToAll 的单 rank send tensor 是 `2 × bytes_per_peer`。测试还持有 recv 和
 expected tensor；256MiB 点每个 rank 约需1.5GiB基础tensor空间，四个endpoint进程约6GiB，
-不含通信runtime额外占用。
+不含通信runtime额外占用。send和expected直接按最终shape分配并原地填充，不再通过
+`torch.stack`额外产生约512MiB/rank的临时峰值；100次正式调用始终复用同一组tensor。
+
+runner不再对全部尺寸固定设置`HCCL_BUFFSIZE=2300`。默认`--hccl-buffsize-mb auto`按
+下式为每个尺寸、每个通信域单独设置：
+
+```text
+max(200MB, ceil(2 × bytes_per_peer / MiB) + 64MB)
+```
+
+因此16KiB至64MiB使用200MB，256MiB使用576MB。这里`2 × bytes_per_peer`是单rank完整
+payload，64MB是初始化余量；prepared算子直接读写用户send/recv tensor，这个HCCL buffer
+不是256MiB数据的64份副本。需要复现实验机的固定配置时，可显式传
+`--hccl-buffsize-mb N`，实际取值保存在`run_settings.json`并写入每个case日志。
 
 ## 2. 拉取与入口检查
 

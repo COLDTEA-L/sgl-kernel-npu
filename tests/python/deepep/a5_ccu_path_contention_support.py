@@ -18,6 +18,9 @@ DEFAULT_SIZES = (
     256 * 1024 * 1024,
 )
 
+HCCL_BUFFER_MIN_MB = 200
+HCCL_BUFFER_HEADROOM_MB = 64
+
 
 def format_size_label(byte_count):
     """Return a path-safe binary-size label using the requested KB/MB spelling."""
@@ -48,6 +51,26 @@ def parse_sizes(text):
     if len(values) != len(set(values)):
         raise ValueError("sizes must not contain duplicates")
     return values
+
+
+def resolve_hccl_buffer_mb(bytes_per_peer, setting="auto", world_size=2):
+    """Bound the per-domain HCCL buffer while covering one rank's payload.
+
+    The prepared operator transfers directly between user tensors, so this is
+    a conservative initialization budget rather than a staging allocation.
+    """
+    if not isinstance(bytes_per_peer, int) or bytes_per_peer <= 0:
+        raise ValueError("bytes_per_peer must be a positive integer")
+    if not isinstance(world_size, int) or world_size <= 0:
+        raise ValueError("world_size must be a positive integer")
+    if setting != "auto":
+        text = str(setting)
+        if not text.isdecimal() or int(text) <= 0:
+            raise ValueError("HCCL buffer setting must be auto or a positive MB integer")
+        return int(text)
+    mib = 1024 * 1024
+    rank_payload_mb = (world_size * bytes_per_peer + mib - 1) // mib
+    return max(HCCL_BUFFER_MIN_MB, rank_payload_mb + HCCL_BUFFER_HEADROOM_MB)
 
 
 def contention_measurement_start(directory, job_name, rank, world_size=2,
