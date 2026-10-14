@@ -19,6 +19,18 @@ DEFAULT_SIZES = (
 )
 
 
+def format_size_label(byte_count):
+    """Return a path-safe binary-size label using the requested KB/MB spelling."""
+    if not isinstance(byte_count, int) or byte_count <= 0:
+        raise ValueError("byte count must be a positive integer")
+    mib = 1024 * 1024
+    if byte_count % mib == 0:
+        return f"{byte_count // mib}MB"
+    if byte_count % 1024 == 0:
+        return f"{byte_count // 1024}KB"
+    return f"{byte_count}B"
+
+
 def safe_name(value):
     value = str(value)
     if not value or re.search(r"[^A-Za-z0-9_.-]", value):

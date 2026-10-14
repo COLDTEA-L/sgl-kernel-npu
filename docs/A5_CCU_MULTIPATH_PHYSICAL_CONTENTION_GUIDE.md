@@ -103,9 +103,16 @@ MindStudio profile包含该case正式阶段的100个标记
 调用开始前仍会有同步和四进程起跑屏障，因此“只取100次”是指其中只包含100次被测算子，
 不是说profile文件完全没有CPU同步事件。
 
-这里一个尺寸共有四个独立case：baseline P、baseline Q、concurrent P和concurrent Q；
-每个case各采100次，而不是四个case合计100次。若通过`--repeats N`增加重复轮数，
-每轮、每个case仍各自采100次。
+这里一个尺寸包含三个实验case：baseline P、baseline Q和concurrent PQ。concurrent PQ
+同时运行P、Q并分别保存两份采集结果，所以总共得到baseline P、baseline Q、并发中的P、
+并发中的Q四份100次记录，而不是四份合计100次。若通过`--repeats N`增加重复轮数，
+每轮的每份记录仍各自包含100次。
+
+其中`concurrent P`和`concurrent Q`不是先后运行的两个实验。runner会同时启动P、Q两个
+torchrun进程组，四个rank在同一个host单调时钟目标点释放。因为P和Q属于不同进程组，
+它们必须各自生成trace和profiler文件；目录统一放在同一次
+`concurrent_PQ/P`、`concurrent_PQ/Q`下面。分析器随后把两边100次调用的区间做交集，
+输出每个作业的`conflict_iterations / iterations`和`conflict_rate`。
 
 baseline 使用同一作业、同一尺寸全部repeat的单次耗时中位数。实验组每次调用的
 `time_inflation`定义为：
@@ -151,7 +158,7 @@ case_status.tsv                   # 每个子作业是否通过
 logs/                             # torchrun完整日志
 traces/                           # 每rank每次调用起止时间
 profiles/                         # 可选MindStudio数据
-results/size_<bytes>/             # 每个数据量单独保存的一套结果
+results/size_<KB或MB>/            # 每个数据量单独保存的一套结果
 path_contention_baselines.csv     # baseline原始单次耗时
 path_contention_iterations.csv    # 每次并发调用、冲突命中和膨胀
 path_contention_summary.csv       # Excel可直接打开的尺寸级汇总
@@ -162,16 +169,28 @@ path_contention_report.md         # 人读报告
 例如16KiB的独立结果位于：
 
 ```text
-results/size_16384/path_contention_baselines.csv
-results/size_16384/path_contention_iterations.csv
-results/size_16384/path_contention_summary.csv
-results/size_16384/path_contention_summary.json
-results/size_16384/path_contention_report.md
+results/size_16KB/path_contention_baselines.csv
+results/size_16KB/path_contention_iterations.csv
+results/size_16KB/path_contention_summary.csv
+results/size_16KB/path_contention_summary.json
+results/size_16KB/path_contention_report.md
 ```
 
-`traces/size_<bytes>/`和`profiles/size_<bytes>/`也按数据量隔离。结果目录根部的同名CSV、
-JSON和Markdown是跨全部数据量的总表，便于一次导入Excel比较；`results/size_<bytes>/`
+目录名使用`16KB`、`64KB`、`256KB`、`1MB`等可读标签；这里KB和MB分别按1024和
+1024²字节换算。CSV/JSON内部仍记录精确的`bytes_per_peer`整数。
+
+`traces/size_<KB或MB>/`和`profiles/size_<KB或MB>/`也按数据量隔离。结果目录根部的同名CSV、
+JSON和Markdown是跨全部数据量的总表，便于一次导入Excel比较；`results/size_<KB或MB>/`
 中的文件仅包含该数据量，方便后续逐个留存和查看。
+
+以16KB、repeat 1为例，并发目录为：
+
+```text
+profiles/size_16KB/repeat_1/concurrent_PQ/P/   # P在同一次P+Q并发运行中的profile
+profiles/size_16KB/repeat_1/concurrent_PQ/Q/   # Q在同一次P+Q并发运行中的profile
+traces/size_16KB/repeat_1/concurrent_PQ/P/     # P的100次调用区间
+traces/size_16KB/repeat_1/concurrent_PQ/Q/     # Q的100次调用区间
+```
 
 `path_contention_iterations.csv`中的关键列：
 

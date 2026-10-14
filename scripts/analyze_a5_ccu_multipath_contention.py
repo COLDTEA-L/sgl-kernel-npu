@@ -10,7 +10,7 @@ import sys
 
 support_dir = Path(__file__).resolve().parents[1] / "tests/python/deepep"
 sys.path.insert(0, str(support_dir))
-from a5_ccu_path_contention_support import overlap_ns  # noqa: E402
+from a5_ccu_path_contention_support import format_size_label, overlap_ns  # noqa: E402
 
 
 def read_tsv(path):
@@ -36,6 +36,19 @@ def percentile(values, fraction):
 
 def fmt(value, digits=3):
     return "NA" if value is None else f"{value:.{digits}f}"
+
+
+def trace_size_root(run_dir, size):
+    """Use human-readable paths for new runs and accept numeric legacy runs."""
+    current = run_dir / "traces" / f"size_{format_size_label(size)}"
+    legacy = run_dir / "traces" / f"size_{size}"
+    return current if current.exists() or not legacy.exists() else legacy
+
+
+def concurrent_trace_dir(repeat_root, job):
+    current = repeat_root / "concurrent_PQ" / job
+    legacy = repeat_root / f"concurrent_{job}"
+    return current if current.exists() or not legacy.exists() else legacy
 
 
 def render_report(sizes, repeats, iterations, shared_directions, link_identity, aggregate):
@@ -159,7 +172,7 @@ def analyze(run_dir):
         for job in ("P", "Q"):
             samples = []
             for repeat in range(1, repeats + 1):
-                directory = (run_dir / "traces" / f"size_{size}" /
+                directory = (trace_size_root(run_dir, size) /
                              f"repeat_{repeat}" / f"baseline_{job}")
                 intervals = load_collective_intervals(directory, iterations)
                 for item in intervals:
@@ -177,9 +190,9 @@ def analyze(run_dir):
     pair_counts = {}
     for size in sizes:
         for repeat in range(1, repeats + 1):
-            root = run_dir / "traces" / f"size_{size}" / f"repeat_{repeat}"
+            root = trace_size_root(run_dir, size) / f"repeat_{repeat}"
             intervals = {
-                job: load_collective_intervals(root / f"concurrent_{job}", iterations)
+                job: load_collective_intervals(concurrent_trace_dir(root, job), iterations)
                 for job in ("P", "Q")
             }
             overlaps = {"P": {item["iteration"]: [] for item in intervals["P"]},
@@ -273,7 +286,7 @@ def analyze(run_dir):
         "settings": settings,
         "aggregate": aggregate,
         "per_size_results": {
-            str(size): f"results/size_{size}" for size in sizes
+            str(size): f"results/size_{format_size_label(size)}" for size in sizes
         },
     }
     (run_dir / "path_contention_summary.json").write_text(
@@ -288,7 +301,7 @@ def analyze(run_dir):
 
     baseline_fields = ("bytes_per_peer", "repeat", "job", "iteration", "duration_us")
     for size in sizes:
-        result_dir = run_dir / "results" / f"size_{size}"
+        result_dir = run_dir / "results" / f"size_{format_size_label(size)}"
         size_baselines = [row for row in baseline_rows if row["bytes_per_peer"] == size]
         size_rows = [row for row in rows if row["bytes_per_peer"] == size]
         size_aggregate = [row for row in aggregate if row["bytes_per_peer"] == size]

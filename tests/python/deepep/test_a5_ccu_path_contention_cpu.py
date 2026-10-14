@@ -6,6 +6,7 @@ import unittest
 from a5_ccu_path_contention_support import (
     DEFAULT_SIZES,
     contention_measurement_start,
+    format_size_label,
     overlap_ns,
     parse_sizes,
     safe_name,
@@ -20,6 +21,11 @@ class PathContentionSupportTest(unittest.TestCase):
         for text in ("", "0", "1", "256,256", "256,x"):
             with self.assertRaises(ValueError):
                 parse_sizes(text)
+        self.assertEqual(format_size_label(16 * 1024), "16KB")
+        self.assertEqual(format_size_label(256 * 1024), "256KB")
+        self.assertEqual(format_size_label(1024 * 1024), "1MB")
+        self.assertEqual(format_size_label(256 * 1024 * 1024), "256MB")
+        self.assertEqual(format_size_label(768), "768B")
 
     def test_names_and_overlap(self):
         self.assertEqual(safe_name("P"), "P")

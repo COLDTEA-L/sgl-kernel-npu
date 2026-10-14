@@ -51,12 +51,12 @@ class PathContentionAnalyzerTest(unittest.TestCase):
             write_manifest(root / "manifests/Q.tsv", 4, 5, 2)
             (root / "run_settings.json").write_text(json.dumps(dict(
                 sizes=[16384], repeats=1, iterations=2)))
-            trace = root / "traces/size_16384/repeat_1"
+            trace = root / "traces/size_16KB/repeat_1"
             base = 1_000_000_000
             write_trace(trace / "baseline_P", "P", [10, 10], [base, base + 20_000])
             write_trace(trace / "baseline_Q", "Q", [20, 20], [base, base + 30_000])
-            write_trace(trace / "concurrent_P", "P", [15, 15], [base, base + 20_000])
-            write_trace(trace / "concurrent_Q", "Q", [25, 25], [base + 5_000, base + 31_000])
+            write_trace(trace / "concurrent_PQ/P", "P", [15, 15], [base, base + 20_000])
+            write_trace(trace / "concurrent_PQ/Q", "Q", [25, 25], [base + 5_000, base + 31_000])
             subprocess.run([sys.executable, str(analyzer), "--run-dir", str(root)], check=True)
             summary = json.loads((root / "path_contention_summary.json").read_text())
             self.assertEqual(summary["shared_physical_directions"], ["2->4", "4->2"])
@@ -69,7 +69,7 @@ class PathContentionAnalyzerTest(unittest.TestCase):
             self.assertEqual(by_job["Q"]["conflict_inflation_median"], 1.25)
             self.assertTrue((root / "path_contention_iterations.csv").is_file())
             self.assertTrue((root / "path_contention_report.md").is_file())
-            size_root = root / "results/size_16384"
+            size_root = root / "results/size_16KB"
             self.assertTrue((size_root / "path_contention_baselines.csv").is_file())
             self.assertTrue((size_root / "path_contention_iterations.csv").is_file())
             self.assertTrue((size_root / "path_contention_summary.csv").is_file())

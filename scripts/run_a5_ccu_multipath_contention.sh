@@ -105,6 +105,17 @@ mkdir -p "$output_root"
 run_dir=$(mktemp -d "${output_root}/a5_path_contention_2_3_4_5_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "$run_dir/manifests" "$run_dir/logs" "$run_dir/traces" "$run_dir/profiles"
 
+format_size_label() {
+    local byte_count=$1
+    if ((byte_count % (1024 * 1024) == 0)); then
+        printf '%dMB' "$((byte_count / (1024 * 1024)))"
+    elif ((byte_count % 1024 == 0)); then
+        printf '%dKB' "$((byte_count / 1024))"
+    else
+        printf '%dB' "$byte_count"
+    fi
+}
+
 resolve_manifest() {
     local src=$1 dst=$2 relay=$3 plane=$4 output=$5
     python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py" \
@@ -135,7 +146,7 @@ settings = dict(
         "warmup_iterations": int(warmup),
         "measured_iterations_per_case": int(iterations),
     },
-    per_size_results="results/size_<bytes_per_peer>",
+    per_size_results="results/size_<KB_or_MB_label>",
 )
 (pathlib.Path(root) / "run_settings.json").write_text(json.dumps(settings, indent=2) + "\n")
 PY
@@ -145,7 +156,13 @@ test_script=tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py
 
 run_job() {
     local job=$1 phase=$2 size=$3 repeat=$4 sync_dir=$5 log=$6
-    local devices manifest profile_args=()
+    local devices manifest profile_args=() case_path size_label
+    size_label=$(format_size_label "$size")
+    if [[ "$phase" == concurrent ]]; then
+        case_path="concurrent_PQ/${job}"
+    else
+        case_path="baseline_${job}"
+    fi
     if [[ "$job" == P ]]; then
         devices=$p_devices
         manifest="$run_dir/manifests/P.tsv"
@@ -155,7 +172,7 @@ run_job() {
     fi
     if ((mindstudio_profile != 0)); then
         profile_args=(--profile --profile-iters "$iterations"
-            --profile-root "$run_dir/profiles/size_${size}/repeat_${repeat}/${phase}_${job}")
+            --profile-root "$run_dir/profiles/size_${size_label}/repeat_${repeat}/${case_path}")
     fi
     local sync_args=()
     [[ -z "$sync_dir" ]] || sync_args=(--contention-sync-dir "$sync_dir")
@@ -165,10 +182,10 @@ run_job() {
             python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
             "$test_script" --implementation prepared --relay-manifest "$manifest" \
             --direct-route 0 --path-weights "$weights" \
-            --plan-id "path-contention-${job}-${phase}-${size}-${repeat}" \
+            --plan-id "path-contention-${job}-${phase}-${size_label}-${repeat}" \
             --bytes "$size" --dtype float32 --warmup "$warmup" --iters "$iterations" \
             --trace-job "$job" \
-            --iteration-trace-dir "$run_dir/traces/size_${size}/repeat_${repeat}/${phase}_${job}" \
+            --iteration-trace-dir "$run_dir/traces/size_${size_label}/repeat_${repeat}/${case_path}" \
             "${sync_args[@]}" "${profile_args[@]}"
     ) >"$log" 2>&1
 }
@@ -185,11 +202,12 @@ record_status() {
 
 IFS=',' read -ra size_array <<<"$sizes"
 for size in "${size_array[@]}"; do
+    size_label=$(format_size_label "$size")
     for ((repeat=1; repeat<=repeats; ++repeat)); do
-        trace_root="$run_dir/traces/size_${size}/repeat_${repeat}"
+        trace_root="$run_dir/traces/size_${size_label}/repeat_${repeat}"
         mkdir -p "$trace_root"
         for job in P Q; do
-            log="$run_dir/logs/size_${size}_repeat_${repeat}_baseline_${job}.log"
+            log="$run_dir/logs/size_${size_label}_repeat_${repeat}_baseline_${job}.log"
             status=0
             run_job "$job" baseline "$size" "$repeat" "" "$log" || status=$?
             if ! record_status "$size" "$repeat" baseline "$job" "$status" "$log"; then
@@ -199,10 +217,10 @@ for size in "${size_array[@]}"; do
             fi
         done
 
-        sync_dir="$run_dir/sync/size_${size}/repeat_${repeat}"
+        sync_dir="$run_dir/sync/size_${size_label}/repeat_${repeat}"
         mkdir -p "$sync_dir"
-        p_log="$run_dir/logs/size_${size}_repeat_${repeat}_concurrent_P.log"
-        q_log="$run_dir/logs/size_${size}_repeat_${repeat}_concurrent_Q.log"
+        p_log="$run_dir/logs/size_${size_label}_repeat_${repeat}_concurrent_PQ_P.log"
+        q_log="$run_dir/logs/size_${size_label}_repeat_${repeat}_concurrent_PQ_Q.log"
         set +e
         run_job P concurrent "$size" "$repeat" "$sync_dir" "$p_log" &
         p_pid=$!
