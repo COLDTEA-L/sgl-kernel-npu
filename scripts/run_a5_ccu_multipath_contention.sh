@@ -92,9 +92,9 @@ PY
 
 cd "$repo_root"
 source "${cann_root}/set_env.sh"
-set +u
-source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
-set -u
+# The vendor environment belongs to the installed DeepEP wheel and is not a
+# tracked source-tree file.  Each worker's a5_ccu_test_runtime bootstrap finds
+# that wheel, adds its OPP/library paths, and re-execs before importing torch.
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-2300}
 export PYTHONUNBUFFERED=1

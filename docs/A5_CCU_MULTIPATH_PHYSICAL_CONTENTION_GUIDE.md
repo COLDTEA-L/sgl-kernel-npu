@@ -49,6 +49,12 @@ bash scripts/run_a5_ccu_multipath_contention.sh --help
 这是Python、Shell和分析器改动，不含新的C++内核。实验机需要已经安装与基线分支
 `feature/a5-ccu-copy-comm-overlap`匹配的DeepEP扩展及route library。
 
+仓库源码中不要求存在
+`python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash`。它是构建或安装阶段的生成文件，
+不属于Git checkout。runner只加载CANN环境；每个worker会通过`a5_ccu_test_runtime.py`从当前
+Python解释器实际安装的`deep_ep`包定位扩展、custom OPP和route library，并在导入torch前
+补齐环境。若wheel或route library没有安装，worker会直接报告缺少的组件，不会误用源码目录。
+
 ## 3. 首次短测
 
 先确认物理卡2、3、4、5均空闲。短测仅使用16KiB，并显式关闭MindStudio profiler：
