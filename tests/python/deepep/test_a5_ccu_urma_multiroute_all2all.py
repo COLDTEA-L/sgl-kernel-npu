@@ -17,7 +17,10 @@ from a5_ccu_test_runtime import (
 )
 from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
 from a5_ccu_path_contention_support import (
+    contention_file_barrier,
     contention_measurement_start,
+    format_size_label,
+    parse_sizes,
     safe_name,
     write_iteration_trace,
 )
@@ -30,7 +33,8 @@ def mark_phase(name):
     global CURRENT_PHASE
     CURRENT_PHASE = name
     print(
-        f"CASE_PHASE pid={os.getpid()} rank={os.environ.get('RANK', 'NA')} phase={name}",
+        f"CASE_PHASE pid={os.getpid()} rank={os.environ.get('RANK', 'NA')} "
+        f"phase={name} wall_time_ns={time.time_ns()} monotonic_ns={time.monotonic_ns()}",
         flush=True,
     )
 
@@ -169,6 +173,11 @@ def parse_args():
                         default="multiroute")
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024,
                         help="bytes in each destination slice")
+    parser.add_argument("--suite-sizes", default="",
+                        help="persistent contention suite sizes; one communicator/plan serves all values")
+    parser.add_argument("--suite-repeats", type=int, default=1)
+    parser.add_argument("--suite-job", choices=("P", "Q"), default="")
+    parser.add_argument("--suite-run-dir", default="")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32", "int8", "int32"),
                         default="float32", help="operator infers dtype from the input tensor")
     parser.add_argument("--route-index", type=int, default=0)
@@ -239,7 +248,7 @@ def parse_args():
         parser.error("--bytes must be a positive multiple of dtype element size")
     if args.implementation == "standard" and args.dtype != "float32":
         parser.error("the historical ACLNN standard experiment is outside the multi-dtype prepared-plan change")
-    if args.warmup < 0 or args.iters <= 0 or args.profile_iters <= 0:
+    if args.warmup < 0 or args.iters <= 0 or args.profile_iters <= 0 or args.suite_repeats <= 0:
         parser.error("invalid warmup/iters/profile-iters")
     if args.profile and args.profile_iters != args.iters:
         parser.error(
@@ -250,6 +259,18 @@ def parse_args():
         parser.error("--validate-every-iteration is incompatible with batch completion")
     if args.runtime_check:
         return args
+    suite_values = (args.suite_sizes, args.suite_job, args.suite_run_dir)
+    if any(suite_values) and not all(suite_values):
+        parser.error("--suite-sizes, --suite-job and --suite-run-dir must be supplied together")
+    if args.suite_sizes:
+        try:
+            parse_sizes(args.suite_sizes)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.implementation != "prepared" or args.completion_mode != "batch":
+            parser.error("persistent suite requires --implementation prepared --completion-mode batch")
+        if args.compile_backend != "none" or args.validate_every_iteration:
+            parser.error("persistent suite does not support graph compilation or per-iteration validation")
     if args.trace_job:
         try:
             safe_name(args.trace_job)
@@ -323,6 +344,197 @@ def select_routes(args):
         os.environ["A5_CCU_PATH_WEIGHTS"] = args.path_weights
     else:
         os.environ.pop("A5_CCU_PATH_WEIGHTS", None)
+
+
+def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
+                                    explicit_weights):
+    """Run all sizes/phases while retaining one process group and one plan."""
+    run_dir = Path(args.suite_run_dir).resolve()
+    sizes = parse_sizes(args.suite_sizes)
+    job = args.suite_job
+    dtype = getattr(torch, args.dtype)
+    element_size = torch.empty((), dtype=dtype).element_size()
+    suite_sync = run_dir / "sync" / "persistent_suite"
+
+    def global_barrier(case_root, tag):
+        contention_file_barrier(case_root, tag, job, rank, world_size)
+
+    for size in sizes:
+        if size % element_size:
+            raise RuntimeError(
+                f"suite size {size} is not divisible by {args.dtype} element size {element_size}"
+            )
+        size_label = format_size_label(size)
+        elements = size // element_size
+        mark_phase(f"suite_allocate_{size_label}")
+        send = torch.empty((world_size, elements), dtype=dtype, device="npu")
+        for dst in range(world_size):
+            send[dst].fill_(float(rank * 100 + dst + 1))
+        recv = torch.empty_like(send)
+        expected = torch.empty_like(send)
+        for src in range(world_size):
+            expected[src].fill_(float(src * 100 + rank + 1))
+        torch.npu.synchronize()
+
+        def check_result(phase):
+            try:
+                torch.testing.assert_close(recv, expected, rtol=0, atol=0)
+            except AssertionError:
+                mismatch_by_row = torch.count_nonzero(
+                    recv != expected, dim=1
+                ).detach().cpu().tolist()
+                print(
+                    f"CASE_DATA_DIAGNOSTIC rank={rank} phase={phase} "
+                    f"size={size_label} mismatch_by_row={mismatch_by_row}",
+                    flush=True,
+                )
+                raise
+
+        def run_op():
+            buffer.ccu_urma_prepared_multipath_alltoall_policy_out(
+                send, recv, plan_handle, explicit_weights
+            )
+
+        for repeat in range(1, args.suite_repeats + 1):
+            case_root = suite_sync / f"size_{size_label}" / f"repeat_{repeat}"
+            trace_root = run_dir / "traces" / f"size_{size_label}" / f"repeat_{repeat}"
+            profile_root = run_dir / "profiles" / f"size_{size_label}" / f"repeat_{repeat}"
+            status_root = run_dir / "status" / f"size_{size_label}" / f"repeat_{repeat}"
+
+            for phase in ("baseline_P", "baseline_Q", "concurrent_PQ"):
+                active = phase == f"baseline_{job}" or phase == "concurrent_PQ"
+                phase_tag = safe_name(f"{phase}_r{repeat}_{size_label}")
+                global_barrier(case_root, f"{phase_tag}_begin")
+                if active:
+                    case_path = Path(phase) if phase != "concurrent_PQ" else Path(phase) / job
+                    trace_dir = trace_root / case_path
+                    status_dir = status_root / case_path
+                    profile_dir = profile_root / case_path / f"rank{rank}"
+                    mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_warmup")
+                    for _ in range(args.warmup):
+                        run_op()
+                    torch.npu.synchronize()
+                    check_result(phase)
+
+                    profiler = None
+                    iteration_records = []
+                    if args.profile:
+                        mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_profiling")
+                        profiler = make_profiler(profile_dir, rank)
+                        profiler.start()
+                    else:
+                        mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_timing")
+                    try:
+                        torch.npu.synchronize()
+                        if phase == "concurrent_PQ":
+                            start_lateness_us = contention_measurement_start(
+                                case_root / "concurrent_start", job, rank, world_size
+                            )
+                        else:
+                            start_lateness_us = measurement_start(
+                                case_root / f"{phase}_start", rank, world_size
+                            )
+                        batch_started_ns = time.monotonic_ns()
+                        for index in range(args.iters):
+                            started_ns = time.monotonic_ns()
+                            marker = (
+                                torch.autograd.profiler.record_function(
+                                    f"A5_PATH_CONTENTION_{job}_ITER_{index + 1:04d}"
+                                ) if args.profile else nullcontext()
+                            )
+                            with marker:
+                                run_op()
+                            ended_ns = time.monotonic_ns()
+                            iteration_records.append({
+                                "iteration": index + 1,
+                                "started_ns": started_ns,
+                                "ended_ns": ended_ns,
+                                "duration_us": (ended_ns - started_ns) / 1000.0,
+                                "timing_semantics": "host_submission_only",
+                            })
+                        torch.npu.synchronize()
+                        batch_ended_ns = time.monotonic_ns()
+                    finally:
+                        if profiler is not None:
+                            profiler.stop()
+                    batch_total_us = (batch_ended_ns - batch_started_ns) / 1000.0
+                    average_us = batch_total_us / args.iters
+                    check_result(phase)
+                    trace_path = write_iteration_trace(
+                        trace_dir,
+                        job,
+                        rank,
+                        {
+                            "bytes_per_peer": size,
+                            "warmup_iterations": args.warmup,
+                            "iterations": args.iters,
+                            "implementation": args.implementation,
+                            "self_copy_mode": args.self_copy_mode,
+                            "channel_sync_mode": args.channel_sync_mode,
+                            "completion_mode": args.completion_mode,
+                            "iteration_timing_semantics": "host_submission_only",
+                            "batch_started_ns": batch_started_ns,
+                            "batch_ended_ns": batch_ended_ns,
+                            "batch_total_us": batch_total_us,
+                            "batch_average_us": average_us,
+                            "profile_enabled": bool(args.profile),
+                            "profile_scope": "measure_only_after_warmup",
+                            "start_lateness_us": start_lateness_us,
+                        },
+                        iteration_records,
+                    )
+                    status_dir.mkdir(parents=True, exist_ok=True)
+                    status_path = status_dir / f"rank{rank}.json"
+                    status_tmp = status_path.with_suffix(f".pid{os.getpid()}.tmp")
+                    status_tmp.write_text(json.dumps({
+                        "status": "PASS",
+                        "job": job,
+                        "phase": phase,
+                        "rank": rank,
+                        "bytes_per_peer": size,
+                        "repeat": repeat,
+                        "warmup": args.warmup,
+                        "iterations": args.iters,
+                        "host_batch_avg_us": average_us,
+                        "trace": str(trace_path),
+                        "profile": str(profile_dir) if args.profile else "",
+                    }, indent=2, sort_keys=True) + "\n")
+                    status_tmp.replace(status_path)
+                    print(
+                        f"CASE_PERSISTENT_RESULT job={job} rank={rank} phase={phase} "
+                        f"size={size_label} repeat={repeat} host_batch_avg_us={average_us:.3f} "
+                        f"trace={trace_path}",
+                        flush=True,
+                    )
+                global_barrier(case_root, f"{phase_tag}_done")
+
+            global_barrier(case_root, f"size_{size_label}_repeat_{repeat}_complete_pre")
+            if job == "P" and rank == 0:
+                progress_dir = run_dir / "progress"
+                progress_dir.mkdir(parents=True, exist_ok=True)
+                progress_path = progress_dir / f"size_{size_label}_repeat_{repeat}.json"
+                progress_tmp = progress_path.with_suffix(f".pid{os.getpid()}.tmp")
+                progress_tmp.write_text(json.dumps({
+                    "status": "PASS",
+                    "bytes_per_peer": size,
+                    "size_label": size_label,
+                    "repeat": repeat,
+                    "completed_wall_time_ns": time.time_ns(),
+                }, indent=2, sort_keys=True) + "\n")
+                progress_tmp.replace(progress_path)
+                print(
+                    f"CASE_SUITE_SIZE_COMPLETE size={size_label} repeat={repeat}",
+                    flush=True,
+                )
+            global_barrier(case_root, f"size_{size_label}_repeat_{repeat}_complete_post")
+
+        del expected, recv, send
+        torch.npu.empty_cache()
+    print(
+        f"PASS: persistent_contention_suite job={job} sizes={len(sizes)} "
+        f"repeats={args.suite_repeats}",
+        flush=True,
+    )
 
 
 def main():
@@ -420,6 +632,26 @@ def main():
         print(f"CASE_PREPARED_PLAN rank={rank} plan_id={args.plan_id} "
               f"plan_handle={plan_handle} paths={len(explicit_weights)}", flush=True)
         mark_phase("prepare_explicit_multipath_plan_done")
+
+    if args.suite_sizes:
+        mark_phase("persistent_contention_suite")
+        run_persistent_contention_suite(
+            args, buffer, plan_handle, rank, world_size, explicit_weights
+        )
+        mark_phase("release_persistent_copy_plan")
+        torch.npu.synchronize()
+        runtime = ctypes.CDLL(str(ROUTE_LIB))
+        release = runtime.HcclCcuUrmaExplicitMultipathPlanDestroy
+        release.argtypes = [ctypes.c_uint64]
+        release.restype = ctypes.c_int
+        status = release(plan_handle)
+        if status != 0:
+            raise RuntimeError(f"prepared plan destroy failed: status={status}")
+        mark_phase("destroy_persistent_process_group")
+        dist.destroy_process_group()
+        faulthandler.cancel_dump_traceback_later()
+        mark_phase("complete")
+        return
 
     dtype = getattr(torch, args.dtype)
     elements = args.bytes // torch.empty((), dtype=dtype).element_size()

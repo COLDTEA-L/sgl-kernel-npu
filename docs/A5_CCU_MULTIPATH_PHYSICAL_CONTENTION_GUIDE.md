@@ -34,16 +34,18 @@ expected tensor；256MiB 点每个 rank 约需1.5GiB基础tensor空间，四个e
 `torch.stack`额外产生约512MiB/rank的临时峰值；100次正式调用始终复用同一组tensor。
 
 runner不再对全部尺寸固定设置`HCCL_BUFFSIZE=2300`。默认`--hccl-buffsize-mb auto`按
-下式为每个尺寸、每个通信域单独设置：
+下式计算每个尺寸的最低需求：
 
 ```text
 max(200MB, ceil(2 × bytes_per_peer / MiB) + 64MB)
 ```
 
-因此16KiB至64MiB使用200MB，256MiB使用576MB。这里`2 × bytes_per_peer`是单rank完整
-payload，64MB是初始化余量；prepared算子直接读写用户send/recv tensor，这个HCCL buffer
-不是256MiB数据的64份副本。需要复现实验机的固定配置时，可显式传
-`--hccl-buffsize-mb N`，实际取值保存在`run_settings.json`并写入每个case日志。
+常驻通信域初始化后不能按尺寸修改该环境变量，因此一次实验取所有请求尺寸需求的最大值：
+扫描到128MiB时统一使用320MB，扫描到256MiB时统一使用576MB。这里
+`2 × bytes_per_peer`是单rank完整payload，64MB是初始化余量；prepared算子直接读写用户
+send/recv tensor，这个HCCL buffer不是256MiB数据的64份副本。需要复现实验机的固定配置时，
+可显式传`--hccl-buffsize-mb N`。最低需求、整次实验实际值都保存在
+`run_settings.json`，启动时shell也会打印`PERSISTENT_ENVIRONMENT`。
 
 ## 2. 拉取与入口检查
 
@@ -141,6 +143,25 @@ bash scripts/run_a5_ccu_multipath_contention.sh \
 5. P和Q只对齐第一个正式iteration的起跑点，此后没有逐iteration barrier，也不会互相
    synchronize。
 
+P和Q两组两rank worker在整次尺寸扫描开始时各启动一次。每个rank只创建一次HCCL通信域，
+只执行一次prepared plan创建及`HcclCcuKernelRegister/Finish`，随后同一个plan和默认stream
+依次服务全部数据量、baseline和concurrent阶段。尺寸切换只重新分配对应大小的send/recv/
+expected tensor，不重启`torchrun`，也不销毁重建通信域。全部尺寸结束后才统一销毁plan和
+通信域。因此14个尺寸不再触发56次独立worker初始化。
+
+两个instance始终是独立HCCL通信域。baseline P时Q进程只等待host文件屏障且不向device提交
+算子；baseline Q时P同理。并发阶段才同时向各自stream提交任务。host文件屏障只控制阶段边界，
+不产生P/Q之间的device Event或Notify依赖。
+
+每个`size × repeat`完成全部四份记录后，shell立即输出一行，例如：
+
+```text
+SIZE_COMPLETE size=16KB bytes_per_peer=16384 repeat=1 baseline_P_us=... baseline_Q_us=... concurrent_P_us=... concurrent_Q_us=... artifacts=...
+```
+
+这行出现时，该组的四份trace、profile和状态JSON均已落盘，可以直接看到进度；最终跨尺寸CSV、
+JSON和Markdown仍在全部数据量完成后由分析器统一生成。
+
 每次正式调用应只有一个包含GroupCopy和多路径WriteNb的CCU launch。P、Q起跑屏障只使用
 host文件和`CLOCK_MONOTONIC`，不会建立P与Q之间的device Event/Notify依赖。
 
@@ -206,6 +227,10 @@ run_settings.json                 # 完整实验参数
 manifests/P.tsv、Q.tsv            # 显式物理relay清单
 case_status.tsv                   # 每个子作业是否通过
 logs/                             # torchrun完整日志
+logs/persistent_P.log             # P常驻instance的全部尺寸/阶段日志
+logs/persistent_Q.log             # Q常驻instance的全部尺寸/阶段日志
+status/                           # 每个尺寸/阶段/rank的完成状态与batch时间
+progress/                         # shell逐尺寸完成通知
 traces/                           # host提交记录和整批完成窗口，不是device执行区间
 profiles/                         # 可选MindStudio数据
 results/size_<KB或MB>/            # 每个数据量单独保存的一套结果

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from a5_ccu_path_contention_support import (
     DEFAULT_SIZES,
+    contention_file_barrier,
     contention_measurement_start,
     format_size_label,
     overlap_ns,
@@ -68,6 +69,29 @@ class PathContentionSupportTest(unittest.TestCase):
             self.assertEqual(len(values), 4)
             self.assertTrue(all(value >= 0 for value in values.values()))
 
+    def test_four_rank_persistent_barrier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            passed = []
+            failures = []
+
+            def participant(job, rank):
+                try:
+                    contention_file_barrier(
+                        directory, "baseline_P_done", job, rank, timeout=2
+                    )
+                    passed.append((job, rank))
+                except Exception as error:  # pragma: no cover - failure diagnostic
+                    failures.append(error)
+
+            threads = [threading.Thread(target=participant, args=(job, rank))
+                       for job in ("P", "Q") for rank in (0, 1)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertFalse(failures)
+            self.assertEqual(set(passed), {("P", 0), ("P", 1), ("Q", 0), ("Q", 1)})
+
     def test_runner_pins_full_ccu_baseline_policy(self):
         runner = (Path(__file__).resolve().parents[3] /
                   "scripts/run_a5_ccu_multipath_contention.sh").read_text()
@@ -78,7 +102,10 @@ class PathContentionSupportTest(unittest.TestCase):
         self.assertIn('--self-copy-mode "$self_copy_mode"', runner)
         self.assertIn('--channel-sync-mode "$channel_sync_mode"', runner)
         self.assertIn('self_copy=GroupCopy8x32K', runner)
-        self.assertIn("! grep -q '^SELF_COPY_LANE '", runner)
+        self.assertIn("grep -q '^SELF_COPY_LANE '", runner)
+        self.assertIn('--suite-sizes "$sizes"', runner)
+        self.assertIn('--plan-id "path-contention-${job}-persistent"', runner)
+        self.assertIn('SIZE_COMPLETE size=', runner)
 
 
 if __name__ == "__main__":

@@ -107,6 +107,33 @@ def contention_measurement_start(directory, job_name, rank, world_size=2,
     return max(0, time.monotonic_ns() - target) / 1000.0
 
 
+def contention_file_barrier(directory, tag, job_name, rank, world_size=2,
+                            timeout=900):
+    """Synchronize both ranks of the persistent P and Q instances.
+
+    The two jobs intentionally use independent HCCL process groups, so this
+    host-file rendezvous keeps the idle job out of a solo baseline without
+    introducing a device event or Notify dependency between P and Q.
+    """
+    if job_name not in ("P", "Q"):
+        raise ValueError("contention barrier requires job name P or Q")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank is outside world size")
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{tag}.{job_name}.rank{rank}").touch()
+    expected = [root / f"{tag}.{job}.rank{item}"
+                for job in ("P", "Q") for item in range(world_size)]
+    deadline = time.monotonic() + timeout
+    while not all(path.exists() for path in expected):
+        if time.monotonic() >= deadline:
+            missing = [path.name for path in expected if not path.exists()]
+            raise TimeoutError(
+                f"four-rank barrier {tag} timed out; missing={missing}"
+            )
+        time.sleep(0.001)
+
+
 def write_iteration_trace(directory, job_name, rank, metadata, records):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)

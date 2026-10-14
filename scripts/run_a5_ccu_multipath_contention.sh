@@ -51,7 +51,8 @@ while (($#)); do
             echo 'A5 direct+relay contention: P=2,3 relay4; Q=4,5 relay2.'
             echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=10 iters=100 repeats=1.'
             echo 'Data plane is fixed to CCU GroupCopy8x32K self-copy and baseline Channel synchronization; D2D overlap/packed modes are rejected.'
-            echo 'HCCL buffer defaults to auto: max(200MB, two-rank payload in MiB + 64MB); override with --hccl-buffsize-mb N.'
+            echo 'P/Q workers, process groups and prepared plans stay alive across every requested size and phase.'
+            echo 'HCCL buffer defaults to the maximum requirement across all sizes: max(200MB, two-rank payload in MiB + 64MB).'
             echo 'MindStudio profiling is enabled by default and starts only after warmup; use --no-mindstudio-profile for timing-only runs.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
@@ -154,11 +155,20 @@ resolve_manifest() {
 resolve_manifest 2 3 "$p_relay" "$p_relay_plane" "$run_dir/manifests/P.tsv"
 resolve_manifest 4 5 "$q_relay" "$q_relay_plane" "$run_dir/manifests/Q.tsv"
 
+IFS=',' read -ra size_array <<<"$sizes"
+suite_hccl_buffsize_mb=0
+for size in "${size_array[@]}"; do
+    candidate=$(resolve_hccl_buffsize_mb "$size")
+    ((candidate > suite_hccl_buffsize_mb)) && suite_hccl_buffsize_mb=$candidate
+done
+echo "PERSISTENT_ENVIRONMENT sizes=${#size_array[@]} HCCL_BUFFSIZE_MB=${suite_hccl_buffsize_mb} plan_scope=all_sizes"
+
 python3 - "$run_dir" "$sizes" "$warmup" "$iterations" "$repeats" \
     "$weights" "$mindstudio_profile" "$p_relay_plane" "$q_relay_plane" \
-    "$hccl_buffsize_mb" "$repo_root" "$self_copy_mode" "$channel_sync_mode" <<'PY'
+    "$hccl_buffsize_mb" "$repo_root" "$self_copy_mode" "$channel_sync_mode" \
+    "$suite_hccl_buffsize_mb" <<'PY'
 import json, pathlib, sys
-root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo, self_copy, channel_sync = sys.argv[1:]
+root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo, self_copy, channel_sync, suite_buffer = sys.argv[1:]
 sys.path.insert(0, repo + "/tests/python/deepep")
 from a5_ccu_path_contention_support import resolve_hccl_buffer_mb
 size_values = list(map(int, sizes.split(',')))
@@ -175,10 +185,18 @@ settings = dict(
     self_copy_mode=self_copy,
     channel_sync_mode=channel_sync,
     completion_mode="batch",
+    execution_lifecycle={
+        "worker_processes": "persistent_across_all_sizes_and_phases",
+        "process_groups_per_job": 1,
+        "prepared_plans_per_rank": 1,
+        "plan_reused_across_sizes": True,
+    },
     hccl_buffsize_policy=dict(
         setting=hccl_buffer,
         unit="MB",
         auto_formula="max(200, ceil(2 * bytes_per_peer / MiB) + 64)",
+        persistent_runtime_mb=int(suite_buffer),
+        persistent_runtime_basis="maximum requirement across all requested sizes",
         per_size_mb={str(size): resolve_hccl_buffer_mb(size, hccl_buffer)
                      for size in size_values},
     ),
@@ -196,16 +214,9 @@ PY
 printf 'size\trepeat\tphase\tjob\tstatus\tresult\n' >"$run_dir/case_status.tsv"
 test_script=tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py
 
-run_job() {
-    local job=$1 phase=$2 size=$3 repeat=$4 sync_dir=$5 log=$6
-    local devices manifest profile_args=() case_path size_label case_hccl_buffsize_mb
-    size_label=$(format_size_label "$size")
-    case_hccl_buffsize_mb=$(resolve_hccl_buffsize_mb "$size")
-    if [[ "$phase" == concurrent ]]; then
-        case_path="concurrent_PQ/${job}"
-    else
-        case_path="baseline_${job}"
-    fi
+run_persistent_job() {
+    local job=$1 log=$2
+    local devices manifest profile_args=()
     if [[ "$job" == P ]]; then
         devices=$p_devices
         manifest="$run_dir/manifests/P.tsv"
@@ -214,82 +225,124 @@ run_job() {
         manifest="$run_dir/manifests/Q.tsv"
     fi
     if ((mindstudio_profile != 0)); then
-        profile_args=(--profile --profile-iters "$iterations"
-            --profile-root "$run_dir/profiles/size_${size_label}/repeat_${repeat}/${case_path}")
+        profile_args=(--profile --profile-iters "$iterations")
     fi
-    local sync_args=()
-    [[ -z "$sync_dir" ]] || sync_args=(--contention-sync-dir "$sync_dir")
     (
         export ASCEND_RT_VISIBLE_DEVICES="$devices"
-        export HCCL_BUFFSIZE="$case_hccl_buffsize_mb"
-        echo "CASE_MEMORY_PLAN size=${size_label} bytes_per_peer=${size} HCCL_BUFFSIZE_MB=${HCCL_BUFFSIZE}" >&2
-        timeout --signal=TERM --kill-after=10 "$timeout_seconds" \
+        export HCCL_BUFFSIZE="$suite_hccl_buffsize_mb"
+        echo "CASE_MEMORY_PLAN scope=all_sizes sizes=${sizes} HCCL_BUFFSIZE_MB=${HCCL_BUFFSIZE}" >&2
+        timeout --signal=TERM --kill-after=10 "$suite_timeout_seconds" \
             python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
             "$test_script" --implementation prepared --relay-manifest "$manifest" \
             --direct-route 0 --path-weights "$weights" \
-            --plan-id "path-contention-${job}-${phase}-${size_label}-${repeat}" \
-            --bytes "$size" --dtype float32 --warmup "$warmup" --iters "$iterations" \
+            --plan-id "path-contention-${job}-persistent" \
+            --dtype float32 --warmup "$warmup" --iters "$iterations" \
             --completion-mode batch \
             --self-copy-mode "$self_copy_mode" --channel-sync-mode "$channel_sync_mode" \
-            --trace-job "$job" \
-            --iteration-trace-dir "$run_dir/traces/size_${size_label}/repeat_${repeat}/${case_path}" \
-            "${sync_args[@]}" "${profile_args[@]}"
+            --suite-sizes "$sizes" --suite-repeats "$repeats" \
+            --suite-job "$job" --suite-run-dir "$run_dir" \
+            "${profile_args[@]}"
     ) >"$log" 2>&1
 }
 
-record_status() {
-    local size=$1 repeat=$2 phase=$3 job=$4 status=$5 log=$6 result=FAIL
-    local policy_count group_copy_count
-    policy_count=$(grep -c 'CASE_DATA_PLANE_POLICY .*self_copy=ccu channel_sync=baseline' "$log" || true)
-    group_copy_count=$(grep -c '^CCU_LOCAL_REMOTE_PLAN .*self_copy=GroupCopy8x32K' "$log" || true)
-    if ((status == 0 && policy_count == 2 && group_copy_count == 2)) && \
-       grep -q '^PASS: implementation=prepared' "$log" && \
-       ! grep -q '^SELF_COPY_LANE ' "$log"; then
-        result=PASS
-    fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$size" "$repeat" "$phase" "$job" "$status" "$result" \
-        >>"$run_dir/case_status.tsv"
-    [[ "$result" == PASS ]]
+print_size_complete() {
+    local size=$1 repeat=$2 size_label=$3
+    python3 - "$run_dir" "$size" "$repeat" "$size_label" <<'PY'
+import json, pathlib, sys
+root, size, repeat, label = sys.argv[1:]
+base = pathlib.Path(root) / "status" / f"size_{label}" / f"repeat_{repeat}"
+cases = {
+    "baseline_P": base / "baseline_P",
+    "baseline_Q": base / "baseline_Q",
+    "concurrent_P": base / "concurrent_PQ" / "P",
+    "concurrent_Q": base / "concurrent_PQ" / "Q",
+}
+values = {}
+for name, directory in cases.items():
+    rows = [json.loads((directory / f"rank{rank}.json").read_text()) for rank in (0, 1)]
+    values[name] = max(float(row["host_batch_avg_us"]) for row in rows)
+print(
+    f"SIZE_COMPLETE size={label} bytes_per_peer={size} repeat={repeat} "
+    f"baseline_P_us={values['baseline_P']:.3f} baseline_Q_us={values['baseline_Q']:.3f} "
+    f"concurrent_P_us={values['concurrent_P']:.3f} concurrent_Q_us={values['concurrent_Q']:.3f} "
+    f"artifacts={root}/traces/size_{label}/repeat_{repeat}",
+    flush=True,
+)
+PY
 }
 
-IFS=',' read -ra size_array <<<"$sizes"
+suite_timeout_seconds=$((timeout_seconds + 180 * ${#size_array[@]} * repeats))
+p_log="$run_dir/logs/persistent_P.log"
+q_log="$run_dir/logs/persistent_Q.log"
+run_persistent_job P "$p_log" &
+p_pid=$!
+run_persistent_job Q "$q_log" &
+q_pid=$!
+
+cleanup_children() {
+    kill "$p_pid" "$q_pid" 2>/dev/null || true
+    wait "$p_pid" "$q_pid" 2>/dev/null || true
+}
+trap cleanup_children EXIT INT TERM
+
 for size in "${size_array[@]}"; do
     size_label=$(format_size_label "$size")
     for ((repeat=1; repeat<=repeats; ++repeat)); do
-        trace_root="$run_dir/traces/size_${size_label}/repeat_${repeat}"
-        mkdir -p "$trace_root"
-        for job in P Q; do
-            log="$run_dir/logs/size_${size_label}_repeat_${repeat}_baseline_${job}.log"
-            status=0
-            run_job "$job" baseline "$size" "$repeat" "" "$log" || status=$?
-            if ! record_status "$size" "$repeat" baseline "$job" "$status" "$log"; then
-                echo "baseline ${job} failed: size=${size} repeat=${repeat} status=${status}" >&2
-                tail -n 100 "$log" >&2
+        progress="$run_dir/progress/size_${size_label}_repeat_${repeat}.json"
+        while [[ ! -f "$progress" ]]; do
+            if ! kill -0 "$p_pid" 2>/dev/null || ! kill -0 "$q_pid" 2>/dev/null; then
+                echo "persistent worker exited before size=${size_label} repeat=${repeat} completed" >&2
+                cleanup_children
+                tail -n 120 "$p_log" >&2 || true
+                tail -n 120 "$q_log" >&2 || true
                 exit 1
             fi
+            sleep 1
         done
+        print_size_complete "$size" "$repeat" "$size_label"
+    done
+done
 
-        sync_dir="$run_dir/sync/size_${size_label}/repeat_${repeat}"
-        mkdir -p "$sync_dir"
-        p_log="$run_dir/logs/size_${size_label}_repeat_${repeat}_concurrent_PQ_P.log"
-        q_log="$run_dir/logs/size_${size_label}_repeat_${repeat}_concurrent_PQ_Q.log"
-        set +e
-        run_job P concurrent "$size" "$repeat" "$sync_dir" "$p_log" &
-        p_pid=$!
-        run_job Q concurrent "$size" "$repeat" "$sync_dir" "$q_log" &
-        q_pid=$!
-        wait "$p_pid"; p_status=$?
-        wait "$q_pid"; q_status=$?
-        set -e
-        p_ok=0; q_ok=0
-        record_status "$size" "$repeat" concurrent P "$p_status" "$p_log" && p_ok=1 || true
-        record_status "$size" "$repeat" concurrent Q "$q_status" "$q_log" && q_ok=1 || true
-        if ((p_ok == 0 || q_ok == 0)); then
-            echo "concurrent jobs failed: size=${size} repeat=${repeat} P=${p_status} Q=${q_status}" >&2
-            tail -n 100 "$p_log" >&2
-            tail -n 100 "$q_log" >&2
-            exit 1
-        fi
+set +e
+wait "$p_pid"; p_status=$?
+wait "$q_pid"; q_status=$?
+set -e
+trap - EXIT INT TERM
+if ((p_status != 0 || q_status != 0)); then
+    echo "persistent jobs failed: P=${p_status} Q=${q_status}" >&2
+    tail -n 120 "$p_log" >&2 || true
+    tail -n 120 "$q_log" >&2 || true
+    exit 1
+fi
+
+for job in P Q; do
+    log_var="${job,,}_log"
+    log=${!log_var}
+    policy_count=$(grep -c 'CASE_DATA_PLANE_POLICY .*self_copy=ccu channel_sync=baseline' "$log" || true)
+    group_copy_count=$(grep -c '^CCU_LOCAL_REMOTE_PLAN .*self_copy=GroupCopy8x32K' "$log" || true)
+    plan_count=$(grep -c '^CASE_PREPARED_PLAN ' "$log" || true)
+    if ((policy_count != 2 || group_copy_count != 2 || plan_count != 2)) || \
+       grep -q '^SELF_COPY_LANE ' "$log" || \
+       ! grep -q "^PASS: persistent_contention_suite job=${job} " "$log"; then
+        echo "persistent ${job} log failed lifecycle/data-plane validation" >&2
+        tail -n 120 "$log" >&2
+        exit 1
+    fi
+done
+
+for size in "${size_array[@]}"; do
+    size_label=$(format_size_label "$size")
+    for ((repeat=1; repeat<=repeats; ++repeat)); do
+        for job in P Q; do
+            baseline_status="$run_dir/status/size_${size_label}/repeat_${repeat}/baseline_${job}"
+            concurrent_status="$run_dir/status/size_${size_label}/repeat_${repeat}/concurrent_PQ/${job}"
+            for rank in 0 1; do
+                [[ -f "$baseline_status/rank${rank}.json" ]] || { echo "missing $baseline_status/rank${rank}.json" >&2; exit 1; }
+                [[ -f "$concurrent_status/rank${rank}.json" ]] || { echo "missing $concurrent_status/rank${rank}.json" >&2; exit 1; }
+            done
+            printf '%s\t%s\tbaseline\t%s\t0\tPASS\n' "$size" "$repeat" "$job" >>"$run_dir/case_status.tsv"
+            printf '%s\t%s\tconcurrent\t%s\t0\tPASS\n' "$size" "$repeat" "$job" >>"$run_dir/case_status.tsv"
+        done
     done
 done
 
