@@ -19,6 +19,8 @@ repeats=1
 mindstudio_profile=1
 timeout_seconds=900
 hccl_buffsize_mb=auto
+self_copy_mode=ccu
+channel_sync_mode=baseline
 topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
 output_root=/home/l00934901/profiling
@@ -48,6 +50,7 @@ while (($#)); do
         --help)
             echo 'A5 direct+relay contention: P=2,3 relay4; Q=4,5 relay2.'
             echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=10 iters=100 repeats=1.'
+            echo 'Data plane is fixed to CCU GroupCopy8x32K self-copy and baseline Channel synchronization; D2D overlap/packed modes are rejected.'
             echo 'HCCL buffer defaults to auto: max(200MB, two-rank payload in MiB + 64MB); override with --hccl-buffsize-mb N.'
             echo 'MindStudio profiling is enabled by default and starts only after warmup; use --no-mindstudio-profile for timing-only runs.'
             exit 0;;
@@ -104,11 +107,14 @@ export HCCL_OP_EXPANSION_MODE=CCU_SCHED
 export PYTHONUNBUFFERED=1
 unset ASCEND_LAUNCH_BLOCKING A5_CCU_SOURCE_ROUTE_MANIFEST A5_CCU_SOURCE_ROUTE_PROVIDER
 unset A5_CCU_SYNTHETIC_ROUTE_MANIFEST A5_CCU_PATH_UIDS A5_CCU_ROUTE_INDICES A5_CCU_ROUTE_INDEX
+export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
+export A5_CCU_CHANNEL_SYNC_MODE="$channel_sync_mode"
 
 # Validate the actual Python package, extension and route-library pair before
 # resolving topology or creating any device communicator.
 python3 tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
-    --implementation prepared --runtime-check
+    --implementation prepared --self-copy-mode "$self_copy_mode" \
+    --channel-sync-mode "$channel_sync_mode" --runtime-check
 
 mkdir -p "$output_root"
 run_dir=$(mktemp -d "${output_root}/a5_path_contention_2_3_4_5_$(date +%Y%m%d_%H%M%S).XXXXXX")
@@ -150,9 +156,9 @@ resolve_manifest 4 5 "$q_relay" "$q_relay_plane" "$run_dir/manifests/Q.tsv"
 
 python3 - "$run_dir" "$sizes" "$warmup" "$iterations" "$repeats" \
     "$weights" "$mindstudio_profile" "$p_relay_plane" "$q_relay_plane" \
-    "$hccl_buffsize_mb" "$repo_root" <<'PY'
+    "$hccl_buffsize_mb" "$repo_root" "$self_copy_mode" "$channel_sync_mode" <<'PY'
 import json, pathlib, sys
-root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo = sys.argv[1:]
+root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo, self_copy, channel_sync = sys.argv[1:]
 sys.path.insert(0, repo + "/tests/python/deepep")
 from a5_ccu_path_contention_support import resolve_hccl_buffer_mb
 size_values = list(map(int, sizes.split(',')))
@@ -166,6 +172,8 @@ settings = dict(
     sizes=size_values, weights=list(map(int, weights.split(','))),
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
     mindstudio_profile=bool(int(profile)), implementation="prepared",
+    self_copy_mode=self_copy,
+    channel_sync_mode=channel_sync,
     completion_mode="batch",
     hccl_buffsize_policy=dict(
         setting=hccl_buffer,
@@ -222,6 +230,7 @@ run_job() {
             --plan-id "path-contention-${job}-${phase}-${size_label}-${repeat}" \
             --bytes "$size" --dtype float32 --warmup "$warmup" --iters "$iterations" \
             --completion-mode batch \
+            --self-copy-mode "$self_copy_mode" --channel-sync-mode "$channel_sync_mode" \
             --trace-job "$job" \
             --iteration-trace-dir "$run_dir/traces/size_${size_label}/repeat_${repeat}/${case_path}" \
             "${sync_args[@]}" "${profile_args[@]}"
@@ -230,7 +239,12 @@ run_job() {
 
 record_status() {
     local size=$1 repeat=$2 phase=$3 job=$4 status=$5 log=$6 result=FAIL
-    if ((status == 0)) && grep -q '^PASS: implementation=prepared' "$log"; then
+    local policy_count group_copy_count
+    policy_count=$(grep -c 'CASE_DATA_PLANE_POLICY .*self_copy=ccu channel_sync=baseline' "$log" || true)
+    group_copy_count=$(grep -c '^CCU_LOCAL_REMOTE_PLAN .*self_copy=GroupCopy8x32K' "$log" || true)
+    if ((status == 0 && policy_count == 2 && group_copy_count == 2)) && \
+       grep -q '^PASS: implementation=prepared' "$log" && \
+       ! grep -q '^SELF_COPY_LANE ' "$log"; then
         result=PASS
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$size" "$repeat" "$phase" "$job" "$status" "$result" \

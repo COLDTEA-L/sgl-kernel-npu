@@ -4,6 +4,12 @@
 baseline 与独立instance并发执行。脚本自动计算整批平均时间膨胀；逐次冲突概率只从
 MindStudio device timeline统计，不用host提交区间代替device执行区间。
 
+数据面固定使用overlap分支已经验证的全CCU组合：远端为本仓的CCU+URMA direct/relay
+多路径WriteNb，本地self slice为`GroupCopy8x32K`，Channel元数据协议为`baseline`。
+runner会强制设置`A5_CCU_SELF_COPY_MODE=ccu`和
+`A5_CCU_CHANNEL_SYNC_MODE=baseline`；不允许退回ACL D2D overlap，也不使用存在性能劣化的
+`packed`或`packed-ready`协议。
+
 ## 1. 冲突构造
 
 | 共享物理方向 | 作业 P：端点2、3，relay4 | 作业 Q：端点4、5，relay2 |
@@ -67,6 +73,8 @@ bash scripts/run_a5_ccu_multipath_contention.sh --help
 正式runner还会在解析拓扑、初始化设备和创建通信域之前自动执行一次真实runtime预检。
 成功时会打印`CASE_TEST_EXTENSION`和`MULTIPATH_RUNTIME_VERIFIED`，确认当前`python3`选中的
 DeepEP包、`deep_ep_cpp`二进制及route library来自同一套可用环境。预检失败不会占卡。
+本实验要求prepared-plan ABI至少为16、local+remote ABI至少为2、Channel sync ABI至少为1；
+旧route library会在预检阶段直接失败，不能静默改用D2D或旧Channel协议。
 
 仓库源码中不要求存在
 `python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash`。它是构建或安装阶段的生成文件，
@@ -100,6 +108,17 @@ manifests/Q.tsv   # 4→2→5
 如果拓扑存在多个同卡relay候选，解析器会拒绝猜测。根据报错使用
 `--p-relay-plane 0|1`、`--q-relay-plane 0|1`明确指定，不要随意选择。
 
+每个case日志必须同时出现以下标记，否则runner把该case记为失败：
+
+```text
+CASE_DATA_PLANE_POLICY ... self_copy=ccu channel_sync=baseline
+CCU_LOCAL_REMOTE_PLAN ... self_copy=GroupCopy8x32K
+```
+
+日志中出现`SELF_COPY_LANE mode=overlap`同样会导致失败。这保证正式100次调用的本地和
+卡间数据搬运都在同一个CCU图内，不会混入独立D2D copy stream的`MemcpyAsync`及其
+`aclrtStreamWaitEvent`。
+
 ## 4. 正式实验
 
 默认完整扫描已经固定为：每个case先warmup 10次，再连续正式执行100次，repeat为1，
@@ -121,6 +140,9 @@ bash scripts/run_a5_ccu_multipath_contention.sh \
    `torch.npu.synchronize()`；各instance只在自己的循环结束后同步一次；
 5. P和Q只对齐第一个正式iteration的起跑点，此后没有逐iteration barrier，也不会互相
    synchronize。
+
+每次正式调用应只有一个包含GroupCopy和多路径WriteNb的CCU launch。P、Q起跑屏障只使用
+host文件和`CLOCK_MONOTONIC`，不会建立P与Q之间的device Event/Notify依赖。
 
 Profiler在每个case的warmup和warmup正确性检查全部完成后才启动。也就是说，每份
 MindStudio profile包含该case正式阶段的100个标记
@@ -169,9 +191,10 @@ A5_PATH_CONTENTION_P_ITER_0001
 A5_PATH_CONTENTION_Q_ITER_0001
 ```
 
-Profiler输出按数据量、repeat、phase和job分别保存在`profiles/`。将各rank生成的
-`*_ascend_pt`目录或其中的DB
-复制到装有MindStudio Insight的机器中导入，在Timeline中检查P/Q标记、CCU任务和通信
+Profiler输出按数据量、repeat、phase和job分别保存在`profiles/`。检查并发case时，将完整的
+`profiles/size_<尺寸>/repeat_<轮次>/concurrent_PQ/`父目录复制到装有MindStudio Insight的
+机器并一次性导入，使P、Q各rank处于同一cluster Timeline；不要分别只导入P或Q的单个DB。
+在Timeline中检查P/Q标记、CCU任务和通信
 任务的重叠。逐次冲突概率必须以device task区间为准：对P的100次device调用，统计其中
 与Q任意一次device调用在共享物理方向上发生重叠的次数，再除以100；Q同理。CPU marker
 只用于关联iteration编号，其自身宽度是host提交耗时，不是device算子耗时。

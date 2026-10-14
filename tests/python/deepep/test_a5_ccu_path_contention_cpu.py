@@ -2,6 +2,7 @@
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 from a5_ccu_path_contention_support import (
     DEFAULT_SIZES,
@@ -66,6 +67,18 @@ class PathContentionSupportTest(unittest.TestCase):
             self.assertFalse(failures)
             self.assertEqual(len(values), 4)
             self.assertTrue(all(value >= 0 for value in values.values()))
+
+    def test_runner_pins_full_ccu_baseline_policy(self):
+        runner = (Path(__file__).resolve().parents[3] /
+                  "scripts/run_a5_ccu_multipath_contention.sh").read_text()
+        self.assertIn('self_copy_mode=ccu', runner)
+        self.assertIn('channel_sync_mode=baseline', runner)
+        self.assertIn('export A5_CCU_SELF_COPY_MODE="$self_copy_mode"', runner)
+        self.assertIn('export A5_CCU_CHANNEL_SYNC_MODE="$channel_sync_mode"', runner)
+        self.assertIn('--self-copy-mode "$self_copy_mode"', runner)
+        self.assertIn('--channel-sync-mode "$channel_sync_mode"', runner)
+        self.assertIn('self_copy=GroupCopy8x32K', runner)
+        self.assertIn("! grep -q '^SELF_COPY_LANE '", runner)
 
 
 if __name__ == "__main__":

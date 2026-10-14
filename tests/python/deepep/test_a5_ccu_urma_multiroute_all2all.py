@@ -124,10 +124,33 @@ if IMPLEMENTATION != "native":
                     f"route library lacks prepared-plan ABI marker: {ROUTE_LIB}"
                 ) from error
             plan_abi.restype = ctypes.c_int
-            if plan_abi() < 14:
-                raise RuntimeError(f"invalid prepared-plan ABI in {ROUTE_LIB}")
+            if plan_abi() < 16:
+                raise RuntimeError(
+                    f"prepared-plan ABI >=16 is required for grouped CCU self-copy: {ROUTE_LIB}"
+                )
             print(f"CASE_PREPARED_PLAN_ABI rank={os.environ.get('RANK', 'NA')} "
                   f"version={plan_abi()} route_library={ROUTE_LIB}", flush=True)
+            for symbol, minimum in (
+                ("A5CcuLocalRemoteAbiVersion", 2),
+                ("A5CcuChannelSyncAbiVersion", 1),
+            ):
+                try:
+                    abi = getattr(route_extension, symbol)
+                except AttributeError as error:
+                    raise RuntimeError(
+                        f"route library lacks required ABI marker {symbol}: {ROUTE_LIB}"
+                    ) from error
+                abi.restype = ctypes.c_int
+                value = abi()
+                if value < minimum:
+                    raise RuntimeError(
+                        f"invalid {symbol}={value}, expected >= {minimum}: {ROUTE_LIB}"
+                    )
+                print(
+                    f"CASE_ROUTE_FEATURE_ABI rank={os.environ.get('RANK', 'NA')} "
+                    f"symbol={symbol} version={value} route_library={ROUTE_LIB}",
+                    flush=True,
+                )
     if IMPLEMENTATION == "multiroute":
         route_extension = ctypes.CDLL(str(ROUTE_LIB))
         route_abi = route_extension.A5CcuUrmaPreparedPlanAbiVersion
@@ -174,6 +197,16 @@ def parse_args():
         default="per-iteration",
         help=("per-iteration waits after every prepared call; batch enqueues the "
               "whole loop and synchronizes once after the loop"),
+    )
+    parser.add_argument(
+        "--self-copy-mode", choices=("ccu", "ccu-direct", "overlap", "serial"),
+        default=os.environ.get("A5_CCU_SELF_COPY_MODE", "overlap"),
+        help="local self-slice implementation selected before plan creation",
+    )
+    parser.add_argument(
+        "--channel-sync-mode", choices=("baseline", "packed", "packed-ready"),
+        default=os.environ.get("A5_CCU_CHANNEL_SYNC_MODE", "baseline"),
+        help="Channel metadata protocol frozen into the registered CCU graph",
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
@@ -295,6 +328,14 @@ def select_routes(args):
 def main():
     mark_phase("parse_args")
     args = parse_args()
+    os.environ["A5_CCU_SELF_COPY_MODE"] = args.self_copy_mode
+    os.environ["A5_CCU_CHANNEL_SYNC_MODE"] = args.channel_sync_mode
+    print(
+        f"CASE_DATA_PLANE_POLICY rank={os.environ.get('RANK', 'NA')} "
+        f"implementation={args.implementation} self_copy={args.self_copy_mode} "
+        f"channel_sync={args.channel_sync_mode}",
+        flush=True,
+    )
     if args.runtime_check:
         print(
             f"MULTIPATH_RUNTIME_VERIFIED extension={EXTENSION} "
@@ -675,6 +716,8 @@ def main():
                 "warmup_iterations": args.warmup,
                 "iterations": args.iters,
                 "implementation": args.implementation,
+                "self_copy_mode": args.self_copy_mode,
+                "channel_sync_mode": args.channel_sync_mode,
                 "completion_mode": args.completion_mode,
                 "iteration_timing_semantics": (
                     "completed_invocation" if complete_each_invocation
@@ -700,7 +743,8 @@ def main():
 
     if rank == 0:
         result = {
-            "self_copy_mode": os.environ.get("A5_CCU_SELF_COPY_MODE", "overlap"),
+            "self_copy_mode": args.self_copy_mode,
+            "channel_sync_mode": args.channel_sync_mode,
             "dtype": args.dtype,
             "implementation": args.implementation,
             "paths": ((f"direct{args.direct_route}+{len(explicit_weights) - 1}relay")
