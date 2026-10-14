@@ -58,12 +58,14 @@ void log_all(std::ostream &os, Args &&...args)
         }                                                                                         \
     } while (0)
 
-#define HCCL_CHECK(ret)                                                                            \
-    ;                                                                                              \
-    do {                                                                                           \
-        if (ret != HCCL_SUCCESS) {                                                                 \
-            throw deep_ep::EPException("HCCL Assertion", __FILE__, __LINE__, std::to_string(ret)); \
-        }                                                                                          \
+#define HCCL_CHECK(ret)                                                                                   \
+    ;                                                                                                     \
+    do {                                                                                                  \
+        const HcclResult hccl_check_status = (ret);                                                        \
+        if (hccl_check_status != HCCL_SUCCESS) {                                                           \
+            throw deep_ep::EPException("HCCL Assertion", __FILE__, __LINE__,                              \
+                                       std::to_string(static_cast<int>(hccl_check_status)));               \
+        }                                                                                                 \
     } while (0)
 
 #ifdef DEBUG_MODE

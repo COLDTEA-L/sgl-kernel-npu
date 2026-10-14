@@ -72,6 +72,22 @@ bool DebugEnabled()
     return value != nullptr && std::string(value) == "1";
 }
 
+HcclResult ReportPreparedLaunchFailure(const char *step, HcclResult status,
+                                       const RouteResources &resources,
+                                       uint64_t peerBytes)
+{
+    if (status != HCCL_SUCCESS) {
+        std::fprintf(stderr,
+            "[A5 CCU URMA] prepared launch failed: step=%s status=%d rank=%u "
+            "peer_bytes=%lu cross_thread=%d\n",
+            step, static_cast<int>(status), resources.rank,
+            static_cast<unsigned long>(peerBytes),
+            resources.routeThread != resources.mainThread ? 1 : 0);
+        std::fflush(stderr);
+    }
+    return status;
+}
+
 HcclResult GetSerializedSchedule(bool *serialized)
 {
     if (serialized == nullptr) return HCCL_E_PTR;
@@ -274,22 +290,40 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     if (resources.routeThread != resources.mainThread) {
         status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
             resources.mainThread, resources.routeThread, THREAD_NOTIFY_INDEX));
-        if (status != HCCL_SUCCESS) return status;
+        if (status != HCCL_SUCCESS) {
+            return ReportPreparedLaunchFailure(
+                "main_to_route_record", status, resources, bytes);
+        }
         status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
             resources.routeThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
-        if (status != HCCL_SUCCESS) return status;
+        if (status != HCCL_SUCCESS) {
+            return ReportPreparedLaunchFailure(
+                "route_wait_main", status, resources, bytes);
+        }
     }
 
     status = HcclCcuKernelLaunch(
         comm, resources.routeThread, resources.kernel, &taskArg);
-    if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
+    if (status != HCCL_SUCCESS) {
+        ReportPreparedLaunchFailure("ccu_launch", status, resources, bytes);
+        return copy.Finish(status);
+    }
+    if (resources.routeThread == resources.mainThread) {
         return copy.Finish(status);
     }
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(
         resources.mainThread, THREAD_NOTIFY_INDEX, THREAD_NOTIFY_TIMEOUT));
-    if (status != HCCL_SUCCESS) return status;
-    return copy.Finish(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
-        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX)));
+    if (status != HCCL_SUCCESS) {
+        return ReportPreparedLaunchFailure(
+            "main_wait_route", status, resources, bytes);
+    }
+    status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(
+        resources.routeThread, resources.mainThread, THREAD_NOTIFY_INDEX));
+    if (status != HCCL_SUCCESS) {
+        ReportPreparedLaunchFailure(
+            "route_to_main_record", status, resources, bytes);
+    }
+    return copy.Finish(status);
 }
 
 HcclResult RunMultiRouteAllToAll(void *sendBuf, void *recvBuf,

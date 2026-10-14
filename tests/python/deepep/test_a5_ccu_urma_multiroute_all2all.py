@@ -390,10 +390,24 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                 )
                 raise
 
-        def run_op():
-            buffer.ccu_urma_prepared_multipath_alltoall_policy_out(
-                send, recv, plan_handle, explicit_weights
-            )
+        def run_op(phase, stage, iteration, repeat):
+            try:
+                buffer.ccu_urma_prepared_multipath_alltoall_policy_out(
+                    send, recv, plan_handle, explicit_weights
+                )
+            except Exception as error:
+                context = (
+                    f"job={job} rank={rank} size={size_label} repeat={repeat} "
+                    f"phase={phase} stage={stage} iteration={iteration}"
+                )
+                print(
+                    f"CASE_EXECUTE_ERROR {context} "
+                    f"exception_type={type(error).__name__} exception={error!r}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    f"prepared multipath execution failed: {context}"
+                ) from error
 
         for repeat in range(1, args.suite_repeats + 1):
             case_root = suite_sync / f"size_{size_label}" / f"repeat_{repeat}"
@@ -411,8 +425,8 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                     status_dir = status_root / case_path
                     profile_dir = profile_root / case_path / f"rank{rank}"
                     mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_warmup")
-                    for _ in range(args.warmup):
-                        run_op()
+                    for index in range(args.warmup):
+                        run_op(phase, "warmup", index + 1, repeat)
                     torch.npu.synchronize()
                     check_result(phase)
 
@@ -443,7 +457,7 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                                 ) if args.profile else nullcontext()
                             )
                             with marker:
-                                run_op()
+                                run_op(phase, "measure", index + 1, repeat)
                             ended_ns = time.monotonic_ns()
                             iteration_records.append({
                                 "iteration": index + 1,

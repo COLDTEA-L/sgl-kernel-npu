@@ -107,6 +107,23 @@ class PathContentionSupportTest(unittest.TestCase):
         self.assertIn('--plan-id "path-contention-${job}-persistent"', runner)
         self.assertIn('SIZE_COMPLETE size=', runner)
 
+    def test_failure_diagnostics_preserve_the_first_hccl_status(self):
+        root = Path(__file__).resolve().parents[3]
+        exception_header = (root / "csrc/deepep/exception.hpp").read_text()
+        launch_source = (root /
+            "examples/a5_ccu_urma_route_probe/op_host/all_to_all_multiroute.cc").read_text()
+        worker_source = (root /
+            "tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py").read_text()
+
+        self.assertIn("const HcclResult hccl_check_status = (ret);", exception_header)
+        self.assertIn("std::to_string(static_cast<int>(hccl_check_status))", exception_header)
+        for step in ("main_to_route_record", "route_wait_main", "ccu_launch",
+                     "main_wait_route", "route_to_main_record"):
+            self.assertIn(f'"{step}"', launch_source)
+        self.assertIn("CASE_EXECUTE_ERROR", worker_source)
+        self.assertIn('run_op(phase, "warmup", index + 1, repeat)', worker_source)
+        self.assertIn('run_op(phase, "measure", index + 1, repeat)', worker_source)
+
 
 if __name__ == "__main__":
     unittest.main()
