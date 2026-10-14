@@ -13,10 +13,10 @@ q_relay=2
 q_relay_plane=all
 sizes=16384,65536,262144,1048576,4194304,16777216,67108864,268435456
 weights=1,1
-warmup=2
-iterations=10
-repeats=3
-mindstudio_profile=0
+warmup=10
+iterations=100
+repeats=1
+mindstudio_profile=1
 timeout_seconds=900
 topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
 topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
@@ -37,6 +37,7 @@ while (($#)); do
         --iters) iterations=$2; shift 2;;
         --repeats) repeats=$2; shift 2;;
         --mindstudio-profile) mindstudio_profile=1; shift;;
+        --no-mindstudio-profile) mindstudio_profile=0; shift;;
         --timeout-seconds) timeout_seconds=$2; shift 2;;
         --topology) topology=$2; shift 2;;
         --topology-json) topology_json=$2; shift 2;;
@@ -44,8 +45,8 @@ while (($#)); do
         --cann-root) cann_root=$2; shift 2;;
         --help)
             echo 'A5 direct+relay contention: P=2,3 relay4; Q=4,5 relay2.'
-            echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=2 iters=10 repeats=3.'
-            echo 'Use --mindstudio-profile only for a short trace-validation run; profiler overhead changes timing.'
+            echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=10 iters=100 repeats=1.'
+            echo 'MindStudio profiling is enabled by default and starts only after warmup; use --no-mindstudio-profile for timing-only runs.'
             exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
@@ -129,6 +130,12 @@ settings = dict(
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
     mindstudio_profile=bool(int(profile)), implementation="prepared",
     size_semantics="bytes_per_peer_slice",
+    profile_scope={
+        "warmup_excluded": True,
+        "warmup_iterations": int(warmup),
+        "measured_iterations_per_case": int(iterations),
+    },
+    per_size_results="results/size_<bytes_per_peer>",
 )
 (pathlib.Path(root) / "run_settings.json").write_text(json.dumps(settings, indent=2) + "\n")
 PY

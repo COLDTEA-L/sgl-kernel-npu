@@ -19,6 +19,7 @@ def read_tsv(path):
 
 
 def write_csv(path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -35,6 +36,39 @@ def percentile(values, fraction):
 
 def fmt(value, digits=3):
     return "NA" if value is None else f"{value:.{digits}f}"
+
+
+def render_report(sizes, repeats, iterations, shared_directions, link_identity, aggregate):
+    lines = [
+        "# A5 multi-path physical-direction contention report", "",
+        "- complete: `True`",
+        f"- shared directed physical hops: `{shared_directions}`",
+        f"- shared physical link identity: `{link_identity}`",
+        f"- sizes (bytes per peer slice): `{sizes}`",
+        f"- repeats / measured iterations: `{repeats} / {iterations}`",
+        "- warmup is completed before profiling and is absent from the iteration tables.",
+        "- one conflict pair means one P invocation and one Q invocation had a non-empty host-monotonic execution overlap.",
+        "- timing inflation is concurrent invocation time divided by the same job/size solo baseline median.",
+        "", "## Conflict summary", "",
+        "| bytes/peer | job | conflicts/iters | overlap pairs | baseline us | conflict median us | inflation median | inflation p95 | inflation max | median overlap |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in aggregate:
+        lines.append(
+            f"| {row['bytes_per_peer']} | {row['job']} | "
+            f"{row['conflict_iterations']}/{row['iterations']} | {row['overlapping_pairs']} | "
+            f"{fmt(row['baseline_median_us'])} | {fmt(row['conflict_duration_median_us'])} | "
+            f"{fmt(row['conflict_inflation_median'])}x | {fmt(row['conflict_inflation_p95'])}x | "
+            f"{fmt(row['conflict_inflation_max'])}x | {fmt(row['overlap_fraction_median'])} |"
+        )
+    lines += [
+        "", "## Interpretation boundary", "",
+        "The manifests prove that every invocation has a positive-weight relay path over the shared directed hops. "
+        "Interval overlap therefore identifies an attempted collision window, while slowdown relative to the solo "
+        "baseline quantifies its observed impact. Host intervals do not prove cycle-level arbitration on a port; "
+        "use the optional MindStudio traces and HCCN counters for that final attribution.", "",
+    ]
+    return "\n".join(lines)
 
 
 def route_directions(row):
@@ -238,40 +272,53 @@ def analyze(run_dir):
         "shared_physical_link": link_identity,
         "settings": settings,
         "aggregate": aggregate,
+        "per_size_results": {
+            str(size): f"results/size_{size}" for size in sizes
+        },
     }
     (run_dir / "path_contention_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
 
-    lines = [
-        "# A5 multi-path physical-direction contention report", "",
-        "- complete: `True`",
-        f"- shared directed physical hops: `{summary['shared_physical_directions']}`",
-        f"- shared physical link identity: `{link_identity}`",
-        f"- sizes (bytes per peer slice): `{sizes}`",
-        f"- repeats / iterations: `{repeats} / {iterations}`",
-        "- one conflict pair means one P invocation and one Q invocation had a non-empty host-monotonic execution overlap.",
-        "- timing inflation is concurrent invocation time divided by the same job/size solo baseline median.",
-        "", "## Conflict summary", "",
-        "| bytes/peer | job | conflicts/iters | overlap pairs | baseline us | conflict median us | inflation median | inflation p95 | inflation max | median overlap |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for row in aggregate:
-        lines.append(
-            f"| {row['bytes_per_peer']} | {row['job']} | "
-            f"{row['conflict_iterations']}/{row['iterations']} | {row['overlapping_pairs']} | "
-            f"{fmt(row['baseline_median_us'])} | {fmt(row['conflict_duration_median_us'])} | "
-            f"{fmt(row['conflict_inflation_median'])}x | {fmt(row['conflict_inflation_p95'])}x | "
-            f"{fmt(row['conflict_inflation_max'])}x | {fmt(row['overlap_fraction_median'])} |"
+    report = render_report(
+        sizes, repeats, iterations, summary["shared_physical_directions"],
+        link_identity, aggregate,
+    )
+    (run_dir / "path_contention_report.md").write_text(report)
+
+    baseline_fields = ("bytes_per_peer", "repeat", "job", "iteration", "duration_us")
+    for size in sizes:
+        result_dir = run_dir / "results" / f"size_{size}"
+        size_baselines = [row for row in baseline_rows if row["bytes_per_peer"] == size]
+        size_rows = [row for row in rows if row["bytes_per_peer"] == size]
+        size_aggregate = [row for row in aggregate if row["bytes_per_peer"] == size]
+        write_csv(result_dir / "path_contention_baselines.csv", size_baselines,
+                  baseline_fields)
+        write_csv(result_dir / "path_contention_iterations.csv", size_rows,
+                  iteration_fields)
+        write_csv(result_dir / "path_contention_summary.csv", size_aggregate,
+                  aggregate_fields)
+        size_summary = {
+            "complete": True,
+            "bytes_per_peer": size,
+            "warmup_iterations": int(settings.get("warmup", 0)),
+            "measured_iterations_per_case": iterations,
+            "repeats": repeats,
+            "profile_scope": settings.get("profile_scope", {
+                "warmup_excluded": True,
+                "measured_iterations_per_case": iterations,
+            }),
+            "shared_physical_directions": summary["shared_physical_directions"],
+            "shared_physical_link": link_identity,
+            "aggregate": size_aggregate,
+        }
+        (result_dir / "path_contention_summary.json").write_text(
+            json.dumps(size_summary, indent=2, sort_keys=True) + "\n"
         )
-    lines += [
-        "", "## Interpretation boundary", "",
-        "The manifests prove that every invocation has a positive-weight relay path over the shared directed hops. "
-        "Interval overlap therefore identifies an attempted collision window, while slowdown relative to the solo "
-        "baseline quantifies its observed impact. Host intervals do not prove cycle-level arbitration on a port; "
-        "use the optional MindStudio traces and HCCN counters for that final attribution.", "",
-    ]
-    (run_dir / "path_contention_report.md").write_text("\n".join(lines))
+        (result_dir / "path_contention_report.md").write_text(render_report(
+            [size], repeats, iterations, summary["shared_physical_directions"],
+            link_identity, size_aggregate,
+        ))
     print(json.dumps({"complete": True, "aggregate_rows": len(aggregate),
                       "shared_physical_directions": summary["shared_physical_directions"]}))
 

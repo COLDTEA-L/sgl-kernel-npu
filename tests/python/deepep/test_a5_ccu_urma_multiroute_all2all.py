@@ -613,6 +613,11 @@ def main():
         profile_dir = (Path(args.profile_root) /
                        f"a5_ccu_alltoall_{case_tag}_{run_id}" / f"rank{rank}")
         profiler = make_profiler(profile_dir, rank)
+        print(
+            f"CASE_PROFILE_SCOPE rank={rank} warmup_excluded={args.warmup} "
+            f"measured_iterations={args.iters}",
+            flush=True,
+        )
         profiler.start()
     else:
         mark_phase("timing")
@@ -641,9 +646,11 @@ def main():
             rank,
             {
                 "bytes_per_peer": args.bytes,
+                "warmup_iterations": args.warmup,
                 "iterations": args.iters,
                 "implementation": args.implementation,
                 "profile_enabled": bool(args.profile),
+                "profile_scope": "measure_only_after_warmup",
                 "start_lateness_us": start_lateness_us,
             },
             iteration_records,

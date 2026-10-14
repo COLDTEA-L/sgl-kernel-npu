@@ -51,13 +51,14 @@ bash scripts/run_a5_ccu_multipath_contention.sh --help
 
 ## 3. 首次短测
 
-先确认物理卡2、3、4、5均空闲。短测仅使用16KiB，不启用MindStudio profiler：
+先确认物理卡2、3、4、5均空闲。短测仅使用16KiB，并显式关闭MindStudio profiler：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_multipath_contention.sh \
   --sizes 16384 \
-  --warmup 1 --iters 3 --repeats 1 \
+  --warmup 2 --iters 5 --repeats 1 \
+  --no-mindstudio-profile \
   --output-root /home/l00934901/profiling
 ```
 
@@ -71,23 +72,34 @@ manifests/Q.tsv   # 4→2→5
 如果拓扑存在多个同卡relay候选，解析器会拒绝猜测。根据报错使用
 `--p-relay-plane 0|1`、`--q-relay-plane 0|1`明确指定，不要随意选择。
 
-## 4. 正式时间实验
+## 4. 正式实验
 
-默认完整扫描：
+默认完整扫描已经固定为：每个case先warmup 10次，再连续正式执行100次，repeat为1，
+并启用MindStudio profiler。直接运行：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_multipath_contention.sh \
-  --warmup 2 --iters 10 --repeats 3 \
   --output-root /home/l00934901/profiling
 ```
 
-对每个尺寸和repeat，顺序如下：
+对每个尺寸，顺序如下：
 
-1. P单独连续执行，形成P baseline；
-2. Q单独连续执行，形成Q baseline；
-3. P/Q四个rank等待同一个`CLOCK_MONOTONIC`目标时间后同时开始，分别连续执行10次；
+1. P单独warmup 10次，warmup完成后连续执行100次，形成P baseline；
+2. Q单独warmup 10次，warmup完成后连续执行100次，形成Q baseline；
+3. 并发P/Q各自先完成warmup 10次；四个rank随后等待同一个`CLOCK_MONOTONIC`
+   目标时间并同时开始，P和Q分别连续执行100次；
 4. 每次prepared调用都等待本次调用完成，再进入下一次，因此每条记录对应一次完整算子。
+
+Profiler在每个case的warmup和warmup正确性检查全部完成后才启动。也就是说，每份
+MindStudio profile包含该case正式阶段的100个标记
+`A5_PATH_CONTENTION_<P|Q>_ITER_0001..0100`，不包含前10次warmup。Profiler启动后到正式
+调用开始前仍会有同步和四进程起跑屏障，因此“只取100次”是指其中只包含100次被测算子，
+不是说profile文件完全没有CPU同步事件。
+
+这里一个尺寸共有四个独立case：baseline P、baseline Q、concurrent P和concurrent Q；
+每个case各采100次，而不是四个case合计100次。若通过`--repeats N`增加重复轮数，
+每轮、每个case仍各自采100次。
 
 baseline 使用同一作业、同一尺寸全部repeat的单次耗时中位数。实验组每次调用的
 `time_inflation`定义为：
@@ -98,15 +110,16 @@ baseline 使用同一作业、同一尺寸全部repeat的单次耗时中位数�
 
 ## 5. MindStudio时间线复核
 
-Profiler会改变小尺寸的绝对时间，因此不要把开启profiler的结果与无profiler baseline混用。
-建议单独跑一个代表尺寸和较少迭代，例如1MiB：
+正式实验默认启用Profiler，baseline和concurrent都会在相同条件下采集，避免在同一报告中
+混合有profiler和无profiler的耗时。如需只测host计时，可额外使用
+`--no-mindstudio-profile`另起一次实验；不要把两次实验的绝对时间直接混用。
+
+若只想先复核1MiB的完整100次时间线：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_multipath_contention.sh \
   --sizes 1048576 \
-  --warmup 1 --iters 5 --repeats 1 \
-  --mindstudio-profile \
   --output-root /home/l00934901/profiling
 ```
 
@@ -117,8 +130,8 @@ A5_PATH_CONTENTION_P_ITER_0001
 A5_PATH_CONTENTION_Q_ITER_0001
 ```
 
-Profiler输出位于结果目录的`profiles/`，baseline和concurrent都会采集，以免在同一份
-报告中混合有profiler和无profiler的耗时。将各rank生成的`*_ascend_pt`目录或其中的DB
+Profiler输出按数据量、repeat、phase和job分别保存在`profiles/`。将各rank生成的
+`*_ascend_pt`目录或其中的DB
 复制到装有MindStudio Insight的机器中导入，在Timeline中检查P/Q标记、CCU任务和通信
 任务的重叠。正式冲突计数仍使用`traces/`中的同机单调时钟区间，避免依赖两个独立
 profiler文件的时间轴展示精度。
@@ -132,12 +145,27 @@ case_status.tsv                   # 每个子作业是否通过
 logs/                             # torchrun完整日志
 traces/                           # 每rank每次调用起止时间
 profiles/                         # 可选MindStudio数据
+results/size_<bytes>/             # 每个数据量单独保存的一套结果
 path_contention_baselines.csv     # baseline原始单次耗时
 path_contention_iterations.csv    # 每次并发调用、冲突命中和膨胀
 path_contention_summary.csv       # Excel可直接打开的尺寸级汇总
 path_contention_summary.json      # 机器可读汇总
 path_contention_report.md         # 人读报告
 ```
+
+例如16KiB的独立结果位于：
+
+```text
+results/size_16384/path_contention_baselines.csv
+results/size_16384/path_contention_iterations.csv
+results/size_16384/path_contention_summary.csv
+results/size_16384/path_contention_summary.json
+results/size_16384/path_contention_report.md
+```
+
+`traces/size_<bytes>/`和`profiles/size_<bytes>/`也按数据量隔离。结果目录根部的同名CSV、
+JSON和Markdown是跨全部数据量的总表，便于一次导入Excel比较；`results/size_<bytes>/`
+中的文件仅包含该数据量，方便后续逐个留存和查看。
 
 `path_contention_iterations.csv`中的关键列：
 
@@ -158,5 +186,6 @@ path_contention_report.md         # 人读报告
 - 单调时钟区间证明两个完整算子在时间上重叠；
 - 相对baseline的膨胀量化冲突影响；
 - 这些证据不能单独证明端口内部逐周期仲裁，最终归因应结合MindStudio时间线和HCCN端口计数；
-- 同机其他作业也可能造成膨胀，正式实验应选择空闲窗口并至少重复三轮；
+- 同机其他作业也可能造成膨胀；默认先完整采一轮，需要评估轮间波动时再使用
+  `--repeats 3`另跑三轮；
 - `2→4`与`4→2`分别统计，不假设双向链路互相竞争。

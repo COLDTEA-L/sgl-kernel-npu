@@ -69,6 +69,16 @@ class PathContentionAnalyzerTest(unittest.TestCase):
             self.assertEqual(by_job["Q"]["conflict_inflation_median"], 1.25)
             self.assertTrue((root / "path_contention_iterations.csv").is_file())
             self.assertTrue((root / "path_contention_report.md").is_file())
+            size_root = root / "results/size_16384"
+            self.assertTrue((size_root / "path_contention_baselines.csv").is_file())
+            self.assertTrue((size_root / "path_contention_iterations.csv").is_file())
+            self.assertTrue((size_root / "path_contention_summary.csv").is_file())
+            self.assertTrue((size_root / "path_contention_report.md").is_file())
+            size_summary = json.loads(
+                (size_root / "path_contention_summary.json").read_text()
+            )
+            self.assertEqual(size_summary["bytes_per_peer"], 16384)
+            self.assertEqual(len(size_summary["aggregate"]), 2)
 
 
 if __name__ == "__main__":
