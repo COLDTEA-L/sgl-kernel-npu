@@ -35,9 +35,19 @@ def write_trace(path, job, durations, starts):
         for index, (duration, start) in enumerate(zip(durations, starts), 1):
             records.append(dict(iteration=index, started_ns=start + rank,
                                 ended_ns=start + int(duration * 1000) + rank,
-                                duration_us=duration))
+                                duration_us=duration,
+                                timing_semantics="host_submission_only"))
         (path / f"rank{rank}.json").write_text(json.dumps(dict(
-            job=job, rank=rank, records=records)))
+            job=job, rank=rank, completion_mode="batch",
+            iteration_timing_semantics="host_submission_only",
+            batch_started_ns=min(starts) + rank,
+            batch_ended_ns=max(
+                start + int(duration * 1000)
+                for duration, start in zip(durations, starts)
+            ) + rank,
+            batch_total_us=sum(durations),
+            batch_average_us=sum(durations) / len(durations),
+            records=records)))
 
 
 class PathContentionAnalyzerTest(unittest.TestCase):
@@ -50,7 +60,12 @@ class PathContentionAnalyzerTest(unittest.TestCase):
             write_manifest(root / "manifests/P.tsv", 2, 3, 4)
             write_manifest(root / "manifests/Q.tsv", 4, 5, 2)
             (root / "run_settings.json").write_text(json.dumps(dict(
-                sizes=[16384], repeats=1, iterations=2)))
+                sizes=[16384], repeats=1, iterations=2, warmup=1,
+                completion_mode="batch",
+                jobs={
+                    "P": {"endpoints": [2, 3], "relay": 4},
+                    "Q": {"endpoints": [4, 5], "relay": 2},
+                })))
             trace = root / "traces/size_16KB/repeat_1"
             base = 1_000_000_000
             write_trace(trace / "baseline_P", "P", [10, 10], [base, base + 20_000])
@@ -63,15 +78,18 @@ class PathContentionAnalyzerTest(unittest.TestCase):
             self.assertEqual(summary["shared_physical_link"]["card2_port"], 1)
             self.assertEqual(summary["shared_physical_link"]["card4_port"], 2)
             by_job = {row["job"]: row for row in summary["aggregate"]}
-            self.assertEqual(by_job["P"]["conflict_iterations"], 2)
-            self.assertEqual(by_job["P"]["overlapping_pairs"], 3)
-            self.assertEqual(by_job["P"]["conflict_inflation_median"], 1.5)
-            self.assertEqual(by_job["Q"]["conflict_inflation_median"], 1.25)
-            self.assertTrue((root / "path_contention_iterations.csv").is_file())
+            self.assertEqual(by_job["P"]["time_inflation_median"], 1.5)
+            self.assertEqual(by_job["Q"]["time_inflation_median"], 1.25)
+            self.assertEqual(
+                by_job["P"]["conflict_probability"],
+                "MINDSTUDIO_TIMELINE_REQUIRED",
+            )
+            self.assertTrue((root / "path_contention_batches.csv").is_file())
+            self.assertTrue((root / "path_contention_submissions.csv").is_file())
             self.assertTrue((root / "path_contention_report.md").is_file())
             size_root = root / "results/size_16KB"
-            self.assertTrue((size_root / "path_contention_baselines.csv").is_file())
-            self.assertTrue((size_root / "path_contention_iterations.csv").is_file())
+            self.assertTrue((size_root / "path_contention_batches.csv").is_file())
+            self.assertTrue((size_root / "path_contention_submissions.csv").is_file())
             self.assertTrue((size_root / "path_contention_summary.csv").is_file())
             self.assertTrue((size_root / "path_contention_report.md").is_file())
             size_summary = json.loads(

@@ -166,6 +166,12 @@ def parse_args():
                         default="concurrent")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--completion-mode", choices=("per-iteration", "batch"),
+        default="per-iteration",
+        help=("per-iteration waits after every prepared call; batch enqueues the "
+              "whole loop and synchronizes once after the loop"),
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
         "--validate-every-iteration", action="store_true",
@@ -200,6 +206,8 @@ def parse_args():
             "profiling measures the same formal iterations as --iters; "
             "set --profile-iters equal to --iters"
         )
+    if args.completion_mode == "batch" and args.validate_every_iteration:
+        parser.error("--validate-every-iteration is incompatible with batch completion")
     if args.trace_job:
         try:
             safe_name(args.trace_job)
@@ -438,18 +446,15 @@ def main():
         else:
             buffer.ccu_urma_multiroute_alltoall_out(send, recv)
 
-    # A prepared-plan performance sample is one completed AllToAll invocation,
-    # not one host-side enqueue into a batch of outstanding launches that reuse
-    # the same Channel notify/event set and output buffer.  Completing each
-    # invocation does not serialize the direct/relay paths inside it: the CCU
-    # kernel still submits every path's WriteNb before waiting for any event.
-    complete_each_invocation = args.implementation == "prepared"
-    if complete_each_invocation:
-        print(
-            f"CASE_LAUNCH_COMPLETION rank={rank} "
-            "mode=complete_each_prepared_invocation",
-            flush=True,
-        )
+    complete_each_invocation = (
+        args.implementation == "prepared" and
+        args.completion_mode == "per-iteration"
+    )
+    print(
+        f"CASE_LAUNCH_COMPLETION rank={rank} mode={args.completion_mode} "
+        f"synchronize_inside_loop={int(complete_each_invocation)}",
+        flush=True,
+    )
 
     iteration_records = []
 
@@ -481,6 +486,10 @@ def main():
                     "started_ns": started_ns,
                     "ended_ns": ended_ns,
                     "duration_us": (ended_ns - started_ns) / 1000.0,
+                    "timing_semantics": (
+                        "completed_invocation" if complete_each_invocation
+                        else "host_submission_only"
+                    ),
                 })
             if args.validate_every_iteration:
                 try:
@@ -629,10 +638,12 @@ def main():
             )
         else:
             start_lateness_us = measurement_start(sync_dir, rank, world_size)
-        begin = time.perf_counter()
+        batch_started_ns = time.monotonic_ns()
         run_repeated(args.iters, "measure")
         torch.npu.synchronize()
-        average_us = (time.perf_counter() - begin) * 1e6 / args.iters
+        batch_ended_ns = time.monotonic_ns()
+        batch_total_us = (batch_ended_ns - batch_started_ns) / 1000.0
+        average_us = batch_total_us / args.iters
     finally:
         if profiler is not None:
             profiler.stop()
@@ -649,6 +660,15 @@ def main():
                 "warmup_iterations": args.warmup,
                 "iterations": args.iters,
                 "implementation": args.implementation,
+                "completion_mode": args.completion_mode,
+                "iteration_timing_semantics": (
+                    "completed_invocation" if complete_each_invocation
+                    else "host_submission_only"
+                ),
+                "batch_started_ns": batch_started_ns,
+                "batch_ended_ns": batch_ended_ns,
+                "batch_total_us": batch_total_us,
+                "batch_average_us": average_us,
                 "profile_enabled": bool(args.profile),
                 "profile_scope": "measure_only_after_warmup",
                 "start_lateness_us": start_lateness_us,

@@ -1,7 +1,8 @@
 # A5 多路径算子物理方向冲突实验
 
 本实验只面向有卡实验机器。它比较两个 prepared direct+relay AllToAll 作业的单独执行
-baseline 与同步并发执行，并统计发生实际执行区间重叠的次数及时间膨胀。
+baseline 与独立instance并发执行。脚本自动计算整批平均时间膨胀；逐次冲突概率只从
+MindStudio device timeline统计，不用host提交区间代替device执行区间。
 
 ## 1. 冲突构造
 
@@ -95,13 +96,17 @@ bash scripts/run_a5_ccu_multipath_contention.sh \
 2. Q单独warmup 10次，warmup完成后连续执行100次，形成Q baseline；
 3. 并发P/Q各自先完成warmup 10次；四个rank随后等待同一个`CLOCK_MONOTONIC`
    目标时间并同时开始，P和Q分别连续执行100次；
-4. 每次prepared调用都等待本次调用完成，再进入下一次，因此每条记录对应一次完整算子。
+4. P、Q各自在自己的进程和stream中连续提交100次，循环内部不调用
+   `torch.npu.synchronize()`；各instance只在自己的循环结束后同步一次；
+5. P和Q只对齐第一个正式iteration的起跑点，此后没有逐iteration barrier，也不会互相
+   synchronize。
 
 Profiler在每个case的warmup和warmup正确性检查全部完成后才启动。也就是说，每份
 MindStudio profile包含该case正式阶段的100个标记
 `A5_PATH_CONTENTION_<P|Q>_ITER_0001..0100`，不包含前10次warmup。Profiler启动后到正式
-调用开始前仍会有同步和四进程起跑屏障，因此“只取100次”是指其中只包含100次被测算子，
-不是说profile文件完全没有CPU同步事件。
+调用开始前仍会有一次本地stream清空和四进程首轮起跑屏障，100次提交完成后有一次各自
+instance的本地同步。因此“只取100次”是指其中只有100次被测算子，不是说profile文件
+完全没有CPU同步事件。
 
 这里一个尺寸包含三个实验case：baseline P、baseline Q和concurrent PQ。concurrent PQ
 同时运行P、Q并分别保存两份采集结果，所以总共得到baseline P、baseline Q、并发中的P、
@@ -111,14 +116,14 @@ MindStudio profile包含该case正式阶段的100个标记
 其中`concurrent P`和`concurrent Q`不是先后运行的两个实验。runner会同时启动P、Q两个
 torchrun进程组，四个rank在同一个host单调时钟目标点释放。因为P和Q属于不同进程组，
 它们必须各自生成trace和profiler文件；目录统一放在同一次
-`concurrent_PQ/P`、`concurrent_PQ/Q`下面。分析器随后把两边100次调用的区间做交集，
-输出每个作业的`conflict_iterations / iterations`和`conflict_rate`。
+`concurrent_PQ/P`、`concurrent_PQ/Q`下面。host trace只记录提交时刻和整批完成窗口，
+不把提交区间解释成device冲突区间。
 
-baseline 使用同一作业、同一尺寸全部repeat的单次耗时中位数。实验组每次调用的
-`time_inflation`定义为：
+baseline和concurrent都采用“连续提交100次、循环外同步”的同一方式。每轮整批耗时除以
+100得到batch平均单次耗时；`time_inflation`定义为：
 
 ```text
-并发时该次调用耗时 / 同作业同尺寸baseline中位数
+并发batch平均单次耗时 / 同作业同尺寸baseline batch平均耗时中位数
 ```
 
 ## 5. MindStudio时间线复核
@@ -146,8 +151,9 @@ A5_PATH_CONTENTION_Q_ITER_0001
 Profiler输出按数据量、repeat、phase和job分别保存在`profiles/`。将各rank生成的
 `*_ascend_pt`目录或其中的DB
 复制到装有MindStudio Insight的机器中导入，在Timeline中检查P/Q标记、CCU任务和通信
-任务的重叠。正式冲突计数仍使用`traces/`中的同机单调时钟区间，避免依赖两个独立
-profiler文件的时间轴展示精度。
+任务的重叠。逐次冲突概率必须以device task区间为准：对P的100次device调用，统计其中
+与Q任意一次device调用在共享物理方向上发生重叠的次数，再除以100；Q同理。CPU marker
+只用于关联iteration编号，其自身宽度是host提交耗时，不是device算子耗时。
 
 ## 6. 输出与判读
 
@@ -156,11 +162,11 @@ run_settings.json                 # 完整实验参数
 manifests/P.tsv、Q.tsv            # 显式物理relay清单
 case_status.tsv                   # 每个子作业是否通过
 logs/                             # torchrun完整日志
-traces/                           # 每rank每次调用起止时间
+traces/                           # host提交记录和整批完成窗口，不是device执行区间
 profiles/                         # 可选MindStudio数据
 results/size_<KB或MB>/            # 每个数据量单独保存的一套结果
-path_contention_baselines.csv     # baseline原始单次耗时
-path_contention_iterations.csv    # 每次并发调用、冲突命中和膨胀
+path_contention_batches.csv       # baseline/concurrent整批平均时间和膨胀
+path_contention_submissions.csv   # 每次host提交记录，仅用于编号和诊断
 path_contention_summary.csv       # Excel可直接打开的尺寸级汇总
 path_contention_summary.json      # 机器可读汇总
 path_contention_report.md         # 人读报告
@@ -169,8 +175,8 @@ path_contention_report.md         # 人读报告
 例如16KiB的独立结果位于：
 
 ```text
-results/size_16KB/path_contention_baselines.csv
-results/size_16KB/path_contention_iterations.csv
+results/size_16KB/path_contention_batches.csv
+results/size_16KB/path_contention_submissions.csv
 results/size_16KB/path_contention_summary.csv
 results/size_16KB/path_contention_summary.json
 results/size_16KB/path_contention_report.md
@@ -188,28 +194,26 @@ JSON和Markdown是跨全部数据量的总表，便于一次导入Excel比较；
 ```text
 profiles/size_16KB/repeat_1/concurrent_PQ/P/   # P在同一次P+Q并发运行中的profile
 profiles/size_16KB/repeat_1/concurrent_PQ/Q/   # Q在同一次P+Q并发运行中的profile
-traces/size_16KB/repeat_1/concurrent_PQ/P/     # P的100次调用区间
-traces/size_16KB/repeat_1/concurrent_PQ/Q/     # Q的100次调用区间
+traces/size_16KB/repeat_1/concurrent_PQ/P/     # P的100次host提交和batch窗口
+traces/size_16KB/repeat_1/concurrent_PQ/Q/     # Q的100次host提交和batch窗口
 ```
 
-`path_contention_iterations.csv`中的关键列：
+`path_contention_batches.csv`中的关键列：
 
-- `conflict=YES`：该作业本次调用与另一作业至少一次调用有非零区间重叠；
-- `peer_iterations`：与它重叠的另一作业迭代编号；
-- `overlap_fraction`：本次collective窗口被另一作业覆盖的比例；
-- `time_inflation`：相对solo baseline的倍数；
-- `time_inflation_percent`：相对solo baseline增加的百分比。
+- `batch_average_us`：整批完成时间除以正式调用次数；
+- `time_inflation`：并发batch平均值相对solo baseline中位数的倍数；
+- `host_batch_overlap_fraction`：P/Q整批host等待窗口是否确实重叠，只用于实验有效性检查；
+- `conflict_probability=MINDSTUDIO_TIMELINE_REQUIRED`：明确禁止用host记录自动推断逐次冲突。
 
-汇总中的`overlapping_pairs`按P迭代与Q迭代的重叠配对计数；
-`conflict_iterations`则按每个作业自身被冲突覆盖的迭代计数。一个较慢的P迭代可能跨过
-两个Q迭代，所以两种计数不一定相等。
+`path_contention_submissions.csv`中的`enqueue_duration_us`只是Python/C++入口提交耗时。
+它不能用于算子时延、P/Q重叠或冲突概率计算。
 
 ## 7. 结论边界
 
 - manifest中的卡号、UDie、port和edge共同证明路径共享同一物理链路；EID不要求相同；
 - 正权重保证每次调用有relay数据；
-- 单调时钟区间证明两个完整算子在时间上重叠；
-- 相对baseline的膨胀量化冲突影响；
+- host整批窗口只证明两组实验在总体时间上同时运行；
+- 相对baseline的batch平均膨胀量化总体影响，逐次膨胀和冲突概率以Timeline为准；
 - 这些证据不能单独证明端口内部逐周期仲裁，最终归因应结合MindStudio时间线和HCCN端口计数；
 - 同机其他作业也可能造成膨胀；默认先完整采一轮，需要评估轮间波动时再使用
   `--repeats 3`另跑三轮；

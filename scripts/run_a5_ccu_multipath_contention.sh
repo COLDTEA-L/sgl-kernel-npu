@@ -140,6 +140,7 @@ settings = dict(
     sizes=list(map(int, sizes.split(','))), weights=list(map(int, weights.split(','))),
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
     mindstudio_profile=bool(int(profile)), implementation="prepared",
+    completion_mode="batch",
     size_semantics="bytes_per_peer_slice",
     profile_scope={
         "warmup_excluded": True,
@@ -184,6 +185,7 @@ run_job() {
             --direct-route 0 --path-weights "$weights" \
             --plan-id "path-contention-${job}-${phase}-${size_label}-${repeat}" \
             --bytes "$size" --dtype float32 --warmup "$warmup" --iters "$iterations" \
+            --completion-mode batch \
             --trace-job "$job" \
             --iteration-trace-dir "$run_dir/traces/size_${size_label}/repeat_${repeat}/${case_path}" \
             "${sync_args[@]}" "${profile_args[@]}"

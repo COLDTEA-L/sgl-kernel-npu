@@ -51,6 +51,265 @@ def concurrent_trace_dir(repeat_root, job):
     return current if current.exists() or not legacy.exists() else legacy
 
 
+def load_collective_batch(directory, expected_iterations):
+    documents = []
+    for rank in (0, 1):
+        path = directory / f"rank{rank}.json"
+        if not path.is_file():
+            raise RuntimeError(f"missing batch trace: {path}")
+        document = json.loads(path.read_text())
+        records = document.get("records", [])
+        if len(records) != expected_iterations:
+            raise RuntimeError(
+                f"{path} has {len(records)} submissions, expected {expected_iterations}"
+            )
+        if document.get("completion_mode") != "batch":
+            raise RuntimeError(f"{path} is not a batch-completion trace")
+        if document.get("iteration_timing_semantics") != "host_submission_only":
+            raise RuntimeError(f"{path} has invalid batch timing semantics")
+        for offset, record in enumerate(records, 1):
+            if record.get("iteration") != offset:
+                raise RuntimeError(f"submission numbering mismatch in {path}")
+        documents.append(document)
+    started = min(int(item["batch_started_ns"]) for item in documents)
+    ended = max(int(item["batch_ended_ns"]) for item in documents)
+    if ended <= started:
+        raise RuntimeError(f"non-positive batch interval in {directory}")
+    return {
+        "started_ns": started,
+        "ended_ns": ended,
+        "batch_window_us": (ended - started) / 1000.0,
+        "batch_average_us": max(float(item["batch_average_us"]) for item in documents),
+        "documents": documents,
+    }
+
+
+def render_batch_report(settings, shared_directions, link_identity, aggregate):
+    lines = [
+        "# A5 multi-path physical-direction contention report", "",
+        "- complete: `True`",
+        f"- shared directed physical hops: `{shared_directions}`",
+        f"- shared physical link identity: `{link_identity}`",
+        f"- sizes (bytes per peer slice): `{settings['sizes']}`",
+        f"- warmup / measured calls / repeats: `{settings['warmup']} / {settings['iterations']} / {settings['repeats']}`",
+        "- P and Q align only their first measured submission; each instance then enqueues the full loop independently.",
+        "- each rank calls torch.npu.synchronize() once after the measured loop, never inside it.",
+        "- host submission records are not device execution intervals and are not used to infer per-iteration conflicts.",
+        "- conflict probability must be counted from the concurrent P/Q MindStudio device timelines.",
+        "", "## Batch slowdown summary", "",
+        "| bytes/peer | job | baseline avg us | concurrent avg us | inflation median | inflation p95 | inflation max | host batch overlap | conflict probability |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in aggregate:
+        lines.append(
+            f"| {row['bytes_per_peer']} | {row['job']} | "
+            f"{fmt(row['baseline_batch_average_us_median'])} | "
+            f"{fmt(row['concurrent_batch_average_us_median'])} | "
+            f"{fmt(row['time_inflation_median'])}x | "
+            f"{fmt(row['time_inflation_p95'])}x | "
+            f"{fmt(row['time_inflation_max'])}x | "
+            f"{fmt(row['host_batch_overlap_fraction_median'])} | MindStudio timeline required |"
+        )
+    lines += [
+        "", "## MindStudio counting rule", "",
+        "For each job, count a measured device invocation as conflicted only when its CCU/communication task interval "
+        "overlaps a measured invocation of the other job on the shared physical direction. Divide that count by the "
+        "measured invocation count. The profiler markers A5_PATH_CONTENTION_<P|Q>_ITER_XXXX identify submissions; "
+        "host marker duration itself is not device duration.", "",
+    ]
+    return "\n".join(lines)
+
+
+def analyze_batch(run_dir, settings):
+    sizes = [int(item) for item in settings["sizes"]]
+    repeats = int(settings["repeats"])
+    iterations = int(settings["iterations"])
+    p_rows = read_tsv(run_dir / "manifests/P.tsv")
+    q_rows = read_tsv(run_dir / "manifests/Q.tsv")
+    if len(p_rows) != 1 or len(q_rows) != 1:
+        raise RuntimeError("the contention experiment requires exactly one relay per job")
+    link_identity = shared_link_identity(p_rows[0], q_rows[0])
+    shared = sorted(route_directions(p_rows[0]) & route_directions(q_rows[0]))
+    if not shared:
+        raise RuntimeError("P and Q manifests do not share a directed physical hop")
+    shared_directions = [f"{src}->{dst}" for src, dst in shared]
+
+    batch_rows = []
+    submission_rows = []
+    baselines = {}
+    for size in sizes:
+        size_root = trace_size_root(run_dir, size)
+        for job in ("P", "Q"):
+            samples = []
+            for repeat in range(1, repeats + 1):
+                batch = load_collective_batch(
+                    size_root / f"repeat_{repeat}" / f"baseline_{job}", iterations
+                )
+                samples.append(batch["batch_average_us"])
+                batch_rows.append({
+                    "bytes_per_peer": size, "repeat": repeat, "phase": "baseline",
+                    "job": job, "iterations": iterations,
+                    "batch_started_ns": batch["started_ns"],
+                    "batch_ended_ns": batch["ended_ns"],
+                    "batch_window_us": batch["batch_window_us"],
+                    "batch_average_us": batch["batch_average_us"],
+                })
+                append_submission_rows(
+                    submission_rows, settings, size, repeat, "baseline", job, batch
+                )
+            baselines[(size, job)] = statistics.median(samples)
+
+    concurrent_rows = []
+    for size in sizes:
+        size_root = trace_size_root(run_dir, size)
+        for repeat in range(1, repeats + 1):
+            root = size_root / f"repeat_{repeat}"
+            batches = {
+                job: load_collective_batch(concurrent_trace_dir(root, job), iterations)
+                for job in ("P", "Q")
+            }
+            overlap = overlap_ns(
+                (batches["P"]["started_ns"], batches["P"]["ended_ns"]),
+                (batches["Q"]["started_ns"], batches["Q"]["ended_ns"]),
+            )
+            shorter = min(
+                batches["P"]["ended_ns"] - batches["P"]["started_ns"],
+                batches["Q"]["ended_ns"] - batches["Q"]["started_ns"],
+            )
+            for job in ("P", "Q"):
+                batch = batches[job]
+                baseline = baselines[(size, job)]
+                inflation = batch["batch_average_us"] / baseline
+                row = {
+                    "bytes_per_peer": size, "repeat": repeat, "phase": "concurrent_PQ",
+                    "job": job, "iterations": iterations,
+                    "batch_started_ns": batch["started_ns"],
+                    "batch_ended_ns": batch["ended_ns"],
+                    "batch_window_us": batch["batch_window_us"],
+                    "batch_average_us": batch["batch_average_us"],
+                    "baseline_median_us": baseline,
+                    "time_inflation": inflation,
+                    "time_inflation_percent": (inflation - 1.0) * 100.0,
+                    "host_batch_overlap_us": overlap / 1000.0,
+                    "host_batch_overlap_fraction": overlap / shorter if shorter else 0.0,
+                    "conflict_probability": "MINDSTUDIO_TIMELINE_REQUIRED",
+                }
+                batch_rows.append(row)
+                concurrent_rows.append(row)
+                append_submission_rows(
+                    submission_rows, settings, size, repeat, "concurrent_PQ", job, batch
+                )
+
+    groups = {}
+    for row in concurrent_rows:
+        groups.setdefault((row["bytes_per_peer"], row["job"]), []).append(row)
+    aggregate = []
+    for (size, job), rows in sorted(groups.items()):
+        inflations = [row["time_inflation"] for row in rows]
+        aggregate.append({
+            "bytes_per_peer": size,
+            "job": job,
+            "repeats": len(rows),
+            "iterations_per_repeat": iterations,
+            "baseline_batch_average_us_median": baselines[(size, job)],
+            "concurrent_batch_average_us_median": statistics.median(
+                [row["batch_average_us"] for row in rows]
+            ),
+            "time_inflation_median": statistics.median(inflations),
+            "time_inflation_p95": percentile(inflations, 0.95),
+            "time_inflation_max": max(inflations),
+            "host_batch_overlap_fraction_median": statistics.median(
+                [row["host_batch_overlap_fraction"] for row in rows]
+            ),
+            "conflict_probability": "MINDSTUDIO_TIMELINE_REQUIRED",
+        })
+
+    batch_fields = (
+        "bytes_per_peer", "repeat", "phase", "job", "iterations",
+        "batch_started_ns", "batch_ended_ns", "batch_window_us", "batch_average_us",
+        "baseline_median_us", "time_inflation", "time_inflation_percent",
+        "host_batch_overlap_us", "host_batch_overlap_fraction", "conflict_probability",
+    )
+    submission_fields = (
+        "bytes_per_peer", "repeat", "phase", "job", "rank", "physical_device",
+        "iteration", "enqueue_started_ns", "enqueue_ended_ns", "enqueue_duration_us",
+        "timing_semantics",
+    )
+    aggregate_fields = (
+        "bytes_per_peer", "job", "repeats", "iterations_per_repeat",
+        "baseline_batch_average_us_median", "concurrent_batch_average_us_median",
+        "time_inflation_median", "time_inflation_p95", "time_inflation_max",
+        "host_batch_overlap_fraction_median", "conflict_probability",
+    )
+    write_csv(run_dir / "path_contention_batches.csv", batch_rows, batch_fields)
+    write_csv(run_dir / "path_contention_submissions.csv", submission_rows, submission_fields)
+    write_csv(run_dir / "path_contention_summary.csv", aggregate, aggregate_fields)
+
+    summary = {
+        "complete": True,
+        "measurement_mode": "independent_batch_enqueue_then_local_sync",
+        "conflict_probability_source": "MindStudio device timeline",
+        "host_submission_intervals_are_device_intervals": False,
+        "shared_physical_directions": shared_directions,
+        "shared_physical_link": link_identity,
+        "settings": settings,
+        "aggregate": aggregate,
+        "per_size_results": {
+            str(size): f"results/size_{format_size_label(size)}" for size in sizes
+        },
+    }
+    (run_dir / "path_contention_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    )
+    report = render_batch_report(settings, shared_directions, link_identity, aggregate)
+    (run_dir / "path_contention_report.md").write_text(report)
+
+    for size in sizes:
+        result_dir = run_dir / "results" / f"size_{format_size_label(size)}"
+        size_batches = [row for row in batch_rows if row["bytes_per_peer"] == size]
+        size_submissions = [row for row in submission_rows if row["bytes_per_peer"] == size]
+        size_aggregate = [row for row in aggregate if row["bytes_per_peer"] == size]
+        write_csv(result_dir / "path_contention_batches.csv", size_batches, batch_fields)
+        write_csv(result_dir / "path_contention_submissions.csv", size_submissions,
+                  submission_fields)
+        write_csv(result_dir / "path_contention_summary.csv", size_aggregate,
+                  aggregate_fields)
+        size_summary = dict(summary)
+        size_summary["bytes_per_peer"] = size
+        size_summary["settings"] = dict(settings, sizes=[size])
+        size_summary["aggregate"] = size_aggregate
+        size_summary["per_size_results"] = {str(size): f"results/size_{format_size_label(size)}"}
+        (result_dir / "path_contention_summary.json").write_text(
+            json.dumps(size_summary, indent=2, sort_keys=True) + "\n"
+        )
+        (result_dir / "path_contention_report.md").write_text(
+            render_batch_report(size_summary["settings"], shared_directions,
+                                link_identity, size_aggregate)
+        )
+    print(json.dumps({"complete": True, "aggregate_rows": len(aggregate),
+                      "conflict_probability_source": "MindStudio device timeline"}))
+
+
+def append_submission_rows(output, settings, size, repeat, phase, job, batch):
+    endpoints = settings["jobs"][job]["endpoints"]
+    for document in batch["documents"]:
+        rank = int(document["rank"])
+        for record in document["records"]:
+            output.append({
+                "bytes_per_peer": size,
+                "repeat": repeat,
+                "phase": phase,
+                "job": job,
+                "rank": rank,
+                "physical_device": endpoints[rank],
+                "iteration": record["iteration"],
+                "enqueue_started_ns": record["started_ns"],
+                "enqueue_ended_ns": record["ended_ns"],
+                "enqueue_duration_us": record["duration_us"],
+                "timing_semantics": record.get("timing_semantics", "host_submission_only"),
+            })
+
+
 def render_report(sizes, repeats, iterations, shared_directions, link_identity, aggregate):
     lines = [
         "# A5 multi-path physical-direction contention report", "",
@@ -154,6 +413,8 @@ def load_collective_intervals(directory, expected_iterations):
 
 def analyze(run_dir):
     settings = json.loads((run_dir / "run_settings.json").read_text())
+    if settings.get("completion_mode") == "batch":
+        return analyze_batch(run_dir, settings)
     sizes = [int(item) for item in settings["sizes"]]
     repeats = int(settings["repeats"])
     iterations = int(settings["iterations"])
