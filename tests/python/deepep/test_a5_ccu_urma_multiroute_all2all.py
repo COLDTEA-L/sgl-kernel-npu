@@ -11,7 +11,10 @@ import re
 import sys
 import time
 from pathlib import Path
-from a5_ccu_test_runtime import prepare_runtime as shared_prepare_runtime
+from a5_ccu_test_runtime import (
+    import_deep_ep as shared_import_deep_ep,
+    prepare_runtime as shared_prepare_runtime,
+)
 from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
 from a5_ccu_path_contention_support import (
     contention_measurement_start,
@@ -93,7 +96,7 @@ import torch_npu
 mark_phase("import_torch_npu_done")
 if IMPLEMENTATION != "native":
     mark_phase("import_deep_ep")
-    import deep_ep
+    deep_ep, DEEP_EP_CPP = shared_import_deep_ep(EXTENSION)
     mark_phase("import_deep_ep_done")
     if IMPLEMENTATION in ("standard", "prepared"):
         extension = ctypes.CDLL(str(EXTENSION))
@@ -193,6 +196,10 @@ def parse_args():
               "integration, and aclgraph performs explicit torch.npu.NPUGraph capture/replay"),
     )
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--runtime-check", action="store_true",
+        help="validate DeepEP and route-library loading without initializing NPU devices",
+    )
     args = parser.parse_args()
     element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int32": 4}[args.dtype]
     if args.bytes <= 0 or args.bytes % element_bytes:
@@ -208,6 +215,8 @@ def parse_args():
         )
     if args.completion_mode == "batch" and args.validate_every_iteration:
         parser.error("--validate-every-iteration is incompatible with batch completion")
+    if args.runtime_check:
+        return args
     if args.trace_job:
         try:
             safe_name(args.trace_job)
@@ -286,6 +295,13 @@ def select_routes(args):
 def main():
     mark_phase("parse_args")
     args = parse_args()
+    if args.runtime_check:
+        print(
+            f"MULTIPATH_RUNTIME_VERIFIED extension={EXTENSION} "
+            f"route_library={ROUTE_LIB}",
+            flush=True,
+        )
+        return
     if args.implementation == "multiroute":
         select_routes(args)
     elif args.implementation in ("explicit", "standard", "prepared"):

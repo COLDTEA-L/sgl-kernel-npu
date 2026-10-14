@@ -103,6 +103,33 @@ class RuntimeSetupTests(unittest.TestCase):
                     [mock.call(str(route), mode=ctypes.RTLD_GLOBAL)] * 2)
                 execute.assert_not_called()
 
+    def test_prepare_runtime_searches_user_site(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            user_site = root / "user-site"
+            package = user_site / "deep_ep"
+            package.mkdir(parents=True)
+            extension = package / "deep_ep_cpp.fake.so"
+            extension.touch()
+            route = root / "route/liba5_ccu_urma_route_probe.so"
+            route.parent.mkdir()
+            route.touch()
+            caller = root / "repo/tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py"
+            environment = {
+                "A5_CCU_ROUTE_PROBE_LIB": str(route),
+                "LD_LIBRARY_PATH": str(route.parent),
+            }
+            with mock.patch("a5_ccu_test_runtime.site.getsitepackages", return_value=[]), \
+                 mock.patch("a5_ccu_test_runtime.site.getusersitepackages",
+                            return_value=str(user_site)), \
+                 mock.patch.dict(os.environ, environment, clear=True), \
+                 mock.patch.object(sys, "path", []), \
+                 mock.patch("a5_ccu_test_runtime.ctypes.CDLL") as load, \
+                 mock.patch("a5_ccu_test_runtime.os.execvpe") as execute:
+                self.assertEqual(prepare_runtime(caller), (extension, route))
+                load.assert_called_once_with(str(route), mode=ctypes.RTLD_GLOBAL)
+                execute.assert_not_called()
+
     def test_measurement_rendezvous_has_a_single_shared_start_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:

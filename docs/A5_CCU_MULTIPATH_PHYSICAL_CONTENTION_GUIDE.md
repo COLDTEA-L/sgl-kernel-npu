@@ -56,6 +56,7 @@ git switch "${BRANCH}"
 git merge --ff-only "origin/${BRANCH}"
 python3 tests/python/deepep/test_a5_ccu_path_contention_cpu.py
 python3 tests/python/deepep/test_a5_ccu_path_contention_analyzer_cpu.py
+python3 tests/python/deepep/test_a5_ccu_test_runtime_cpu.py
 bash scripts/run_a5_ccu_multipath_contention.sh --help
 )
 ```
@@ -63,11 +64,18 @@ bash scripts/run_a5_ccu_multipath_contention.sh --help
 这是Python、Shell和分析器改动，不含新的C++内核。实验机需要已经安装与基线分支
 `feature/a5-ccu-copy-comm-overlap`匹配的DeepEP扩展及route library。
 
+正式runner还会在解析拓扑、初始化设备和创建通信域之前自动执行一次真实runtime预检。
+成功时会打印`CASE_TEST_EXTENSION`和`MULTIPATH_RUNTIME_VERIFIED`，确认当前`python3`选中的
+DeepEP包、`deep_ep_cpp`二进制及route library来自同一套可用环境。预检失败不会占卡。
+
 仓库源码中不要求存在
 `python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash`。它是构建或安装阶段的生成文件，
 不属于Git checkout。runner只加载CANN环境；每个worker会通过`a5_ccu_test_runtime.py`从当前
 Python解释器实际安装的`deep_ep`包定位扩展、custom OPP和route library，并在导入torch前
-补齐环境。若wheel或route library没有安装，worker会直接报告缺少的组件，不会误用源码目录。
+补齐环境。bootstrap同时搜索系统site-packages、user site、当前解释器的`sys.path`以及本仓
+源码构建目录；加载时将包内extension注册为`deep_ep_cpp`和`deep_ep.deep_ep_cpp`同一个模块，
+兼容旧wheel的顶层导入和新版相对导入。若仍失败，错误会列出实际Python解释器和全部搜索
+目录，而不是只显示模糊的module-not-found。
 
 ## 3. 首次短测
 

@@ -71,8 +71,22 @@ def prepare_runtime(entrypoint, require_route_library=True):
     or import an executable benchmark to obtain its runtime setup.
     """
     entrypoint = Path(entrypoint).resolve()
-    packages = [Path(path) / "deep_ep" for path in site.getsitepackages()]
-    packages.append(entrypoint.parents[3] / "python/deep_ep/deep_ep")
+    roots = list(site.getsitepackages())
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str):
+        roots.append(user_site)
+    else:
+        roots.extend(user_site)
+    roots.extend(path for path in sys.path if path)
+    roots.append(entrypoint.parents[3] / "python/deep_ep")
+    packages = []
+    seen = set()
+    for root in roots:
+        package = Path(root).resolve() / "deep_ep"
+        key = str(package)
+        if key not in seen:
+            seen.add(key)
+            packages.append(package)
     explicit = os.environ.get("A5_CCU_ROUTE_PROBE_LIB")
     if explicit and not Path(explicit).is_file():
         raise RuntimeError(f"configured route library does not exist: {explicit}")
@@ -119,4 +133,8 @@ def prepare_runtime(entrypoint, require_route_library=True):
         print(f"CASE_TEST_RUNTIME entrypoint={entrypoint} route={route_lib} "
               f"extension={extensions[0].resolve()} load=before_torch,RTLD_GLOBAL", flush=True)
         return extensions[0].resolve(), route_lib
-    raise RuntimeError("deep_ep_cpp not found; install the DeepEP wheel")
+    searched = ", ".join(str(package) for package in packages)
+    raise RuntimeError(
+        f"deep_ep_cpp not found for interpreter {sys.executable}; searched: {searched}; "
+        "install the DeepEP wheel into this interpreter or build the source package"
+    )

@@ -105,6 +105,11 @@ export PYTHONUNBUFFERED=1
 unset ASCEND_LAUNCH_BLOCKING A5_CCU_SOURCE_ROUTE_MANIFEST A5_CCU_SOURCE_ROUTE_PROVIDER
 unset A5_CCU_SYNTHETIC_ROUTE_MANIFEST A5_CCU_PATH_UIDS A5_CCU_ROUTE_INDICES A5_CCU_ROUTE_INDEX
 
+# Validate the actual Python package, extension and route-library pair before
+# resolving topology or creating any device communicator.
+python3 tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
+    --implementation prepared --runtime-check
+
 mkdir -p "$output_root"
 run_dir=$(mktemp -d "${output_root}/a5_path_contention_2_3_4_5_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "$run_dir/manifests" "$run_dir/logs" "$run_dir/traces" "$run_dir/profiles"
