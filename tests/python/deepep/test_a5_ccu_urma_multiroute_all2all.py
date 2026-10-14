@@ -3,6 +3,7 @@
 
 import argparse
 import ctypes
+from contextlib import nullcontext
 import faulthandler
 import json
 import os
@@ -12,6 +13,11 @@ import time
 from pathlib import Path
 from a5_ccu_test_runtime import prepare_runtime as shared_prepare_runtime
 from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
+from a5_ccu_path_contention_support import (
+    contention_measurement_start,
+    safe_name,
+    write_iteration_trace,
+)
 
 os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
 CURRENT_PHASE = "module_import"
@@ -167,6 +173,12 @@ def parse_args():
     )
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument("--profile-root", default="/home/l00934901/profiling")
+    parser.add_argument("--trace-job", default="",
+                        help="stable P/Q label written into per-iteration trace files")
+    parser.add_argument("--iteration-trace-dir", default="",
+                        help="write rank0/rank1 host-monotonic intervals as JSON")
+    parser.add_argument("--contention-sync-dir", default="",
+                        help="shared directory used to release jobs P and Q together")
     parser.add_argument(
         "--compile-backend",
         choices=("none", "eager", "aot_eager", "npu", "npugraphs", "npugraph_ex", "inductor", "aclgraph"),
@@ -188,6 +200,17 @@ def parse_args():
             "profiling measures the same formal iterations as --iters; "
             "set --profile-iters equal to --iters"
         )
+    if args.trace_job:
+        try:
+            safe_name(args.trace_job)
+        except ValueError as error:
+            parser.error(str(error))
+    if bool(args.iteration_trace_dir) != bool(args.trace_job):
+        parser.error("--iteration-trace-dir and --trace-job must be supplied together")
+    if args.contention_sync_dir and args.trace_job not in ("P", "Q"):
+        parser.error("--contention-sync-dir requires --trace-job P or Q")
+    if args.iteration_trace_dir and args.implementation != "prepared":
+        parser.error("per-iteration contention traces require --implementation prepared")
     if args.implementation == "native" and args.schedule != "concurrent":
         parser.error("--schedule applies only to --implementation multiroute")
     if args.compile_backend != "none" and args.implementation not in ("prepared", "standard"):
@@ -428,6 +451,8 @@ def main():
             flush=True,
         )
 
+    iteration_records = []
+
     def run_repeated(count, stage):
         for index in range(count):
             if args.validate_every_iteration:
@@ -437,9 +462,26 @@ def main():
                 send.add_(17)
                 expected.add_(17)
                 recv.fill_(-128)
-            run_op()
-            if complete_each_invocation:
-                torch.npu.synchronize()
+            trace_iteration = stage == "measure" and bool(args.iteration_trace_dir)
+            started_ns = time.monotonic_ns() if trace_iteration else None
+            marker = (
+                torch.autograd.profiler.record_function(
+                    f"A5_PATH_CONTENTION_{args.trace_job}_ITER_{index + 1:04d}"
+                )
+                if trace_iteration and args.profile else nullcontext()
+            )
+            with marker:
+                run_op()
+                if complete_each_invocation:
+                    torch.npu.synchronize()
+            if trace_iteration:
+                ended_ns = time.monotonic_ns()
+                iteration_records.append({
+                    "iteration": index + 1,
+                    "started_ns": started_ns,
+                    "ended_ns": ended_ns,
+                    "duration_us": (ended_ns - started_ns) / 1000.0,
+                })
             if args.validate_every_iteration:
                 try:
                     check_result()
@@ -576,7 +618,12 @@ def main():
         mark_phase("timing")
     try:
         torch.npu.synchronize()
-        start_lateness_us = measurement_start(sync_dir, rank, world_size)
+        if args.contention_sync_dir:
+            start_lateness_us = contention_measurement_start(
+                args.contention_sync_dir, args.trace_job, rank, world_size
+            )
+        else:
+            start_lateness_us = measurement_start(sync_dir, rank, world_size)
         begin = time.perf_counter()
         run_repeated(args.iters, "measure")
         torch.npu.synchronize()
@@ -586,6 +633,22 @@ def main():
             profiler.stop()
             print(f"[rank={rank}] profiling={profile_dir.resolve()}", flush=True)
     check_result()
+
+    if args.iteration_trace_dir:
+        trace_path = write_iteration_trace(
+            args.iteration_trace_dir,
+            args.trace_job,
+            rank,
+            {
+                "bytes_per_peer": args.bytes,
+                "iterations": args.iters,
+                "implementation": args.implementation,
+                "profile_enabled": bool(args.profile),
+                "start_lateness_us": start_lateness_us,
+            },
+            iteration_records,
+        )
+        print(f"CASE_ITERATION_TRACE rank={rank} path={trace_path}", flush=True)
 
     (sync_dir / f"average.rank{rank}.json").write_text(json.dumps(average_us))
     file_barrier(sync_dir, "timing_results", rank, world_size)
@@ -613,6 +676,8 @@ def main():
             "compile_backend": args.compile_backend,
             "measurement_mode": measurement_mode,
             "measurement_start_lateness_us": start_lateness_us,
+            "trace_job": args.trace_job,
+            "iteration_trace_dir": args.iteration_trace_dir,
         }
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
         print(f"PASS: implementation={result['implementation']} paths={result['paths']} "
