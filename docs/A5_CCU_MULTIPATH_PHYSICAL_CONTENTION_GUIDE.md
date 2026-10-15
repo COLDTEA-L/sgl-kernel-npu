@@ -22,6 +22,23 @@ runner会强制设置`A5_CCU_SELF_COPY_MODE=ccu`和
 分析器不仅比较卡号，还强制比较两份manifest中的UDie、port和topology edge；EID允许不同，
 但物理端口不相同会直接判定实验无效。
 
+表中卡号是默认配置，不是runner硬编码。可以通过`--p-devices A,B --p-relay C`和
+`--q-devices C,D --q-relay A`选择任意四张物理卡。两个作业的端点集合必须互不重叠，
+并且P的relay必须是Q的第一个端点、Q的relay必须是P的第一个端点；这样共享方向自动记为
+`A→C`和`C→A`。例如卡2、3、6、7使用：
+
+```text
+P：端点2、3，relay6
+Q：端点6、7，relay2
+共享方向：2→6、6→2
+```
+
+对应参数为：
+
+```bash
+--p-devices 2,3 --p-relay 6 --q-devices 6,7 --q-relay 2
+```
+
 尺寸参数表示每个 peer slice 的字节数，默认取：
 
 ```text
@@ -89,7 +106,7 @@ Python解释器实际安装的`deep_ep`包定位扩展、custom OPP和route libr
 
 ## 3. 首次短测
 
-先确认物理卡2、3、4、5均空闲。短测仅使用16KiB，并显式关闭MindStudio profiler：
+先确认所选的四张物理卡均空闲。短测仅使用16KiB，并显式关闭MindStudio profiler：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -106,6 +123,8 @@ bash scripts/run_a5_ccu_multipath_contention.sh \
 manifests/P.tsv   # 2→4→3
 manifests/Q.tsv   # 4→2→5
 ```
+
+以上注释对应默认卡号；自定义卡号时manifest会按命令行端点和relay动态生成。
 
 如果拓扑存在多个同卡relay候选，解析器会拒绝猜测。根据报错使用
 `--p-relay-plane 0|1`、`--q-relay-plane 0|1`明确指定，不要随意选择。

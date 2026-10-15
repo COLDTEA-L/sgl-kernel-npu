@@ -22,6 +22,34 @@ HCCL_BUFFER_MIN_MB = 200
 HCCL_BUFFER_HEADROOM_MB = 64
 
 
+def parse_device_pair(text, name):
+    items = str(text).split(",")
+    if (len(items) != 2 or len(set(items)) != 2 or
+            any(not item.isdecimal() for item in items)):
+        raise ValueError(f"{name} must contain two distinct physical card IDs")
+    return tuple(map(int, items))
+
+
+def validate_contention_devices(p_devices, p_relay, q_devices, q_relay):
+    """Validate two disjoint jobs whose relays are endpoints of the peer job."""
+    p = parse_device_pair(p_devices, "--p-devices")
+    q = parse_device_pair(q_devices, "--q-devices")
+    relay_text = (str(p_relay), str(q_relay))
+    if any(not value.isdecimal() for value in relay_text):
+        raise ValueError("relay IDs must be nonnegative integers")
+    p_relay_id, q_relay_id = map(int, relay_text)
+    if set(p) & set(q):
+        raise ValueError("P and Q endpoint cards must be disjoint")
+    if p_relay_id in p or q_relay_id in q:
+        raise ValueError("a relay cannot also be an endpoint of its own job")
+    if p_relay_id != q[0] or q_relay_id != p[0]:
+        raise ValueError(
+            "contention requires P relay to equal Q's first endpoint and "
+            "Q relay to equal P's first endpoint"
+        )
+    return p, p_relay_id, q, q_relay_id
+
+
 def format_size_label(byte_count):
     """Return a path-safe binary-size label using the requested KB/MB spelling."""
     if not isinstance(byte_count, int) or byte_count <= 0:

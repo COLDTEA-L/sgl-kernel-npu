@@ -351,7 +351,7 @@ def route_directions(row):
 
 
 def shared_link_identity(p_row, q_row):
-    """Require P's 2--4 first edge to be Q's 4--2 first edge in reverse.
+    """Require P's source--relay edge to be Q's source--relay edge in reverse.
 
     EIDs may differ between jobs.  Physical card, UDie and port identities may not.
     """
@@ -365,15 +365,19 @@ def shared_link_identity(p_row, q_row):
         and p_row["src_edge"] == q_row["src_edge"]
     )
     if not matches:
+        p_src = int(p_row["src_phy"])
+        p_relay = int(p_row["relay_phy"])
         raise RuntimeError(
-            "P and Q resolve card 2<->4 through different physical UDie/ports; "
+            f"P and Q resolve card {p_src}<->{p_relay} through different physical UDie/ports; "
             "select relay planes that identify one shared physical edge"
         )
     return {
-        "card2_udie": int(p_row["src_die"]),
-        "card2_port": int(p_row["src_port"]),
-        "card4_udie": int(p_row["relay_die"]),
-        "card4_port": int(p_row["relay_port_from_src"]),
+        "p_source_phy": int(p_row["src_phy"]),
+        "p_source_udie": int(p_row["src_die"]),
+        "p_source_port": int(p_row["src_port"]),
+        "p_relay_phy": int(p_row["relay_phy"]),
+        "p_relay_udie": int(p_row["relay_die"]),
+        "p_relay_port": int(p_row["relay_port_from_src"]),
         "topology_edge": p_row["src_edge"],
     }
 

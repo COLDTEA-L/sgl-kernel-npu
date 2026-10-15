@@ -13,6 +13,7 @@ from a5_ccu_path_contention_support import (
     parse_sizes,
     resolve_hccl_buffer_mb,
     safe_name,
+    validate_contention_devices,
 )
 
 
@@ -45,6 +46,25 @@ class PathContentionSupportTest(unittest.TestCase):
             safe_name("P/Q")
         self.assertEqual(overlap_ns((0, 10), (4, 12)), 6)
         self.assertEqual(overlap_ns((0, 3), (3, 8)), 0)
+
+    def test_parameterized_contention_devices(self):
+        self.assertEqual(
+            validate_contention_devices("2,3", "6", "6,7", "2"),
+            ((2, 3), 6, (6, 7), 2),
+        )
+        self.assertEqual(
+            validate_contention_devices("0,1", "4", "4,5", "0"),
+            ((0, 1), 4, (4, 5), 0),
+        )
+        for values in (
+            ("2,2", "6", "6,7", "2"),
+            ("2,3", "6", "3,7", "2"),
+            ("2,3", "5", "6,7", "2"),
+            ("2,3", "6", "6,7", "5"),
+            ("2,3", "7", "6,7", "2"),
+        ):
+            with self.assertRaises(ValueError):
+                validate_contention_devices(*values)
 
     def test_four_rank_release(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +126,9 @@ class PathContentionSupportTest(unittest.TestCase):
         self.assertIn('--suite-sizes "$sizes"', runner)
         self.assertIn('--plan-id "path-contention-${job}-persistent"', runner)
         self.assertIn('SIZE_COMPLETE size=', runner)
+        self.assertNotIn('intentionally pinned', runner)
+        self.assertIn('resolve_manifest "$p_src" "$p_dst"', runner)
+        self.assertIn('resolve_manifest "$q_src" "$q_dst"', runner)
 
     def test_failure_diagnostics_preserve_the_first_hccl_status(self):
         root = Path(__file__).resolve().parents[3]

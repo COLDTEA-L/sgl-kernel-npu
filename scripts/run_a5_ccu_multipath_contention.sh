@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two prepared direct+relay AllToAll jobs sharing physical directions 2->4 and 4->2.
+# Two prepared direct+relay AllToAll jobs sharing a pair of physical directions.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -48,7 +48,8 @@ while (($#)); do
         --output-root) output_root=$2; shift 2;;
         --cann-root) cann_root=$2; shift 2;;
         --help)
-            echo 'A5 direct+relay contention: P=2,3 relay4; Q=4,5 relay2.'
+            echo 'A5 direct+relay contention; defaults: P=2,3 relay4; Q=4,5 relay2.'
+            echo "P/Q endpoints must be disjoint; each relay must be the other job's first endpoint."
             echo 'Defaults: 16KiB,64KiB,256KiB,1MiB,4MiB,16MiB,64MiB,256MiB; warmup=10 iters=100 repeats=1.'
             echo 'Data plane is fixed to CCU GroupCopy8x32K self-copy and baseline Channel synchronization; D2D overlap/packed modes are rejected.'
             echo 'P/Q workers, process groups and prepared plans stay alive across every requested size and phase.'
@@ -65,22 +66,14 @@ python3 - "$repo_root" "$p_devices" "$p_relay" "$q_devices" "$q_relay" \
 import sys
 repo, p_devices, p_relay, q_devices, q_relay, p_plane, q_plane, sizes, weights, warmup, iters, repeats, timeout, hccl_buffer = sys.argv[1:]
 sys.path.insert(0, repo + "/tests/python/deepep")
-from a5_ccu_path_contention_support import parse_sizes, resolve_hccl_buffer_mb
+from a5_ccu_path_contention_support import (
+    parse_sizes, resolve_hccl_buffer_mb, validate_contention_devices,
+)
 
-def pair(text, name):
-    items = text.split(',')
-    if len(items) != 2 or len(set(items)) != 2 or any(not item.isdecimal() for item in items):
-        raise SystemExit(f"{name} must contain two distinct physical card IDs")
-    return tuple(map(int, items))
-
-p = pair(p_devices, "--p-devices")
-q = pair(q_devices, "--q-devices")
-if not p_relay.isdecimal() or not q_relay.isdecimal():
-    raise SystemExit("relay IDs must be nonnegative integers")
-if int(p_relay) in p or int(q_relay) in q:
-    raise SystemExit("a relay cannot also be an endpoint of its own job")
-if p != (2, 3) or q != (4, 5) or int(p_relay) != 4 or int(q_relay) != 2:
-    raise SystemExit("this first experiment is intentionally pinned to P=2,3/relay4 and Q=4,5/relay2")
+try:
+    validate_contention_devices(p_devices, p_relay, q_devices, q_relay)
+except ValueError as error:
+    raise SystemExit(str(error)) from error
 if p_plane not in ("all", "0", "1") or q_plane not in ("all", "0", "1"):
     raise SystemExit("relay plane must be all, 0 or 1")
 parsed_sizes = parse_sizes(sizes)
@@ -118,7 +111,9 @@ python3 tests/python/deepep/test_a5_ccu_urma_multiroute_all2all.py \
     --channel-sync-mode "$channel_sync_mode" --runtime-check
 
 mkdir -p "$output_root"
-run_dir=$(mktemp -d "${output_root}/a5_path_contention_2_3_4_5_$(date +%Y%m%d_%H%M%S).XXXXXX")
+IFS=',' read -r p_src p_dst <<<"$p_devices"
+IFS=',' read -r q_src q_dst <<<"$q_devices"
+run_dir=$(mktemp -d "${output_root}/a5_path_contention_${p_src}_${p_dst}_${q_src}_${q_dst}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "$run_dir/manifests" "$run_dir/logs" "$run_dir/traces" "$run_dir/profiles"
 
 format_size_label() {
@@ -152,8 +147,8 @@ resolve_manifest() {
         --src-phy "$src" --dst-phy "$dst" --relay-phys "$relay" \
         --relay-planes "$plane" --weights 1 >"$output"
 }
-resolve_manifest 2 3 "$p_relay" "$p_relay_plane" "$run_dir/manifests/P.tsv"
-resolve_manifest 4 5 "$q_relay" "$q_relay_plane" "$run_dir/manifests/Q.tsv"
+resolve_manifest "$p_src" "$p_dst" "$p_relay" "$p_relay_plane" "$run_dir/manifests/P.tsv"
+resolve_manifest "$q_src" "$q_dst" "$q_relay" "$q_relay_plane" "$run_dir/manifests/Q.tsv"
 
 IFS=',' read -ra size_array <<<"$sizes"
 suite_hccl_buffsize_mb=0
@@ -166,19 +161,24 @@ echo "PERSISTENT_ENVIRONMENT sizes=${#size_array[@]} HCCL_BUFFSIZE_MB=${suite_hc
 python3 - "$run_dir" "$sizes" "$warmup" "$iterations" "$repeats" \
     "$weights" "$mindstudio_profile" "$p_relay_plane" "$q_relay_plane" \
     "$hccl_buffsize_mb" "$repo_root" "$self_copy_mode" "$channel_sync_mode" \
-    "$suite_hccl_buffsize_mb" <<'PY'
+    "$suite_hccl_buffsize_mb" "$p_devices" "$p_relay" "$q_devices" "$q_relay" <<'PY'
 import json, pathlib, sys
-root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo, self_copy, channel_sync, suite_buffer = sys.argv[1:]
+root, sizes, warmup, iterations, repeats, weights, profile, p_plane, q_plane, hccl_buffer, repo, self_copy, channel_sync, suite_buffer, p_devices, p_relay, q_devices, q_relay = sys.argv[1:]
 sys.path.insert(0, repo + "/tests/python/deepep")
-from a5_ccu_path_contention_support import resolve_hccl_buffer_mb
+from a5_ccu_path_contention_support import resolve_hccl_buffer_mb, validate_contention_devices
 size_values = list(map(int, sizes.split(',')))
+p, p_relay_id, q, q_relay_id = validate_contention_devices(
+    p_devices, p_relay, q_devices, q_relay
+)
 settings = dict(
     experiment="two_prepared_multipath_jobs_shared_directed_hops",
     jobs={
-        "P": {"endpoints": [2, 3], "relay": 4, "relay_plane": p_plane},
-        "Q": {"endpoints": [4, 5], "relay": 2, "relay_plane": q_plane},
+        "P": {"endpoints": list(p), "relay": p_relay_id, "relay_plane": p_plane},
+        "Q": {"endpoints": list(q), "relay": q_relay_id, "relay_plane": q_plane},
     },
-    expected_shared_physical_directions=["2->4", "4->2"],
+    expected_shared_physical_directions=[
+        f"{q_relay_id}->{p_relay_id}", f"{p_relay_id}->{q_relay_id}"
+    ],
     sizes=size_values, weights=list(map(int, weights.split(','))),
     warmup=int(warmup), iterations=int(iterations), repeats=int(repeats),
     mindstudio_profile=bool(int(profile)), implementation="prepared",
