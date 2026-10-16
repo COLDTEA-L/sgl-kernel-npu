@@ -5,6 +5,7 @@ import argparse
 import ctypes
 from contextlib import nullcontext
 import faulthandler
+from functools import partial
 import json
 import os
 import re
@@ -15,13 +16,16 @@ from a5_ccu_test_runtime import (
     import_deep_ep as shared_import_deep_ep,
     prepare_runtime as shared_prepare_runtime,
 )
-from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
+from a5_ccu_peer_test_support import (
+    file_barrier, make_profiler, measurement_start, validate_queued_calls,
+)
 from a5_ccu_path_contention_support import (
     contention_file_barrier,
     contention_measurement_start,
     format_size_label,
     parse_sizes,
     safe_name,
+    suite_phases,
     write_iteration_trace,
 )
 
@@ -178,6 +182,8 @@ def parse_args():
     parser.add_argument("--suite-repeats", type=int, default=1)
     parser.add_argument("--suite-job", choices=("P", "Q"), default="")
     parser.add_argument("--suite-run-dir", default="")
+    parser.add_argument("--suite-mode", choices=("solo", "resident", "contention"),
+                        default="contention")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32", "int8", "int32"),
                         default="float32", help="operator infers dtype from the input tensor")
     parser.add_argument("--route-index", type=int, default=0)
@@ -354,10 +360,14 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
     job = args.suite_job
     dtype = getattr(torch, args.dtype)
     element_size = torch.empty((), dtype=dtype).element_size()
-    suite_sync = run_dir / "sync" / "persistent_suite"
+    scope = f"solo_{job}" if args.suite_mode == "solo" else args.suite_mode
+    suite_sync = run_dir / "sync" / "persistent_suite" / scope
 
     def global_barrier(case_root, tag):
-        contention_file_barrier(case_root, tag, job, rank, world_size)
+        if args.suite_mode == "solo":
+            file_barrier(case_root, tag, rank, world_size)
+        else:
+            contention_file_barrier(case_root, tag, job, rank, world_size)
 
     for size in sizes:
         if size % element_size:
@@ -376,12 +386,13 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
             expected[src].fill_(float(src * 100 + rank + 1))
         torch.npu.synchronize()
 
-        def check_result(phase):
+        def check_result(phase, output=None):
+            output = recv if output is None else output
             try:
-                torch.testing.assert_close(recv, expected, rtol=0, atol=0)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
             except AssertionError:
                 mismatch_by_row = torch.count_nonzero(
-                    recv != expected, dim=1
+                    output != expected, dim=1
                 ).detach().cpu().tolist()
                 print(
                     f"CASE_DATA_DIAGNOSTIC rank={rank} phase={phase} "
@@ -390,24 +401,43 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                 )
                 raise
 
-        def run_op(phase, stage, iteration, repeat):
-            try:
-                buffer.ccu_urma_prepared_multipath_alltoall_policy_out(
-                    send, recv, plan_handle, explicit_weights
-                )
-            except Exception as error:
-                context = (
-                    f"job={job} rank={rank} size={size_label} repeat={repeat} "
-                    f"phase={phase} stage={stage} iteration={iteration}"
-                )
-                print(
-                    f"CASE_EXECUTE_ERROR {context} "
-                    f"exception_type={type(error).__name__} exception={error!r}",
-                    flush=True,
-                )
-                raise RuntimeError(
-                    f"prepared multipath execution failed: {context}"
-                ) from error
+        # Bind everything once. In both warmup and measurement the loop body
+        # is only launch(), matching the overlap branch's batch perf harness.
+        launch = partial(buffer.ccu_urma_prepared_multipath_alltoall_policy_out,
+                         send, recv, plan_handle, explicit_weights)
+
+        def report_failure(error, phase, stage, iteration, repeat):
+            context = (
+                f"job={job} rank={rank} size={size_label} repeat={repeat} "
+                f"phase={phase} stage={stage} iteration={iteration}"
+            )
+            print(f"CASE_EXECUTE_ERROR {context} "
+                  f"exception_type={type(error).__name__} exception={error!r}", flush=True)
+            return RuntimeError(f"prepared multipath execution failed: {context}")
+
+        def validate_batch(phase):
+            # Bounded two-call gate, outside warmup/profiling. Distinct full
+            # snapshots reject stale/omitted calls while reusing send/recv.
+            snapshots = [torch.empty_like(recv) for _ in range(2)]
+            def prepare(index):
+                for dst in range(world_size):
+                    send[dst].fill_(float(rank * 100 + dst + 1 + (index + 1) * 11))
+                recv.fill_(-128)
+            def snapshot(index):
+                snapshots[index].copy_(recv)
+            def check(index):
+                for src in range(world_size):
+                    expected[src].fill_(float(src * 100 + rank + 1 + (index + 1) * 11))
+                check_result(phase, snapshots[index])
+            torch.npu.synchronize()
+            validate_queued_calls(prepare, launch, snapshot, torch.npu.synchronize, check, 2)
+            for dst in range(world_size):
+                send[dst].fill_(float(rank * 100 + dst + 1))
+            for src in range(world_size):
+                expected[src].fill_(float(src * 100 + rank + 1))
+            torch.npu.synchronize()
+            print(f"CASE_BATCH_VALIDATION job={job} rank={rank} phase={phase} "
+                  f"size={size_label} calls=2 every_snapshot_checked=1 status=PASS", flush=True)
 
         for repeat in range(1, args.suite_repeats + 1):
             case_root = suite_sync / f"size_{size_label}" / f"repeat_{repeat}"
@@ -415,8 +445,8 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
             profile_root = run_dir / "profiles" / f"size_{size_label}" / f"repeat_{repeat}"
             status_root = run_dir / "status" / f"size_{size_label}" / f"repeat_{repeat}"
 
-            for phase in ("baseline_P", "baseline_Q", "concurrent_PQ"):
-                active = phase == f"baseline_{job}" or phase == "concurrent_PQ"
+            for phase in suite_phases(args.suite_mode, job):
+                active = phase in (f"baseline_{job}", f"solo_baseline_{job}", "concurrent_PQ")
                 phase_tag = safe_name(f"{phase}_r{repeat}_{size_label}")
                 global_barrier(case_root, f"{phase_tag}_begin")
                 if active:
@@ -424,14 +454,18 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                     trace_dir = trace_root / case_path
                     status_dir = status_root / case_path
                     profile_dir = profile_root / case_path / f"rank{rank}"
+                    validate_batch(phase)
                     mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_warmup")
-                    for index in range(args.warmup):
-                        run_op(phase, "warmup", index + 1, repeat)
-                    torch.npu.synchronize()
+                    index = -1
+                    try:
+                        for index in range(args.warmup):
+                            launch()
+                        torch.npu.synchronize()
+                    except Exception as error:
+                        raise report_failure(error, phase, "warmup", index + 1, repeat) from error
                     check_result(phase)
 
                     profiler = None
-                    iteration_records = []
                     if args.profile:
                         mark_phase(f"suite_{size_label}_repeat_{repeat}_{phase}_{job}_profiling")
                         profiler = make_profiler(profile_dir, rank)
@@ -448,26 +482,14 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                             start_lateness_us = measurement_start(
                                 case_root / f"{phase}_start", rank, world_size
                             )
+                        index = -1
                         batch_started_ns = time.monotonic_ns()
                         for index in range(args.iters):
-                            started_ns = time.monotonic_ns()
-                            marker = (
-                                torch.autograd.profiler.record_function(
-                                    f"A5_PATH_CONTENTION_{job}_ITER_{index + 1:04d}"
-                                ) if args.profile else nullcontext()
-                            )
-                            with marker:
-                                run_op(phase, "measure", index + 1, repeat)
-                            ended_ns = time.monotonic_ns()
-                            iteration_records.append({
-                                "iteration": index + 1,
-                                "started_ns": started_ns,
-                                "ended_ns": ended_ns,
-                                "duration_us": (ended_ns - started_ns) / 1000.0,
-                                "timing_semantics": "host_submission_only",
-                            })
+                            launch()
                         torch.npu.synchronize()
                         batch_ended_ns = time.monotonic_ns()
+                    except Exception as error:
+                        raise report_failure(error, phase, "measure", index + 1, repeat) from error
                     finally:
                         if profiler is not None:
                             profiler.stop()
@@ -486,7 +508,11 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                             "self_copy_mode": args.self_copy_mode,
                             "channel_sync_mode": args.channel_sync_mode,
                             "completion_mode": args.completion_mode,
-                            "iteration_timing_semantics": "host_submission_only",
+                            "iteration_timing_semantics": "batch_only",
+                            "loop_body": "launch_only",
+                            "pid": os.getpid(),
+                            "suite_mode": args.suite_mode,
+                            "batch_validation": "PASS",
                             "batch_started_ns": batch_started_ns,
                             "batch_ended_ns": batch_ended_ns,
                             "batch_total_us": batch_total_us,
@@ -495,7 +521,7 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                             "profile_scope": "measure_only_after_warmup",
                             "start_lateness_us": start_lateness_us,
                         },
-                        iteration_records,
+                        [],
                     )
                     status_dir.mkdir(parents=True, exist_ok=True)
                     status_path = status_dir / f"rank{rank}.json"
@@ -523,8 +549,8 @@ def run_persistent_contention_suite(args, buffer, plan_handle, rank, world_size,
                 global_barrier(case_root, f"{phase_tag}_done")
 
             global_barrier(case_root, f"size_{size_label}_repeat_{repeat}_complete_pre")
-            if job == "P" and rank == 0:
-                progress_dir = run_dir / "progress"
+            if rank == 0 and (job == "P" or args.suite_mode == "solo"):
+                progress_dir = run_dir / "progress" / scope
                 progress_dir.mkdir(parents=True, exist_ok=True)
                 progress_path = progress_dir / f"size_{size_label}_repeat_{repeat}.json"
                 progress_tmp = progress_path.with_suffix(f".pid{os.getpid()}.tmp")

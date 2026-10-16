@@ -59,13 +59,17 @@ def load_collective_batch(directory, expected_iterations):
             raise RuntimeError(f"missing batch trace: {path}")
         document = json.loads(path.read_text())
         records = document.get("records", [])
-        if len(records) != expected_iterations:
+        batch_only = document.get("iteration_timing_semantics") == "batch_only"
+        if batch_only and (records or document.get("iterations") != expected_iterations or
+                           document.get("loop_body") != "launch_only"):
+            raise RuntimeError(f"invalid launch-only batch metadata: {path}")
+        if not batch_only and len(records) != expected_iterations:
             raise RuntimeError(
                 f"{path} has {len(records)} submissions, expected {expected_iterations}"
             )
         if document.get("completion_mode") != "batch":
             raise RuntimeError(f"{path} is not a batch-completion trace")
-        if document.get("iteration_timing_semantics") != "host_submission_only":
+        if not batch_only and document.get("iteration_timing_semantics") != "host_submission_only":
             raise RuntimeError(f"{path} has invalid batch timing semantics")
         for offset, record in enumerate(records, 1):
             if record.get("iteration") != offset:
@@ -114,8 +118,9 @@ def render_batch_report(settings, shared_directions, link_identity, aggregate):
         "", "## MindStudio counting rule", "",
         "For each job, count a measured device invocation as conflicted only when its CCU/communication task interval "
         "overlaps a measured invocation of the other job on the shared physical direction. Divide that count by the "
-        "measured invocation count. The profiler markers A5_PATH_CONTENTION_<P|Q>_ITER_XXXX identify submissions; "
-        "host marker duration itself is not device duration.", "",
+        "measured invocation count. New runs contain no per-iteration Python markers or timers; "
+        "number the measured CCU launches in order on each rank's execution stream. "
+        "Legacy host markers, when present, are not device intervals.", "",
     ]
     return "\n".join(lines)
 
@@ -310,6 +315,104 @@ def append_submission_rows(output, settings, size, repeat, phase, job, batch):
             })
 
 
+def analyze_baseline_resources(run_dir, settings):
+    """Compare identical launches with and without the other job resident."""
+    from analyze_a5_ccu_local_copy_perf import parse_device
+
+    iterations = int(settings["iterations"])
+    profiled = settings.get("mindstudio_profile", False)
+    cases = []
+    device_complete = bool(profiled)
+    for size in settings["sizes"]:
+        for repeat in range(1, int(settings["repeats"]) + 1):
+            for job in ("P", "Q"):
+                for mode, phase in (("solo", f"solo_baseline_{job}"),
+                                    ("resident", f"baseline_{job}")):
+                    root = trace_size_root(run_dir, size) / f"repeat_{repeat}"
+                    batch = load_collective_batch(root / phase, iterations)
+                    for document in batch["documents"]:
+                        rank = int(document["rank"])
+                        profile_root = (run_dir / "profiles" / f"size_{format_size_label(size)}" /
+                                        f"repeat_{repeat}" / phase / f"rank{rank}")
+                        events, copies, sources = parse_device(profile_root, document.get("pid")) if profiled else ([], 0, [])
+                        accepted = profiled and len(events) == iterations and copies == 0
+                        device_complete = device_complete and accepted
+                        values = [event["duration_us"] for event in events] if accepted else []
+                        cases.append(dict(
+                            bytes_per_peer=size, size_label=format_size_label(size),
+                            repeat=repeat, job=job, rank=rank,
+                            physical_device=settings["jobs"][job]["endpoints"][rank],
+                            mode=mode, host_batch_average_us=float(document["batch_average_us"]),
+                            device_samples=len(events), expected_samples=iterations,
+                            memcpy_samples=copies, device_accepted=accepted,
+                            ccu_min_us=min(values) if values else None,
+                            ccu_median_us=statistics.median(values) if values else None,
+                            ccu_max_us=max(values) if values else None,
+                            sources=sources))
+    rows = []
+    for size in settings["sizes"]:
+        for job in ("P", "Q"):
+            for rank in (0, 1):
+                groups = {mode: [item for item in cases if item["bytes_per_peer"] == size
+                                and item["job"] == job and item["rank"] == rank and item["mode"] == mode]
+                          for mode in ("solo", "resident")}
+                row = dict(bytes_per_peer=size, size_label=format_size_label(size), job=job,
+                           rank=rank, physical_device=settings["jobs"][job]["endpoints"][rank])
+                for mode, group in groups.items():
+                    row[f"{mode}_host_average_us"] = statistics.median(
+                        [item["host_batch_average_us"] for item in group])
+                    accepted = all(item["device_accepted"] for item in group)
+                    for metric in ("min", "median", "max"):
+                        row[f"{mode}_ccu_{metric}_us"] = statistics.median(
+                            [item[f"ccu_{metric}_us"] for item in group]) if accepted else None
+                row["resident_over_solo_host_ratio"] = row["resident_host_average_us"] / row["solo_host_average_us"]
+                row["resident_over_solo_ccu_ratio"] = (
+                    row["resident_ccu_median_us"] / row["solo_ccu_median_us"]
+                    if row["solo_ccu_median_us"] is not None and row["resident_ccu_median_us"] is not None else None)
+                rows.append(row)
+
+    complete = not profiled or device_complete
+    summary = dict(complete=complete, device_profile_complete=device_complete,
+                   experiment_mode="baseline-check", settings=settings, aggregate=rows,
+                   cases=cases, formal_loop_body="launch_only")
+
+    def save(root, size_rows, size_cases, current_settings):
+        root.mkdir(parents=True, exist_ok=True)
+        write_csv(root / "baseline_resource_summary.csv", size_rows, tuple(rows[0]))
+        write_csv(root / "baseline_resource_cases.csv", size_cases, tuple(cases[0]))
+        current = dict(summary, aggregate=size_rows, cases=size_cases, settings=current_settings)
+        (root / "baseline_resource_summary.json").write_text(json.dumps(current, indent=2) + "\n")
+        lines = ["# Baseline resource residency comparison", "",
+                 f"- complete: `{complete}`; device profile complete: `{device_complete}`",
+                 "- solo: only the measured job has endpoint processes, communicators and plans.",
+                 "- resident: both jobs have resources; only the measured job submits work.",
+                 "- paths, weights, dtype, HCCL buffer budget, warmup and formal loop are identical.",
+                 "- no concurrent phase; warmup/queued correctness checks are outside profiling.",
+                 "- host batch average includes submission gaps and final synchronization; compare CCU separately.",
+                 "- ratios describe the whole idle-instance environment (processes + runtime + plans), not a single resource type.", "",
+                 "| size | job | rank/card | solo host us | resident host us | solo CCU median us | resident CCU median us | CCU ratio |",
+                 "|---|---|---|---:|---:|---:|---:|---:|"]
+        for row in size_rows:
+            lines.append(f"| {row['size_label']} | {row['job']} | {row['rank']}/{row['physical_device']} | "
+                         f"{fmt(row['solo_host_average_us'])} | {fmt(row['resident_host_average_us'])} | "
+                         f"{fmt(row['solo_ccu_median_us'])} | {fmt(row['resident_ccu_median_us'])} | "
+                         f"{fmt(row['resident_over_solo_ccu_ratio'])} |")
+        lines += ["", "Missing/extra device tasks are marked incomplete, never replaced by host timing.",
+                  "Inspect both rank profiles and launch gaps; sequential solo/resident runs may also reflect other users' activity.", ""]
+        report = "\n".join(lines)
+        (root / "baseline_resource_report.md").write_text(report)
+        (root / "path_contention_report.md").write_text(report)
+
+    save(run_dir, rows, cases, settings)
+    for size in settings["sizes"]:
+        save(run_dir / "results" / f"size_{format_size_label(size)}",
+             [row for row in rows if row["bytes_per_peer"] == size],
+             [row for row in cases if row["bytes_per_peer"] == size], dict(settings, sizes=[size]))
+    print(json.dumps(dict(complete=complete, experiment_mode="baseline-check",
+                          device_profile_complete=device_complete, aggregate_rows=len(rows))))
+    return summary
+
+
 def render_report(sizes, repeats, iterations, shared_directions, link_identity, aggregate):
     lines = [
         "# A5 multi-path physical-direction contention report", "",
@@ -417,6 +520,8 @@ def load_collective_intervals(directory, expected_iterations):
 
 def analyze(run_dir):
     settings = json.loads((run_dir / "run_settings.json").read_text())
+    if settings.get("experiment_mode") == "baseline-check":
+        return analyze_baseline_resources(run_dir, settings)
     if settings.get("completion_mode") == "batch":
         return analyze_batch(run_dir, settings)
     sizes = [int(item) for item in settings["sizes"]]
@@ -605,7 +710,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True, type=Path)
     args = parser.parse_args()
-    analyze(args.run_dir.resolve())
+    result = analyze(args.run_dir.resolve())
+    if isinstance(result, dict) and not result["complete"]:
+        raise SystemExit("baseline profiles incomplete; inspect baseline_resource_cases.csv")
 
 
 if __name__ == "__main__":

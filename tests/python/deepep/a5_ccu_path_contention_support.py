@@ -22,6 +22,16 @@ HCCL_BUFFER_MIN_MB = 200
 HCCL_BUFFER_HEADROOM_MB = 64
 
 
+def suite_phases(mode, job):
+    if mode == "solo":
+        return (f"solo_baseline_{job}",)
+    if mode == "resident":
+        return ("baseline_P", "baseline_Q")
+    if mode == "contention":
+        return ("baseline_P", "baseline_Q", "concurrent_PQ")
+    raise ValueError(f"unsupported suite mode: {mode}")
+
+
 def parse_device_pair(text, name):
     items = str(text).split(",")
     if (len(items) != 2 or len(set(items)) != 2 or
