@@ -1,5 +1,9 @@
 # 显式多路径 AllToAll：本地 copy 与远端 CCU 并行调度
 
+换机器或从零安装时，先看[新机器部署指南](A5_CCU_MULTIPATH_NEW_MACHINE_DEPLOYMENT.md)。
+先核对CANN/HCOMM旧对象接口、容器透传和本机拓扑/EID，不能直接复用下文旧环境路径与快照。
+新环境验收使用`--self-copy-mode ccu --channel-sync-mode baseline`；packed系列仅保留实验对照。
+
 分支 `feature/a5-ccu-copy-comm-overlap`，基于多类型分支 `2bb77ec`。
 支持两卡 prepared-plan、两/四卡 peer-plan、FP16/BF16/FP32/INT8/INT32。
 默认 `--self-copy-mode overlap`；`serial` 保留原本本地copy后再CCU的对照。
