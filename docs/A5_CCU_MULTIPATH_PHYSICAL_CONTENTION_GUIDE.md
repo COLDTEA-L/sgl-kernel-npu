@@ -75,6 +75,11 @@ send/recv tensor，这个HCCL buffer不是256MiB数据的64份副本。需要复
 
 ## 2. 拉取与入口检查
 
+若从旧 Docker 镜像重新创建容器，先按
+[Docker 恢复与依赖安装指南](A5_CCU_DOCKER_RECOVERY_GUIDE.md)恢复环境。
+本节只更新源码和检查入口，**不会安装 DeepEP wheel 或生成缺失的 route `.so`**；
+出现 stale DeepEP/route library 缺失时，不能通过反复执行本节解决。
+
 实验机只拉取和运行。若tracked工作区不干净则停止，不自动清理或覆盖。
 
 ```bash
