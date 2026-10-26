@@ -19,6 +19,10 @@ struct Variable {
         eval = [left, right](const Env &e) { return left(e) + right(e); }; return *this;
     }
 };
+inline Variable operator!=(const Variable &v, uint64_t value) {
+    Variable result; const auto expr = v.eval;
+    result.eval = [expr, value](const Env &e) { return uint64_t(expr(e) != value); }; return result;
+}
 struct LocalAddr { Variable addr, token; };
 struct RemoteAddr { Variable addr, token; };
 struct CompletedEvent { int id = -1; };
@@ -53,6 +57,18 @@ protected:
     int nextEvent_ = 0;
     virtual HcclResult Algorithm() = 0;
     virtual std::vector<uint64_t> GeneArgs(const CcuTaskArg &) = 0;
+    // Record both branches symbolically; the scheduler evaluates each launch.
+    struct ConditionalScope {
+        CcuKernel *owner;
+        ConditionalScope(CcuKernel *kernel, const CcuRep::Variable &v) : owner(kernel) {
+            Instruction i; i.op="if_begin"; i.len=v; owner->instructions.push_back(i);
+        }
+        ConditionalScope(ConditionalScope &&other) : owner(other.owner) { other.owner=nullptr; }
+        ConditionalScope(const ConditionalScope &) = delete;
+        explicit operator bool() const { return true; }
+        ~ConditionalScope() { if(owner) { Instruction i; i.op="if_end"; owner->instructions.push_back(i); } }
+    };
+    ConditionalScope Conditional(const CcuRep::Variable &v) { return ConditionalScope(this,v); }
     CcuRep::Variable CreateVariable() { return {}; }
     HcclResult CreateVariable(ChannelHandle ch, uint32_t slot, CcuRep::Variable *v) {
         v->eval = [ch, slot](const CcuRep::Env &e) { return e.remote(ch, slot); }; return 0;
@@ -65,8 +81,8 @@ protected:
     CcuRep::RemoteAddr CreateRemoteAddr() { return {}; }
     CcuRep::CompletedEvent CreateCompletedEvent() { return {nextEvent_++}; }
     HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t variable,
-        const CcuRep::Variable &, uint32_t mask) {
-        Instruction i; i.op="record"; i.channel=ch; i.slot=slot; i.mask=mask; i.variable=variable;
+        const CcuRep::Variable &value, uint32_t mask) {
+        Instruction i; i.op="record"; i.channel=ch; i.slot=slot; i.mask=mask; i.variable=variable; i.len=value;
         instructions.push_back(i); return 0;
     }
     HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t mask) {
@@ -93,4 +109,6 @@ protected:
     }
 };
 } // namespace hcomm
+// Mirrors the SDK graph-builder conditional, not a C++ data-dependent branch.
+#define CCU_IF(condition) if (auto ccu_condition = this->Conditional(condition))
 #endif

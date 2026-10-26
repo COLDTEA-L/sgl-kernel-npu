@@ -35,8 +35,8 @@ def load_requested_policy(devices, relay_map=None, relay_phys=None):
 
 
 def validate_policy(devices, available, policy):
-    if len(devices) not in (2, 4) or len(set(devices)) != len(devices):
-        raise ValueError("--devices requires 2 or 4 distinct physical devices")
+    if len(devices) not in (2, 4, 8) or len(set(devices)) != len(devices):
+        raise ValueError("--devices requires 2/4 or direct-only 8 distinct physical devices")
     if any(d < 0 for d in available) or len(set(available)) != len(available) or not set(devices) <= set(available):
         raise ValueError("available device set must be unique and contain communicator")
     if not isinstance(policy, dict):
@@ -49,6 +49,8 @@ def validate_policy(devices, available, policy):
             raise ValueError(f"invalid canonical physical pair {key}")
         if not isinstance(values, list) or len(values) > limit:
             raise ValueError(f"pair {key}: relay count exceeds (N-k)//(k-1)={limit}")
+        if len(devices) == 8 and values:
+            raise ValueError("8-rank plans are direct-only")
         rows, seen = [], set()
         for value in values:
             spec = {"physical_device": value} if isinstance(value, int) else dict(value)

@@ -15,6 +15,11 @@
 
 namespace deep_ep {
 
+torch::Tensor ccu_urma_peer_plan_alltoallv_out_op(const torch::Tensor &, const torch::Tensor &,
+    int64_t, int64_t, const c10::List<int64_t> &);
+torch::Tensor ccu_urma_peer_plan_alltoallv_out_meta(const torch::Tensor &, const torch::Tensor &,
+    int64_t, int64_t, const c10::List<int64_t> &);
+
 torch::Tensor ccu_urma_peer_plan_alltoall_op(const torch::Tensor &, int64_t,
     const c10::List<int64_t> &);
 torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &, int64_t,
@@ -35,6 +40,11 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
     const c10::List<int64_t> &path_weights);
 
 struct Buffer {
+    int64_t prepare_ccu_urma_peer_plan_alltoallv(const std::string &, const std::string &);
+    void bind_ccu_urma_peer_plan_alltoallv(int64_t handle);
+    torch::Tensor ccu_urma_peer_plan_alltoallv_out(const torch::Tensor &, const torch::Tensor &,
+        int64_t, const std::vector<int64_t> &);
+
     int64_t prepare_ccu_urma_peer_plan(const std::string &plan_id,
         const std::string &manifest, int64_t available_cards);
     void bind_ccu_urma_peer_plan(int64_t handle);

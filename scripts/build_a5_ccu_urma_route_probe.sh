@@ -176,6 +176,9 @@ built_library=$(
     exit 1
 }
 required_symbols=(
+    A5CcuAllToAllVAbiVersion
+    HcclCcuUrmaPeerPlanAllToAllVCreate
+    HcclCcuUrmaPeerPlanAllToAllVExecute
     HcclCcuUrmaMultiRouteAllToAll
     HcclCcuUrmaExplicitMultipathPlanCreate
     HcclCcuUrmaExplicitMultipathPlanBindStream
@@ -229,6 +232,12 @@ sync_actual = sync_version()
 print(f"Verified Channel-sync ABI: {sync_actual} ({library_path})")
 if sync_actual < 1:
     raise SystemExit("channel sync ABI is stale; expected >= 1")
+v_version = library.A5CcuAllToAllVAbiVersion
+v_version.restype = ctypes.c_int
+v_actual = v_version()
+print(f"Verified AllToAllV ABI: {v_actual} ({library_path})")
+if v_actual != 1:
+    raise SystemExit("AllToAllV ABI mismatch; expected 1")
 PY
 }
 verify_prepared_plan_abi "${built_library}"

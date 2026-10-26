@@ -1,3 +1,4 @@
+#include "../../examples/a5_ccu_urma_route_probe/common/alltoallv_layout.h"
 #include <memory>
 #include <cstdint>
 #include <cmath>
@@ -819,6 +820,94 @@ torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &send, int64_
     PeerTensorCheck(send, handle);
     PeerWeights(ToWeightVector(weights));
     return torch::empty_like(send);
+}
+
+extern "C" __attribute__((visibility("default"))) int A5DeepEpAllToAllVAbiVersion() { return 1; }
+namespace {
+using AllToAllVExecute = HcclResult (*)(void *, void *, uint64_t, uint64_t, uint64_t, uint32_t,
+    HcclComm, aclrtStream, uint64_t, const uint64_t *, uint32_t);
+struct AllToAllVTensors {
+    std::vector<uint64_t> counts;
+    uint64_t rowBytes;
+};
+AllToAllVTensors CheckAllToAllVTensors(const torch::Tensor &send, const torch::Tensor &recv,
+    int64_t handle, int64_t rank, const std::vector<int64_t> &counts)
+{
+    EP_HOST_ASSERT(handle > 0 && rank >= 0 && rank < 8 && counts.size() == 64);
+    EP_HOST_ASSERT(send.dim() >= 1 && recv.dim() == send.dim() && send.is_contiguous() && recv.is_contiguous());
+    EP_HOST_ASSERT(send.device() == recv.device() && send.scalar_type() == recv.scalar_type());
+    CcuPayloadType(send);
+    AllToAllVTensors result;
+    result.rowBytes = send.element_size();
+    for (int64_t i = 1; i < send.dim(); ++i) {
+        EP_HOST_ASSERT(send.size(i) > 0 && recv.size(i) == send.size(i));
+        EP_HOST_ASSERT(static_cast<uint64_t>(send.size(i)) <= UINT64_MAX / result.rowBytes);
+        result.rowBytes *= send.size(i);
+    }
+    for (auto c : counts) { EP_HOST_ASSERT(c >= 0); result.counts.push_back(c); }
+    std::vector<uint32_t> peers;
+    for (uint32_t i = 0; i < 8; ++i) if (i != rank) peers.push_back(i);
+    a5_ccu_urma_probe::AllToAllVLayout layout;
+    EP_HOST_ASSERT(a5_ccu_urma_probe::BuildAllToAllVLayout(rank, result.counts.data(), 64,
+        result.rowBytes, peers, &layout));
+    EP_HOST_ASSERT(layout.sendBytes / result.rowBytes == static_cast<uint64_t>(send.size(0)));
+    EP_HOST_ASSERT(layout.recvBytes / result.rowBytes == static_cast<uint64_t>(recv.size(0)));
+    return result;
+}
+void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
+    int64_t rank, const std::vector<int64_t> &counts, HcclComm comm)
+{
+    const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, counts);
+    EP_HOST_ASSERT(torch_npu::utils::is_npu(send));
+    // Empty tensors can have null data_ptr(). Allocate real, non-aliasing token
+    // backing; recordStream keeps these temporary sentinels alive for this stream.
+    auto input = send.numel() ? send : torch::empty({1}, send.options());
+    auto output = recv.numel() ? recv : torch::empty({1}, recv.options());
+    auto stream = OrderedCcuTensorStream(input, output);
+    static auto execute = reinterpret_cast<AllToAllVExecute>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVExecute"));
+    HCCL_CHECK(execute(input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
+        checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64));
+}
+} // namespace
+int64_t Buffer::prepare_ccu_urma_peer_plan_alltoallv(const std::string &id, const std::string &manifest)
+{
+    EP_HOST_ASSERT(num_ranks == 8 && !id.empty() && !manifest.empty());
+    static auto abi = reinterpret_cast<int (*)()>(PeerPlanSymbol("A5CcuAllToAllVAbiVersion"));
+    EP_HOST_ASSERT(abi() == 1);
+    static auto create = reinterpret_cast<PeerCreate>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVCreate"));
+    uint64_t handle = 0;
+    HCCL_CHECK(create(ResolveComm(moe_all_to_all_group_name, ep_comm),
+        c10_npu::getCurrentNPUStream().stream(), id.c_str(), manifest.c_str(), 8, &handle));
+    EP_HOST_ASSERT(handle > 0);
+    return handle;
+}
+void Buffer::bind_ccu_urma_peer_plan_alltoallv(int64_t handle)
+{
+    EP_HOST_ASSERT(num_ranks == 8 && handle > 0);
+    static auto bind = reinterpret_cast<PeerBind>(PeerPlanSymbol("HcclCcuUrmaPeerPlanBindStream"));
+    HCCL_CHECK(bind(handle, ResolveComm(moe_all_to_all_group_name, ep_comm),
+        c10_npu::getCurrentNPUStream().stream()));
+}
+torch::Tensor Buffer::ccu_urma_peer_plan_alltoallv_out(const torch::Tensor &send,
+    const torch::Tensor &recv, int64_t handle, const std::vector<int64_t> &counts)
+{
+    c10::DeviceGuard guard(send.device());
+    EP_HOST_ASSERT(num_ranks == 8);
+    LaunchAllToAllV(send, recv, handle, rank, counts, ResolveComm(moe_all_to_all_group_name, ep_comm));
+    return recv;
+}
+torch::Tensor ccu_urma_peer_plan_alltoallv_out_op(const torch::Tensor &send, const torch::Tensor &recv,
+    int64_t handle, int64_t rank, const c10::List<int64_t> &counts)
+{
+    c10::DeviceGuard guard(send.device());
+    LaunchAllToAllV(send, recv, handle, rank, ToWeightVector(counts), nullptr);
+    return recv;
+}
+torch::Tensor ccu_urma_peer_plan_alltoallv_out_meta(const torch::Tensor &send, const torch::Tensor &recv,
+    int64_t handle, int64_t rank, const c10::List<int64_t> &counts)
+{
+    CheckAllToAllVTensors(send, recv, handle, rank, ToWeightVector(counts));
+    return recv;
 }
 
 int64_t Buffer::prepare_ccu_hbm_command_worker(

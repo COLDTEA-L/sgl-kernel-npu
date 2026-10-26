@@ -23,14 +23,15 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
         if (error != nullptr) *error = text;
         return false;
     };
-    if ((rankSize != 2 && rankSize != 4) || availableCards < rankSize || specs.empty())
-        return fail("initial peer-plan supports rankSize 2 or 4 and N >= k");
+    if ((rankSize != 2 && rankSize != 4 && rankSize != 8) || availableCards < rankSize || specs.empty())
+        return fail("peer-plan supports rankSize 2/4 or direct-only 8 and N >= k");
     std::map<uint32_t, uint32_t> mapping;
     std::map<std::pair<uint32_t, uint32_t>, std::vector<const PeerPathSpec *>> pairs;
     for (const auto &p : specs) {
         if (p.srcRank >= p.dstRank || p.dstRank >= rankSize || p.srcPhy == p.dstPhy ||
             p.weight == 0 || p.srcDie > 1 || p.dstDie > 1)
             return fail("invalid canonical rank pair, weight, physical IDs or endpoint die");
+        if (rankSize == 8 && p.relay) return fail("8-rank plans are direct-only");
         for (auto endpoint : {std::make_pair(p.srcRank, p.srcPhy),
                               std::make_pair(p.dstRank, p.dstPhy)}) {
             const auto inserted = mapping.emplace(endpoint);

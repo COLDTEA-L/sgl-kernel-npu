@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "alltoallv_kernel.h"
 #include "route_kernel.h"
 #include "all_to_all_multiroute_kernel.h"
 #include "command_block_worker_kernel.h"
@@ -1226,12 +1227,13 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
 }
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
-    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode)
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode, bool allToAllV)
 {
     if (!comm || !stream || !resources) return HCCL_E_PTR;
     PeerPlanResources result;
     auto &r = result.route;
-    const auto copyModeStatus = GetCcuSelfCopyMode(&r.ccuSelfCopy,&r.ccuGroupCopy);
+    const auto copyModeStatus = allToAllV ? HCCL_SUCCESS : GetCcuSelfCopyMode(&r.ccuSelfCopy,&r.ccuGroupCopy);
+    if (allToAllV) { r.ccuSelfCopy = true; r.ccuGroupCopy = true; }
     if (copyModeStatus != HCCL_SUCCESS) return copyModeStatus;
     HcclResult status = HcclGetRankId(comm, &r.rank);
     if (status != HCCL_SUCCESS) return status;
@@ -1292,7 +1294,8 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                 CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
         }
     }
-    if (descs.empty() || (r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
+    if ((allToAllV && (r.rankSize != 8 || descs.size() != 7 || syncMode != ChannelSyncMode::BASELINE)) ||
+        descs.empty() || (allToAllV ? 10 : r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);
     // Thread resources must exist before ChannelAcquire on every rank.
     status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread);
@@ -1319,7 +1322,13 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     }
     RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy, syncMode);
     hcomm::KernelCreator creator = CreateRouteKernel;
-    status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
+    if (allToAllV) {
+        AllToAllVKernelArg vArg(r.channels);
+        hcomm::KernelCreator vCreator = CreateAllToAllVKernel;
+        status = HcclCcuKernelRegister(comm, &r.kernel, &vCreator, &vArg);
+    } else {
+        status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
+    }
     if (status != HCCL_SUCCESS) return status;
     status = HcclCcuKernelRegisterFinish(comm);
     if (status != HCCL_SUCCESS) return status;

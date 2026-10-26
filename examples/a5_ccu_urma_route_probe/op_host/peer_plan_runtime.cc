@@ -3,6 +3,7 @@
 #include "data_type.h"
 #include "self_copy_lane.h"
 #include "route_kernel.h"
+#include "alltoallv_kernel.h"
 #include <hcomm/ccu/hccl_ccu_res.h>
 #include <hcomm/hcomm_res.h>
 #include <atomic>
@@ -21,6 +22,7 @@ struct PeerPreparedPlan {
     HcclComm comm = nullptr;
     int32_t device = -1;
     uint32_t rankSize = 0;
+    bool allToAllV = false;
     std::string id, content;
     uint32_t availableCards = 0;
     ChannelSyncMode syncMode = ChannelSyncMode::BASELINE;
@@ -114,7 +116,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         snapshot = found->second;
     }
     PeerPlanResources resources;
-    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode);
+    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV);
     if (status != HCCL_SUCCESS) return status;
     if (!resources.route.ccuSelfCopy) {
         const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
@@ -139,8 +141,8 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
 extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() { return 5; }
 extern "C" __attribute__((visibility("default"))) int A5CcuChannelSyncAbiVersion() { return 1; }
 
-extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
-    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
+static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle, bool allToAllV)
 {
     if (!comm || !stream || !planId || !manifest || !handle) return HCCL_E_PTR;
     *handle = 0;
@@ -148,6 +150,9 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
     if (!ReadChannelSyncMode(&plan.syncMode)) return HCCL_E_PARA;
     if (!*planId || HcclGetRankSize(comm, &plan.rankSize) != HCCL_SUCCESS ||
         aclrtGetDevice(&plan.device) != ACL_SUCCESS) return HCCL_E_PARA;
+    if (allToAllV ? (plan.rankSize != 8 || plan.syncMode != ChannelSyncMode::BASELINE) :
+        (plan.rankSize != 2 && plan.rankSize != 4)) return HCCL_E_PARA;
+    plan.allToAllV = allToAllV;
     plan.comm = comm; plan.id = planId; plan.availableCards = availableCards;
     const auto status = Load(manifest, plan.rankSize, availableCards, &plan.specs, &plan.content);
     if (status != HCCL_SUCCESS) return status;
@@ -159,7 +164,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
             const auto &p = entry.second;
             if (p.comm == comm && p.id == plan.id) {
                 if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards ||
-                    p.syncMode != plan.syncMode)
+                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV)
                     return HCCL_E_PARA;
                 id = entry.first;
                 break;
@@ -179,6 +184,15 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
     *handle = id;
     return HCCL_SUCCESS;
 }
+
+extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
+{ return CreatePeerPlan(comm, stream, planId, manifest, availableCards, handle, false); }
+
+extern "C" int A5CcuAllToAllVAbiVersion() { return 1; }
+extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
+{ return CreatePeerPlan(comm, stream, planId, manifest, availableCards, handle, true); }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanBindStream(uint64_t handle, HcclComm comm, aclrtStream stream)
 {
@@ -207,6 +221,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
             std::fprintf(stderr, "PEER_PLAN_UNBOUND bind execution/capture stream outside graph first\n");
             return HCCL_E_NOT_FOUND;
         }
+        if (found->second.allToAllV) return HCCL_E_PARA;
         owner = found->second.comm;
         resources = bound->second;
     }
@@ -246,6 +261,50 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));
     if (status != HCCL_SUCCESS) return status;
     return copy.Finish(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)));
+}
+
+extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count)
+{
+    if (!send || !recv || !stream || !counts) return HCCL_E_PTR;
+    std::lock_guard<std::mutex> submit(submitMutex);
+    PeerPlanResources resources;
+    HcclComm owner;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        const auto found = plans.find(handle);
+        int32_t device = -1;
+        if (found == plans.end()) return HCCL_E_NOT_FOUND;
+        if (!found->second.allToAllV || (comm && comm != found->second.comm) ||
+            aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return HCCL_E_PARA;
+        const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
+        if (bound == found->second.streams.end()) return HCCL_E_NOT_FOUND;
+        resources = bound->second; owner = found->second.comm;
+    }
+    const auto &r = resources.route;
+    AllToAllVLayout layout;
+    if (rank != r.rank || r.rankSize != 8 ||
+        !BuildAllToAllVLayout(rank, counts, count, rowBytes, resources.peers, &layout) ||
+        !DisjointAllToAllVBuffers(reinterpret_cast<uint64_t>(send), sendCapacity,
+            reinterpret_cast<uint64_t>(recv), recvCapacity, layout) || layout.selfBytes > GROUP_MAX_BYTES)
+        return HCCL_E_PARA;
+    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), sendCapacity);
+    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
+    AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
+        inputToken, outputToken, layout);
+    auto status = HCCL_SUCCESS;
+    if (r.routeThread != r.mainThread) {
+        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0));
+        if (status != HCCL_SUCCESS) return status;
+        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800));
+        if (status != HCCL_SUCCESS) return status;
+    }
+    status = HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task);
+    if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
+    status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));
+    if (status != HCCL_SUCCESS) return status;
+    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0));
 }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)

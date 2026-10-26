@@ -549,6 +549,24 @@ class Buffer:
             send_data, recv_data, relay_manifest, direct_route, path_weights
         )
 
+    def prepare_ccu_urma_peer_plan_alltoallv(self, plan_id, manifest):
+        """Prepare an EP8 direct-only plan outside execution (baseline, one IO die)."""
+        return self.runtime.prepare_ccu_urma_peer_plan_alltoallv(plan_id, manifest)
+
+    def bind_ccu_urma_peer_plan_alltoallv(self, handle):
+        """Bind the current execution stream outside execution/capture."""
+        return self.runtime.bind_ccu_urma_peer_plan_alltoallv(handle)
+
+    def ccu_urma_peer_plan_alltoallv_out(self, send, recv, handle, counts):
+        """Out-of-place EP8 AllToAllV over contiguous rows.
+
+        counts is the SAME flattened 8x8 source/destination row-count matrix
+        on every rank, including self. send/recv may have different first
+        dimensions or zero rows. Only FP16/BF16/FP32/INT8/INT32 are supported.
+        No device-side synchronization or graph support is implied by Meta.
+        """
+        return self.runtime.ccu_urma_peer_plan_alltoallv_out(send, recv, handle, list(counts))
+
     def prepare_ccu_urma_peer_plan(self, plan_id, manifest, available_cards=8):
         """Graph-out preparation for explicit 2/4-rank peer plans; no auto relay allocation."""
         return self.runtime.prepare_ccu_urma_peer_plan(plan_id, manifest, available_cards)

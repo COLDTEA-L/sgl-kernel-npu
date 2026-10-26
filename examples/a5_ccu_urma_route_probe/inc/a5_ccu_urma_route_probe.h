@@ -89,6 +89,17 @@ HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv, uint64_t elementsP
     HcclDataType dtype, HcclComm comm, aclrtStream stream, uint64_t handle,
     const uint32_t *policy, uint32_t policyCount);
 
+/** Independent ABI 1: 8-rank direct-only row-count AllToAllV. All ranks pass
+ * identical 64-entry counts[s*8+d]. Capacities are bytes and must be >=1 even
+ * for an empty tensor. Out-of-place, baseline sync, one local IO die per rank.
+ * BindStream and Destroy above also manage these handles. */
+int A5CcuAllToAllVAbiVersion(void);
+HcclResult HcclCcuUrmaPeerPlanAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle);
+HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count);
+
 /**
  * Build and register all control-plane resources for one explicit multipath
  * plan. This call performs CommLink construction, HcclChannelAcquire and CCU
