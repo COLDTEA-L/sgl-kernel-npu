@@ -9,8 +9,16 @@ AllToAll、全 CCU baseline 多路径算子及 physical contention 测试环境�
 命令分为**宿主机执行**与**容器内执行**，不要混用。需要 `set -e` 的操作放在括号
 子 shell 内，失败不会退出当前 Docker 交互 shell。任一步失败都先解决，不继续整套粘贴。
 
-常用顺序：旧容器还在先看第 2 节；确需新建看第 3 节；旧镜像缺包看第 4/6 节；
-所有恢复最后都要做第 7 节预检和第 8 节单尺寸验收。不要每次默认从源码重编。
+**本次恢复的固定目标：** 宿主机归档
+`/home/l00934901/sglang_yuanwen_old_transfer_20261016.rar`，新容器名和 hostname
+都为 `sglang_yuanwen_old`。镜像名与容器名不是一回事；第 3 节根据实际 load 结果
+确认镜像，不假定压缩包里的镜像仍叫 `sglang:a5_0623`。
+
+本次从头恢复按顺序执行：**3.1 检查 → 3.2 解包/load → 3.3 创建/进入容器 →
+第 4 节检查并补依赖 → 第 5 节更新源码 → 6.2 编译安装 route → 6.3 编译安装
+DeepEP → 第 7 节预检 → 第 8 节短测**。第 3 节在宿主机执行，进入容器后再做第 4～8 节。
+已有匹配二进制时可以用 6.1 替代两次编译；不能只编译 DeepEP 而漏装 route。
+若同名旧容器还在，先看第 2 节，不删除它来腾名字。
 
 ## 1. 恢复顺序与需要保留的东西
 
@@ -35,6 +43,9 @@ HCCL 源码树在这里提供 custom-op 构建框架；不是让你编译替换�
 以下沿用实验路径，实际不同必须相应修改：
 
 ```text
+宿主机镜像归档：   /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+新容器/hostname：  sglang_yuanwen_old
+恢复用本地镜像名： sglang_yuanwen_old:recovery_20261016（第 3.2 节创建）
 宿主机/容器工作区： /home/l00934901
 算子仓库：         /home/l00934901/sgl-kernel-npu
 HCCL 构建源码：    /home/l00934901/hccl
@@ -57,8 +68,8 @@ npu-smi info -m
 
 ```bash
 # 替换成 docker ps -a 中确认属于自己的旧实验容器名。
-docker start sglang_yuanwen
-docker exec -it sglang_yuanwen /bin/bash
+docker start sglang_yuanwen_old
+docker exec -it sglang_yuanwen_old /bin/bash
 ```
 
 如果旧容器仍在、确需创建新容器，先在宿主机保存配置，特别是 Mounts、Devices、
@@ -68,7 +79,7 @@ DeviceRequests、网络、共享内存、Runtime 和镜像 ID：
 (
 set -e
 umask 077
-RECOVERY_OLD_CONTAINER=sglang_yuanwen
+RECOVERY_OLD_CONTAINER=sglang_yuanwen_old
 RECOVERY_RECORD_DIR=$(mktemp -d /home/l00934901/a5_docker_record.XXXXXX)
 docker inspect "${RECOVERY_OLD_CONTAINER}" > "${RECOVERY_RECORD_DIR}/container.inspect.json"
 docker inspect --format '{{.Image}}' "${RECOVERY_OLD_CONTAINER}"
@@ -81,114 +92,269 @@ echo "容器配置保存在：${RECOVERY_RECORD_DIR}"
 
 ## 3. 宿主机：加载镜像、创建新容器
 
-### 3.1 加载原来匹配的镜像
+### 3.1 确认压缩包、工具、磁盘和同名容器
+
+以下只检查，不 load、不占用 NPU：
 
 ```bash
 (
 set -e
-RECOVERY_IMAGE_TAR=/home/l00934901/a5_recovery/images/validated-a5-image.tar
-test -f "${RECOVERY_IMAGE_TAR}"
-docker load --input "${RECOVERY_IMAGE_TAR}"
-docker image ls
+test -f /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+command -v file
+command -v python3
+command -v tar
+docker version
+file /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+ls -lh /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+df -h /home/l00934901
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+command -v unrar || true
 )
 ```
 
-文件名是恢复材料的约定名，替换为实际备份路径。`docker load` 恢复镜像和 tag，
-不会恢复旧容器的挂载、设备权限、容器内后装软件或运行中的任务。[Docker load 说明](https://docs.docker.com/reference/cli/docker/image/load/)
+另查上面 `DockerRootDir` 所在磁盘的可用空间：RAR 解压需要额外空间，Docker load
+还需要展开镜像层；压缩包大小不等于最终占用。空间不足先协调，本文不清理其他镜像。
 
-旧镜像本来没有最新 DeepEP/route 包是正常的，后续需要补装。不要为了“修复”而盲目
-下载最新版 torch/CANN；本实验使用的是原来验证过的 T560 软件组合。
+**若 `sglang_yuanwen_old` 已存在，停止新建，先按第 2 节确认是否直接 start/exec。**
+不要删除旧容器来绕过重名。RAR 来自自己可信的备份才解压；不运行归档里的未知脚本。
+真正的 RAR 需要能支持其格式的 `unrar`。缺工具时由管理员从允许的软件源/离线包安装
+`unrar`（包名、RAR5 支持和授权以本机发行版为准），不要在共享宿主机照抄容器的 apt/dnf
+依赖安装命令。分卷 RAR 必须先补齐所有分卷，损坏或缺卷先解决，不强行 load。
 
-### 3.2 创建容器的 A5/950 模板
+### 3.2 解开 RAR，确认 Docker 镜像归档，再 load
 
-**首选复用原来验证通过的启动参数。** 以下是原参数丢失时的检查型模板，不是对当前
-服务器节点映射的现场确认。示例假设授权卡对应 `/dev/davinci2` 至 `/dev/davinci5`；
-先结合旧配置和 `npu-smi info -m` 核实，不能把 NPU ID、Chip ID、逻辑 ID 混为一谈。
-若使用 Ascend Docker Runtime，还要恢复其原来验证过的配置；此处不修改 daemon。
+**不要只改 `.rar` 后缀，也不要默认直接 `docker load -i xxx.rar`。** Docker load
+支持镜像 tar 及 gzip/bzip2/xz/zstd 压缩，不直接支持 RAR；也可能只是文件误命名，
+所以先尝试只列出 tar 内容，失败才按 RAR 解压。[Docker load 说明](https://docs.docker.com/reference/cli/docker/image/load/)
 
-950 官方示例包含 `/dev/ummu`、`/dev/uburma`，不要照抄只含旧型号设备的启动命令。
-节点名或形态与本机不同，先让管理员确认，不能通过创建假节点或直接加特权掩盖问题。
-[Ascend 官方 950 容器示例](https://github.com/Ascend/cann-container-image/blob/main/OVERVIEW.md)
+下面在一个全新的临时目录解压，不覆盖原压缩包或旧工作区；常见的“RAR 中只有一份
+镜像 tar”可整段执行。它会打印解包目录、加载日志和最后确定的镜像 ID：
+
+```bash
+(
+set -eo pipefail
+umask 077
+RECOVERY_ARCHIVE=/home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+RECOVERY_IMAGE_ALIAS=sglang_yuanwen_old:recovery_20261016
+test -f "${RECOVERY_ARCHIVE}"
+# 防止重复执行时覆盖上一次恢复用的镜像标签；已有该标签时先核对并复用。
+if docker image inspect "${RECOVERY_IMAGE_ALIAS}" >/dev/null 2>&1; then
+    echo "恢复镜像标签已存在，先核对；不要重复 load 或覆盖：${RECOVERY_IMAGE_ALIAS}" >&2
+    exit 1
+fi
+mkdir -p /home/l00934901/a5_recovery
+RECOVERY_UNPACK=$(mktemp -d /home/l00934901/a5_recovery/sglang_yuanwen_old_unpack.XXXXXX)
+echo "恢复记录和解包目录：${RECOVERY_UNPACK}"
+
+if tar -tf "${RECOVERY_ARCHIVE}" >"${RECOVERY_UNPACK}/outer-tar.list" \
+    2>"${RECOVERY_UNPACK}/outer-tar-check.log"; then
+    # 文件虽然叫 .rar，实际已经是 tar/压缩 tar；不复制、不解开镜像层。
+    RECOVERY_IMAGE_ARCHIVE=${RECOVERY_ARCHIVE}
+else
+    command -v unrar >/dev/null || {
+        echo '不是可读 tar，且缺少 unrar；请先补齐解压工具或检查文件是否损坏。' >&2
+        exit 1
+    }
+    unrar t "${RECOVERY_ARCHIVE}"
+    unrar lb "${RECOVERY_ARCHIVE}" >"${RECOVERY_UNPACK}/rar-files.list"
+    # 拒绝明显越出解压目录的路径；仅处理自己可信的备份，仍不执行包内脚本。
+    python3 - "${RECOVERY_UNPACK}/rar-files.list" <<'PY'
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import sys
+for name in Path(sys.argv[1]).read_text().splitlines():
+    posix = PurePosixPath(name.replace('\\', '/'))
+    windows = PureWindowsPath(name)
+    if posix.is_absolute() or windows.drive or '..' in posix.parts:
+        raise SystemExit('归档路径异常，停止：' + name)
+PY
+    mkdir "${RECOVERY_UNPACK}/files"
+    unrar x -o- "${RECOVERY_ARCHIVE}" "${RECOVERY_UNPACK}/files/"
+    RECOVERY_IMAGE_ARCHIVE=$(python3 - "${RECOVERY_UNPACK}/files" <<'PY'
+from pathlib import Path
+import sys
+suffixes = ('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2',
+            '.tar.xz', '.txz', '.tar.zst', '.tzst')
+files = sorted(p for p in Path(sys.argv[1]).rglob('*')
+               if p.is_file() and not p.is_symlink() and p.name.lower().endswith(suffixes))
+if len(files) != 1:
+    for path in files:
+        print('候选镜像归档：' + str(path), file=sys.stderr)
+    raise SystemExit('没有找到唯一镜像 tar；先人工确认归档内容，不批量 load、不猜文件。')
+print(files[0].resolve())
+PY
+    )
+fi
+
+# 防止把 docker export 的 rootfs 或普通源码压缩包当成 docker save 镜像。
+tar -tf "${RECOVERY_IMAGE_ARCHIVE}" >"${RECOVERY_UNPACK}/image-tar.list"
+python3 - "${RECOVERY_UNPACK}/image-tar.list" <<'PY'
+from pathlib import Path, PurePosixPath
+import sys
+names = {str(PurePosixPath(line)) for line in Path(sys.argv[1]).read_text().splitlines()}
+if 'manifest.json' not in names and not {'oci-layout', 'index.json'} <= names:
+    raise SystemExit('不是可识别的 Docker/OCI 镜像归档；停止，不自动改用 docker import。')
+print('IMAGE_ARCHIVE_LAYOUT_OK')
+PY
+
+# load 可能重设归档内原有标签的指向。保留原启动命令使用的旧标签，避免丢失引用。
+docker image ls --no-trunc >"${RECOVERY_UNPACK}/images-before-load.txt"
+if docker image inspect sglang:a5_0623 >/dev/null 2>&1; then
+    RECOVERY_OLD_IMAGE=$(docker image inspect --format '{{.Id}}' sglang:a5_0623)
+    docker image tag "${RECOVERY_OLD_IMAGE}" \
+        "sglang_yuanwen_old_before_load:$(basename "${RECOVERY_UNPACK}")"
+fi
+echo "准备加载：${RECOVERY_IMAGE_ARCHIVE}"
+docker load --input "${RECOVERY_IMAGE_ARCHIVE}" 2>&1 | tee "${RECOVERY_UNPACK}/docker-load.log"
+python3 - "${RECOVERY_UNPACK}/docker-load.log" <<'PY' >"${RECOVERY_UNPACK}/loaded-refs.txt"
+from pathlib import Path
+import sys
+refs = set()
+for line in Path(sys.argv[1]).read_text().splitlines():
+    for prefix in ('Loaded image: ', 'Loaded image ID: '):
+        if line.startswith(prefix):
+            refs.add(line[len(prefix):].strip())
+if not refs:
+    raise SystemExit('未从 load 日志识别镜像，请人工查看日志，不使用猜测的旧 tag。')
+print('\n'.join(sorted(refs)))
+PY
+while IFS= read -r RECOVERY_REF; do
+    docker image inspect --format '{{.Id}}' "${RECOVERY_REF}"
+done <"${RECOVERY_UNPACK}/loaded-refs.txt" | sort -u >"${RECOVERY_UNPACK}/loaded-ids.txt"
+test "$(wc -l <"${RECOVERY_UNPACK}/loaded-ids.txt")" -eq 1 || {
+    echo '归档加载了多个不同镜像；先按日志选择正确镜像，不自动建容器。' >&2
+    exit 1
+}
+RECOVERY_IMAGE_ID=$(<"${RECOVERY_UNPACK}/loaded-ids.txt")
+docker image tag "${RECOVERY_IMAGE_ID}" "${RECOVERY_IMAGE_ALIAS}"
+docker image inspect --format 'ID={{.Id}} OS={{.Os}} ARCH={{.Architecture}}' "${RECOVERY_IMAGE_ALIAS}"
+echo "第 3.3 节使用镜像：${RECOVERY_IMAGE_ALIAS}"
+echo "保留恢复记录：${RECOVERY_UNPACK}"
+)
+```
+
+注意：
+
+- 大镜像的 `unrar t`、解压、tar 列表检查和 load 都可能耗时较长，这是 Host 磁盘工作，
+  **尚未下发通信算子**，不要因等待同时再开一份恢复任务。
+- 若 RAR 内有多份 tar、只有展开后的 `manifest.json`/layers、文件没有常见 tar 后缀，
+  上面会停止。先查看打印的解包目录，确认哪份是原始 `docker save` 产物；不要选择
+  `layer.tar` 当整份镜像，也不要把整个工作区重新打成 tar 后盲目 load。
+- 仅有 `bin/`、`etc/`、`usr/` 等 rootfs 而没有镜像 manifest，可能是 `docker export`
+  备份。它与 `docker save` 不同，不能按原镜像完整恢复配置；应优先取得 save 归档，
+  不自动用 `docker import`，以免丢失原 ENV/USER/CMD 等镜像配置。
+- 这里新增的本地镜像别名固定为 `sglang_yuanwen_old:recovery_20261016`；它不要求
+  原归档的 tag 是 `sglang:a5_0623`。若归档带有其他正在使用的同名 tag，load 前应先
+  与使用者协调并保留那些 tag 的原 ID，不能只凭容器名推断镜像归属。
+- 镜像恢复不包含宿主机绑定目录，也不重建旧容器的挂载/权限；旧镜像没有最新
+  DeepEP/route 包时，需要后面两步编译安装，不能直接认为 load 完就恢复好了。
+
+### 3.3 按原挂载方式创建 `sglang_yuanwen_old`
+
+下面参考提供的旧命令：保留 host 网络、特权模式、hixlep/route/hccn、工作区、NPU
+日志、dcmi、driver 和 firmware 的挂载，**容器名和 hostname 改为 `sglang_yuanwen_old`**。
+为防止误写宿主机，配置、工具、driver/firmware 改为只读挂载；工作区、`/mnt` 和日志
+仍可写。`--mount` 在源路径缺失时会报错，不像 `-v` 自动创建同名空目录。
+
+**仅在管理员已允许原特权运行方式、镜像可信时执行。** `--privileged` 提供很大的宿主机
+权限，并不限制到 2/3/4/5 卡；只读挂载也不是特权容器的安全隔离保证。不得在容器内
+安装/修改宿主机驱动、固件、路由或复位公共设备。本文沿用原配权限不是要求把已有的
+最小权限环境升级成特权；设备隔离策略不同的新机器应先由管理员确认。
+[Docker 权限说明](https://docs.docker.com/engine/containers/run/#runtime-privilege-and-linux-capabilities)
 
 ```bash
 (
 set -e
-# 必须替换成 docker image ls 中实际存在的已验证镜像名:tag 或镜像 ID。
-RECOVERY_IMAGE='REPLACE_WITH_VALIDATED_IMAGE'
-RECOVERY_CONTAINER="sglang_yuanwen_recovery_$(date +%Y%m%d_%H%M%S)"
-RECOVERY_WORKSPACE=/home/l00934901
-RECOVERY_CARDS=(2 3 4 5)
-
-test "${RECOVERY_IMAGE}" != REPLACE_WITH_VALIDATED_IMAGE
-docker image inspect --format '{{.Os}}/{{.Architecture}}' "${RECOVERY_IMAGE}"
-uname -m
-# 上面架构应对应：aarch64 对应 arm64，x86_64 对应 amd64；不匹配则停止。
-test -d "${RECOVERY_WORKSPACE}"
-test -d /usr/local/Ascend/driver
-test -f /usr/local/Ascend/driver/topo/950/atlas_950_1.json
-test -x /usr/local/bin/npu-smi
-mkdir -p "${RECOVERY_WORKSPACE}/a5_recovery" "${RECOVERY_WORKSPACE}/profiling"
-
-RECOVERY_DEVICE_ARGS=()
-for RECOVERY_CARD in "${RECOVERY_CARDS[@]}"; do
-    test -c "/dev/davinci${RECOVERY_CARD}"
-    RECOVERY_DEVICE_ARGS+=(--device "/dev/davinci${RECOVERY_CARD}")
+RECOVERY_CONTAINER=sglang_yuanwen_old
+RECOVERY_IMAGE=sglang_yuanwen_old:recovery_20261016
+docker image inspect "${RECOVERY_IMAGE}" >/dev/null
+if docker container inspect "${RECOVERY_CONTAINER}" >/dev/null 2>&1; then
+    echo "同名容器已存在，停止；先检查并按第 2 节复用：${RECOVERY_CONTAINER}" >&2
+    exit 1
+fi
+RECOVERY_IMAGE_PLATFORM=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${RECOVERY_IMAGE}")
+case "$(uname -m):${RECOVERY_IMAGE_PLATFORM}" in
+    aarch64:linux/arm64|x86_64:linux/amd64) ;;
+    *) echo "镜像平台与本机不匹配：$(uname -m) / ${RECOVERY_IMAGE_PLATFORM}" >&2; exit 1 ;;
+esac
+for RECOVERY_DIR in /etc/hixlep /mnt /home/l00934901 /var/log/npu \
+    /usr/local/dcmi /usr/local/Ascend/driver /usr/local/Ascend/firmware; do
+    test -d "${RECOVERY_DIR}" || { echo "缺少挂载目录：${RECOVERY_DIR}" >&2; exit 1; }
 done
-for RECOVERY_NODE in /dev/davinci_manager /dev/hisi_hdc /dev/ummu /dev/uburma; do
-    test -e "${RECOVERY_NODE}"
-    RECOVERY_DEVICE_ARGS+=(--device "${RECOVERY_NODE}")
+for RECOVERY_FILE in /lib/route.conf /etc/hccn.conf /etc/ascend_install.info \
+    /usr/local/Ascend/driver/topo/950/atlas_950_1.json; do
+    test -f "${RECOVERY_FILE}" || { echo "缺少配置/拓扑：${RECOVERY_FILE}" >&2; exit 1; }
 done
-# 有些原配环境还需要该节点；存在时按原配置带入。
-if test -e /dev/devmm_svm; then
-    RECOVERY_DEVICE_ARGS+=(--device /dev/devmm_svm)
-fi
-RECOVERY_EXTRA_MOUNTS=()
-if test -d /usr/local/dcmi; then
-    RECOVERY_EXTRA_MOUNTS+=(--mount type=bind,src=/usr/local/dcmi,dst=/usr/local/dcmi,readonly)
-fi
-if test -f /etc/ascend_install.info; then
-    RECOVERY_EXTRA_MOUNTS+=(--mount type=bind,src=/etc/ascend_install.info,dst=/etc/ascend_install.info,readonly)
-fi
+# 两个 npu-smi 路径只挂载本机真实存在且可执行的；至少需要一个。
+RECOVERY_NPU_SMI_MOUNTS=()
+for RECOVERY_BIN in /usr/local/bin/npu-smi /usr/local/sbin/npu-smi; do
+    if test -x "${RECOVERY_BIN}"; then
+        RECOVERY_NPU_SMI_MOUNTS+=(--mount "type=bind,src=${RECOVERY_BIN},dst=${RECOVERY_BIN},readonly")
+    fi
+done
+test "${#RECOVERY_NPU_SMI_MOUNTS[@]}" -gt 0 || { echo '没有找到可挂载的 npu-smi' >&2; exit 1; }
+for RECOVERY_NODE in /dev/ummu /dev/uburma; do
+    test -e "${RECOVERY_NODE}" || { echo "缺少 A5 设备节点：${RECOVERY_NODE}" >&2; exit 1; }
+done
+mkdir -p /home/l00934901/a5_recovery /home/l00934901/profiling
 
-docker run --pull=never -dit \
+docker run --pull=never \
     --name "${RECOVERY_CONTAINER}" \
-    --network host \
-    --ipc private --shm-size 16g \
-    --ulimit memlock=-1:-1 \
-    "${RECOVERY_DEVICE_ARGS[@]}" \
-    --mount "type=bind,src=${RECOVERY_WORKSPACE},dst=${RECOVERY_WORKSPACE}" \
-    --mount type=bind,src=/usr/local/Ascend/driver,dst=/usr/local/Ascend/driver,readonly \
-    --mount type=bind,src=/usr/local/bin/npu-smi,dst=/usr/local/bin/npu-smi,readonly \
-    "${RECOVERY_EXTRA_MOUNTS[@]}" \
-    --workdir "${RECOVERY_WORKSPACE}" \
+    --hostname "${RECOVERY_CONTAINER}" \
     --entrypoint /bin/bash \
-    "${RECOVERY_IMAGE}"
+    --network host \
+    --privileged \
+    --ipc private --shm-size 16g --ulimit memlock=-1:-1 \
+    --mount type=bind,src=/etc/hixlep,dst=/etc/hixlep,readonly \
+    --mount type=bind,src=/mnt,dst=/mnt \
+    --mount type=bind,src=/home/l00934901,dst=/home/l00934901 \
+    --mount type=bind,src=/var/log/npu,dst=/usr/slog \
+    --mount type=bind,src=/lib/route.conf,dst=/lib/route.conf,readonly \
+    --mount type=bind,src=/etc/hccn.conf,dst=/etc/hccn.conf,readonly \
+    --mount type=bind,src=/etc/ascend_install.info,dst=/etc/ascend_install.info,readonly \
+    "${RECOVERY_NPU_SMI_MOUNTS[@]}" \
+    --mount type=bind,src=/usr/local/dcmi,dst=/usr/local/dcmi,readonly \
+    --mount type=bind,src=/usr/local/Ascend/driver,dst=/usr/local/Ascend/driver,readonly \
+    --mount type=bind,src=/usr/local/Ascend/firmware,dst=/usr/local/Ascend/firmware,readonly \
+    --workdir /home/l00934901 \
+    -itd "${RECOVERY_IMAGE}" --noprofile --norc
 
-echo "新容器：${RECOVERY_CONTAINER}"
-docker exec -it "${RECOVERY_CONTAINER}" /bin/bash
+docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination "RW=" .RW}}{{end}}' \
+    "${RECOVERY_CONTAINER}"
+echo '已创建。下一步在宿主机执行 docker exec，进入后做第 4 节。'
 )
+```
+
+```bash
+docker exec -it sglang_yuanwen_old /bin/bash
 ```
 
 说明：
 
-- 模板不加 `--rm`，退出 shell 不会自动删容器，也不停止旧容器。
-- 工作区用**同一次父目录挂载**，使两个源码仓可进行硬链接。route 构建脚本的
-  `cp -al` 不能跨文件系统/独立挂载边界，分开挂载两仓可能出现 `Invalid cross-device link`。
-  该挂载会暴露自己的工作区文件，只对可信镜像使用；不要改成挂载宿主机根目录。
-  源码树若缺失，创建容器后按第 5 节恢复；仅安装已验证二进制包时不强制要求 HCCL 源码。
-- 只挂载宿主机 driver，不把宿主机整个 `/usr/local/Ascend` 覆盖到镜像上，避免遮住镜像
-  自己的 CANN。驱动目录只读；拓扑缺失时也不会在容器里伪造一份。
-- CANN 默认由镜像提供，route 安装在该容器的 CANN 目录；工作区与结果持久化到宿主机。
-- `/dev/uburma` 等是共享管理/通信接口，设备挂载和 `ASCEND_RT_VISIBLE_DEVICES` 都不是
-  独占资源的保证。先协调授权，不能借挂载权限使用其他用户的卡或 relay。
-- 模板采用私有 IPC 和 16GiB 共享内存上限。若原来使用不同 IPC、额外节点/挂载或权限，
-  以已验证配置为准；不要通过全量特权、挂载整个 `/dev` 来绕过错误。
+- 创建时的 `--noprofile --norc` 防止直接执行镜像里旧 shell 启动脚本；进入新 shell 后
+  仍按第 4 节显式选择 Python、source T560，不依赖旧环境变量碰巧正确。
+- 缺少上述配置文件/驱动目录时先联系管理员核对新机器的真实路径，不创建空文件凑数，
+  不把其他机器的 route/hccn 配置直接覆盖过来。只读配置若与原安装器不兼容，应先确认
+  具体写入目标，不为绕过错误把共享 driver/firmware 改成可写。
+- 工作区用**同一次父目录挂载**，使两个源码仓可进行硬链接。route 构建脚本的 `cp -al`
+  不能跨文件系统/独立挂载边界；两个仓本身也必须在同一文件系统，不要额外分别挂载。
+- `/home/l00934901` 和 `/mnt` 的挂载会遮住镜像里同路径的旧文件。若原 HCCL 源码、
+  wheel 或工具只在镜像内这些位置，load 不会把它们合并到宿主机；先恢复各自工作区备份。
+  不在目标目录已有文件时盲目 docker cp 覆盖。
+- 不挂载整个 `/usr/local/Ascend`，CANN 由镜像提供；仅 driver/firmware 来自宿主机。
+  950 还需要 UB/UMMU 设备节点与匹配用户态库，特权模式不能修复缺失的宿主机组件。
+  [Ascend 官方 950 容器示例](https://github.com/Ascend/cann-container-image/blob/main/OVERVIEW.md)
+- 不加 `--rm`，退出交互 shell 不删除容器；不停止或重命名原来的 `sglang_yuanwen`。
+  私有 IPC 的共享内存上限设为 16GiB（不是启动就占用 16GiB），不共享他人的 IPC。
+- 能看到所有设备不等于有权使用所有设备。后续 `--p-devices`/`--q-devices` 和 relay
+  只能填写管理员授权且健康的卡；`ASCEND_RT_VISIBLE_DEVICES` 也不是独占资源保证。
 
 ## 4. 容器内：检查基础环境，不立即占卡
 
 ### 4.1 设备、目录和 CANN
 
 ```bash
+id
 uname -m
 cat /etc/os-release
 npu-smi info
@@ -199,6 +365,9 @@ ls -l /usr/local/Ascend/driver/topo/950/atlas_950_1.json
 
 宿主机正常而容器不正常，优先查挂载、权限和运行库，不要重装驱动。
 有卡显示 Critical/Alarm 时，不用该卡或经过它的 relay 路径做测试，先交管理员定位。
+安装到容器自己的 `/usr/local/Ascend/cann-9.1.T560` 需要相应写权限；若镜像默认不是
+root 用户，由管理员确认后在宿主机用 `docker exec -it -u 0 sglang_yuanwen_old /bin/bash`
+进入，再激活原 Python 环境。不要改宿主机目录权限来绕过安装错误。
 以下是加载库/查看版本，不创建 tensor 或通信域：
 
 ```bash
@@ -356,7 +525,7 @@ python3 -m pip install --no-index \
 先检查，不修改宿主机：
 
 ```bash
-for RECOVERY_TOOL in bash gcc g++ make cmake git nm readelf patch tar gzip unzip zip timeout; do
+for RECOVERY_TOOL in bash gcc g++ make cmake git nm readelf file patch tar gzip unzip zip timeout; do
     command -v "${RECOVERY_TOOL}" || true
 done
 cmake --version
@@ -369,13 +538,13 @@ gcc --version
 ```bash
 # Ubuntu/Debian 容器，按需执行；离线环境使用管理员提供的镜像源/离线包。
 apt-get update
-apt-get install -y build-essential cmake git binutils patch tar gzip unzip zip \
+apt-get install -y build-essential cmake git binutils file patch tar gzip unzip zip \
   util-linux procps python3-dev
 ```
 
 ```bash
 # openEuler/RHEL 系容器，按需执行；不要与上面的 apt 命令混用。
-dnf install -y gcc gcc-c++ make cmake git binutils patch tar gzip unzip zip \
+dnf install -y gcc gcc-c++ make cmake git binutils file patch tar gzip unzip zip \
   util-linux procps-ng python3-devel
 ```
 
@@ -398,14 +567,35 @@ test -f tests/python/deepep/a5_ccu_test_runtime.py
 test -f docs/topology/a5_hccn_device_topology_raw.txt
 ```
 
-源码更新按 [physical contention 指南第 2 节](A5_CCU_MULTIPATH_PHYSICAL_CONTENTION_GUIDE.md#2-拉取与入口检查)
-执行。不要因重装镜像改切旧 overlap 分支，不自动清理用户修改。
-如果挂载目录里根本没有仓库，可在确认目标路径不存在后首次克隆：
+若算子仓库已存在，先检查并更新当前实验分支。下面只更新干净的 tracked 工作区，
+发现本地修改或快进失败就停止；不覆盖、不清理用户修改。不因重装镜像改切旧 overlap 分支：
 
 ```bash
+(
+set -e
+cd /home/l00934901/sgl-kernel-npu
+git status --short
+git diff --quiet
+git diff --cached --quiet
+RECOVERY_BRANCH=feature/a5-multipath-physical-contention
+git fetch origin "${RECOVERY_BRANCH}"
+git switch "${RECOVERY_BRANCH}"
+git merge --ff-only "origin/${RECOVERY_BRANCH}"
+test -f scripts/build_a5_ccu_urma_route_probe.sh
+test -f tests/python/deepep/a5_ccu_test_runtime.py
+)
+```
+
+如果挂载目录里根本没有算子仓库，**不执行上面的已有仓库更新块**，改用首次克隆：
+
+```bash
+(
+set -e
+test ! -e /home/l00934901/sgl-kernel-npu
 git clone --branch feature/a5-multipath-physical-contention --single-branch \
   https://github.com/COLDTEA-L/sgl-kernel-npu.git \
   /home/l00934901/sgl-kernel-npu
+)
 ```
 
 HCCL 源码及 `cann-cmake` 等第三方依赖应恢复**原来配套的源码树/缓存**；不要用未知
@@ -439,7 +629,11 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${RECOVERY_DE
 前提是来源、版本与框架/CANN 配套均明确。安装后必须做第 7 节真实加载检查；安装器
 返回成功不等于实际加载的 `.so` 已更新。缺包或不配套时走 6.2/6.3。
 
-### 6.2 没有 route 包：编译并安装
+### 6.2 从头编译安装第一份组件：route 包
+
+本次需要从源码恢复时先执行本节，再执行 6.3。先确认第 4 节的 Python 环境已激活、
+第 5 节两个仓库都在、没有自己的旧实验仍占用这些安装文件。构建日志保存在挂载工作区，
+失败时从日志找具体缺失依赖，不继续装另一份不配套的旧产物：
 
 ```bash
 (
@@ -448,10 +642,29 @@ cd /home/l00934901/sgl-kernel-npu
 test "$(git branch --show-current)" = feature/a5-multipath-physical-contention
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD A5_CCU_PREPARED_ALLOW_LAZY_STREAM A5_URMA_TP_TRACE_PREFIX
+set -o pipefail
+# route builder 会优先 source 这两个别名中的第一个；提前阻止其切到其他 CANN。
+for RECOVERY_CANN_ALIAS in /usr/local/Ascend/cann/set_env.sh \
+    /usr/local/Ascend/ascend-toolkit/set_env.sh; do
+    if test -f "${RECOVERY_CANN_ALIAS}"; then
+        RECOVERY_ALIAS_HOME=$(bash -ec 'source "$1" >/dev/null; readlink -f "$ASCEND_HOME_PATH"' \
+            _ "${RECOVERY_CANN_ALIAS}")
+        test "${RECOVERY_ALIAS_HOME}" = "$(readlink -f /usr/local/Ascend/cann-9.1.T560)" || {
+            echo "构建入口 ${RECOVERY_CANN_ALIAS} 指向其他 CANN：${RECOVERY_ALIAS_HOME}" >&2
+            exit 1
+        }
+        break
+    fi
+done
+test -x /home/l00934901/hccl/build.sh
+mkdir -p /home/l00934901/a5_recovery/build_logs
+RECOVERY_ROUTE_LOG=$(mktemp /home/l00934901/a5_recovery/build_logs/route.XXXXXX.log)
+echo "route 编译日志：${RECOVERY_ROUTE_LOG}"
 HCCL_REPO=/home/l00934901/hccl \
 bash scripts/build_a5_ccu_urma_route_probe.sh \
-    --install --install-path /usr/local/Ascend/cann-9.1.T560
+    --install --install-path /usr/local/Ascend/cann-9.1.T560 2>&1 | tee "${RECOVERY_ROUTE_LOG}"
 test -f /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
+echo 'ROUTE_BUILD_AND_INSTALL_DONE；仍需第 7 节检查实际 ABI'
 )
 ```
 
@@ -460,7 +673,10 @@ test -f /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_ro
 纠正容器内的环境配置，不能用两个版本混合编译。不要修改宿主机共享软链接。
 编译脚本会使用 HCCL 源码目录及缓存，但不会要求安装 patched `libhccl.so`。
 
-### 6.3 没有合格 DeepEP wheel：编译并安装
+### 6.3 从头编译安装第二份组件：DeepEP wheel
+
+用同一个已激活的 Python 环境执行，**仅构建 A5 DeepEP 所需的多路径单算子**，不运行
+默认全模块构建，也不需要再额外编译 SGLang 或替换系统 HCCL：
 
 ```bash
 (
@@ -469,18 +685,27 @@ cd /home/l00934901/sgl-kernel-npu
 test "$(git branch --show-current)" = feature/a5-multipath-physical-contention
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 unset LD_PRELOAD
+set -o pipefail
+mkdir -p /home/l00934901/a5_recovery/build_logs
+RECOVERY_DEEPEP_LOG=$(mktemp /home/l00934901/a5_recovery/build_logs/deepep.XXXXXX.log)
+RECOVERY_BUILD_STARTED_NS=$(python3 -c 'import time; print(time.time_ns())')
+echo "DeepEP 编译日志：${RECOVERY_DEEPEP_LOG}"
 DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu \
-bash build.sh -a deepep Ascend950
-RECOVERY_BUILT_WHEEL=$(python3 - <<'PY'
+bash build.sh -a deepep Ascend950 2>&1 | tee "${RECOVERY_DEEPEP_LOG}"
+RECOVERY_BUILT_WHEEL=$(python3 - "${RECOVERY_BUILD_STARTED_NS}" <<'PY'
 from pathlib import Path
-wheels = list(Path('output').glob('deep_ep-*.whl'))
+import sys
+wheels = [p for p in Path('output').glob('deep_ep-*.whl')
+          if p.stat().st_mtime_ns >= int(sys.argv[1])]
 if not wheels:
-    raise SystemExit('构建后没有找到 DeepEP wheel')
+    raise SystemExit('没有找到本次新生成的 DeepEP wheel；不安装遗留旧包')
 print(max(wheels, key=lambda path: path.stat().st_mtime).resolve())
 PY
 )
 test -f "${RECOVERY_BUILT_WHEEL}"
 python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${RECOVERY_BUILT_WHEEL}"
+python3 -m pip show deep-ep
+echo 'DEEPEP_BUILD_AND_INSTALL_DONE；继续第 7 节实际加载预检'
 )
 ```
 
@@ -655,9 +880,8 @@ wheelhouse，不能在实验机临时找公共源最新版。检查本地路径/
 (
 set -e
 umask 077
-# 替换成第 3 节实际创建、且已经通过验收的自己的容器名。
-RECOVERY_CONTAINER=REPLACE_WITH_VALIDATED_CONTAINER
-test "${RECOVERY_CONTAINER}" != REPLACE_WITH_VALIDATED_CONTAINER
+# 只能对本次自己的、已经完全验收且没有运行任务的容器做快照。
+RECOVERY_CONTAINER=sglang_yuanwen_old
 RECOVERY_IMAGE="a5-ccu-validated:$(date +%Y%m%d_%H%M%S)"
 RECOVERY_HOST_SNAPSHOT=$(mktemp -d /home/l00934901/a5_recovery/image_snapshot.XXXXXX)
 docker inspect "${RECOVERY_CONTAINER}" > "${RECOVERY_HOST_SNAPSHOT}/container.inspect.json"
