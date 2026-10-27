@@ -1,0 +1,149 @@
+# 当前机器的 CCU 多路径选路：rootinfo + Atlas + hccn_tool
+
+适用分支：`feature/a5-ccu-8rank-direct-alltoallv`。
+
+本分支同时保留旧 2/4 卡等长多路径 AllToAll 和新的 8 卡 direct-only
+AllToAllV。两者的 C/Python 接口、kernel、ABI、数据布局和通知协议不变。
+这次修改在资源准备脚本中替换 relay 地址的来源，不实现 8 卡 relay。
+
+## 地址如何生成
+
+1. 从当前机器 rootinfo 2.0 的 `rank_list[].device_id` 读取物理卡号，保留
+   `local_id` 和 `rank_id` 作为独立身份，不把 rank_id 当物理卡号。
+2. 在指定 `net_layer` / `net_instance_id` 中读取 `rank_addr_list` 的
+   `addr_type=EID`、`addr`、`ports`、`plane_id`。端口必须是明确的 `DieID/PortID`。
+3. 依据 Atlas JSON 的 `peer_list[].local_id`（物理卡号）和
+   `edge_list[].local_a/local_b`、两端 ports，关联两段 `UB_CTP / PEER2PEER`
+   DEVICE 链路。端口列表按位置配对；列表长度不相同则报错。
+4. 在资源准备时，对涉及的每张物理卡执行一次：
+   `/usr/local/Ascend/driver/tools/hccn_tool -g -dev_info -i PHYSICAL_ID`。
+   校验明确绑定的 EID 确实出现在该卡 EID 表中，端口状态为 `UB / UP`。
+   源、目的、relay 入口和出口四个端点都检查。
+5. 要求 relay 两段在同一 IO die，网络 plane / instance 相容，路径唯一。
+   有歧义则报错，不取第一项、不取模、不通过 EID 位段推测端口。
+6. 输出原格式 TSV；peer-plan JSON 自动包含配置文件路径、SHA256、查询命令、
+   查询输出 SHA256 和地址验证结果。单独 resolver 可以用 `--diagnostics-json`
+   保存相同来源记录。
+
+支持紧凑 32 位十六进制、完整及压缩冒号格式的 EID，统一输出完整冒号格式。
+一个 EID 绑定多个明确 ports 时逐个关联；IPV4/IPV6 host 地址不会被重新解释成 EID。
+UDMAC 名称和 EID Index 仅用于记录，不参与设备、端口或路径推断。
+
+**不再读取或维护 `docs/topology/a5_hccn_device_topology_raw.txt`。**
+旧 `--topology TXT` 参数在实际生成时明确报错并给出迁移提示。
+历史文档中的旧 TXT 命令应改成下面的新选项。
+
+## 配置文件发现
+
+不传路径时，在当前执行环境中检查：
+
+- rootinfo：`/etc/hccl_rootinfo.json`、`/etc/hccl_rootInfo.json`。
+- Atlas：`/usr/local/Ascend/driver/topo/950/atlas_950.json`、
+  `/usr/local/Ascend/driver/topo/950/atlas_950_1.json`。
+- hccn_tool：`/usr/local/Ascend/driver/tools/hccn_tool`。
+
+同类自动候选内容不同时，要求显式指定，不猜哪个有效。没有完整 2.0 EID/ports
+映射时明确失败。可用参数：
+
+```text
+--root-info PATH        # --rootinfo 是同义参数
+--topology-json PATH
+--hccn-tool PATH        # 查询工具实际名 hccn_tool；也接受 --hccl-tool 同义参数
+--query-timeout 15      # 每张卡查询上限秒数
+--net-layer 0
+--net-instance-id NAME  # rootinfo 涉及多个机器时明确选择本机 instance
+--plane-id LABEL        # rootinfo 网络 plane 标签，不是 IO die
+--diagnostics-json PATH
+```
+
+保留旧 `--plane` / `--relay-planes` / relay-map `plane` 的含义：选择 **relay IO die**。
+它们和新增 `--plane-id` 是不同维度。当前保守检查要求一条物理 hop 的两端以及
+同 die 的 relay 入口/出口使用相同网络 plane 标签；不支持未明确映射的跨 plane 转发。
+
+Docker 中必须使用当前宿主机的实际 rootinfo、Atlas 与 driver 信息。
+先核对宿主机与容器内容，不能从旧镜像复制配置覆盖新宿主机。
+本脚本不改系统文件，不初始化 HCCL，不修改全局路由，也不会修复 HCCL 的 EI0014。
+选路校验成功和 HCCL 通信域初始化成功是两个独立条件。
+
+## 只生成计划，不占卡运行通信
+
+两卡示例（IDs 和 IO die 按实际拓扑选择）：
+
+```bash
+python3 scripts/prepare_a5_ccu_peer_plan.py \
+  --devices 2,3 --relay-phys 0,1 \
+  --root-info /etc/hccl_rootInfo.json \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --output-dir /tmp/a5-two-card-plan
+```
+
+若返回多条候选，可用 relay-map 明确指定 relay IO die，而不是重新手写 EID：
+
+```json
+{"2,3": [{"physical_device": 0, "plane": "0"}, {"physical_device": 1, "plane": "0"}]}
+```
+
+使用 `--relay-map /path/policy.json` 代替 `--relay-phys`。
+此 JSON 是用户选择的卡对/relay 策略，不是静态机器 EID 库。
+
+四卡策略仍使用 `--relay-map`，例如：
+
+```json
+{
+  "0,1": [{"physical_device": 4, "plane": "0"}],
+  "2,3": [{"physical_device": 4, "plane": "0"}],
+  "0,2": [{"physical_device": 5, "plane": "0"}],
+  "1,3": [{"physical_device": 5, "plane": "0"}],
+  "0,3": [{"physical_device": 6, "plane": "0"}],
+  "1,2": [{"physical_device": 6, "plane": "0"}]
+}
+```
+
+```bash
+python3 scripts/prepare_a5_ccu_peer_plan.py \
+  --devices 0,1,2,3 --relay-map /path/four-card-policy.json \
+  --output-dir /tmp/a5-four-card-plan
+```
+
+两卡旧 explicit-multirelay 接口也使用同一查询模块，输出列和 route_id 保持兼容：
+
+```bash
+python3 scripts/resolve_a5_explicit_multirelay_eids.py \
+  --src-phy 2 --dst-phy 3 --relay-phys 0,1 --relay-planes 0,0 \
+  --diagnostics-json /tmp/a5-route-source.json > /tmp/a5-relays.tsv
+```
+
+peer-plan、explicit-multirelay、explicit-multipath 性能测试、channel-sync、
+synthetic probe/causal compare 和 HBM command runner 均转发这些新选项。
+查询和关联在准备阶段一次完成；warmup/正式调用复用 prepared plan。
+
+直连仍由 HCCL 从当前 communicator 发现并由 runtime 检查 hop=1、物理卡身份和
+本地 IO die。没有 synthetic relay 的 2/4/8 卡 direct-only 计划不需要运行 hccn 查询，
+也不需要这三个来源来人为构造 EID。`--direct-route` 继续表示 HCCL 候选序号，
+不是 Atlas 物理边编号；机器变化后应核对对应的 PATH_CATALOG。
+
+## 验证范围
+
+CPU 回归：
+
+```bash
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_*cpu.py' -v
+```
+
+新测试使用显式 rootinfo/Atlas fixtures 和独立的 fake hccn 子进程；覆盖新编码、
+实际 hccn 表格形状、一次/卡查询、2/4 卡 TSV 和 8 卡 direct-only，以及过期地址、
+端口 DOWN、缺失字段、网络 plane 不一致、跨 die 和多候选失败。
+它们不证明新机器真实配置、建链、NPU 正确性或性能已经通过。
+
+字段依据：[CANN 9.1 Atlas 950 rank table 与拓扑配置](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/user_guide/cluster_info_config/rank_table_config_a5.md)。
+
+### 本次开发验证（2026-10-27）
+
+- 开发服务器 CPU suite：87 项通过，包含原有 2/4 卡及 EP8 CPU kernel 模型。
+- `cam_lyw_dev_91`：route 自定义包重新构建通过，DeepEP build target 通过。
+  prepared=16、peer=5、channel-sync=1、AllToAllV=1 ABI 验证通过。
+- 编译产物 Meta gate：160 个有效 EP8 用例、12 个非法输入、10 个旧接口用例通过。
+- 用户提供的新机物理 2 卡 hccn 输出可解析为 21 个 EID、17 个端口；这是离线解析。
+- 未安装系统包，未运行 NPU 通信。尚未取得新机完整 rootinfo/Atlas 配对样本，
+  因而未确认新机配置兼容性、HCCL 初始化、实际 ChannelAcquire 或设备数据正确性。
+- 开发服务器日志：`build/ep8_validation/rootinfo_cpu.log`、`rootinfo_build.log`。

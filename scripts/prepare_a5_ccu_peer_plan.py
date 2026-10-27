@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from resolve_a5_explicit_multirelay_eids import resolve_relay
-from resolve_a5_synthetic_relay_eids import load_entries, load_topology
+from a5_ccu_machine_topology import add_machine_arguments, load_machine
 
 FIELDS = ("src_rank", "dst_rank", "src_phy", "dst_phy", "kind", "relay_phy",
           "direct_route", "weight", "src_die", "dst_die", "src_eid", "dst_eid")
@@ -72,7 +72,7 @@ def validate_policy(devices, available, policy):
     return normalized, limit
 
 
-def build_rows(devices, available, policy, entries, edges, direct_route=0):
+def build_rows(devices, available, policy, entries, edges, direct_route=0, net_layer=0):
     policy, limit = validate_policy(devices, available, policy)
     rows, diagnostics = [], []
     local_dies = {d: set() for d in devices}
@@ -84,7 +84,7 @@ def build_rows(devices, available, policy, entries, edges, direct_route=0):
                          src_die=0, dst_die=0, src_eid="-", dst_eid="-"))
         for spec in policy.get(tuple(sorted((src, dst))), []):
             relay = spec["physical_device"]
-            resolved = resolve_relay(entries, edges, src, dst, relay, spec["plane"], 0)
+            resolved = resolve_relay(entries, edges, src, dst, relay, spec["plane"], net_layer)
             local_dies[src].add(resolved["src_die"])
             local_dies[dst].add(resolved["dst_die"])
             rows.append(dict(base, kind="relay", relay_phy=relay, weight=1,
@@ -108,8 +108,7 @@ def main():
     relay_options.add_argument("--relay-map", type=Path, help="explicit physical-pair JSON policy (two or four cards)")
     relay_options.add_argument("--relay-phys", help="two-card explicit relay IDs, e.g. 0,1; omit both options for direct-only")
     p.add_argument("--direct-route", type=int, default=0)
-    p.add_argument("--topology", type=Path, default=Path("docs/topology/a5_hccn_device_topology_raw.txt"))
-    p.add_argument("--topology-json", type=Path, default=Path("/usr/local/Ascend/driver/topo/950/atlas_950_1.json"))
+    add_machine_arguments(p)
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--validate-only", action="store_true", help="validate policy without runtime, topology reads or file writes")
     args = p.parse_args()
@@ -126,14 +125,20 @@ def main():
             print("PEER_POLICY_VALIDATED " + json.dumps(dict(devices=devices,
                 available_devices=available, relay_limit_per_peer=limit, relay_policy=policy)))
             return
+        if args.topology is not None:
+            raise ValueError("--topology TXT input has been removed; use --root-info and --hccn-tool")
         if any(normalized.values()):
-            entries = load_entries(args.topology)
-            known, edges = load_topology(args.topology_json)
-            if not set(available) <= known:
-                raise ValueError("available physical IDs missing from driver topology")
+            required = set(devices) | {spec["physical_device"]
+                                      for specs in normalized.values() for spec in specs}
+            entries, edges, provenance = load_machine(args, required)
         else:
-            entries, edges = [], []  # direct-only never requires an EID inventory
-        rows, summary = build_rows(devices, available, policy, entries, edges, args.direct_route)
+            # Direct-only uses HCCL's current communicator path discovery. No
+            # synthetic EID, old TXT, or address-bit mapping is involved.
+            entries, edges = [], []
+            provenance = {"source": "hccl_direct_discovery"}
+        rows, summary = build_rows(devices, available, policy, entries, edges,
+                                   args.direct_route, args.net_layer)
+        summary["machine_topology"] = provenance
         summary["policy_source"] = ("command_line" if args.relay_phys is not None
                                     else "json" if args.relay_map is not None else "direct_only")
         summary["requested_relay_policy"] = policy

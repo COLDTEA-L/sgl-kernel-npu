@@ -11,8 +11,7 @@ direct_route=0
 bytes=4194304
 timeout_seconds=600
 output_root=/home/l00934901/profiling
-topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
-topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+machine_args=(--query-timeout 15)
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 graph=1
 worker_register_mode=full
@@ -28,8 +27,8 @@ while [[ $# -gt 0 ]]; do
         --bytes) bytes=$2; shift 2 ;;
         --timeout-seconds) timeout_seconds=$2; shift 2 ;;
         --output-root) output_root=$2; shift 2 ;;
-        --topology) topology=$2; shift 2 ;;
-        --topology-json) topology_json=$2; shift 2 ;;
+        --topology) echo "--topology TXT input removed; use --root-info, --topology-json and --hccn-tool" >&2; exit 2;;
+        --root-info|--rootinfo|--topology-json|--hccn-tool|--hccl-tool|--query-timeout|--net-layer|--net-instance-id|--plane-id|--diagnostics-json) machine_args+=("$1" "$2"); shift 2;;
         --cann-root) cann_root=$2; shift 2 ;;
         --no-graph) graph=0; shift ;;
         --worker-register-mode) worker_register_mode=$2; shift 2 ;;
@@ -106,7 +105,7 @@ for ((i=0; i<${#relay_array[@]}; ++i)); do
     relay_weights+=1
 done
 resolve=(python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py"
-    --topology "${topology}" --topology-json "${topology_json}"
+    --diagnostics-json "${run_dir}/machine_topology.json" "${machine_args[@]}"
     --src-phy "${src_phy}" --dst-phy "${dst_phy}"
     --relay-phys "${relay_phys}" --weights "${relay_weights}")
 [[ -z "${relay_planes}" ]] || resolve+=(--relay-planes "${relay_planes}")

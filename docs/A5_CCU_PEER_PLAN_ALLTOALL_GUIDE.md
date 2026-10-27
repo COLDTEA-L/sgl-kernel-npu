@@ -1,5 +1,9 @@
 # 显式 peer-plan CCU AllToAll：两卡 / 四卡
 
+> 2026-10-27：本分支继续支持 2/4 卡多路径 AllToAll。relay 准备改用当前机器
+> rootinfo + Atlas JSON + 实时 hccn_tool；旧 TXT/地址位推断入口已移除。
+> 新参数、兼容边界与例子见 [当前机器选路指南](A5_CCU_MACHINE_ROUTE_DISCOVERY.md)。
+
 分支：`feature/a5-ccu-copy-comm-overlap`（基于多类型分支）。本版在已验证的两卡 prepared-plan
 数据面上扩展 peer 维度，不改 HCCL、不改 UBUS route table，不加载新 ko。
 本地copy默认独立stream，与远端CCU分支fork/join；`--self-copy-mode serial`为对照。

@@ -22,8 +22,7 @@ profile=0
 shutdown_native=0
 cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
 output_root=/home/l00934901/profiling
-topology="${repo}/docs/topology/a5_hccn_device_topology_raw.txt"
-topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+machine_args=(--query-timeout 15)
 while (($#)); do
     case "$1" in
         --devices) devices=$2; shift 2;;
@@ -45,8 +44,8 @@ while (($#)); do
         --shutdown-native-backtrace) shutdown_native=1; shift;;
         --cann-root) cann_root=$2; shift 2;;
         --output-root) output_root=$2; shift 2;;
-        --topology) topology=$2; shift 2;;
-        --topology-json) topology_json=$2; shift 2;;
+        --topology) echo "--topology TXT input removed; use --root-info, --topology-json and --hccn-tool" >&2; exit 2;;
+        --root-info|--rootinfo|--topology-json|--hccn-tool|--hccl-tool|--query-timeout|--net-layer|--net-instance-id|--plane-id|--diagnostics-json) machine_args+=("$1" "$2"); shift 2;;
         --help) echo 'Explicit 2/4-rank AllToAll. --devices IDs [--relay-phys IDs (two cards) | --relay-map JSON (per-pair policy)]; omit both for direct-only. --profile --graph-backend none|aclgraph [--shutdown-native-backtrace]';
             echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).';
             echo '--dtype float16|bfloat16|float32|int8|int32 (default float32).';
@@ -73,7 +72,7 @@ fi
 # Validate the physical policy before importing any NPU runtime. Reuse the
 # same argument vector for manifest generation; never hard-code a relay pool.
 plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
-    --topology "$topology" --topology-json "$topology_json")
+    "${machine_args[@]}")
 ((relay_map_set == 0)) || plan_args+=(--relay-map "$relay_map")
 ((relay_phys_set == 0)) || plan_args+=(--relay-phys "$relay_phys")
 python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}" --validate-only

@@ -10,8 +10,7 @@ relay_phys=""
 relay_planes=""
 weights=""
 base_route=0
-topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
-topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+machine_args=(--query-timeout 15)
 bytes=4194304
 warmup=10
 iterations=100
@@ -28,8 +27,8 @@ while [[ $# -gt 0 ]]; do
         --relay-planes) relay_planes=$2; shift 2 ;;
         --weights) weights=$2; shift 2 ;;
         --base-route) base_route=$2; shift 2 ;;
-        --topology) topology=$2; shift 2 ;;
-        --topology-json) topology_json=$2; shift 2 ;;
+        --topology) echo "--topology TXT input removed; use --root-info, --topology-json and --hccn-tool" >&2; exit 2;;
+        --root-info|--rootinfo|--topology-json|--hccn-tool|--hccl-tool|--query-timeout|--net-layer|--net-instance-id|--plane-id|--diagnostics-json) machine_args+=("$1" "$2"); shift 2;;
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
@@ -65,9 +64,6 @@ done
 (( bytes > 0 && bytes % 256 == 0 && iterations > 0 && repeats > 0 )) || {
     echo "bytes must be a positive multiple of 256; iters/repeats must be positive" >&2; exit 2;
 }
-[[ -f "${topology}" && -f "${topology_json}" ]] || {
-    echo "topology inventory or driver JSON is missing" >&2; exit 2;
-}
 
 cd "${repo_root}"
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
@@ -88,7 +84,7 @@ run_dir="${output_root}/a5_ccu_explicit_multirelay_${src_phy}_${dst_phy}_$(date 
 mkdir -p "${run_dir}/cases" "${run_dir}/footprint"
 raw_manifest="${run_dir}/resolved_explicit_relays.tsv"
 resolve=(python3 "${script_dir}/resolve_a5_explicit_multirelay_eids.py"
-    --topology "${topology}" --topology-json "${topology_json}"
+    --diagnostics-json "${run_dir}/machine_topology.json" "${machine_args[@]}"
     --src-phy "${src_phy}" --dst-phy "${dst_phy}"
     --relay-phys "${relay_phys}" --weights "${weights}")
 [[ -z "${relay_planes}" ]] || resolve+=(--relay-planes "${relay_planes}")
