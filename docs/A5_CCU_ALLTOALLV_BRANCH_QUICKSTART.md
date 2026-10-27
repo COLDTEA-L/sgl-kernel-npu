@@ -28,11 +28,11 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 A5_BRANCH=feature/a5-ccu-8rank-direct-alltoallv
-git fetch origin "${A5_BRANCH}"
+git fetch origin "refs/heads/${A5_BRANCH}:refs/remotes/origin/${A5_BRANCH}"
 if git show-ref --verify --quiet "refs/heads/${A5_BRANCH}"; then
     git switch "${A5_BRANCH}"
 else
-    git switch --track -c "${A5_BRANCH}" "origin/${A5_BRANCH}"
+    git switch -c "${A5_BRANCH}" "refs/remotes/origin/${A5_BRANCH}"
 fi
 git merge --ff-only "origin/${A5_BRANCH}"
 git log -3 --oneline
@@ -40,6 +40,11 @@ git status --short
 echo '第1步完成'
 )
 ```
+
+若旧仓是 single-branch clone，`git fetch origin 分支名` 可能只写 FETCH_HEAD，
+不会创建 `origin/分支名`，随后报 `invalid reference`。上面的显式 refspec 会直接
+创建对应 remote-tracking ref，不依赖旧仓的 fetch 范围；新建本地分支也不要求旧配置
+能自动识别 upstream。后续更新仍用本步骤的 fetch 和 `merge --ff-only`。
 
 有本地修改时先检查，再可用 `git stash push -m backup-before-alltoallv-branch`
 保存 tracked 修改；此命令不收走 untracked 文件。切分支若提示未跟踪文件冲突，
