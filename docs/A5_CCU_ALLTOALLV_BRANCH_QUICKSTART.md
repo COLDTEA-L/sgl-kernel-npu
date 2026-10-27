@@ -151,7 +151,8 @@ set -Ee -o pipefail
 trap 'echo "第4步失败，行号 ${LINENO}；先处理选路错误，再继续。" >&2' ERR
 cd /home/l00934901/sgl-kernel-npu
 echo '第4步开始：实时选路预检'
-A5_CHECK_DIR=$(mktemp -d /tmp/a5-route-check.XXXXXX)
+mkdir -p /home/l00934901/profiling
+A5_CHECK_DIR=$(mktemp -d /home/l00934901/profiling/a5-route-check.XXXXXX)
 echo "选路输出目录：${A5_CHECK_DIR}"
 python3 scripts/resolve_a5_explicit_multirelay_eids.py \
   --src-phy 2 --dst-phy 3 --relay-phys 4 --relay-planes 1 \
@@ -222,7 +223,8 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 cd /home/l00934901/sgl-kernel-npu
 echo '第5.2步开始：DeepEP 构建和安装'
 mkdir -p build/ep8_validation
-A5_WHEEL_MARKER=$(mktemp /tmp/a5-wheel-build.XXXXXX)
+mkdir -p /home/l00934901/profiling
+A5_WHEEL_MARKER=$(mktemp /home/l00934901/profiling/a5-wheel-build.XXXXXX)
 DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu bash build.sh -a deepep Ascend950 \
   2>&1 | tee build/ep8_validation/new_machine_deepep_build.log
 python3 - "${A5_WHEEL_MARKER}" <<'PY'
@@ -344,7 +346,8 @@ set -Ee -o pipefail
 trap 'echo "第7步 relay 失败，行号 ${LINENO}" >&2' ERR
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 cd /home/l00934901/sgl-kernel-npu
-A5_POLICY_DIR=$(mktemp -d /tmp/a5-two-card-policy.XXXXXX)
+mkdir -p /home/l00934901/profiling
+A5_POLICY_DIR=$(mktemp -d /home/l00934901/profiling/a5-two-card-policy.XXXXXX)
 cat > "${A5_POLICY_DIR}/policy.json" <<'JSON'
 {"2,3": [{"physical_device": 4, "plane": "1"}]}
 JSON
@@ -376,7 +379,8 @@ a5_ccu_prepare_test_env /usr/local/Ascend/cann-9.1.T560 "$PWD"
 export A5_CCU_ROUTE_PROBE_LIB=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export A5_CCU_CHANNEL_SYNC_MODE=baseline
-A5_EP8_RUN=$(mktemp -d /tmp/a5-ep8-correctness.XXXXXX)
+mkdir -p /home/l00934901/profiling
+A5_EP8_RUN=$(mktemp -d /home/l00934901/profiling/a5-ep8-correctness.XXXXXX)
 echo "八卡结果目录：${A5_EP8_RUN}"
 python3 scripts/prepare_a5_ccu_peer_plan.py \
   --devices "$ASCEND_RT_VISIBLE_DEVICES" --available-phys 0,1,2,3,4,5,6,7 \
@@ -414,3 +418,39 @@ echo '第8步完成'
 每次使用新结果目录；八个 rank 结果和成功退出缺一不可。
 其他 dtype 可在 float32 gate 通过后分别测试；API 与布局细节见
 [EP8 AllToAllV 说明](A5_CCU_8RANK_ALLTOALLV.md)。
+
+## 9. 八卡大消息正确性与简单计时（不采集 profiler）
+
+第 8 步通过后，在八卡均空闲时执行。只新增 Python/Shell，无需重编译或重装 wheel。
+结果、计划、日志和本次临时目录都放在 `/home/l00934901/profiling`。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_alltoallv_benchmark.sh
+```
+
+默认 FP16、width=4096，每行 8192 字节。使用原非对称矩阵的 epoch=0，
+各项乘 128：每条流 0～1280 行，最大跨卡流 10 MiB；八卡合计含 self
+244 MiB，其中跨卡有效载荷 214 MiB，每卡发送量（含 self）最大 43 MiB。
+保留 rank 7 全零发送、rank 6 全零接收，以及独立 self 偏移。
+这是合成路由分布，尚不是实际模型 router 采集的流量。
+
+先校验自定义输出、输入与 guard、原生 AllToAllV 对照，再计时。
+自定义与原生各计 3 轮，每轮各 warmup 5 次、连续调用 20 次并等待 NPU 完成；
+轮间交替先后顺序。每轮计时前更换输入、污染输出，计时后验证结果和自定义 buffer guard。
+不在计时区间内进行 CPU 数据生成、建链、分配张量、校验或额外 barrier。
+计时结果是 **host wall-clock 下批量提交并等待完成的平均每次调用耗时**，包含
+Python/C++ 调用开销及算子自身同步；不是 CCU 纯内核时间，也不含 MoE router/pack/unpack。
+
+终端应显示 `EP8_BENCHMARK_PASS`，`summary.json` 中 custom/native 的 `mean_us`
+是每轮先取八个 rank 中最大的平均耗时，再对三轮求均值；`native_over_custom`
+大于 1 表示该计时口径下自定义更快。实际是否走原生 CCU 路径仍以 HCCL 日志为准。
+只记录日志和 JSON，不生成 profiler trace；算子打印日志等调用自身开销仍可能进入计时。
+
+可选覆盖数据量与循环次数，例如：
+
+```bash
+bash scripts/run_a5_ccu_alltoallv_benchmark.sh --row-scale 256 --iters 50
+```
+
+此时最大单流 20 MiB、八卡跨卡总量 428 MiB。先验证默认用例再扩大。
