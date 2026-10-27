@@ -1,5 +1,9 @@
 # A5 CCU 显式多路径 AllToAll 新机器部署指南
 
+> AllToAllV 分支请从 [分支操作指南](A5_CCU_ALLTOALLV_BRANCH_QUICKSTART.md) 开始。
+> 2026-10-27 已确认旧镜像可能保留旧机 rootinfo；原创建命令漏挂该文件。
+> 当前容器修复和持久只读挂载见 [rootinfo 来源修复](A5_CCU_ROOTINFO_CONTAINER_FIX.md)。
+
 适用代码分支：`feature/a5-ccu-copy-comm-overlap`。编写日期：2026年10月19日。
 
 目标是在另一台 Ascend 950 机器上，重新部署两卡或四卡显式 direct/relay AllToAll。
@@ -41,7 +45,7 @@
 | wheel和SO | 旧aarch64、特定Python/CANN编译产物 | 优先本地重编；不能跨Python ABI、架构或未知SDK直接复制 |
 | 计算卡和relay | 旧例子计算6、7，relay0～5 | 确认存在、允许使用且拓扑满足要求，不假设这些ID仍有效 |
 | 可用卡集合N | 旧例子N=8 | 传实际可借用集合；不是盲目传0～7，更不是进程可见卡数 |
-| EID与UDMAC | 仓库`docs/topology/a5_hccn_device_topology_raw.txt` | 该文件是旧机器快照，relay测试必须替换为新机器采集结果 |
+| EID与UDMAC | 仓库旧机 TXT 快照 | AllToAllV 分支不再读该 TXT；使用本机 rootinfo 明确端口绑定、Atlas 和实时 hccn 校验 |
 | driver topology | `atlas_950_1.json` | 文件名、JSON格式、physical ID映射和实际接线都要核对 |
 | direct-route编号 | 旧实验candidate0是direct | 编号是当前CommLink枚举序号，不保证新环境0一定是direct |
 | profiling和性能 | 旧机器几十微秒的结果 | 重新测；CPU、NUMA、频率、共享负载及relay使用情况都会不同 |
@@ -97,6 +101,9 @@ docker exec -it "${A5_CONTAINER}" bash
 
 - NPU及HCOMM/URMA所需设备可访问；不能只有计算设备而缺少通信设备。
 - driver运行库、拓扑目录可读；读挂载足够的目录不要申请写权限。
+- 本机 rootinfo 必须显式只读挂载，核对宿主/容器实际内容；不能沿用镜像中的旧文件。
+  将本机同一源文件挂到 `/etc/hccl_rootinfo.json` 与 `/etc/hccl_rootInfo.json` 两个路径，
+  避免大小写不同的消费者读到旧配置，参数见 rootinfo 来源修复指南第 4 节。
 - 编译仓和输出目录可写，磁盘、共享内存及权限满足框架运行要求。
 - CANN和Python安装目录是否为宿主机bind mount或共享卷。**Docker内安装不等于不影响宿主机**。
 - 不要默认使用`--privileged`、挂载整个`/dev`，或为relay暴露不必要的计算设备。具体透传由管理员确认。

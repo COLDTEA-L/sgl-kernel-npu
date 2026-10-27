@@ -169,3 +169,10 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_*cpu.py' -v
 用户输出同时显示上述四个 rootinfo EID 的 `live_eid_present=False`，端口为 UB/UP。
 这项地址不一致尚未定位，仍会阻止建计划；不能因端口 UP 就跳过 EID 校验。
 需进一步比较 rootinfo 中的实际 EID、实时 hccn EID，以及宿主机/容器配置来源。
+
+### 宿主机与容器来源已确认不一致
+
+用户进一步确认宿主/容器 rootinfo hashes 不同，显式挂载缺少 rootinfo；容器地址
+逐条命中旧机快照。当前容器修复及后续只读挂载见
+[容器 rootinfo 修复指南](A5_CCU_ROOTINFO_CONTAINER_FIX.md)。
+检查宿主副本是否匹配实时设备后再安装，不能直接把“宿主文件”视作已经校验。
