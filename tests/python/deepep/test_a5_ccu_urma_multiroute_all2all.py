@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 from a5_ccu_test_runtime import prepare_runtime as shared_prepare_runtime
-from a5_ccu_test_runtime import ccu_pg_options, verify_ccu_communicator
+from a5_ccu_test_runtime import ccu_pg_kwargs, log_ccu_communicator
 from a5_ccu_peer_test_support import file_barrier, make_profiler, measurement_start
 
 os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
@@ -281,7 +281,7 @@ def main():
     mark_phase("set_device")
     torch.npu.set_device(local_rank)
     mark_phase("init_process_group")
-    pg_kwargs = {} if args.implementation == "native" else {"pg_options": ccu_pg_options(torch_npu)}
+    pg_kwargs = {} if args.implementation == "native" else ccu_pg_kwargs(torch_npu)
     pg_init_file = os.environ.get("A5_CCU_PG_INIT_FILE", "")
     if pg_init_file:
         pg_init_path = Path(pg_init_file).resolve()
@@ -305,7 +305,7 @@ def main():
     if args.implementation != "native":
         mark_phase("deep_ep_buffer_init")
         buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
-        verify_ccu_communicator(buffer.moe_all_to_all_group_name)
+        log_ccu_communicator(buffer.moe_all_to_all_group_name)
         mark_phase("deep_ep_buffer_init_done")
 
     explicit_weights = [int(item) for item in args.path_weights.split(",") if item]

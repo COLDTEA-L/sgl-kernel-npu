@@ -2,6 +2,7 @@
 import ctypes
 import importlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import site
@@ -10,44 +11,88 @@ import sys
 _LOADED_LIBRARIES = []
 
 
-def ccu_pg_options(torch_npu):
-    """Select CCU_SCHED explicitly for this test communicator.
+def prepare_ccu_environment():
+    """Match the historical CCU workers before loading any native runtime."""
+    mode = os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "CCU_SCHED")
+    if mode != "CCU_SCHED":
+        raise RuntimeError(f"CCU worker requires HCCL_OP_EXPANSION_MODE=CCU_SCHED, got {mode!r}")
+    os.environ.setdefault("HCCL_BUFFSIZE", "2300")
+    pg_mode = os.environ.get("A5_CCU_PG_MODE", "env")
+    if pg_mode not in ("env", "config6"):
+        raise RuntimeError(f"invalid A5_CCU_PG_MODE={pg_mode!r}; expected env or config6")
 
-    HcclCommConfig uses 6 for CCU_SCHED. HcclConfigGetInfo reports 5 for
-    that same mode: these are different enums. Environment alone does not
-    guarantee the mode of the communicator returned by ProcessGroupHCCL.
+
+def log_ccu_environment(stage):
+    fields = {name: os.environ.get(name) for name in (
+        "HCCL_OP_EXPANSION_MODE", "HCCL_BUFFSIZE", "HCCL_ALGO", "A5_CCU_PG_MODE",
+        "ASCEND_HOME_PATH", "ASCEND_RT_VISIBLE_DEVICES", "LD_LIBRARY_PATH", "LD_PRELOAD")}
+    fields.update(stage=stage, rank=os.environ.get("RANK", "NA"), pid=os.getpid(),
+                  python=sys.executable, torch_loaded="torch" in sys.modules,
+                  torch_npu_loaded="torch_npu" in sys.modules)
+    print("CCU_RUNTIME_ENV " + json.dumps(fields, sort_keys=True), flush=True)
+
+
+def ccu_pg_kwargs(torch_npu):
+    """Default to the old branches' environment-only communicator creation.
+
+    config6 is an explicit comparison, not an automatic retry. Public SDK
+    HcclCommConfig uses 6 for CCU_SCHED; T560 behavior still needs hardware
+    validation. Do not require a newer SDK query enum to gate old runtimes.
     """
+    log_ccu_environment("before_process_group")
+    prepare_ccu_environment()
+    mode = os.environ.get("A5_CCU_PG_MODE", "env")
+    print(f"CCU_PG_CONFIG rank={os.environ.get('RANK', 'NA')} mode={mode} "
+          f"pg_options={'omitted' if mode == 'env' else 'hccl_op_expansion_mode:6'} "
+          f"torch_npu={getattr(torch_npu, '__version__', 'unknown')}", flush=True)
+    if mode == "env":
+        return {}
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     options.hccl_config = {"hccl_op_expansion_mode": 6}
-    print(f"CCU_PG_CONFIG rank={os.environ.get('RANK', 'NA')} "
-          f"hccl_op_expansion_mode=6 requested=CCU_SCHED "
-          f"env={os.environ.get('HCCL_OP_EXPANSION_MODE', '<unset>')}", flush=True)
-    return options
+    return {"pg_options": options}
 
 
-def verify_ccu_communicator(group_name):
-    """Check the actual DeepEP communicator before requesting CCU channels."""
-    if not group_name:
-        raise RuntimeError("CCU test requires a named ProcessGroupHCCL communicator")
-    hccl = ctypes.CDLL("libhccl.so")
-    get_comm = hccl.HcomGetCommHandleByGroup
-    get_comm.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
-    get_comm.restype = ctypes.c_int
-    get_config = hccl.HcclConfigGetInfo
-    get_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p]
-    get_config.restype = ctypes.c_int
-    comm = ctypes.c_void_p()
-    status = get_comm(group_name.encode(), ctypes.byref(comm))
-    if status != 0 or not comm.value:
-        raise RuntimeError(f"HcomGetCommHandleByGroup({group_name!r}) failed: status={status}")
-    mode = ctypes.c_int(-1)
-    status = get_config(comm, 0, ctypes.sizeof(mode), ctypes.byref(mode))
-    print(f"CCU_PG_MODE rank={os.environ.get('RANK', 'NA')} group={group_name} "
-          f"query_status={status} op_expansion_mode={mode.value} expected=5(CCU_SCHED)", flush=True)
-    if status != 0 or mode.value != 5:
-        raise RuntimeError("CCU communicator mode check failed before ChannelAcquire: "
-                           f"status={status}, actual={mode.value}, expected=5(CCU_SCHED); "
-                           "init_process_group must receive hccl_op_expansion_mode=6 in pg_options")
+def log_ccu_communicator(group_name):
+    """Record raw query evidence; ChannelAcquire remains the capability gate.
+
+    T560 returned success/raw=0 after config6 in an actual run. We have not
+    established its query implementation/enum matches the public 9.1 SDK.
+    A diagnostic query must not turn this into an artificial test failure.
+    """
+    log_ccu_environment("before_channel_prepare")
+    try:
+        mappings = Path("/proc/self/maps").read_text().splitlines()
+        paths = set()
+        for line in mappings:
+            fields = line.split(maxsplit=5)
+            if len(fields) == 6 and any(name in Path(fields[5]).name for name in (
+                    "libhccl.so", "libhcomm.so", "liba5_ccu_urma_route_probe.so", "deep_ep_cpp")):
+                paths.add(fields[5])
+        print("CCU_RUNTIME_LIBS " + json.dumps(sorted(paths)), flush=True)
+    except OSError as error:
+        print(f"CCU_RUNTIME_LIBS unavailable={error}", flush=True)
+    try:
+        if not group_name:
+            raise ValueError("unnamed communicator")
+        hccl = ctypes.CDLL("libhccl.so")
+        get_comm = hccl.HcomGetCommHandleByGroup
+        get_comm.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        get_comm.restype = ctypes.c_int
+        get_config = hccl.HcclConfigGetInfo
+        get_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p]
+        get_config.restype = ctypes.c_int
+        comm = ctypes.c_void_p()
+        status = get_comm(group_name.encode(), ctypes.byref(comm))
+        if status != 0 or not comm.value:
+            raise ValueError(f"HcomGetCommHandleByGroup status={status}, null={not comm.value}")
+        mode = ctypes.c_int(-1)
+        status = get_config(comm, 0, ctypes.sizeof(mode), ctypes.byref(mode))
+        print(f"CCU_PG_MODE rank={os.environ.get('RANK', 'NA')} group={group_name} "
+              f"query_status={status} raw_mode={mode.value} diagnostic_only=1", flush=True)
+        return status, mode.value
+    except (AttributeError, OSError, ValueError) as error:
+        print(f"CCU_PG_MODE group={group_name!r} unavailable={error} diagnostic_only=1", flush=True)
+        return None
 
 
 def import_deep_ep(extension_path):
@@ -110,6 +155,8 @@ def prepare_runtime(entrypoint, require_route_library=True):
     Call before importing torch/torch_npu. Never re-exec this helper's __file__
     or import an executable benchmark to obtain its runtime setup.
     """
+    prepare_ccu_environment()
+    log_ccu_environment("before_runtime_load")
     entrypoint = Path(entrypoint).resolve()
     packages = [Path(path) / "deep_ep" for path in site.getsitepackages()]
     packages.append(entrypoint.parents[3] / "python/deep_ep/deep_ep")

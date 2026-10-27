@@ -287,21 +287,37 @@ echo '第6步完成：应看到 ALLTOALLV_META_PASS valid=160 invalid=12 legacy=
 以下开始使用 NPU；选择实际允许使用的计算卡和中转卡。先跑 direct-only，若 HCCL
 初始化失败就停在这里，处理配置，不继续多路径或性能测试。
 
-测试 worker 显式向 `init_process_group` 传入
-`pg_options.hccl_config={"hccl_op_expansion_mode": 6}`，为当前测试通信域选择
-CCU_SCHED；不能只凭 shell 中的 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 判断通信域模式。
-准备 Channel 前还会查询 DeepEP 实际使用的同一个通信域，正常日志应包含：
+启动方式已按旧分支 `feature/a5-ccu-copy-comm-overlap` 和
+`feature/a5-multipath-physical-contention` 核对。默认 `--pg-mode env`：
+先 source CANN 并设置 `HCCL_OP_EXPANSION_MODE=CCU_SCHED`，worker 在加载 route library / Torch
+之前再次核对环境，以 `RTLD_GLOBAL` 预加载 route library，使用 file-store 初始化 HCCL
+通信域，不传 `pg_options`。旧分支的共享环境和 peer-plan bootstrap 在 `fac9d39` 之前
+已与本分支一致；这次恢复的是 `fac9d39` 新增强制配置前的通信域初始化方式。
+
+应先看到以下日志；它们用于记录初始化条件，不代表建链或数据正确性通过：
 
 ```text
-CCU_PG_CONFIG ... hccl_op_expansion_mode=6 requested=CCU_SCHED ...
-CCU_PG_MODE ... query_status=0 op_expansion_mode=5 expected=5(CCU_SCHED)
+CCU_PG_CONFIG ... mode=env pg_options=omitted ...
+CCU_PG_MODE ... query_status=0 raw_mode=... diagnostic_only=1
 ```
 
-这里 **配置值 6** 与 **查询值 5** 属于两套不同的枚举，不能互换。
-若旧日志出现 `opExpansionMode[2] is not supported by CCU engine[5]`，
-表示 HCCL 在通信域模式检查处拒绝建链，还不能据此判断 EID 或 Channel 描述符有错。
-更新本次 Python worker 修复后，从本节 direct-only 重跑；无需重编 route 或重装 DeepEP wheel。
-如果模式预检仍失败，保留 `CCU_PG_CONFIG`、`CCU_PG_MODE` 和该次 worker plog，停在此处。
+`fac9d39` 在 T560 上观测到查询成功但 `actual=0`，随后被 Python 的 `expected=5` 检查提前终止，
+该次并未调用 ChannelAcquire。此前把公开 SDK 的查询枚举直接作为 T560 硬性门槛缺少验证，
+现已移除此门槛。原始查询仅作诊断，不把 0 宣称为成功，也不自动创建其他模式的通信域重试。
+仍需实际 `PEER_PLAN_ACQUIRE ... status=0`、Channel 状态正常、数据校验通过和进程正常退出。
+
+如果需要单独对照显式配置，在下面同一条命令加 `--pg-mode config6`，会向
+`init_process_group` 传 `hccl_config={"hccl_op_expansion_mode":6}`；每次使用新的 worker 进程，
+runner 不自动回退。EP8 和旧两卡 worker 可通过 `A5_CCU_PG_MODE=env|config6` 选择，默认 env。
+
+`CCU_RUNTIME_ENV` 记录 runtime 加载前、PG 创建前、Channel 准备前的环境和 Python 路径；
+`CCU_RUNTIME_LIBS` 记录进程实际映射的 HCCL/HCOMM/route/DeepEP 库路径。
+失败时 runner 自动保存并打印 `r1/failure_context.log`，包含这些标记和本次 worker PID 对应的
+近期 plog，优先保留 `HcclChannelAcquire` / `opExpansionMode` 错误。找不到 plog 会明确报告。
+如仍出现 `opExpansionMode[2] is not supported by CCU engine[5]`，保留该摘要，停在 direct-only。
+恢复旧启动方式本身尚不能证明最初的模式错误已修复。
+
+本次只改 Python/Shell 和文档；更新后直接从本节重跑，无需重编 route 或重装 DeepEP wheel。
 
 编号依据见 [HcclCommConfig 的 hcclOpExpansionMode](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/commlib/hcclug/docs/zh/api_ref/comm_mgr_c/data_type_definition/HcclRootInfo.md)
 和 [HcclOpExpansionMode 查询枚举](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/api_ref/comm_mgr_c/data_type_definition/HcclOpExpansionMode.md)。
@@ -313,7 +329,7 @@ trap 'echo "第7步 direct-only 失败，行号 ${LINENO}" >&2' ERR
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
-  --devices 2,3 --bytes 4096 --dtype float32 \
+  --devices 2,3 --bytes 4096 --dtype float32 --pg-mode env \
   --self-copy-mode ccu --channel-sync-mode baseline \
   --warmup 1 --iters 3 --repeats 1 --timeout-seconds 180 \
   --output-root /home/l00934901/profiling/a5-alltoallv-branch

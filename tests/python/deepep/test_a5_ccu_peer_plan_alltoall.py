@@ -14,8 +14,8 @@ import time
 from a5_ccu_peer_test_support import (file_barrier, make_profiler, measurement_start,
     warmup_calls, measure_calls, validate_queued_calls, write_rank_result,
     PAYLOAD_DTYPES, payload_code)
-from a5_ccu_test_runtime import (prepare_runtime, import_deep_ep, ccu_pg_options,
-                                verify_ccu_communicator)
+from a5_ccu_test_runtime import (prepare_runtime, import_deep_ep, ccu_pg_kwargs,
+                                log_ccu_communicator)
 
 
 def phase(name):
@@ -113,7 +113,7 @@ def main():
           f"deep_ABI={abi_versions['A5DeepEpPeerPlanAbiVersion']} "
           f"self_copy_mode={args.self_copy_mode} channel_sync_mode={args.channel_sync_mode}", flush=True)
     if args.runtime_check:
-        ccu_pg_options(torch_npu)
+        ccu_pg_kwargs(torch_npu)
         return
 
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
@@ -123,9 +123,9 @@ def main():
     phase("communicator_init")
     dist.init_process_group("hccl", init_method=f"file://{(args.run_dir / 'pg_init').resolve()}",
                             rank=rank, world_size=k, timeout=timedelta(seconds=180),
-                            pg_options=ccu_pg_options(torch_npu))
+                            **ccu_pg_kwargs(torch_npu))
     buffer = Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
-    verify_ccu_communicator(buffer.moe_all_to_all_group_name)
+    log_ccu_communicator(buffer.moe_all_to_all_group_name)
     capture_stream = torch.npu.Stream() if args.graph_backend == "aclgraph" else None
     phase("prepare_plan")
     # Like the validated two-rank harness, prepare directly on the capture

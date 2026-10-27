@@ -34,8 +34,8 @@ def main():
     if args.width < 1 or not args.manifest.is_file() or int(os.environ.get("WORLD_SIZE", 0)) != 8:
         parser.error("positive width, an existing manifest and WORLD_SIZE=8 are required")
     os.environ["A5_CCU_CHANNEL_SYNC_MODE"] = "baseline"
-    from a5_ccu_test_runtime import (prepare_runtime, import_deep_ep, ccu_pg_options,
-                                    verify_ccu_communicator)
+    from a5_ccu_test_runtime import (prepare_runtime, import_deep_ep, ccu_pg_kwargs,
+                                    log_ccu_communicator)
     extension_path, route_path = prepare_runtime(__file__)
     import torch
     import torch.distributed as dist
@@ -55,9 +55,9 @@ def main():
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     args.run_dir.mkdir(parents=True, exist_ok=True)
     dist.init_process_group("hccl", timeout=timedelta(seconds=180),
-                            pg_options=ccu_pg_options(torch_npu))
+                            **ccu_pg_kwargs(torch_npu))
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
-    verify_ccu_communicator(buffer.moe_all_to_all_group_name)
+    log_ccu_communicator(buffer.moe_all_to_all_group_name)
     handle = buffer.prepare_ccu_urma_peer_plan_alltoallv("ep8-direct", str(args.manifest.resolve()))
     dtype = getattr(torch, args.dtype)
     guard = 37

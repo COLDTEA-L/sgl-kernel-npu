@@ -12,6 +12,7 @@ bytes=4194304
 dtype=float32
 self_copy_mode=overlap
 channel_sync_mode=baseline
+pg_mode=${A5_CCU_PG_MODE:-env}
 warmup=100
 iterations=20
 repeats=1
@@ -34,6 +35,7 @@ while (($#)); do
         --dtype) dtype=$2; shift 2;;
         --self-copy-mode) self_copy_mode=$2; shift 2;;
         --channel-sync-mode) channel_sync_mode=$2; shift 2;;
+        --pg-mode) pg_mode=$2; shift 2;;
         --warmup) warmup=$2; shift 2;;
         --iters) iterations=$2; shift 2;;
         --repeats) repeats=$2; shift 2;;
@@ -50,7 +52,8 @@ while (($#)); do
             echo '--sync-mode per-call (default) or batch (opt-in changed-payload gate; graph-backend must be none).';
             echo '--dtype float16|bfloat16|float32|int8|int32 (default float32).';
             echo '--self-copy-mode ccu (one CCU local+remote graph, grouped MS copy), ccu-direct (large-copy control), overlap (default) or serial (D2D).';
-            echo '--channel-sync-mode baseline (default), packed or packed-ready; frozen at prepare.'; exit 0;;
+            echo '--channel-sync-mode baseline (default), packed or packed-ready; frozen at prepare.';
+            echo '--pg-mode env (default, historical CCU_SCHED environment) or config6 (explicit pg_options comparison).'; exit 0;;
         *) echo "unsupported argument: $1" >&2; exit 2;;
     esac
 done
@@ -63,6 +66,8 @@ case "$dtype" in float16|bfloat16|float32|int8|int32) ;; *) echo 'unsupported --
 export A5_CCU_SELF_COPY_MODE="$self_copy_mode"
 case "$channel_sync_mode" in baseline|packed|packed-ready) ;; *) echo 'invalid --channel-sync-mode' >&2; exit 2;; esac
 export A5_CCU_CHANNEL_SYNC_MODE="$channel_sync_mode"
+case "$pg_mode" in env|config6) ;; *) echo 'invalid --pg-mode; use env or config6' >&2; exit 2;; esac
+export A5_CCU_PG_MODE="$pg_mode"
 [[ "$graph" == none || "$graph" == aclgraph ]] || exit 2
 [[ "$sync_mode" == per-call || "$sync_mode" == batch ]] || { echo 'invalid --sync-mode' >&2; exit 2; }
 [[ "$sync_mode" != batch || "$graph" == none ]] || { echo 'batch requires --graph-backend none' >&2; exit 2; }
@@ -88,11 +93,12 @@ mkdir -p "${output_root}"
 run_dir=$(mktemp -d "${output_root}/a5_ccu_peer_plan_${devices//,/_}_$(date +%Y%m%d_%H%M%S).XXXXXX")
 mkdir -p "${run_dir}/cases"
 python3 - "$run_dir" "$repeats" "$sync_mode" "$bytes" "$warmup" "$iterations" "$graph" "$dtype" "$self_copy_mode" "$channel_sync_mode" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 (pathlib.Path(sys.argv[1]) / 'run_settings.json').write_text(json.dumps(dict(
     repeats=int(sys.argv[2]), sync_mode=sys.argv[3], bytes_per_peer=int(sys.argv[4]),
     warmup=int(sys.argv[5]), iterations=int(sys.argv[6]), graph_backend=sys.argv[7], dtype=sys.argv[8],
-    self_copy_mode=sys.argv[9], channel_sync_mode=sys.argv[10])) + '\n')
+    self_copy_mode=sys.argv[9], channel_sync_mode=sys.argv[10],
+    pg_mode=os.environ['A5_CCU_PG_MODE'])) + '\n')
 PY
 echo "Result directory: ${run_dir}"
 python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}" --output-dir "${run_dir}/plans"
@@ -126,7 +132,14 @@ for ((r=1; r<=repeats; r++)); do
     # capture to finish. It never signals the test or touches shared hardware.
     wait "$monitor_pid" || true
     echo "peer_plan_r${r}: status=${rc}"
-    if ((rc != 0)); then tail -n 60 "$log"; failed=1; break; fi
+    if ((rc != 0)); then
+        tail -n 60 "$log"
+        python3 "${repo}/scripts/collect_a5_ccu_failure_context.py" \
+            --log "$log" --since-file "${run_dir}/run_settings.json" \
+            --output "${case_dir}/failure_context.log" || true
+        failed=1
+        break
+    fi
 done
 python3 "${repo}/scripts/analyze_a5_ccu_peer_plan.py" --run-dir "$run_dir"
 sed -n '1,180p' "${run_dir}/peer_plan_report.md"
