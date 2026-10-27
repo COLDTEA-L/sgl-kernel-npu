@@ -1,4 +1,4 @@
-"""Shared two-/four-rank runtime bootstrap, with no import-time side effects."""
+"""Shared CCU test runtime bootstrap, with no import-time side effects."""
 import ctypes
 import importlib
 import importlib.util
@@ -8,6 +8,46 @@ import site
 import sys
 
 _LOADED_LIBRARIES = []
+
+
+def ccu_pg_options(torch_npu):
+    """Select CCU_SCHED explicitly for this test communicator.
+
+    HcclCommConfig uses 6 for CCU_SCHED. HcclConfigGetInfo reports 5 for
+    that same mode: these are different enums. Environment alone does not
+    guarantee the mode of the communicator returned by ProcessGroupHCCL.
+    """
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_op_expansion_mode": 6}
+    print(f"CCU_PG_CONFIG rank={os.environ.get('RANK', 'NA')} "
+          f"hccl_op_expansion_mode=6 requested=CCU_SCHED "
+          f"env={os.environ.get('HCCL_OP_EXPANSION_MODE', '<unset>')}", flush=True)
+    return options
+
+
+def verify_ccu_communicator(group_name):
+    """Check the actual DeepEP communicator before requesting CCU channels."""
+    if not group_name:
+        raise RuntimeError("CCU test requires a named ProcessGroupHCCL communicator")
+    hccl = ctypes.CDLL("libhccl.so")
+    get_comm = hccl.HcomGetCommHandleByGroup
+    get_comm.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+    get_comm.restype = ctypes.c_int
+    get_config = hccl.HcclConfigGetInfo
+    get_config.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p]
+    get_config.restype = ctypes.c_int
+    comm = ctypes.c_void_p()
+    status = get_comm(group_name.encode(), ctypes.byref(comm))
+    if status != 0 or not comm.value:
+        raise RuntimeError(f"HcomGetCommHandleByGroup({group_name!r}) failed: status={status}")
+    mode = ctypes.c_int(-1)
+    status = get_config(comm, 0, ctypes.sizeof(mode), ctypes.byref(mode))
+    print(f"CCU_PG_MODE rank={os.environ.get('RANK', 'NA')} group={group_name} "
+          f"query_status={status} op_expansion_mode={mode.value} expected=5(CCU_SCHED)", flush=True)
+    if status != 0 or mode.value != 5:
+        raise RuntimeError("CCU communicator mode check failed before ChannelAcquire: "
+                           f"status={status}, actual={mode.value}, expected=5(CCU_SCHED); "
+                           "init_process_group must receive hccl_op_expansion_mode=6 in pg_options")
 
 
 def import_deep_ep(extension_path):

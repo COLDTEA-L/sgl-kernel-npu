@@ -287,6 +287,25 @@ echo '第6步完成：应看到 ALLTOALLV_META_PASS valid=160 invalid=12 legacy=
 以下开始使用 NPU；选择实际允许使用的计算卡和中转卡。先跑 direct-only，若 HCCL
 初始化失败就停在这里，处理配置，不继续多路径或性能测试。
 
+测试 worker 显式向 `init_process_group` 传入
+`pg_options.hccl_config={"hccl_op_expansion_mode": 6}`，为当前测试通信域选择
+CCU_SCHED；不能只凭 shell 中的 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 判断通信域模式。
+准备 Channel 前还会查询 DeepEP 实际使用的同一个通信域，正常日志应包含：
+
+```text
+CCU_PG_CONFIG ... hccl_op_expansion_mode=6 requested=CCU_SCHED ...
+CCU_PG_MODE ... query_status=0 op_expansion_mode=5 expected=5(CCU_SCHED)
+```
+
+这里 **配置值 6** 与 **查询值 5** 属于两套不同的枚举，不能互换。
+若旧日志出现 `opExpansionMode[2] is not supported by CCU engine[5]`，
+表示 HCCL 在通信域模式检查处拒绝建链，还不能据此判断 EID 或 Channel 描述符有错。
+更新本次 Python worker 修复后，从本节 direct-only 重跑；无需重编 route 或重装 DeepEP wheel。
+如果模式预检仍失败，保留 `CCU_PG_CONFIG`、`CCU_PG_MODE` 和该次 worker plog，停在此处。
+
+编号依据见 [HcclCommConfig 的 hcclOpExpansionMode](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/commlib/hcclug/docs/zh/api_ref/comm_mgr_c/data_type_definition/HcclRootInfo.md)
+和 [HcclOpExpansionMode 查询枚举](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/api_ref/comm_mgr_c/data_type_definition/HcclOpExpansionMode.md)。
+
 ```bash
 (
 set -Ee -o pipefail
