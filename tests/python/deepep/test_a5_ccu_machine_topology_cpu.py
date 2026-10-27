@@ -180,6 +180,40 @@ class MachineTopologyTests(unittest.TestCase):
                 with self.subTest(device=device, port=port, failure=failure):
                     self.assertEqual(relay_candidates(entries, edges, 2, 3, 4, '0', 0), [])
 
+    def test_atlas_cross_die_hop_with_different_endpoint_plane_labels(self):
+        # Actual user topology: 2:0/6 -> 4:1/0 -> 3:0/3.
+        for device, die, port, plane in (
+            (2, 0, 6, 'plane_0'), (3, 0, 3, 'plane_0'),
+            (4, 1, 0, 'plane_1'), (4, 1, 3, 'plane_1'),
+        ):
+            addresses = self.root['rank_list'][device]['level_list'][0]['rank_addr_list']
+            addresses[die * 8 + port]['plane_id'] = plane
+        self.atlas['edge_list'] = [
+            dict(net_layer=0, link_type='PEER2PEER', protocols=['UB_CTP'],
+                 local_a=2, local_b=4, local_a_ports=['0/6'], local_b_ports=['1/0']),
+            dict(net_layer=0, link_type='PEER2PEER', protocols=['UB_CTP'],
+                 local_a=3, local_b=4, local_a_ports=['0/3'], local_b_ports=['1/3']),
+        ]
+        self.atlas['edge_count'] = 2
+        entries, edges, _ = self.loaded()
+        row = resolve_relay(entries, edges, 2, 3, 4, 'all', 0)
+        self.assertEqual((row['src_die'], row['relay_die'], row['dst_die']), (0, 1, 0))
+        self.assertEqual((row['src_port'], row['relay_port_from_src'],
+                          row['relay_port_to_dst'], row['dst_port']), (6, 0, 3, 3))
+        self.assertEqual(relay_candidates(entries, edges, 2, 3, 4, '0', 0), [])
+        # Removing plane-label equality MUST NOT bypass absent live EIDs.
+        for device, die, port in ((2, 0, 6), (3, 0, 3), (4, 1, 0), (4, 1, 3)):
+            altered = copy.deepcopy(entries)
+            for entry in altered:
+                if (entry['device'], entry['die'], entry['port']) == (device, die, port):
+                    entry['verified'] = False
+                    entry['live_eid_present'] = False
+            self.assertEqual(relay_candidates(altered, edges, 2, 3, 4, 'all', 0), [])
+        result = self.run_script('resolve_a5_explicit_multirelay_eids.py',
+                                 '--src-phy', '2', '--dst-phy', '3',
+                                 '--relay-phys', '4', '--relay-planes', '1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_plane_label_is_not_die_and_mismatch_is_rejected(self):
         self.args.plane_id = 'fabric-21'
         entries, edges, _ = self.loaded()
@@ -197,8 +231,10 @@ class MachineTopologyTests(unittest.TestCase):
     def test_cross_die_relay_or_wrong_protocol_rejected(self):
         entries, edges, _ = self.loaded()
         for edge in edges:
-            if edge['local_a'] == 3 and edge['local_b'] == 4:
-                edge['local_b_ports'] = ['1/3', '0/3']
+            if (edge['local_a'], edge['local_b']) == (2, 4):
+                edge['local_a_ports'], edge['local_b_ports'] = ['0/4'], ['0/2']
+            if (edge['local_a'], edge['local_b']) == (3, 4):
+                edge['local_a_ports'], edge['local_b_ports'] = ['0/4'], ['1/3']
         self.assertEqual(relay_candidates(entries, edges, 2, 3, 4, 'all', 0), [])
         for edge in edges:
             edge['protocols'] = ['ROCE']

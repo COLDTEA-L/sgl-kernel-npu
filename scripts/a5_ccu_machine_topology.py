@@ -296,8 +296,10 @@ def endpoint_eids(entries, device, die, port, net_layer=0):
 def connected_pair(entries, a, a_port, b, b_port, net_layer):
     for left in endpoint_eids(entries, a, *a_port, net_layer):
         for right in endpoint_eids(entries, b, *b_port, net_layer):
-            if (left['plane_id'] == right['plane_id']
-                    and left['net_instance_id'] == right['net_instance_id']):
+            # The explicit Atlas edge connects the two local ports. Their
+            # rootinfo plane labels need not match across devices/dies (e.g.
+            # device 2 die0 plane_0 <-> relay 4 die1 plane_1).
+            if left['net_instance_id'] == right['net_instance_id']:
                 yield left, right
 
 

@@ -22,7 +22,7 @@ AllToAllV。两者的 C/Python 接口、kernel、ABI、数据布局和通知协�
    `/usr/local/Ascend/driver/tools/hccn_tool -g -dev_info -i PHYSICAL_ID`。
    校验明确绑定的 EID 确实出现在该卡 EID 表中，端口状态为 `UB / UP`。
    源、目的、relay 入口和出口四个端点都检查。
-5. 要求 relay 两段在同一 IO die，网络 plane / instance 相容，路径唯一。
+5. 要求 relay 两段在同一 IO die，relay 本地 plane 与 instance 相容，路径唯一。
    有歧义则报错，不取第一项、不取模、不通过 EID 位段推测端口。
 6. 输出原格式 TSV；peer-plan JSON 自动包含配置文件路径、SHA256、查询命令、
    查询输出 SHA256 和地址验证结果。单独 resolver 可以用 `--diagnostics-json`
@@ -60,8 +60,11 @@ UDMAC 名称和 EID Index 仅用于记录，不参与设备、端口或路径推
 ```
 
 保留旧 `--plane` / `--relay-planes` / relay-map `plane` 的含义：选择 **relay IO die**。
-它们和新增 `--plane-id` 是不同维度。当前保守检查要求一条物理 hop 的两端以及
-同 die 的 relay 入口/出口使用相同网络 plane 标签；不支持未明确映射的跨 plane 转发。
+它们和新增 `--plane-id` 是不同维度。跨卡物理 hop 由 Atlas 的明确端口配对决定，
+不能要求两个设备的本地 plane 标签字符串相同。例如 `2:0/6 plane_0` 与
+`4:1/0 plane_1` 可以是 Atlas 明确连接的两个端点。
+relay 自身的入口/出口仍保守要求同 IO die、相同本地 plane 标签；
+`--plane-id` 是对所有地址的显式字面过滤，只有确定所有所需端点都具备该标签时才使用。
 
 Docker 中必须使用当前宿主机的实际 rootinfo、Atlas 与 driver 信息。
 先核对宿主机与容器内容，不能从旧镜像复制配置覆盖新宿主机。
@@ -158,3 +161,11 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_*cpu.py' -v
 现已移除依赖，`local_id` 也仅作为可选元数据。无需修改系统 rootinfo 或给它补假 rank。
 仍要求明确的 `device_id` 和地址—端口绑定；其他必要字段缺失时，会报告字段完整路径
 和该对象已有的键，便于核对实际 schema。这次是 Python 准备脚本修复，无需重编二进制。
+
+### 新机 2→4→3 诊断（2026-10-27）
+
+已见 Atlas 配对为 `2:0/6 ↔ 4:1/0`、`3:0/3 ↔ 4:1/3`，因此 relay die 为 1。
+不同设备的 plane_0/plane_1 标签不同，不应单凭字符串不等过滤这条物理边；已修正。
+用户输出同时显示上述四个 rootinfo EID 的 `live_eid_present=False`，端口为 UB/UP。
+这项地址不一致尚未定位，仍会阻止建计划；不能因端口 UP 就跳过 EID 校验。
+需进一步比较 rootinfo 中的实际 EID、实时 hccn EID，以及宿主机/容器配置来源。

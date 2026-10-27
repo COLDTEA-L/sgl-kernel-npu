@@ -118,7 +118,7 @@ echo '第3步完成；应看到 unittest 最终 OK'
 )
 ```
 
-包含 rank_id 兼容修复的提交预期是 89 项通过。部分负向分析测试会输出 FAIL_OR_INCOMPLETE，
+包含 rootinfo/跨端点 plane 兼容修复的提交预期是 90 项通过。部分负向分析测试会输出 FAIL_OR_INCOMPLETE，
 以 unittest 最终汇总为准；CPU 模型不代表 NPU 正确性。
 
 ## 4. 新机器 rootinfo/Atlas/实时 EID 选路预检
@@ -137,7 +137,8 @@ find /usr/local/Ascend/driver/topo/950 -maxdepth 1 \
 确认容器看到的是本机配置。仅“文件存在”不足以证明一致；镜像可能遗留旧机文件。
 若不一致，先纠正容器的配置来源，不能拿旧文件覆盖新宿主机。
 
-下面以计算卡 2、3 和 relay 4、relay IO die 0 为例；按实际选择替换：
+当前用户提供的 Atlas 中，计算卡 2、3 经 relay 4 的两段都在 relay IO die 1。
+下面据此使用 die 1；换机器或卡号时按实际选择替换：
 
 ```bash
 (
@@ -148,7 +149,7 @@ echo '第4步开始：实时选路预检'
 A5_CHECK_DIR=$(mktemp -d /tmp/a5-route-check.XXXXXX)
 echo "选路输出目录：${A5_CHECK_DIR}"
 python3 scripts/resolve_a5_explicit_multirelay_eids.py \
-  --src-phy 2 --dst-phy 3 --relay-phys 4 --relay-planes 0 \
+  --src-phy 2 --dst-phy 3 --relay-phys 4 --relay-planes 1 \
   --diagnostics-json "${A5_CHECK_DIR}/machine_topology.json" \
   > "${A5_CHECK_DIR}/relays.tsv"
 cat "${A5_CHECK_DIR}/relays.tsv"
@@ -305,7 +306,7 @@ source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 cd /home/l00934901/sgl-kernel-npu
 A5_POLICY_DIR=$(mktemp -d /tmp/a5-two-card-policy.XXXXXX)
 cat > "${A5_POLICY_DIR}/policy.json" <<'JSON'
-{"2,3": [{"physical_device": 4, "plane": "0"}]}
+{"2,3": [{"physical_device": 4, "plane": "1"}]}
 JSON
 bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
   --devices 2,3 --relay-map "${A5_POLICY_DIR}/policy.json" \
