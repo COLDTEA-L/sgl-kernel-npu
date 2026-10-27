@@ -21,9 +21,9 @@ DeepEP → 第 7 节预检 → 第 8 节短测**。第 3 节在宿主机执行�
 已有匹配二进制时可以用 6.1 替代两次编译；不能只编译 DeepEP 而漏装 route。
 若同名旧容器还在，先看第 2 节，不删除它来腾名字。
 
-**当前继续位置：重新执行修正后的第 3.1 节。** 此前使用错误文件名的 3.1 在第一条
-检查处退出，没有加载镜像或创建容器；检查显示 `HOST_CHECK_DONE` 后再执行 3.2。
-3.2 成功显示 `IMAGE_LOAD_DONE` 后执行 3.3，不重复 load。
+**当前继续位置：已完成容器创建和第 4.1 节检查时，从第 4.2 节开始。** 直接使用容器
+现有的 `python3`，无需额外激活其他 Python 环境。若尚未完成 4.1，先完成 CANN/设备
+挂载检查；已经成功完成的 load/run 不要重做。首次恢复仍按上面的完整顺序执行。
 
 ## 1. 恢复顺序与需要保留的东西
 
@@ -363,7 +363,7 @@ ls -l /usr/local/Ascend/driver/topo/950/atlas_950_1.json
 有卡显示 Critical/Alarm 时，不用该卡或经过它的 relay 路径做测试，先交管理员定位。
 安装到容器自己的 `/usr/local/Ascend/cann-9.1.T560` 需要相应写权限；若镜像默认不是
 root 用户，由管理员确认后在宿主机用 `docker exec -it -u 0 sglang_yuanwen_old /bin/bash`
-进入，再激活原 Python 环境。不要改宿主机目录权限来绕过安装错误。
+进入，再按 4.2 确认容器现有的 Python 解释器。不要改宿主机目录权限来绕过安装错误。
 以下是加载库/查看版本，不创建 tensor 或通信域：
 
 ```bash
@@ -420,19 +420,24 @@ bash /home/l00934901/a5_recovery/packages/REPLACE_WITH_T560_TOOLKIT.run \
 **不在此猜测 URMA RPM 名称、不重装内核驱动。**
 [CANN Toolkit/ops 安装说明](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/softwareinst/instg/instg_0054.html)
 
-### 4.2 选择原来的 Python 环境，检查依赖
+### 4.2 使用容器现有的 Python，检查依赖
 
-优先激活镜像中原来能跑实验的环境。若它确实是以前的 Conda 环境，可使用：
+以下在 **`sglang_yuanwen_old` 容器内**执行。使用镜像现有的 `python3`，不新建环境、
+不执行额外的环境激活命令。后续安装、构建和测试都使用这个解释器。
+若还在宿主机，先按 3.3 的 `docker exec` 命令进入；已在容器内不要重复执行进入命令。
 
-```bash
-# 仅当此环境确实存在时执行；没有 Conda 不需要额外安装 Conda。
-source /opt/conda/bin/activate cam_py311_pt28
-```
-
-环境名不是版本证据。后续构建和测试都用同一个 `python3`；不要一会儿系统 Python、
-一会儿 Conda。每次新开 shell 都要恢复 CANN 和 Python 环境。
+每次新开容器 shell 都先加载同一套 T560 CANN 环境，并确认 `python3` 路径不变。
+下面只做检查，不安装包、不创建 NPU tensor、不初始化通信域；失败会提示并停止：
 
 ```bash
+(
+set -e
+trap 'echo "[ERROR] 4.2 Python/依赖检查失败：${BASH_COMMAND}；先修复依赖，不继续编译。" >&2' ERR
+echo '[START] 4.2 检查容器现有 Python 与依赖'
+test -r /usr/local/Ascend/cann-9.1.T560/set_env.sh || {
+    echo '[ERROR] 4.2 找不到或无法读取 T560 set_env.sh；先完成第 4.1 节。' >&2
+    exit 1
+}
 source /usr/local/Ascend/cann-9.1.T560/set_env.sh
 command -v python3
 python3 --version
@@ -470,11 +475,16 @@ if not (pathlib.Path(sysconfig.get_path('include')) / 'Python.h').is_file():
 if failed:
     raise SystemExit('需要补齐/修复：' + ', '.join(failed))
 PY
+echo 'PYTHON_ENV_CHECK_DONE：依赖导入和开发头文件检查通过；继续核对 pip 路径与第 4.4 节编译工具。'
+)
 ```
 
 区别 `ModuleNotFoundError` 与 `undefined symbol`/动态库缺失：前者可能缺包，后者
 通常要先核对软件配套和库路径，不能靠反复安装一个“最新版”解决。
 构建脚本内部会使用 `pip3`，其 Python 版本也必须与 `python3 -m pip` 一致。
+检查上面两个 pip 输出的安装路径和 `(python X.Y)` 是否一致；不一致时先修复容器内
+的 PATH/解释器配置，不能混用两套包。缺包按 4.3 补齐后重跑本节；没有缺包时跳过
+4.3 的安装命令。第 4.4 节工具检查通过后，再做第 5 节代码准备和第 6 节编译。
 
 ### 4.3 缺 Python 包：从原配离线 wheelhouse 安装
 
@@ -544,8 +554,9 @@ dnf install -y gcc gcc-c++ make cmake git binutils file patch tar gzip unzip zip
   util-linux procps-ng python3-devel
 ```
 
-开发头文件必须对应实际 Python；系统 `python3-dev/devel` 不一定能补齐另一个 Conda
-解释器的 `Python.h`。OS 源中的 CMake 若过旧，使用管理员认可的对应版本离线包。
+开发头文件必须对应容器实际使用的 `python3`；系统 `python3-dev/devel` 不一定能补齐
+其他安装路径下解释器的 `Python.h`。以 4.2 打印的路径为准，不额外重装 Python 来凑
+头文件。OS 源中的 CMake 若过旧，使用管理员认可的对应版本离线包。
 
 ## 5. 容器内：恢复并确认源码
 
@@ -627,7 +638,7 @@ python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${RECOVERY_DE
 
 ### 6.2 从头编译安装第一份组件：route 包
 
-本次需要从源码恢复时先执行本节，再执行 6.3。先确认第 4 节的 Python 环境已激活、
+本次需要从源码恢复时先执行本节，再执行 6.3。先确认第 4 节的容器 Python 检查已通过、
 第 5 节两个仓库都在、没有自己的旧实验仍占用这些安装文件。构建日志保存在挂载工作区，
 失败时从日志找具体缺失依赖，不继续装另一份不配套的旧产物：
 
@@ -671,7 +682,7 @@ echo 'ROUTE_BUILD_AND_INSTALL_DONE；仍需第 7 节检查实际 ABI'
 
 ### 6.3 从头编译安装第二份组件：DeepEP wheel
 
-用同一个已激活的 Python 环境执行，**仅构建 A5 DeepEP 所需的多路径单算子**，不运行
+使用第 4.2 节确认过的同一个容器 `python3`，**仅构建 A5 DeepEP 所需的多路径单算子**，不运行
 默认全模块构建，也不需要再额外编译 SGLang 或替换系统 HCCL：
 
 ```bash
