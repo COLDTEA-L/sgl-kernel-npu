@@ -1,5 +1,7 @@
 # 当前机器的 CCU 多路径选路：rootinfo + Atlas + hccn_tool
 
+> 尚未拉取本分支：从 [分支操作指南第 1 步](A5_CCU_ALLTOALLV_BRANCH_QUICKSTART.md#1-拉取并切换分支) 开始，按序完成环境、编译、选路和短测。
+
 适用分支：`feature/a5-ccu-8rank-direct-alltoallv`。
 
 本分支同时保留旧 2/4 卡等长多路径 AllToAll 和新的 8 卡 direct-only

@@ -1,5 +1,7 @@
 # EP8 direct-only CCU AllToAllV
 
+> 尚未拉取本分支：从 [分支操作指南第 1 步](A5_CCU_ALLTOALLV_BRANCH_QUICKSTART.md#1-拉取并切换分支) 开始，按序完成环境、编译、选路和短测。
+
 > 2026-10-27：本分支继续支持 2/4 卡多路径 AllToAll。relay 准备改用当前机器
 > rootinfo + Atlas JSON + 实时 hccn_tool；旧 TXT/地址位推断入口已移除。
 > 新参数、兼容边界与例子见 [当前机器选路指南](A5_CCU_MACHINE_ROUTE_DISCOVERY.md)。
