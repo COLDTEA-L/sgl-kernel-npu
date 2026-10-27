@@ -118,7 +118,7 @@ echo '第3步完成；应看到 unittest 最终 OK'
 )
 ```
 
-当前提交的预期是 87 项通过。部分负向分析测试会输出 FAIL_OR_INCOMPLETE，
+包含 rank_id 兼容修复的提交预期是 89 项通过。部分负向分析测试会输出 FAIL_OR_INCOMPLETE，
 以 unittest 最终汇总为准；CPU 模型不代表 NPU 正确性。
 
 ## 4. 新机器 rootinfo/Atlas/实时 EID 选路预检
@@ -155,6 +155,8 @@ cat "${A5_CHECK_DIR}/relays.tsv"
 echo '第4步完成：应有表头及一行 relay 路径'
 )
 ```
+
+`rank_id` 和 `local_id` 不作为选路必填项；若看到裸 `error: 'rank_id'`，说明仍是修复前脚本，先更新本分支。
 
 自动发现两个常见大小写的 rootinfo 路径和两种 Atlas 文件名；冲突或缺失时，
 在上面的 Python 命令中显式增加 `--root-info 实际路径 --topology-json 实际路径`。

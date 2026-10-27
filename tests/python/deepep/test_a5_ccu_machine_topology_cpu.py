@@ -106,6 +106,35 @@ class MachineTopologyTests(unittest.TestCase):
         self.assertEqual(reverse['src_eid'], row['dst_eid'])
         self.assertEqual(reverse['dst_eid'], row['src_eid'])
 
+    def test_resource_rootinfo_without_rank_or_local_ids(self):
+        expected, _, _ = self.loaded()
+        for rank in self.root['rank_list']:
+            rank.pop('rank_id')
+            rank.pop('local_id')
+        entries, edges, _ = self.loaded()
+        before = resolve_relay(expected, edges, 2, 3, 4, '0', 0)
+        after = resolve_relay(entries, edges, 2, 3, 4, '0', 0)
+        self.assertEqual(before, after)
+        # Exercise the actual CLI too, rather than only the parser function.
+        result = self.run_script('resolve_a5_explicit_multirelay_eids.py',
+                                 '--src-phy', '2', '--dst-phy', '3',
+                                 '--relay-phys', '4', '--relay-planes', '0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))), 1)
+
+    def test_missing_required_fields_have_location_and_keys(self):
+        original = copy.deepcopy(self.root)
+        for field in ('device_id', 'level_list'):
+            data = copy.deepcopy(original)
+            del data['rank_list'][2][field]
+            with self.assertRaisesRegex(ValueError, rf'rank_list\[2\].{field}; available keys:'):
+                root_bindings(data, {2, 3, 4})
+        data = copy.deepcopy(original)
+        address = data['rank_list'][2]['level_list'][0]['rank_addr_list'][0]
+        del address['ports']
+        with self.assertRaisesRegex(ValueError, r'rank_addr_list\[0\].ports; available keys:'):
+            root_bindings(data, {2, 3, 4})
+
     def test_eid_formats_and_invalid_values(self):
         eid = '0000:0000:0400:0300:0010:0000:df83:4152'
         for value in (eid, eid.upper(), eid.replace(':', ''), '::400:300:10:0:df83:4152'):

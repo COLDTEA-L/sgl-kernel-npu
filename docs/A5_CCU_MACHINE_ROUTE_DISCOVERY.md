@@ -10,8 +10,9 @@ AllToAllV。两者的 C/Python 接口、kernel、ABI、数据布局和通知协�
 
 ## 地址如何生成
 
-1. 从当前机器 rootinfo 2.0 的 `rank_list[].device_id` 读取物理卡号，保留
-   `local_id` 和 `rank_id` 作为独立身份，不把 rank_id 当物理卡号。
+1. 从当前机器 rootinfo 2.0 的 `rank_list[].device_id` 读取物理卡号，不要求
+   资源文件包含 collective 的 `rank_id`；`local_id` 有则记录，无则留空。
+   物理卡身份必须显式来自 `device_id`，不从 rank_id/local_id 或行号猜测。
 2. 在指定 `net_layer` / `net_instance_id` 中读取 `rank_addr_list` 的
    `addr_type=EID`、`addr`、`ports`、`plane_id`。端口必须是明确的 `DieID/PortID`。
 3. 依据 Atlas JSON 的 `peer_list[].local_id`（物理卡号）和
@@ -149,3 +150,11 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_*cpu.py' -v
 - 未安装系统包，未运行 NPU 通信。尚未取得新机完整 rootinfo/Atlas 配对样本，
   因而未确认新机配置兼容性、HCCL 初始化、实际 ChannelAcquire 或设备数据正确性。
 - 开发服务器日志：`build/ep8_validation/rootinfo_cpu.log`、`rootinfo_build.log`。
+
+### 资源文件缺少 rank_id 时
+
+2026-10-27 修正：旧解析器误把 collective rank table 的必填 `rank_id` 校验
+套用到本地资源 rootinfo，可能出现 `error: 'rank_id'`。选路实际上不用该字段，
+现已移除依赖，`local_id` 也仅作为可选元数据。无需修改系统 rootinfo 或给它补假 rank。
+仍要求明确的 `device_id` 和地址—端口绑定；其他必要字段缺失时，会报告字段完整路径
+和该对象已有的键，便于核对实际 schema。这次是 Python 准备脚本修复，无需重编二进制。

@@ -121,40 +121,53 @@ def directed_links(edges, endpoint, relay, net_layer):
     return links
 
 
+def required(mapping, key, location):
+    if not isinstance(mapping, dict):
+        raise ValueError(f'{location} must be an object')
+    if key not in mapping:
+        raise ValueError(f'missing required field {location}.{key}; '
+                         f'available keys: {sorted(mapping)}')
+    return mapping[key]
+
+
 def root_bindings(data, devices, net_layer=0, net_instance_id=None, plane_id=None):
     if data.get('version') != '2.0' or data.get('status', 'completed') != 'completed':
-        raise ValueError('rootinfo must be a completed version 2.0 rank table')
-    ranks = data['rank_list']
-    if integer(data['rank_count'], 'rank_count') != len(ranks):
+        raise ValueError('rootinfo must have version 2.0 and completed status when status is present')
+    ranks = required(data, 'rank_list', 'rootinfo')
+    if not isinstance(ranks, list) or any(not isinstance(r, dict) for r in ranks):
+        raise ValueError('rootinfo.rank_list must be an array of objects')
+    if integer(required(data, 'rank_count', 'rootinfo'), 'rank_count') != len(ranks):
         raise ValueError('rootinfo rank_count does not match rank_list')
-    rank_ids = [integer(r['rank_id'], 'rank_id') for r in ranks]
-    if len(set(rank_ids)) != len(rank_ids):
-        raise ValueError('duplicate rank_id in rootinfo')
+    # Local resource rootinfo need not be a collective rank table: rank_id
+    # is not used to join physical devices/ports and must not be required.
     selected, instances = {}, set()
-    for rank in ranks:
-        device = integer(rank['device_id'], 'physical device_id')
-        local_id = integer(rank['local_id'], 'local_id')
+    for ordinal, rank in enumerate(ranks):
+        rank_path = f'rootinfo.rank_list[{ordinal}]'
+        device = integer(required(rank, 'device_id', rank_path), 'physical device_id')
         if device not in devices:
             continue
-        for level in rank['level_list']:
-            if integer(level['net_layer'], 'net_layer') != net_layer:
+        local_id = integer(rank['local_id'], 'local_id') if 'local_id' in rank else None
+        for level_index, level in enumerate(required(rank, 'level_list', rank_path)):
+            level_path = f'{rank_path}.level_list[{level_index}]'
+            if integer(required(level, 'net_layer', level_path), 'net_layer') != net_layer:
                 continue
-            instance = str(level['net_instance_id'])
+            instance = str(required(level, 'net_instance_id', level_path))
             if net_instance_id is not None and instance != net_instance_id:
                 continue
             if device in selected:
                 raise ValueError(f'duplicate/ambiguous device {device} at layer {net_layer}; '
                                  'select --net-instance-id for this machine')
-            if level.get('net_type') != 'TOPO_FILE_DESC':
+            if required(level, 'net_type', level_path) != 'TOPO_FILE_DESC':
                 raise ValueError('selected rootinfo layer must use TOPO_FILE_DESC')
             bindings = {}
-            for address in level['rank_addr_list']:
+            for address_index, address in enumerate(required(level, 'rank_addr_list', level_path)):
+                address_path = f'{level_path}.rank_addr_list[{address_index}]'
                 # Never reinterpret an IPv4/IPv6 host address as an EID.
-                if address.get('addr_type', '').upper() != 'EID':
+                if required(address, 'addr_type', address_path).upper() != 'EID':
                     continue
-                eid = normalize_eid(address['addr'])
+                eid = normalize_eid(required(address, 'addr', address_path))
                 plane = str(address.get('plane_id', '0'))
-                for die, port in port_list(address['ports']):
+                for die, port in port_list(required(address, 'ports', address_path)):
                     key = (die, port)
                     item = dict(device=device, local_id=local_id, die=die, port=port,
                                 eid=eid, plane_id=plane, net_layer=net_layer,
@@ -173,8 +186,9 @@ def root_bindings(data, devices, net_layer=0, net_instance_id=None, plane_id=Non
         raise ValueError(f'rootinfo missing physical devices {sorted(set(devices) - set(selected))}')
     if len(instances) != 1:
         raise ValueError('requested devices belong to different net_instance_id values')
-    local_ids = {next(iter(b.values()))['local_id'] for b in selected.values()}
-    if len(local_ids) != len(selected):
+    local_ids = [next(iter(b.values()))['local_id'] for b in selected.values()
+                 if next(iter(b.values()))['local_id'] is not None]
+    if len(set(local_ids)) != len(local_ids):
         raise ValueError('duplicate rootinfo local_id within selected machine')
     return [item for bindings in selected.values() for item in bindings.values()]
 
