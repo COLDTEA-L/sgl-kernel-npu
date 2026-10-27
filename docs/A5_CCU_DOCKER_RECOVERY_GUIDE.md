@@ -10,15 +10,20 @@ AllToAll、全 CCU baseline 多路径算子及 physical contention 测试环境�
 子 shell 内，失败不会退出当前 Docker 交互 shell。任一步失败都先解决，不继续整套粘贴。
 
 **本次恢复的固定目标：** 宿主机归档
-`/home/l00934901/sglang_yuanwen_old_transfer_20261016.rar`，新容器名和 hostname
+`/home/l00934901/sglang_yuanwen_old_transfer_20261016.tar`，新容器名和 hostname
 都为 `sglang_yuanwen_old`。镜像名与容器名不是一回事；第 3 节根据实际 load 结果
-确认镜像，不假定压缩包里的镜像仍叫 `sglang:a5_0623`。
+确认镜像，不假定归档里的镜像仍叫 `sglang:a5_0623`。本机已确认文件后缀为 `.tar`，
+不要改名，不需要 RAR 解压工具；是否为合格的 Docker 镜像归档仍由第 3.2 节检查。
 
-本次从头恢复按顺序执行：**3.1 检查 → 3.2 解包/load → 3.3 创建/进入容器 →
+本次从头恢复按顺序执行：**3.1 检查 → 3.2 检查 tar/load → 3.3 创建/进入容器 →
 第 4 节检查并补依赖 → 第 5 节更新源码 → 6.2 编译安装 route → 6.3 编译安装
 DeepEP → 第 7 节预检 → 第 8 节短测**。第 3 节在宿主机执行，进入容器后再做第 4～8 节。
 已有匹配二进制时可以用 6.1 替代两次编译；不能只编译 DeepEP 而漏装 route。
 若同名旧容器还在，先看第 2 节，不删除它来腾名字。
+
+**当前继续位置：重新执行修正后的第 3.1 节。** 此前使用错误文件名的 3.1 在第一条
+检查处退出，没有加载镜像或创建容器；检查显示 `HOST_CHECK_DONE` 后再执行 3.2。
+3.2 成功显示 `IMAGE_LOAD_DONE` 后执行 3.3，不重复 load。
 
 ## 1. 恢复顺序与需要保留的东西
 
@@ -43,7 +48,7 @@ HCCL 源码树在这里提供 custom-op 构建框架；不是让你编译替换�
 以下沿用实验路径，实际不同必须相应修改：
 
 ```text
-宿主机镜像归档：   /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+宿主机镜像归档：   /home/l00934901/sglang_yuanwen_old_transfer_20261016.tar
 新容器/hostname：  sglang_yuanwen_old
 恢复用本地镜像名： sglang_yuanwen_old:recovery_20261016（第 3.2 节创建）
 宿主机/容器工作区： /home/l00934901
@@ -92,103 +97,93 @@ echo "容器配置保存在：${RECOVERY_RECORD_DIR}"
 
 ## 3. 宿主机：加载镜像、创建新容器
 
-### 3.1 确认压缩包、工具、磁盘和同名容器
+### 3.1 确认 tar 归档、工具、磁盘和同名容器
 
-以下只检查，不 load、不占用 NPU：
+以下在**存放 tar 的那台机器的宿主机**执行，只检查，不 load、不占用 NPU。
+开始和成功都有提示，缺文件/工具会打印具体原因，不再静默退出：
 
 ```bash
 (
 set -e
-test -f /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
-command -v file
-command -v python3
-command -v tar
+trap 'echo "[ERROR] 3.1 检查失败：${BASH_COMMAND}；先处理错误，不执行 3.2。" >&2' ERR
+RECOVERY_ARCHIVE=/home/l00934901/sglang_yuanwen_old_transfer_20261016.tar
+echo "[START] 3.1 宿主机检查，归档：${RECOVERY_ARCHIVE}"
+test -f "${RECOVERY_ARCHIVE}" || {
+    echo "[ERROR] 找不到归档文件：${RECOVERY_ARCHIVE}；请核对所在机器、路径和文件名。" >&2
+    exit 1
+}
+test -r "${RECOVERY_ARCHIVE}" || {
+    echo "[ERROR] 没有归档读取权限：${RECOVERY_ARCHIVE}" >&2
+    exit 1
+}
+for RECOVERY_TOOL in file python3 tar docker; do
+    command -v "${RECOVERY_TOOL}" || {
+        echo "[ERROR] 缺少工具：${RECOVERY_TOOL}" >&2
+        exit 1
+    }
+done
 docker version
-file /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
-ls -lh /home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+file "${RECOVERY_ARCHIVE}"
+ls -lh "${RECOVERY_ARCHIVE}"
 df -h /home/l00934901
 docker info --format 'DockerRootDir={{.DockerRootDir}}'
 docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-command -v unrar || true
+if docker container inspect sglang_yuanwen_old >/dev/null 2>&1; then
+    echo '[ERROR] 同名容器 sglang_yuanwen_old 已存在；先按第 2 节检查复用，不重复 load/run。' >&2
+    exit 1
+fi
+echo 'HOST_CHECK_DONE：检查命令已通过；确认下述磁盘空间要求后执行第 3.2 节。'
 )
 ```
 
-另查上面 `DockerRootDir` 所在磁盘的可用空间：RAR 解压需要额外空间，Docker load
-还需要展开镜像层；压缩包大小不等于最终占用。空间不足先协调，本文不清理其他镜像。
+另查上面 `DockerRootDir` 所在磁盘的可用空间；3.1 只打印目录，不自动判断可用空间
+是否足够。Docker load 需要展开镜像层，归档大小不等于最终占用。**不需要先把这份
+tar 解压到工作区**，也不额外复制一份镜像 tar。空间不足先协调，本文不清理其他镜像。
 
 **若 `sglang_yuanwen_old` 已存在，停止新建，先按第 2 节确认是否直接 start/exec。**
-不要删除旧容器来绕过重名。RAR 来自自己可信的备份才解压；不运行归档里的未知脚本。
-真正的 RAR 需要能支持其格式的 `unrar`。缺工具时由管理员从允许的软件源/离线包安装
-`unrar`（包名、RAR5 支持和授权以本机发行版为准），不要在共享宿主机照抄容器的 apt/dnf
-依赖安装命令。分卷 RAR 必须先补齐所有分卷，损坏或缺卷先解决，不强行 load。
+不要删除旧容器来绕过重名。只使用自己可信的备份，不运行归档里的未知脚本。
+若宿主机缺工具，由管理员从允许的软件源/离线包补齐；不要在共享宿主机照抄
+第 4 节容器内的依赖安装命令。本次 tar 恢复不需要安装解压 RAR 的工具。
 
-### 3.2 解开 RAR，确认 Docker 镜像归档，再 load
+### 3.2 检查这份 tar 是 Docker 镜像归档，然后直接 load
 
-**不要只改 `.rar` 后缀，也不要默认直接 `docker load -i xxx.rar`。** Docker load
-支持镜像 tar 及 gzip/bzip2/xz/zstd 压缩，不直接支持 RAR；也可能只是文件误命名，
-所以先尝试只列出 tar 内容，失败才按 RAR 解压。[Docker load 说明](https://docs.docker.com/reference/cli/docker/image/load/)
+本次直接使用 `/home/l00934901/sglang_yuanwen_old_transfer_20261016.tar`。Docker load
+读取镜像 tar，不需要先 `tar -xf`；后缀为 tar 仍不等于内容一定是 Docker 镜像，所以
+先检查归档布局。检查失败就停止，不自动改用其他解压/导入方式。
+[Docker load 说明](https://docs.docker.com/reference/cli/docker/image/load/)
 
-下面在一个全新的临时目录解压，不覆盖原压缩包或旧工作区；常见的“RAR 中只有一份
-镜像 tar”可整段执行。它会打印解包目录、加载日志和最后确定的镜像 ID：
+下面只在全新的记录目录保存 tar 文件清单和 load 日志，不解压 tar 到宿主机工作区，
+不覆盖原归档；Docker 自己会在其数据目录展开镜像层。可整段执行：
 
 ```bash
 (
 set -eo pipefail
+trap 'echo "[ERROR] 3.2 镜像检查/加载失败：${BASH_COMMAND}；保留日志，先处理错误。" >&2' ERR
 umask 077
-RECOVERY_ARCHIVE=/home/l00934901/sglang_yuanwen_old_transfer_20261016.rar
+RECOVERY_ARCHIVE=/home/l00934901/sglang_yuanwen_old_transfer_20261016.tar
 RECOVERY_IMAGE_ALIAS=sglang_yuanwen_old:recovery_20261016
-test -f "${RECOVERY_ARCHIVE}"
+echo "[START] 3.2 检查并加载：${RECOVERY_ARCHIVE}"
+test -f "${RECOVERY_ARCHIVE}" && test -r "${RECOVERY_ARCHIVE}" || {
+    echo "[ERROR] 归档不存在或不可读：${RECOVERY_ARCHIVE}" >&2
+    exit 1
+}
 # 防止重复执行时覆盖上一次恢复用的镜像标签；已有该标签时先核对并复用。
 if docker image inspect "${RECOVERY_IMAGE_ALIAS}" >/dev/null 2>&1; then
     echo "恢复镜像标签已存在，先核对；不要重复 load 或覆盖：${RECOVERY_IMAGE_ALIAS}" >&2
     exit 1
 fi
 mkdir -p /home/l00934901/a5_recovery
-RECOVERY_UNPACK=$(mktemp -d /home/l00934901/a5_recovery/sglang_yuanwen_old_unpack.XXXXXX)
-echo "恢复记录和解包目录：${RECOVERY_UNPACK}"
-
-if tar -tf "${RECOVERY_ARCHIVE}" >"${RECOVERY_UNPACK}/outer-tar.list" \
-    2>"${RECOVERY_UNPACK}/outer-tar-check.log"; then
-    # 文件虽然叫 .rar，实际已经是 tar/压缩 tar；不复制、不解开镜像层。
-    RECOVERY_IMAGE_ARCHIVE=${RECOVERY_ARCHIVE}
-else
-    command -v unrar >/dev/null || {
-        echo '不是可读 tar，且缺少 unrar；请先补齐解压工具或检查文件是否损坏。' >&2
-        exit 1
-    }
-    unrar t "${RECOVERY_ARCHIVE}"
-    unrar lb "${RECOVERY_ARCHIVE}" >"${RECOVERY_UNPACK}/rar-files.list"
-    # 拒绝明显越出解压目录的路径；仅处理自己可信的备份，仍不执行包内脚本。
-    python3 - "${RECOVERY_UNPACK}/rar-files.list" <<'PY'
-from pathlib import Path, PurePosixPath, PureWindowsPath
-import sys
-for name in Path(sys.argv[1]).read_text().splitlines():
-    posix = PurePosixPath(name.replace('\\', '/'))
-    windows = PureWindowsPath(name)
-    if posix.is_absolute() or windows.drive or '..' in posix.parts:
-        raise SystemExit('归档路径异常，停止：' + name)
-PY
-    mkdir "${RECOVERY_UNPACK}/files"
-    unrar x -o- "${RECOVERY_ARCHIVE}" "${RECOVERY_UNPACK}/files/"
-    RECOVERY_IMAGE_ARCHIVE=$(python3 - "${RECOVERY_UNPACK}/files" <<'PY'
-from pathlib import Path
-import sys
-suffixes = ('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2',
-            '.tar.xz', '.txz', '.tar.zst', '.tzst')
-files = sorted(p for p in Path(sys.argv[1]).rglob('*')
-               if p.is_file() and not p.is_symlink() and p.name.lower().endswith(suffixes))
-if len(files) != 1:
-    for path in files:
-        print('候选镜像归档：' + str(path), file=sys.stderr)
-    raise SystemExit('没有找到唯一镜像 tar；先人工确认归档内容，不批量 load、不猜文件。')
-print(files[0].resolve())
-PY
-    )
-fi
+RECOVERY_LOAD_RECORD=$(mktemp -d /home/l00934901/a5_recovery/sglang_yuanwen_old_load.XXXXXX)
+echo "恢复记录目录：${RECOVERY_LOAD_RECORD}"
 
 # 防止把 docker export 的 rootfs 或普通源码压缩包当成 docker save 镜像。
-tar -tf "${RECOVERY_IMAGE_ARCHIVE}" >"${RECOVERY_UNPACK}/image-tar.list"
-python3 - "${RECOVERY_UNPACK}/image-tar.list" <<'PY'
+echo '[CHECK] 正在检查 tar 目录；大归档可能需要等待。'
+tar -tf "${RECOVERY_ARCHIVE}" >"${RECOVERY_LOAD_RECORD}/image-tar.list" \
+    2>"${RECOVERY_LOAD_RECORD}/tar-check.log" || {
+    echo "[ERROR] tar 读取失败，检查是否损坏/传输完整；日志：${RECOVERY_LOAD_RECORD}/tar-check.log" >&2
+    exit 1
+}
+python3 - "${RECOVERY_LOAD_RECORD}/image-tar.list" <<'PY'
 from pathlib import Path, PurePosixPath
 import sys
 names = {str(PurePosixPath(line)) for line in Path(sys.argv[1]).read_text().splitlines()}
@@ -198,15 +193,15 @@ print('IMAGE_ARCHIVE_LAYOUT_OK')
 PY
 
 # load 可能重设归档内原有标签的指向。保留原启动命令使用的旧标签，避免丢失引用。
-docker image ls --no-trunc >"${RECOVERY_UNPACK}/images-before-load.txt"
+docker image ls --no-trunc >"${RECOVERY_LOAD_RECORD}/images-before-load.txt"
 if docker image inspect sglang:a5_0623 >/dev/null 2>&1; then
     RECOVERY_OLD_IMAGE=$(docker image inspect --format '{{.Id}}' sglang:a5_0623)
     docker image tag "${RECOVERY_OLD_IMAGE}" \
-        "sglang_yuanwen_old_before_load:$(basename "${RECOVERY_UNPACK}")"
+        "sglang_yuanwen_old_before_load:$(basename "${RECOVERY_LOAD_RECORD}")"
 fi
-echo "准备加载：${RECOVERY_IMAGE_ARCHIVE}"
-docker load --input "${RECOVERY_IMAGE_ARCHIVE}" 2>&1 | tee "${RECOVERY_UNPACK}/docker-load.log"
-python3 - "${RECOVERY_UNPACK}/docker-load.log" <<'PY' >"${RECOVERY_UNPACK}/loaded-refs.txt"
+echo "[LOAD] 准备加载：${RECOVERY_ARCHIVE}"
+docker load --input "${RECOVERY_ARCHIVE}" 2>&1 | tee "${RECOVERY_LOAD_RECORD}/docker-load.log"
+python3 - "${RECOVERY_LOAD_RECORD}/docker-load.log" <<'PY' >"${RECOVERY_LOAD_RECORD}/loaded-refs.txt"
 from pathlib import Path
 import sys
 refs = set()
@@ -220,26 +215,27 @@ print('\n'.join(sorted(refs)))
 PY
 while IFS= read -r RECOVERY_REF; do
     docker image inspect --format '{{.Id}}' "${RECOVERY_REF}"
-done <"${RECOVERY_UNPACK}/loaded-refs.txt" | sort -u >"${RECOVERY_UNPACK}/loaded-ids.txt"
-test "$(wc -l <"${RECOVERY_UNPACK}/loaded-ids.txt")" -eq 1 || {
+done <"${RECOVERY_LOAD_RECORD}/loaded-refs.txt" | sort -u >"${RECOVERY_LOAD_RECORD}/loaded-ids.txt"
+test "$(wc -l <"${RECOVERY_LOAD_RECORD}/loaded-ids.txt")" -eq 1 || {
     echo '归档加载了多个不同镜像；先按日志选择正确镜像，不自动建容器。' >&2
     exit 1
 }
-RECOVERY_IMAGE_ID=$(<"${RECOVERY_UNPACK}/loaded-ids.txt")
+RECOVERY_IMAGE_ID=$(<"${RECOVERY_LOAD_RECORD}/loaded-ids.txt")
 docker image tag "${RECOVERY_IMAGE_ID}" "${RECOVERY_IMAGE_ALIAS}"
 docker image inspect --format 'ID={{.Id}} OS={{.Os}} ARCH={{.Architecture}}' "${RECOVERY_IMAGE_ALIAS}"
 echo "第 3.3 节使用镜像：${RECOVERY_IMAGE_ALIAS}"
-echo "保留恢复记录：${RECOVERY_UNPACK}"
+echo "保留恢复记录：${RECOVERY_LOAD_RECORD}"
+echo 'IMAGE_LOAD_DONE：镜像已加载并设置恢复别名；接下来执行第 3.3 节。'
 )
 ```
 
 注意：
 
-- 大镜像的 `unrar t`、解压、tar 列表检查和 load 都可能耗时较长，这是 Host 磁盘工作，
+- 大镜像的 tar 列表检查和 load 都可能耗时较长，这是 Host 磁盘工作，
   **尚未下发通信算子**，不要因等待同时再开一份恢复任务。
-- 若 RAR 内有多份 tar、只有展开后的 `manifest.json`/layers、文件没有常见 tar 后缀，
-  上面会停止。先查看打印的解包目录，确认哪份是原始 `docker save` 产物；不要选择
-  `layer.tar` 当整份镜像，也不要把整个工作区重新打成 tar 后盲目 load。
+- 若文件清单只有另一份镜像 tar、源码或普通数据，没有顶层镜像 manifest，检查会停止。
+  先看记录目录里的 `image-tar.list`，确认是否拿错了归档；不递归解压/批量 load，
+  不选择 `layer.tar` 当整份镜像，也不把整个工作区重新打包后盲目 load。
 - 仅有 `bin/`、`etc/`、`usr/` 等 rootfs 而没有镜像 manifest，可能是 `docker export`
   备份。它与 `docker save` 不同，不能按原镜像完整恢复配置；应优先取得 save 归档，
   不自动用 `docker import`，以免丢失原 ENV/USER/CMD 等镜像配置。
