@@ -86,6 +86,11 @@ HcclResult Load(const char *path, uint32_t rankSize, uint32_t availableCards,
             if (!Uint(get("relay_phy"), &p.relayPhy)) return HCCL_E_PARA;
             p.srcEid = get("src_eid"); p.dstEid = get("dst_eid");
         } else if (get("kind") != "direct") return HCCL_E_PARA;
+        else if (rankSize == 8 && (get("src_eid") != "-" || get("dst_eid") != "-")) {
+            if (get("src_eid").empty() || get("dst_eid").empty() ||
+                get("src_eid") == "-" || get("dst_eid") == "-") return HCCL_E_PARA;
+            p.srcEid = get("src_eid"); p.dstEid = get("dst_eid");
+        }
         specs->push_back(p);
     }
     std::string error;
@@ -190,6 +195,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanCreate(HcclComm comm, aclrtStream strea
 { return CreatePeerPlan(comm, stream, planId, manifest, availableCards, handle, false); }
 
 extern "C" int A5CcuAllToAllVAbiVersion() { return 1; }
+// New opt-in manifest endpoint verification; legacy '-' direct rows are unchanged.
+extern "C" int A5CcuBoundDirectAbiVersion() { return 1; }
 extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle)
 { return CreatePeerPlan(comm, stream, planId, manifest, availableCards, handle, true); }

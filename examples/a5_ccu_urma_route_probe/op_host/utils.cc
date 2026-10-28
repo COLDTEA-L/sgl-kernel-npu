@@ -1280,6 +1280,23 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                     CommAddrToString(desc.localEndpoint.commAddr) + "-" +
                     CommAddrToString(desc.remoteEndpoint.commAddr);
             }
+            if (!p.relay && !p.srcEid.empty()) {
+                uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
+                status = ParseEidText("bound_src_eid", p.srcEid.c_str(), src);
+                if (status != HCCL_SUCCESS) return status;
+                status = ParseEidText("bound_dst_eid", p.dstEid.c_str(), dst);
+                if (status != HCCL_SUCCESS) return status;
+                const auto *local = forward ? src : dst;
+                const auto *remote = forward ? dst : src;
+                if (die != (forward ? p.srcDie : p.dstDie) ||
+                    !std::equal(local, local + EID_BYTE_NUM, desc.localEndpoint.commAddr.eid) ||
+                    !std::equal(remote, remote + EID_BYTE_NUM, desc.remoteEndpoint.commAddr.eid)) {
+                    std::fprintf(stderr, "PEER_PLAN_BOUND_DIRECT_MISMATCH rank=%u peer=%u: "
+                        "HCCL direct route differs from rootinfo/Atlas/live discovery; regenerate plan\n",
+                        r.rank, peer);
+                    return HCCL_E_PARA;
+                }
+            }
             if (haveDie && die != r.dieId) {
                 std::fprintf(stderr, "PEER_PLAN_INVALID mixed local IO dies require a future multi-die scheduler\n");
                 return HCCL_E_PARA;

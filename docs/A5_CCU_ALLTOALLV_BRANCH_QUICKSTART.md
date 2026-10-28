@@ -1,5 +1,8 @@
 # AllToAllV 分支：从拉取代码到选路和正确性短测
 
+八卡组内单 relay 贪心实验请使用新分支，并执行 [EP8 heuristic 指南](A5_CCU_EP8_HEURISTIC_ALLTOALLV.md)。
+本文保留 direct-only 基线和原 2/4 卡接口的步骤。
+
 分支：`feature/a5-ccu-8rank-direct-alltoallv`。
 适用当前实验容器 `sglang_yuanwen_old`，仓库 `/home/l00934901/sgl-kernel-npu`，
 CANN `/usr/local/Ascend/cann-9.1.T560`。全部使用容器现有 `python3`。

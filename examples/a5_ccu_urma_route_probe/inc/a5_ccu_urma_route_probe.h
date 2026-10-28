@@ -94,6 +94,8 @@ HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv, uint64_t elementsP
  * for an empty tensor. Out-of-place, baseline sync, one local IO die per rank.
  * BindStream and Destroy above also manage these handles. */
 int A5CcuAllToAllVAbiVersion(void);
+// Opt-in verification of discovered direct endpoint EIDs and local IO die.
+int A5CcuBoundDirectAbiVersion(void);
 HcclResult HcclCcuUrmaPeerPlanAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle);
 HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
