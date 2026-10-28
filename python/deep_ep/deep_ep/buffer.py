@@ -557,6 +557,15 @@ class Buffer:
         """Bind the current execution stream outside execution/capture."""
         return self.runtime.bind_ccu_urma_peer_plan_alltoallv(handle)
 
+    def ccu_urma_peer_plan_alltoallv_layout_out(self, send, recv, handle, counts, storage_counts):
+        """EP8 eager prefix transfers into original peer segments, without repacking.
+
+        Both matrices must be identical on all ranks; 0 <= counts <= storage_counts.
+        Tensor shapes describe storage_counts. Untransferred suffixes are untouched.
+        """
+        return self.runtime.ccu_urma_peer_plan_alltoallv_layout_out(
+            send, recv, handle, list(counts), list(storage_counts))
+
     def ccu_urma_peer_plan_alltoallv_out(self, send, recv, handle, counts):
         """Out-of-place EP8 AllToAllV over contiguous rows.
 

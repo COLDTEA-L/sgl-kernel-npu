@@ -64,6 +64,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("prepare_ccu_urma_peer_plan_alltoallv", &deep_ep::Buffer::prepare_ccu_urma_peer_plan_alltoallv,
              py::arg("plan_id"), py::arg("manifest"))
         .def("bind_ccu_urma_peer_plan_alltoallv", &deep_ep::Buffer::bind_ccu_urma_peer_plan_alltoallv, py::arg("handle"))
+        .def("ccu_urma_peer_plan_alltoallv_layout_out", &deep_ep::Buffer::ccu_urma_peer_plan_alltoallv_layout_out,
+             pybind11::arg("send"), pybind11::arg("recv"), pybind11::arg("handle"),
+             pybind11::arg("counts"), pybind11::arg("storage_counts"))
         .def("ccu_urma_peer_plan_alltoallv_out", &deep_ep::Buffer::ccu_urma_peer_plan_alltoallv_out,
              py::arg("send"), py::arg("recv"), py::arg("handle"), py::arg("counts"))
         .def("prepare_ccu_urma_peer_plan", &deep_ep::Buffer::prepare_ccu_urma_peer_plan,

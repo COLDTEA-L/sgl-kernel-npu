@@ -42,6 +42,8 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
 struct Buffer {
     int64_t prepare_ccu_urma_peer_plan_alltoallv(const std::string &, const std::string &);
     void bind_ccu_urma_peer_plan_alltoallv(int64_t handle);
+    torch::Tensor ccu_urma_peer_plan_alltoallv_layout_out(const torch::Tensor &, const torch::Tensor &,
+        int64_t, const std::vector<int64_t> &, const std::vector<int64_t> &);
     torch::Tensor ccu_urma_peer_plan_alltoallv_out(const torch::Tensor &, const torch::Tensor &,
         int64_t, const std::vector<int64_t> &);
 

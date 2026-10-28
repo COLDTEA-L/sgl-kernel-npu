@@ -2,6 +2,8 @@
 #include "utils.h"
 #include "data_type.h"
 #include "self_copy_lane.h"
+#include "thread_event_bridge.h"
+#include <cstring>
 #include "route_kernel.h"
 #include "alltoallv_kernel.h"
 #include <hcomm/ccu/hccl_ccu_res.h>
@@ -28,6 +30,7 @@ struct PeerPreparedPlan {
     ChannelSyncMode syncMode = ChannelSyncMode::BASELINE;
     std::vector<PeerPathSpec> specs;
     std::map<uintptr_t, PeerPlanResources> streams;
+    std::map<uintptr_t, std::shared_ptr<ThreadEventBridge>> bridges;
 };
 std::mutex registryMutex, buildMutex, submitMutex;
 std::map<uint64_t, PeerPreparedPlan> plans;
@@ -123,6 +126,20 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
     PeerPlanResources resources;
     const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV);
     if (status != HCCL_SUCCESS) return status;
+    std::shared_ptr<ThreadEventBridge> bridge;
+    if (snapshot.allToAllV) {
+        const char *mode = std::getenv("A5_CCU_EP8_THREAD_BRIDGE");
+        const bool useEvent = !mode || std::strcmp(mode, "event") == 0;
+        if (!useEvent && std::strcmp(mode, "hcomm") != 0) return HCCL_E_PARA;
+        if (useEvent && resources.route.routeThread != resources.route.mainThread) {
+            const auto bridgeStatus = ThreadEventBridge::Create(stream, resources.route.slaveStream, &bridge);
+            if (bridgeStatus != HCCL_SUCCESS) return bridgeStatus;
+        }
+        std::printf("EP8_THREAD_BRIDGE rank=%u die=%u mode=%s main_thread=%lu route_thread=%lu main=%p route=%p events=%u\n",
+            resources.route.rank, resources.route.dieId,
+            resources.route.routeThread == resources.route.mainThread ? "same_thread" : useEvent ? "event" : "hcomm",
+            resources.route.mainThread, resources.route.routeThread, stream, resources.route.slaveStream, bridge ? 2U : 0U);
+    }
     if (!resources.route.ccuSelfCopy) {
         const auto copyStatus = SelfCopyLane::Create(stream, &resources.route.selfCopy);
         if (copyStatus != HCCL_SUCCESS) return copyStatus;
@@ -130,6 +147,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         plans.at(handle).streams.emplace(reinterpret_cast<uintptr_t>(stream), resources);
+        if (bridge) plans.at(handle).bridges.emplace(reinterpret_cast<uintptr_t>(stream), bridge);
     }
     std::printf("PEER_PLAN_BOUND handle=%lu rank=%u ranks=%u channels=%zu stream=%p die=%u\n",
         static_cast<unsigned long>(handle), resources.route.rank, resources.route.rankSize,
@@ -270,22 +288,25 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     return copy.Finish(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)));
 }
 
-extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
+static HcclResult ExecuteAllToAllV(void *send, void *recv,
     uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
-    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count)
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count,
+    const uint64_t *storageCounts, uint32_t storageCount)
 {
-    if (!send || !recv || !stream || !counts) return HCCL_E_PTR;
     std::lock_guard<std::mutex> submit(submitMutex);
     auto checkedStatus = [&](HcclResult status, const char *stage) {
         if (status != HCCL_SUCCESS) {
             std::fprintf(stderr, "ALLTOALLV_STAGE_FAILED rank=%u handle=%lu stage=%s status=%d "
-                "stream=%p send=%p recv=%p send_capacity=%lu recv_capacity=%lu\n",
-                rank, handle, stage, static_cast<int>(status), stream, send, recv, sendCapacity, recvCapacity);
+                "stream=%p send=%p recv=%p counts=%p count=%u send_capacity=%lu recv_capacity=%lu\n",
+                rank, handle, stage, static_cast<int>(status), stream, send, recv,
+                static_cast<const void *>(counts), count, sendCapacity, recvCapacity);
             std::fflush(stderr);
         }
         return status;
     };
+    if (!send || !recv || !stream || !counts) return checkedStatus(HCCL_E_PTR, "entry_pointer");
     PeerPlanResources resources;
+    std::shared_ptr<ThreadEventBridge> bridge;
     HcclComm owner;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
@@ -297,11 +318,14 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
         if (bound == found->second.streams.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
         resources = bound->second; owner = found->second.comm;
+        const auto bridgeFound = found->second.bridges.find(reinterpret_cast<uintptr_t>(stream));
+        if (bridgeFound != found->second.bridges.end()) bridge = bridgeFound->second;
     }
     const auto &r = resources.route;
     AllToAllVLayout layout;
     if (rank != r.rank || r.rankSize != 8 ||
-        !BuildAllToAllVLayout(rank, counts, count, rowBytes, resources.peers, &layout) ||
+        !BuildAllToAllVLayoutWithStorage(rank, counts, count, rowBytes, resources.peers,
+            storageCounts, storageCount, &layout) ||
         !DisjointAllToAllVBuffers(reinterpret_cast<uint64_t>(send), sendCapacity,
             reinterpret_cast<uint64_t>(recv), recvCapacity, layout) || layout.selfBytes > GROUP_MAX_BYTES)
         return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
@@ -310,17 +334,41 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv
     AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout);
     auto status = HCCL_SUCCESS;
-    if (r.routeThread != r.mainThread) {
+    if (bridge) {
+        status = checkedStatus(bridge->Begin(), "event_route_start");
+        if (status != HCCL_SUCCESS) return status;
+    } else if (r.routeThread != r.mainThread) {
         status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0)), "record_route_start");
         if (status != HCCL_SUCCESS) return status;
         status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
         if (status != HCCL_SUCCESS) return status;
     }
     status = checkedStatus(HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task), "kernel_launch");
+    if (bridge) return checkedStatus(bridge->Finish(status), "event_route_done");
     if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
     status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800)), "wait_route_done");
     if (status != HCCL_SUCCESS) return status;
     return checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)), "record_route_done");
+}
+
+// Additive ABI: the old contiguous interface remains unchanged.
+extern "C" int A5CcuAllToAllVLayoutAbiVersion() { return 1; }
+extern "C" int A5CcuEp8ThreadBridgeAbiVersion() { return 1; }
+extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count)
+{
+    return ExecuteAllToAllV(send, recv, sendCapacity, recvCapacity, rowBytes, rank,
+        comm, stream, handle, counts, count, nullptr, 0);
+}
+extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecuteLayout(void *send, void *recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count,
+    const uint64_t *storageCounts, uint32_t storageCount)
+{
+    if (!storageCounts) return HCCL_E_PTR;
+    return ExecuteAllToAllV(send, recv, sendCapacity, recvCapacity, rowBytes, rank,
+        comm, stream, handle, counts, count, storageCounts, storageCount);
 }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)
@@ -330,6 +378,10 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)
     std::lock_guard<std::mutex> lock(registryMutex);
     const auto found = plans.find(handle);
     if (found == plans.end()) return HCCL_E_NOT_FOUND;
+    for (auto &entry : found->second.bridges) {
+        const auto status = entry.second->Close();
+        if (status != HCCL_SUCCESS) return status;
+    }
     for (auto &stream : found->second.streams) {
         if (stream.second.route.selfCopy) {
             const auto status = stream.second.route.selfCopy->Close();

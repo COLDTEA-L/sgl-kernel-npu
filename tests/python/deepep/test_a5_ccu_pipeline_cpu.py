@@ -121,7 +121,7 @@ class FakeRuntime:
     def copy(self, dst, di, src, si, n):
         self.engine.append(self.active, ('copy', self.active),
                            lambda: dst.narrow(0, di, n).copy_(src.narrow(0, si, n)))
-    def transfer(self, lane, send, recv, counts):
+    def transfer(self, lane, send, recv, counts, storage_counts=None):
         import torch
         li = lane.stream[1]; seq = self.sequences[li]; self.sequences[li] += 1
         key = (li, seq)
@@ -131,13 +131,22 @@ class FakeRuntime:
             def action():
                 assert len(node.calls) == 8
                 assert all(c[2] == counts for c in node.calls.values())
-                result = collective([node.calls[r][0].tolist() for r in range(8)], counts)
-                for r in range(8):
-                    target = node.calls[r][1]
-                    target.copy_(torch.tensor(result[r], dtype=target.dtype).reshape(target.shape))
+                assert all(c[3] == storage_counts for c in node.calls.values())
+                if storage_counts is None:
+                    result = collective([node.calls[r][0].tolist() for r in range(8)], counts)
+                    for r in range(8):
+                        target = node.calls[r][1]
+                        target.copy_(torch.tensor(result[r], dtype=target.dtype).reshape(target.shape))
+                else:
+                    for src in range(8):
+                        for dst in range(8):
+                            n = counts[src * 8 + dst]
+                            si = sum(storage_counts[src * 8:src * 8 + dst])
+                            di = sum(storage_counts[s * 8 + dst] for s in range(src))
+                            node.calls[dst][1][di:di+n].copy_(node.calls[src][0][si:si+n])
             node.action = action
             self.engine.collectives[key] = node; self.engine.nodes.append(node)
-        node.calls[self.rank] = (send, recv, counts)
+        node.calls[self.rank] = (send, recv, counts, storage_counts)
         if self.active in self.engine.tails: node.deps.add(self.engine.tails[self.active])
         self.engine.tails[self.active] = node
 
@@ -305,7 +314,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(stats, baseline, 'workspace addresses/events/allocations grew without capacity growth')
             # Each iteration represents completed work before the next batch.
             engine.nodes.clear(); engine.tails.clear(); engine.collectives.clear()
-        self.assertTrue(all(s['tensor_allocations'] == 10 for s in baseline))
+        self.assertTrue(all(s['tensor_allocations'] == 8 for s in baseline))
         self.assertTrue(all(s['event_allocations'] == 11 for s in baseline))
 
     @unittest.skipUnless(importlib.util.find_spec('torch'), 'Torch not installed')
@@ -324,7 +333,7 @@ class PipelineTests(unittest.TestCase):
                 send = (torch.arange(n, dtype=torch.float32) + iteration).reshape(n, 1)
                 recv = torch.empty((m, 1))
                 prepared = old[rank] if iteration == 2 else PreparedPipelinedAllToAllV(
-                    context, plan, send, chunk_bytes=28)
+                    context, plan, send, chunk_bytes=128)
                 if iteration == 0: old.append(prepared)
                 prepared.execute(send, recv)
                 self.assertEqual(prepared._bound_generation, context.generation)
@@ -333,7 +342,7 @@ class PipelineTests(unittest.TestCase):
             for actual, expected in results: self.assertTrue(torch.equal(actual, expected))
             engine.nodes.clear(); engine.tails.clear(); engine.collectives.clear()
         self.assertTrue(all(c.runtime.sync_calls == 1 for c in contexts))
-        self.assertTrue(all(c.allocations == 20 for c in contexts))
+        self.assertTrue(all(c.allocations == 16 for c in contexts))
 
 
 if __name__ == '__main__': unittest.main()

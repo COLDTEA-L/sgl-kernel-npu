@@ -15,6 +15,10 @@ MAX_I64 = (1 << 63) - 1
 
 
 def _uint(value, name, minimum=0):
+    # Device counters converted to host lists contain plain ints. Keep the
+    # Integral fallback for NumPy scalars, without its ABC check on every entry.
+    if type(value) is int and minimum <= value <= MAX_I64:
+        return value
     if isinstance(value, bool) or not isinstance(value, Integral) or not minimum <= int(value) <= MAX_I64:
         raise ValueError(f'{name} must be an integer in [{minimum}, {MAX_I64}]')
     return int(value)
@@ -129,11 +133,13 @@ def make_plan(counts, row_bytes, allowed_relays, *, min_chunk_bytes=1,
     chunk_rows = (min_chunk_bytes + row_bytes - 1) // row_bytes
     for _ in range(max_actions):
         best = None
-        for f in range(64):
-            s, d = divmod(f, N)
-            if s == d or not c[f] or chosen[f] >= 0:
-                continue
+        eligible = sorted((f for f in range(64) if f // N != f % N and c[f] and chosen[f] < 0),
+                          key=lambda f: (-load[f], f))
+        for f in eligible:
             a = load[f]
+            if best is not None and a < best[0][0]:
+                break
+            s, d = divmod(f, N)
             for k in relays[f]:
                 evaluations += 1
                 h = max(load[s * N + k], load[k * N + d])
@@ -206,11 +212,23 @@ def _offsets(counts):
     return src, dst
 
 
-def build_schedule(plan):
-    """Pack into two contiguous AllToAllV stages; preserve final source-major order."""
+def validate_plan(plan):
     c = normalize_counts(plan.counts)
     if len(plan.relay_rank) != 64 or len(plan.relay_rows) != 64:
         raise ValueError('invalid plan shape')
+    for f, n in enumerate(c):
+        s, d = divmod(f, N)
+        x, k = plan.relay_rows[f], plan.relay_rank[f]
+        if not 0 <= x <= n or (x and (k not in range(N) or k in (s, d))) or (not x and k != -1):
+            raise ValueError('invalid relay assignment')
+        if s == d and x:
+            raise ValueError('self traffic cannot use a relay')
+    return c
+
+
+def build_schedule(plan):
+    """Pack into two contiguous AllToAllV stages; preserve final source-major order."""
+    c = validate_plan(plan)
     first, second, raw = [0] * 64, [0] * 64, []
     source, final = _offsets(c)
     for f, n in enumerate(c):

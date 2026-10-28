@@ -43,6 +43,13 @@ static void InvalidLayouts()
     assert(!DisjointAllToAllVBuffers(100,1,200,3,l));
     assert(!DisjointAllToAllVBuffers(100,2,101,3,l));
     assert(!DisjointAllToAllVBuffers(UINT64_MAX,2,200,3,l));
+    std::array<uint64_t,64> storage{}; storage[4]=20;
+    counts={}; counts[4]=21;
+    assert(!BuildAllToAllVLayoutWithStorage(0,counts.data(),64,2,peers,storage.data(),64,&l));
+    counts[4]=10;
+    assert(BuildAllToAllVLayoutWithStorage(0,counts.data(),64,2,peers,storage.data(),64,&l));
+    assert(l.sendBytes==40 && l.pathBytes[3]==20);
+    assert(!BuildAllToAllVLayoutWithStorage(0,counts.data(),64,2,peers,storage.data(),63,&l));
     std::vector<PeerPathSpec> specs;
     for(uint32_t a=0;a<8;++a) for(uint32_t b=a+1;b<8;++b) {
         PeerPathSpec p; p.srcRank=a;p.dstRank=b;p.srcPhy=a;p.dstPhy=b;specs.push_back(p);
@@ -76,13 +83,16 @@ int main()
             for(uint32_t d=0;d<8;++d) counts[7*8+d]=0; // empty sender, nonempty receiver
             for(uint32_t s=0;s<8;++s) counts[s*8+6]=0; // empty receiver, nonempty sender
         }
+        auto transfer=counts;
+        if(epoch%2) for(size_t f=0;f<64;++f) transfer[f]/=2;
         const uint64_t rowBytes=std::array<uint64_t,5>{{1,2,4,14,514}}[epoch%5];
         std::array<AllToAllVLayout,8> layouts;
         std::array<std::vector<unsigned char>,8> input, output, original;
         std::array<hcomm::CcuRep::Env,8> envs;
         uint64_t published[8][8][2]{};
         for(uint32_t r=0;r<8;++r) {
-            assert(BuildAllToAllVLayout(r,counts.data(),64,rowBytes,Peers(r),&layouts[r]));
+            if(epoch%2) assert(BuildAllToAllVLayoutWithStorage(r,transfer.data(),64,rowBytes,Peers(r),counts.data(),64,&layouts[r]));
+            else assert(BuildAllToAllVLayout(r,counts.data(),64,rowBytes,Peers(r),&layouts[r]));
             const auto &l=layouts[r];
             if(l.selfBytes && l.selfSourceOffset!=l.selfDestinationOffset) ++asymmetricSelf;
             input[r].assign(2*guard+std::max<uint64_t>(1,l.sendBytes),0xb7);
@@ -149,11 +159,13 @@ int main()
             for(uint32_t s=0;s<8;++s) {
                 uint64_t sendOffset=0;
                 for(uint32_t q=0;q<d;++q) sendOffset+=counts[s*8+q]*rowBytes;
-                const auto length=counts[s*8+d]*rowBytes;
+                const auto length=transfer[s*8+d]*rowBytes;
                 if(!length) ++zeroDirections;
                 assert(std::memcmp(output[d].data()+guard+recvOffset,
                     input[s].data()+guard+sendOffset,length)==0);
-                recvOffset+=length;
+                const auto segmentBytes=counts[s*8+d]*rowBytes;
+                for(size_t b=length;b<segmentBytes;++b) assert(output[d][guard+recvOffset+b]==0xc3);
+                recvOffset+=segmentBytes;
             }
             for(size_t b=0;b<output[d].size();++b)
                 if(b<guard || b>=guard+layouts[d].recvBytes) assert(output[d][b]==0xc3);

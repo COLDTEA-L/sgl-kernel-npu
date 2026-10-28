@@ -61,6 +61,8 @@ def main():
     p.add_argument('--executor', choices=('pipeline', 'serial'), default='pipeline')
     p.add_argument('--chunk-bytes', type=int, default=8 << 20,
                    help='max bytes per original relayed flow in each chunk round, row-aligned')
+    p.add_argument('--thread-bridge', choices=('event', 'hcomm'), default='event',
+                   help='EP8 die-1 caller/route stream bridge; hcomm is the legacy diagnostic control')
     p.add_argument('--max-chunks', type=int, default=128)
     p.add_argument('--executor-sync', choices=('stream', 'device'), default='stream',
                    help='stream ordering or old four device fences for A/B diagnosis')
@@ -89,6 +91,7 @@ def main():
     else:
         names = ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut') if args.suite == 'correctness' else (args.case,)
         cases = [(name, synthetic(name, args.row_scale)) for name in names]
+    os.environ['A5_CCU_EP8_THREAD_BRIDGE'] = args.thread_bridge
     from a5_ccu_test_runtime import prepare_runtime, import_deep_ep, ccu_pg_kwargs, log_ccu_communicator
     extension, route_path = prepare_runtime(__file__)
     import torch
@@ -99,14 +102,23 @@ def main():
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
     if marker() != 1: raise RuntimeError('rebuild/install route: bound-direct ABI missing')
+    thread_abi = route.A5CcuEp8ThreadBridgeAbiVersion
+    thread_abi.restype = ctypes.c_int
+    if thread_abi() != 1: raise RuntimeError('rebuild/install route: EP8 thread bridge ABI 1 required')
     if args.executor == 'pipeline':
+        try:
+            layout_abi = route.A5CcuAllToAllVLayoutAbiVersion
+            layout_abi.restype = ctypes.c_int
+            if layout_abi() != 1: raise AttributeError('wrong layout ABI')
+        except AttributeError as exc:
+            raise RuntimeError('rebuild/install route: AllToAllV layout ABI 1 is required') from exc
         bridge = ctypes.CDLL(str(extension), mode=ctypes.RTLD_GLOBAL)
         try:
             workspace_abi = bridge.A5DeepEpPipelineWorkspaceAbiVersion
             workspace_abi.restype = ctypes.c_int
-            if workspace_abi() != 1: raise AttributeError('wrong workspace ABI')
+            if workspace_abi() != 2: raise AttributeError('wrong workspace ABI')
         except AttributeError as exc:
-            raise RuntimeError('rebuild/install DeepEP extension: pipeline workspace ABI 1 is required') from exc
+            raise RuntimeError('rebuild/install DeepEP extension: pipeline workspace ABI 2 is required') from exc
     rank = int(os.environ['RANK'])
     def phase(name, **fields):
         print('EP8_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
@@ -322,10 +334,10 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=3, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=4, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
-                                 chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks),
+                                 chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge),
                   mode=args.mode, backend=('participant_hbm_pipelined_ccu' if pipeline else 'participant_hbm_two_stage_ccu'), cases=reports,
                   timing_scope='host_wall_submit_and_device_completion',
                   dynamic_scope=('device_counts_gather_cpu_sync_replan_pooled_workspace_execute_completion' if pipeline else

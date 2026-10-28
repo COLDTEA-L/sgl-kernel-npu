@@ -823,7 +823,7 @@ torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &send, int64_
 }
 
 extern "C" __attribute__((visibility("default"))) int A5DeepEpAllToAllVAbiVersion() { return 1; }
-extern "C" __attribute__((visibility("default"))) int A5DeepEpPipelineWorkspaceAbiVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int A5DeepEpPipelineWorkspaceAbiVersion() { return 2; }
 namespace {
 using AllToAllVExecute = HcclResult (*)(void *, void *, uint64_t, uint64_t, uint64_t, uint32_t,
     HcclComm, aclrtStream, uint64_t, const uint64_t *, uint32_t);
@@ -856,9 +856,18 @@ AllToAllVTensors CheckAllToAllVTensors(const torch::Tensor &send, const torch::T
     return result;
 }
 void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
-    int64_t rank, const std::vector<int64_t> &counts, HcclComm comm)
+    int64_t rank, const std::vector<int64_t> &counts, HcclComm comm,
+    const std::vector<int64_t> *storageCounts = nullptr)
 {
-    const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, counts);
+    const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, storageCounts ? *storageCounts : counts);
+    std::vector<uint64_t> transferCounts;
+    if (storageCounts) {
+        EP_HOST_ASSERT(counts.size() == 64);
+        for (size_t i = 0; i < counts.size(); ++i) {
+            EP_HOST_ASSERT(counts[i] >= 0 && counts[i] <= (*storageCounts)[i]);
+            transferCounts.push_back(counts[i]);
+        }
+    }
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send));
     // Zero-row views can own nonempty persistent backing (pipeline arena).
     // Reuse its BASE address/capacity: no payload will access this direction.
@@ -871,8 +880,17 @@ void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64
     const uint64_t outputBytes = recv.numel() ? output.nbytes() : output.storage().nbytes();
     auto stream = OrderedCcuTensorStream(input, output);
     static auto execute = reinterpret_cast<AllToAllVExecute>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVExecute"));
-    const auto status = execute(inputPtr, outputPtr, inputBytes, outputBytes,
-        checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64);
+    HcclResult status;
+    if (storageCounts) {
+        using ExecuteLayout = HcclResult (*)(void *, void *, uint64_t, uint64_t, uint64_t,
+            uint32_t, HcclComm, aclrtStream, uint64_t, const uint64_t *, uint32_t, const uint64_t *, uint32_t);
+        static auto executeLayout = reinterpret_cast<ExecuteLayout>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVExecuteLayout"));
+        status = executeLayout(inputPtr, outputPtr, inputBytes, outputBytes, checked.rowBytes,
+            rank, comm, stream, handle, transferCounts.data(), 64, checked.counts.data(), 64);
+    } else {
+        status = execute(inputPtr, outputPtr, inputBytes, outputBytes,
+            checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64);
+    }
     if (status != HCCL_SUCCESS) {
         std::fprintf(stderr, "ALLTOALLV_EXECUTE_FAILED rank=%ld handle=%ld stream=%p status=%d "
             "send=%p recv=%p send_capacity=%lu recv_capacity=%lu row_bytes=%lu\n",
@@ -908,6 +926,16 @@ torch::Tensor Buffer::ccu_urma_peer_plan_alltoallv_out(const torch::Tensor &send
     c10::DeviceGuard guard(send.device());
     EP_HOST_ASSERT(num_ranks == 8);
     LaunchAllToAllV(send, recv, handle, rank, counts, ResolveComm(moe_all_to_all_group_name, ep_comm));
+    return recv;
+}
+torch::Tensor Buffer::ccu_urma_peer_plan_alltoallv_layout_out(const torch::Tensor &send,
+    const torch::Tensor &recv, int64_t handle, const std::vector<int64_t> &counts,
+    const std::vector<int64_t> &storageCounts)
+{
+    c10::DeviceGuard guard(send.device());
+    EP_HOST_ASSERT(num_ranks == 8);
+    LaunchAllToAllV(send, recv, handle, rank, counts,
+        ResolveComm(moe_all_to_all_group_name, ep_comm), &storageCounts);
     return recv;
 }
 torch::Tensor ccu_urma_peer_plan_alltoallv_out_op(const torch::Tensor &send, const torch::Tensor &recv,

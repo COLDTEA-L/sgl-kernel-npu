@@ -51,6 +51,21 @@ inline bool BuildAllToAllVLayout(uint32_t rank, const uint64_t *counts,
     return true;
 }
 
+// Transfer a prefix of each original peer segment without repacking it.
+// Storage offsets/capacities come from storageCounts; transfer sizes from counts.
+inline bool BuildAllToAllVLayoutWithStorage(uint32_t rank, const uint64_t *counts,
+    uint32_t count, uint64_t rowBytes, const std::vector<uint32_t> &peers,
+    const uint64_t *storageCounts, uint32_t storageCount, AllToAllVLayout *out)
+{
+    if (!storageCounts) return BuildAllToAllVLayout(rank, counts, count, rowBytes, peers, out);
+    if (!counts || count != 64 || storageCount != 64) return false;
+    for (size_t i = 0; i < 64; ++i) if (counts[i] > storageCounts[i]) return false;
+    if (!BuildAllToAllVLayout(rank, storageCounts, storageCount, rowBytes, peers, out)) return false;
+    out->selfBytes = counts[rank * 8 + rank] * rowBytes;
+    for (size_t i = 0; i < peers.size(); ++i) out->pathBytes[i] = counts[rank * 8 + peers[i]] * rowBytes;
+    return true;
+}
+
 inline bool DisjointAllToAllVBuffers(uint64_t send, uint64_t sendCapacity,
     uint64_t recv, uint64_t recvCapacity, const AllToAllVLayout &layout)
 {

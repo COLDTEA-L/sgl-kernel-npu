@@ -126,6 +126,36 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(sum(load), sum(c[f] for f in range(64) if f // 8 != f % 8) + sum(p.relay_rows))
             simulate(p)
 
+    def test_priority_pruning_matches_exhaustive_candidate_reference(self):
+        rng = random.Random(41)
+        for _ in range(100):
+            c = [rng.randrange(60) for _ in range(64)]
+            allowed = [[k for k in ks if rng.random() < .7] for ks in ALL]
+            cap = [rng.randrange(150) for _ in range(8)]
+            limit, minimum = rng.randrange(57), rng.randrange(1, 6)
+            p = make_plan(c, 1, allowed, max_actions=limit, min_chunk_bytes=minimum,
+                          relay_capacity_bytes=cap)
+            load = [n if f // 8 != f % 8 else 0 for f, n in enumerate(c)]
+            selected, used, expected = set(), [0] * 8, []
+            for step in range(limit):
+                candidates = []
+                for src in range(8):
+                    for dst in range(8):
+                        f = src * 8 + dst
+                        if src == dst or not c[f] or f in selected: continue
+                        for k in allowed[f]:
+                            a = load[f]; h = max(load[src*8+k], load[k*8+dst])
+                            x = min(c[f], max(0, (a-h)//2), cap[k]-used[k])
+                            gain = a-max(a-x, h+x)
+                            if x >= minimum and gain > 0:
+                                candidates.append(((a,gain,-src,-dst,-k),src,dst,k,x,gain))
+                if not candidates: break
+                _, src,dst,k,x,gain = max(candidates)
+                expected.append((src,dst,k,x,gain)); selected.add(src*8+dst); used[k]+=x
+                load[src*8+dst]-=x; load[src*8+k]+=x; load[k*8+dst]+=x
+            self.assertEqual(p.actions, tuple(expected))
+            self.assertEqual(p.link_rows, tuple(load))
+
     def test_serial_cost_gate_does_not_claim_link_peak_speedup(self):
         rng = random.Random(73)
         matrices = [[rng.randrange(100) for _ in range(64)] for _ in range(100)]
