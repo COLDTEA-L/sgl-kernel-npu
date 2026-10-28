@@ -26,11 +26,18 @@ def summarize(root):
         all_cases = [r['cases'][index] for r in ranks]
         if any(c['correctness'] != 'PASS' or c['fingerprint'] != case['fingerprint'] for c in all_cases):
             raise ValueError('plan/correctness differs across ranks')
+        protocol = first['benchmark'].get('protocol', 1)
+        if protocol >= 2 and any(c['execution'] != case['execution'] or
+                                 c['executor_sync'] != case['executor_sync'] for c in all_cases):
+            raise ValueError('inconsistent execution policy or sync mode')
         modes = set(case['prepared_round_us'])
         if any(set(c['prepared_round_us']) != modes or set(c['dynamic_mean_us']) != modes for c in all_cases):
             raise ValueError('inconsistent measured modes')
         summary = dict(case=case['case'], plan=case['plan'], schedule=case['schedule'],
                        planner_max_rank_us=max(c['planner_us'] for c in all_cases), prepared={}, dynamic={})
+        if protocol >= 2:
+            summary['execution'] = case['execution']
+            summary['executor_sync'] = case['executor_sync']
         for mode in sorted(modes):
             rounds = len(case['prepared_round_us'][mode])
             if not rounds or any(len(c['prepared_round_us'][mode]) != rounds for c in all_cases):
@@ -40,7 +47,30 @@ def summarize(root):
             if any(not math.isfinite(v) or v <= 0 for v in values + [dynamic]):
                 raise ValueError('invalid timing value')
             summary['prepared'][mode] = dict(slowest_rank_round_us=values, mean_us=statistics.mean(values))
-            summary['dynamic'][mode] = dict(mean_us=dynamic)
+            if protocol >= 2:
+                if any(set(c['dynamic_round_us']) != modes or
+                       len(c['dynamic_round_us'][mode]) != rounds or
+                       len(c['dynamic_components_round_us'][mode]) != rounds for c in all_cases):
+                    raise ValueError('missing dynamic timing rounds/components')
+                per_round = [max(c['dynamic_round_us'][mode][i] for c in all_cases) for i in range(rounds)]
+                if any(not math.isfinite(v) or v <= 0 for v in per_round):
+                    raise ValueError('invalid dynamic round')
+                # Keep components from the rank with the slowest TOTAL in that
+                # round; independently maxing each component invents a latency.
+                samples = [max(all_cases, key=lambda c: c['dynamic_round_us'][mode][i])
+                           ['dynamic_components_round_us'][mode][i] for i in range(rounds)]
+                if any(not math.isfinite(v) or v < 0 for sample in samples for v in sample.values()):
+                    raise ValueError('invalid dynamic component')
+                summary['dynamic'][mode] = dict(mean_us=statistics.mean(per_round),
+                                               slowest_rank_round_us=per_round,
+                                               slowest_rank_components_round_us=samples)
+            else:
+                summary['dynamic'][mode] = dict(mean_us=dynamic)
+            for scope in ('prepared', 'dynamic'):
+                entry = summary[scope][mode]
+                if 'slowest_rank_round_us' in entry:
+                    samples = entry['slowest_rank_round_us']
+                    entry.update(median_us=statistics.median(samples), min_us=min(samples), max_us=max(samples))
         if modes == {'direct', 'multipath'}:
             for scope in ('prepared', 'dynamic'):
                 summary[scope]['direct_over_multipath'] = (summary[scope]['direct']['mean_us'] /
@@ -48,6 +78,9 @@ def summarize(root):
             summary['analysis'] = ('dynamic multipath faster on this workload' if
                                    summary['dynamic']['direct_over_multipath'] > 1 else
                                    'no dynamic speedup; retain direct for this workload')
+            if protocol >= 2 and not case['execution']['executed_relay']:
+                summary['analysis'] = ('NO_RELAY_EXECUTED: prepared is a direct/direct control; '
+                                       'dynamic includes planner overhead. Ratio is NOT multipath speedup.')
         output['cases'].append(summary)
     return output
 
@@ -63,6 +96,9 @@ def compare_runs(direct_root, multipath_root):
         if d['plan']['fingerprint'] != m['plan']['fingerprint']:
             raise ValueError('comparison counts/row bytes/relay plan differ')
         row = dict(case=d['case'])
+        if 'execution' in m:
+            row['execution'] = m['execution']
+            row['multipath_speedup_claim_allowed'] = m['execution']['executed_relay']
         for scope in ('prepared', 'dynamic'):
             dt, mt = d[scope]['direct']['mean_us'], m[scope]['multipath']['mean_us']
             row[scope] = dict(direct_us=dt, multipath_us=mt, direct_over_multipath=dt / mt)
@@ -86,6 +122,7 @@ def main():
     print('EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS')
     for c in summary['cases']:
         print(json.dumps({k: c[k] for k in ('case', 'planner_max_rank_us', 'prepared', 'dynamic')}))
+        if 'execution' in c: print('EXECUTION ' + json.dumps(c['execution']))
         if 'analysis' in c: print(c['analysis'])
     print('summary: ' + str(args.run_dir / 'summary.json'))
 

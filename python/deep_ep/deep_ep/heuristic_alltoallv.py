@@ -244,13 +244,56 @@ def build_schedule(plan):
                     tuple((source[r * 8 + r], final[r * 8 + r], c[r * 8 + r]) for r in range(N)))
 
 
+def execution_decision(plan, policy='force', *, schedule=None):
+    """Separate a routing proposal from the decision to execute it.
+
+    This is a conservative equal-link-bandwidth model, NOT a hardware latency
+    prediction. With globally serial stages, peak(stage1)+peak(stage2) >=
+    max(original edge): the largest original flow has portions n-x and x in
+    those stages. Thus this executor cannot promise a network-only speedup.
+    `force` is for measuring the actual relay path; `auto` rejects that known
+    structural penalty. A future pipelined executor needs a different model.
+    """
+    if policy not in ('force', 'auto'):
+        raise ValueError('policy must be force/auto')
+    schedule = build_schedule(plan) if schedule is None else schedule
+    direct = max((n for f, n in enumerate(plan.counts) if f // N != f % N), default=0)
+    serial = max(schedule.first_counts) + max(schedule.second_counts)
+    use = plan.uses_relay and (policy == 'force' or serial < direct)
+    return dict(policy=policy, proposed_relay=plan.uses_relay, executed_relay=use,
+                ccu_calls_per_execute=2 if use else 1,
+                scratch_bytes_per_rank=[sum(schedule.scratch_rows(r)) * plan.row_bytes if use else 0
+                                        for r in range(N)],
+                reason=('forced_relay' if use else 'serial_phase_cost_not_better_than_direct'
+                        if plan.uses_relay else 'no_relay_candidate'),
+                direct_peak_bytes=direct * plan.row_bytes,
+                serial_phase_peak_sum_bytes=serial * plan.row_bytes,
+                model='equal_bandwidth_serial_stages_excludes_copy_launch_and_shared_resources')
+
+
+def _coalesce_spans(spans):
+    """Merge only copies adjacent in BOTH source and destination, never gaps."""
+    result = []
+    for src, dst, n in sorted(spans):
+        if result and (result[-1][0] + result[-1][2], result[-1][1] + result[-1][2]) == (src, dst):
+            a, b, old = result[-1]
+            result[-1] = (a, b, old + n)
+        else:
+            result.append((src, dst, n))
+    return result
+
+
 class PreparedAllToAllV:
-    """Reusable eager workspace. Exclusive to one rank/stream and one in-flight call.
+    """Reusable eager workspace. Exclusive to one rank/stream; ordered reuse is allowed.
 
     prepare/apply route matrices explicitly per batch. No hidden counts cache,
     expert histogram, device-to-host copy, graph capture, or background planner.
     """
-    def __init__(self, buffer, handle, rank, plan, example_send, *, max_scratch_bytes=1 << 30):
+    def __init__(self, buffer, handle, rank, plan, example_send, *, max_scratch_bytes=1 << 30,
+                 sync_mode="stream", policy="force"):
+        if sync_mode not in ("stream", "device") or policy not in ("force", "auto"):
+            raise ValueError("sync_mode must be stream/device; policy must be force/auto")
+        self.sync_mode, self.policy = sync_mode, policy
         import torch
         self.rank = _uint(rank, 'rank')
         if self.rank >= N or example_send.dim() < 1 or not example_send.is_contiguous():
@@ -260,6 +303,8 @@ class PreparedAllToAllV:
         if getattr(buffer, 'rank', rank) != rank or getattr(buffer, 'group_size', N) != N:
             raise ValueError('prepared rank/group differs from EP8 Buffer')
         self.schedule = build_schedule(plan)
+        self.decision = execution_decision(plan, policy, schedule=self.schedule)
+        self.uses_relay = self.decision["executed_relay"]
         self.plan, self.buffer, self.handle = plan, buffer, handle
         self.tail, self.dtype, self.device = tuple(example_send.shape[1:]), example_send.dtype, example_send.device
         if example_send.element_size() * prod(self.tail) != plan.row_bytes:
@@ -268,7 +313,7 @@ class PreparedAllToAllV:
         self.recv_rows = sum(plan.counts[rank::8])
         if example_send.shape[0] != self.send_rows:
             raise ValueError('send rows do not match routing matrix')
-        sizes = self.schedule.scratch_rows(rank) if plan.uses_relay else (0, 0, 0, 0)
+        sizes = self.schedule.scratch_rows(rank) if self.uses_relay else (0, 0, 0, 0)
         if sum(sizes) * plan.row_bytes > _uint(max_scratch_bytes, 'max_scratch_bytes'):
             raise ValueError('multipath workspace exceeds max_scratch_bytes')
         self.workspace = [torch.empty((n, *self.tail), dtype=self.dtype, device=self.device) for n in sizes]
@@ -278,12 +323,17 @@ class PreparedAllToAllV:
         self.outgoing = [p for p in self.schedule.pieces if p.src == rank]
         self.forwarding = [p for p in self.schedule.pieces if p.target == rank and p.target != p.dst]
         self.incoming = [p for p in self.schedule.pieces if p.dst == rank]
+        self.pack_spans = _coalesce_spans([(p.source, p.first_send, p.rows) for p in self.outgoing])
+        self.forward_spans = _coalesce_spans([(p.first_recv, p.second_send, p.rows) for p in self.forwarding])
+        self.direct_spans = _coalesce_spans([(p.first_recv, p.final, p.rows) for p in self.incoming if p.target == p.dst])
+        self.relay_spans = _coalesce_spans([(p.second_recv, p.final, p.rows) for p in self.incoming if p.target != p.dst])
 
     def _phase_fence(self):
-        # Conservative eager boundary between Torch's task queue and the CCU
-        # host API. Count these fences in timing; remove only with stream-order
-        # validation on the target CANN/torch_npu stack, not by assumption.
-        if self.device.type != 'cpu':
+        # Legacy reference only. The bridge's OrderedCcuTensorStream drains the
+        # torch_npu host queue before direct ACL/HCOMM submission; the CCU launch
+        # orders completion back onto that same stream (including die-1 slave).
+        # Subsequent Torch copies therefore do not need a device-wide fence.
+        if self.sync_mode == 'device' and self.device.type != 'cpu':
             import torch
             torch.npu.synchronize(self.device)
 
@@ -298,25 +348,24 @@ class PreparedAllToAllV:
             if a < b + recv.numel() * recv.element_size() and b < a + send.numel() * send.element_size():
                 raise ValueError('send and receive buffers overlap')
         op = self.buffer.ccu_urma_peer_plan_alltoallv_out
-        if not self.plan.uses_relay:
+        if not self.uses_relay:
             return op(send, recv, self.handle, self.counts)
         first_send, first_recv, second_send, second_recv = self.workspace
-        for p in self.outgoing:
-            first_send.narrow(0, p.first_send, p.rows).copy_(send.narrow(0, p.source, p.rows))
+        for src, dst, n in self.pack_spans:
+            first_send.narrow(0, dst, n).copy_(send.narrow(0, src, n))
         # Existing CCU kernel publishes all peers before waiting, including zero
         # directions, and completes remote writes before its done handshake.
         self._phase_fence()
         op(first_send, first_recv, self.handle, self.first_counts)
         self._phase_fence()
-        for p in self.forwarding:
-            second_send.narrow(0, p.second_send, p.rows).copy_(first_recv.narrow(0, p.first_recv, p.rows))
+        for src, dst, n in self.forward_spans:
+            second_send.narrow(0, dst, n).copy_(first_recv.narrow(0, src, n))
         self._phase_fence()
         op(second_send, second_recv, self.handle, self.second_counts)
         self._phase_fence()
-        for p in self.incoming:
-            tensor, offset = ((first_recv, p.first_recv) if p.target == p.dst
-                              else (second_recv, p.second_recv))
-            recv.narrow(0, p.final, p.rows).copy_(tensor.narrow(0, offset, p.rows))
+        for tensor, spans in ((first_recv, self.direct_spans), (second_recv, self.relay_spans)):
+            for src, dst, n in spans:
+                recv.narrow(0, dst, n).copy_(tensor.narrow(0, src, n))
         src, dst, n = self.schedule.self_offsets[self.rank]
         if n:
             recv.narrow(0, dst, n).copy_(send.narrow(0, src, n))

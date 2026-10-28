@@ -55,8 +55,12 @@ def main():
     p.add_argument('--relay-capacity-mib', type=int, default=1024)
     p.add_argument('--warmup', type=int, default=3)
     p.add_argument('--iters', type=int, default=10)
-    p.add_argument('--rounds', type=int, default=3)
-    p.add_argument('--dynamic-iters', type=int, default=3)
+    p.add_argument('--rounds', type=int, default=4)
+    p.add_argument('--dynamic-iters', type=int, default=10)
+    p.add_argument('--executor-sync', choices=('stream', 'device'), default='stream',
+                   help='stream ordering or old four device fences for A/B diagnosis')
+    p.add_argument('--multipath-policy', choices=('force', 'auto'), default='force',
+                   help='force really measures relaying; auto may explicitly reject serial forwarding')
     args = p.parse_args()
     if (int(os.environ.get('WORLD_SIZE', 0)) != 8 or args.width < 1 or args.row_scale < 1 or
             args.warmup < 0 or min(args.iters, args.rounds, args.dynamic_iters, args.max_scratch_mib) < 1
@@ -124,9 +128,20 @@ def main():
         stores = {name: torch.full((expected.numel() + 2 * guard,), -17, dtype=dtype, device='npu')
                   for name in ('direct', 'multipath', 'native')}
         outputs = {name: storage[guard:-guard].reshape(sum(recvs), args.width) for name, storage in stores.items()}
-        prepared = PreparedAllToAllV(buffer, handle, rank, plan, send, max_scratch_bytes=args.max_scratch_mib << 20)
+        prepare_options = dict(max_scratch_bytes=args.max_scratch_mib << 20,
+                               sync_mode=args.executor_sync, policy=args.multipath_policy)
+        prepared = PreparedAllToAllV(buffer, handle, rank, plan, send, **prepare_options)
+        forced = (prepared if args.multipath_policy == 'force' else
+                  PreparedAllToAllV(buffer, handle, rank, plan, send,
+                                   **dict(prepare_options, policy='force')))
+        # No-relay prepared timing is an explicit A/A control, using the same
+        # direct call on both labels. Dynamic still includes policy planning.
+        def selected_multi():
+            if prepared.uses_relay:
+                return prepared.execute(send, outputs['multipath'])
+            return buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs['multipath'], handle, list(counts))
         ops = dict(direct=lambda: buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs['direct'], handle, list(counts)),
-                   multipath=lambda: prepared.execute(send, outputs['multipath']),
+                   multipath=selected_multi,
                    native=lambda: dist.all_to_all_single(outputs['native'], send, input_split_sizes=sends, output_split_sizes=recvs))
         def set_payload(epoch):
             send.copy_(source + epoch)
@@ -145,6 +160,21 @@ def main():
             set_payload(epoch)
             for name in ('direct', 'multipath', 'native'):
                 ops[name](); torch.npu.synchronize(); check(name, epoch)
+            # Auto fallback must not hide a broken actual relay executor.
+            forced.execute(send, outputs['multipath'])
+            torch.npu.synchronize(); check('multipath', epoch)
+            # Producer -> relay -> Torch consumer -> next invocation, WITHOUT
+            # an intermediate device sync. Detects stream ordering regressions
+            # that the ordinary per-call correctness sync would otherwise hide.
+            snapshots = []
+            for queued_epoch in (epoch + 7, epoch + 13, epoch + 19):
+                send.copy_(source + queued_epoch)
+                forced.execute(send, outputs['multipath'])
+                snapshots.append((queued_epoch, outputs['multipath'].clone()))
+            torch.npu.synchronize()
+            for queued_epoch, snapshot in snapshots:
+                if not torch.equal(snapshot.cpu(), expected + queued_epoch):
+                    raise AssertionError(f'queued stream ordering failure rank={rank}')
             dist.barrier()
         timings = {name: [] for name in selected}
         for round_id in range(args.rounds):
@@ -163,26 +193,50 @@ def main():
                 check(name, epoch)
         # Same device-resident packed row counters feed both dynamic paths.
         local_counts = torch.tensor(sends, dtype=torch.int64, device='npu')
-        dynamic = {}
-        for name in selected:
-            set_payload(0)
-            dist.barrier(); torch.npu.synchronize()
-            begin = time.perf_counter()
-            for _ in range(args.dynamic_iters):
-                current = gather_routing_counts(local_counts)
-                if name == 'direct':
-                    buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, list(current))
-                else:
-                    current_plan = make_plan(current, row_bytes, allowed, **planner_options)
-                    current_prepared = PreparedAllToAllV(buffer, handle, rank, current_plan, send,
-                                                        max_scratch_bytes=args.max_scratch_mib << 20)
-                    current_prepared.execute(send, outputs[name])
-                # Include completion and safely release per-batch temporary workspaces.
-                torch.npu.synchronize()
-            dynamic[name] = (time.perf_counter() - begin) * 1e6 / args.dynamic_iters
-            check(name, 0)
+        dynamic_rounds = {name: [] for name in selected}
+        components = {name: [] for name in selected}
+        def dynamic_once(name):
+            start = time.perf_counter()
+            current = gather_routing_counts(local_counts)
+            gathered_at = time.perf_counter()
+            if name == 'direct':
+                current_counts = list(current)
+                ready_at = time.perf_counter()
+                buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, current_counts)
+            else:
+                current_plan = make_plan(current, row_bytes, allowed, **planner_options)
+                current_prepared = PreparedAllToAllV(buffer, handle, rank, current_plan, send,
+                                                    **prepare_options)
+                ready_at = time.perf_counter()
+                current_prepared.execute(send, outputs[name])
+            # Completion is part of BOTH paths; temporary workspace remains live.
+            torch.npu.synchronize()
+            finished = time.perf_counter()
+            return ((gathered_at - start) * 1e6, (ready_at - gathered_at) * 1e6,
+                    (finished - ready_at) * 1e6)
+        for round_id in range(args.rounds):
+            order = selected if round_id % 2 == 0 else tuple(reversed(selected))
+            for name in order:
+                set_payload(0)
+                # Warm the SAME counts collective + planner/allocator + executor
+                # path, rather than only warming prepared payload communication.
+                for _ in range(args.warmup): dynamic_once(name)
+                dist.barrier(); torch.npu.synchronize()
+                totals = [0., 0., 0.]
+                begin = time.perf_counter()
+                for _ in range(args.dynamic_iters):
+                    sample = dynamic_once(name)
+                    for i in range(3): totals[i] += sample[i]
+                dynamic_rounds[name].append((time.perf_counter() - begin) * 1e6 / args.dynamic_iters)
+                components[name].append(dict(zip(('counts_gather_sync_us', 'plan_workspace_us',
+                                                  'execute_completion_us'),
+                                                 (v / args.dynamic_iters for v in totals))))
+                check(name, 0)
+        dynamic = {name: sum(v) / len(v) for name, v in dynamic_rounds.items()}
         report = dict(case=case_name, correctness='PASS', plan=plan.report(), schedule=schedule.report(),
                       planner_us=planner_us, prepared_round_us=timings, dynamic_mean_us=dynamic,
+                      dynamic_round_us=dynamic_rounds, dynamic_components_round_us=components,
+                      execution=prepared.decision, executor_sync=args.executor_sync,
                       fingerprint=plan.fingerprint)
         reports.append(report)
         print('EP8_HEURISTIC_CASE ' + json.dumps(dict(rank=rank, case=case_name, actions=len(plan.actions),
@@ -194,7 +248,9 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(warmup=args.warmup, iters=args.iters, rounds=args.rounds, dynamic_iters=args.dynamic_iters),
+                  benchmark=dict(protocol=2, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                                 dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
+                                 multipath_policy=args.multipath_policy),
                   mode=args.mode, backend='participant_hbm_two_stage_ccu', cases=reports,
                   timing_scope='host_wall_submit_and_device_completion',
                   dynamic_scope='device_counts_gather_cpu_sync_plan_workspace_execute_completion')

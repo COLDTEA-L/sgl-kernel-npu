@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 sys.path.insert(0, str(ROOT / 'scripts'))
-from heuristic_alltoallv import make_plan, build_schedule, normalize_counts, cut_lower_bound_rows, PreparedAllToAllV
+from heuristic_alltoallv import make_plan, build_schedule, normalize_counts, cut_lower_bound_rows, PreparedAllToAllV, execution_decision, _coalesce_spans
 from prepare_a5_ccu_ep8_topology import build_topology
 from summarize_a5_ccu_heuristic import summarize, compare_runs
 
@@ -126,6 +126,53 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(sum(load), sum(c[f] for f in range(64) if f // 8 != f % 8) + sum(p.relay_rows))
             simulate(p)
 
+    def test_serial_cost_gate_does_not_claim_link_peak_speedup(self):
+        rng = random.Random(73)
+        matrices = [[rng.randrange(100) for _ in range(64)] for _ in range(100)]
+        hot = [0] * 64; hot[4] = 4096
+        matrices.append(hot)
+        for c in matrices:
+            plan = make_plan(c, 8192, ALL)
+            decision = execution_decision(plan, 'auto')
+            self.assertGreaterEqual(decision['serial_phase_peak_sum_bytes'], decision['direct_peak_bytes'])
+            self.assertFalse(decision['executed_relay'])
+            self.assertEqual(execution_decision(plan, 'force')['executed_relay'], plan.uses_relay)
+        decision = execution_decision(make_plan(hot, 8192, ALL), 'auto')
+        self.assertEqual(decision['direct_peak_bytes'], 32 << 20)
+        self.assertEqual(decision['serial_phase_peak_sum_bytes'], 32 << 20)
+        with self.assertRaises(ValueError): execution_decision(plan, 'bad')
+
+    def test_coalescing_keeps_gaps_and_destination_order(self):
+        self.assertEqual(_coalesce_spans([(3, 13, 2), (0, 10, 3), (5, 20, 1), (7, 21, 2)]),
+                         [(0, 10, 5), (5, 20, 1), (7, 21, 2)])
+
+    def test_v2_dynamic_per_round_slowest_rank_and_no_relay_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'results').mkdir()
+            (root / 'exit.status').write_text('0')
+            for rank in range(8):
+                case = dict(case='cut', correctness='PASS', fingerprint='same',
+                            plan={'fingerprint': 'same'}, schedule={}, planner_us=1,
+                            prepared_round_us={'direct': [10, 10], 'multipath': [10, 10]},
+                            dynamic_mean_us={'direct': 20, 'multipath': 10},
+                            dynamic_round_us={'direct': [20 + rank, 50 - rank], 'multipath': [10, 10]},
+                            dynamic_components_round_us={m: [dict(counts=rank + 1), dict(counts=rank + 2)]
+                                                         for m in ('direct', 'multipath')},
+                            execution={'executed_relay': False}, executor_sync='stream')
+                result = dict(rank=rank, ranks=8, correctness='PASS', mode='both', dtype='float16',
+                              width=8, backend='test', timing_scope='test', dynamic_scope='test',
+                              benchmark={'protocol': 2}, cases=[case])
+                (root / 'results' / f'rank{rank}.json').write_text(json.dumps(result))
+            summary = summarize(root)['cases'][0]
+            self.assertEqual(summary['dynamic']['direct']['slowest_rank_round_us'], [27, 50])
+            self.assertEqual(summary['dynamic']['direct']['mean_us'], 38.5)
+            self.assertEqual(summary['dynamic']['direct']['slowest_rank_components_round_us'],
+                             [dict(counts=8), dict(counts=2)])
+            self.assertIn('NOT multipath speedup', summary['analysis'])
+            result['cases'][0]['dynamic_round_us']['direct'] = [1]
+            (root / 'results' / 'rank7.json').write_text(json.dumps(result))
+            with self.assertRaises(ValueError): summarize(root)
+
     def test_topology_join_and_missing_live_eid(self):
         devices = list(reversed(range(8))); entries, edges = [], []
         for s in range(8):
@@ -168,10 +215,10 @@ class PlannerTests(unittest.TestCase):
     def test_actual_executor_cpu_threads_repeated_and_changed_matrix(self):
         import torch
         torch.set_num_threads(1)
-        for trial in range(3):
+        for trial in range(12):
             c = [((s * 17 + d * 3 + trial) % 13) if d != 6 and s != 7 else 0
                  for s in range(8) for d in range(8)]
-            if trial == 2: c = [2] * 64  # exercise direct fallback too
+            if trial % 3 == 2: c = [2] * 64  # exercise direct fallback too
             p = make_plan(c, 14, ALL)
             rendezvous = threading.Barrier(8, timeout=20)
             calls = [None] * 8
@@ -196,7 +243,12 @@ class PlannerTests(unittest.TestCase):
                     send = input_storage[37:-37].reshape(n, 7); send.copy_(source)
                     storage = torch.full((m * 7 + 74,), -17., dtype=torch.float16)
                     recv = storage[37:-37].reshape(m, 7)
-                    prepared = PreparedAllToAllV(Buffer(r), 1, r, p, send)
+                    prepared = PreparedAllToAllV(Buffer(r), 1, r, p, send,
+                                                sync_mode='device' if trial // 3 % 2 else 'stream',
+                                                policy='auto' if trial // 6 else 'force')
+                    if trial // 6:
+                        self.assertFalse(prepared.uses_relay)
+                        self.assertEqual(sum(v.numel() for v in prepared.workspace), 0)
                     for epoch in range(3):
                         send.copy_(source + epoch); recv.fill_(-17)
                         before = input_storage.clone()
