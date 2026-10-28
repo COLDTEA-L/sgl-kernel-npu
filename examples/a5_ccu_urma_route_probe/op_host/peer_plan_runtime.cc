@@ -276,17 +276,26 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv
 {
     if (!send || !recv || !stream || !counts) return HCCL_E_PTR;
     std::lock_guard<std::mutex> submit(submitMutex);
+    auto checkedStatus = [&](HcclResult status, const char *stage) {
+        if (status != HCCL_SUCCESS) {
+            std::fprintf(stderr, "ALLTOALLV_STAGE_FAILED rank=%u handle=%lu stage=%s status=%d "
+                "stream=%p send=%p recv=%p send_capacity=%lu recv_capacity=%lu\n",
+                rank, handle, stage, static_cast<int>(status), stream, send, recv, sendCapacity, recvCapacity);
+            std::fflush(stderr);
+        }
+        return status;
+    };
     PeerPlanResources resources;
     HcclComm owner;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         const auto found = plans.find(handle);
         int32_t device = -1;
-        if (found == plans.end()) return HCCL_E_NOT_FOUND;
+        if (found == plans.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
         if (!found->second.allToAllV || (comm && comm != found->second.comm) ||
-            aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return HCCL_E_PARA;
+            aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
-        if (bound == found->second.streams.end()) return HCCL_E_NOT_FOUND;
+        if (bound == found->second.streams.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
         resources = bound->second; owner = found->second.comm;
     }
     const auto &r = resources.route;
@@ -295,23 +304,23 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv
         !BuildAllToAllVLayout(rank, counts, count, rowBytes, resources.peers, &layout) ||
         !DisjointAllToAllVBuffers(reinterpret_cast<uint64_t>(send), sendCapacity,
             reinterpret_cast<uint64_t>(recv), recvCapacity, layout) || layout.selfBytes > GROUP_MAX_BYTES)
-        return HCCL_E_PARA;
+        return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
     const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), sendCapacity);
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
     AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout);
     auto status = HCCL_SUCCESS;
     if (r.routeThread != r.mainThread) {
-        status = static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0));
+        status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0)), "record_route_start");
         if (status != HCCL_SUCCESS) return status;
-        status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800));
+        status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
         if (status != HCCL_SUCCESS) return status;
     }
-    status = HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task);
+    status = checkedStatus(HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task), "kernel_launch");
     if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
-    status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));
+    status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800)), "wait_route_done");
     if (status != HCCL_SUCCESS) return status;
-    return static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0));
+    return checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)), "record_route_done");
 }
 
 extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)

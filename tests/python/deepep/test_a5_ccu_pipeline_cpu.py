@@ -101,7 +101,12 @@ class FakeRuntime:
     def __init__(self, engine, rank):
         self.engine, self.rank, self.active = engine, rank, (rank, 0)
         self.sequences = [0, 0, 0]
+        self.sync_calls = 0
     def current(self): return self.active
+    def synchronize(self, stream):
+        # Deferred DAG nodes retain old storage. This mock validates ordering;
+        # real stream completion/reclamation must also be tested on the NPU.
+        self.sync_calls += 1
     @contextlib.contextmanager
     def stream(self, stream):
         previous = self.active; self.active = stream
@@ -262,6 +267,73 @@ class PipelineTests(unittest.TestCase):
         for snapshot, expected, send, values in results:
             self.assertTrue(torch.equal(snapshot, expected))
             self.assertTrue(torch.equal(send, values))
+
+    @unittest.skipUnless(importlib.util.find_spec('torch'), 'Torch not installed')
+    def test_dynamic_pool_stays_bounded_across_64_changed_matrices(self):
+        import torch
+        engine = Engine()
+        contexts = [PipelineContext([PipelineLane(Buffer(r, i), i + 1, (r, i)) for i in range(3)],
+                                    _runtime=FakeRuntime(engine, r)) for r in range(8)]
+        baseline = None
+        retained = []
+        for iteration in range(64):
+            counts = [0] * 64
+            counts[4] = 65 - iteration % 3
+            counts[0] = 3
+            plan = make_plan(counts, 4, ALL)
+            results = []
+            for rank, context in enumerate(contexts):
+                n, m = sum(counts[rank * 8:rank * 8 + 8]), sum(counts[rank::8])
+                send = (torch.arange(n, dtype=torch.float32) + 100 * rank + iteration).reshape(n, 1)
+                recv = torch.full((m, 1), -1.)
+                prepared = PreparedPipelinedAllToAllV(context, plan, send, chunk_bytes=28)
+                # A zero-row view still owns stable, nonempty backing.
+                self.assertTrue(all(t.untyped_storage().nbytes() >= 4 for t in prepared.workspace))
+                prepared.execute(send, recv)
+                expected = []
+                for src in range(8):
+                    start = sum(counts[src * 8:src * 8 + rank])
+                    expected.extend([[row + 100 * src + iteration]
+                                     for row in range(start, start + counts[src * 8 + rank])])
+                results.append((recv, torch.tensor(expected).reshape(m, 1)))
+                # Keep an earlier prepared object alive through pool reuse.
+                if iteration == 0: retained.append(prepared)
+            engine.run(iteration)
+            for actual, expected in results: self.assertTrue(torch.equal(actual, expected))
+            stats = [c.workspace_stats() for c in contexts]
+            if baseline is None: baseline = stats
+            self.assertEqual(stats, baseline, 'workspace addresses/events/allocations grew without capacity growth')
+            # Each iteration represents completed work before the next batch.
+            engine.nodes.clear(); engine.tails.clear(); engine.collectives.clear()
+        self.assertTrue(all(s['tensor_allocations'] == 10 for s in baseline))
+        self.assertTrue(all(s['event_allocations'] == 11 for s in baseline))
+
+    @unittest.skipUnless(importlib.util.find_spec('torch'), 'Torch not installed')
+    def test_capacity_growth_rebinds_old_prepared_after_completion(self):
+        import torch
+        engine = Engine()
+        contexts = [PipelineContext([PipelineLane(Buffer(r, i), i + 1, (r, i)) for i in range(3)],
+                                    _runtime=FakeRuntime(engine, r)) for r in range(8)]
+        old = []
+        for iteration, rows in enumerate((17, 129, 17)):
+            counts = [0] * 64; counts[4] = rows
+            plan = make_plan(counts, 4, ALL)
+            results = []
+            for rank, context in enumerate(contexts):
+                n, m = sum(counts[rank * 8:rank * 8 + 8]), sum(counts[rank::8])
+                send = (torch.arange(n, dtype=torch.float32) + iteration).reshape(n, 1)
+                recv = torch.empty((m, 1))
+                prepared = old[rank] if iteration == 2 else PreparedPipelinedAllToAllV(
+                    context, plan, send, chunk_bytes=28)
+                if iteration == 0: old.append(prepared)
+                prepared.execute(send, recv)
+                self.assertEqual(prepared._bound_generation, context.generation)
+                results.append((recv, (torch.arange(m) + iteration).reshape(m, 1)))
+            engine.run(iteration)
+            for actual, expected in results: self.assertTrue(torch.equal(actual, expected))
+            engine.nodes.clear(); engine.tails.clear(); engine.collectives.clear()
+        self.assertTrue(all(c.runtime.sync_calls == 1 for c in contexts))
+        self.assertTrue(all(c.allocations == 20 for c in contexts))
 
 
 if __name__ == '__main__': unittest.main()

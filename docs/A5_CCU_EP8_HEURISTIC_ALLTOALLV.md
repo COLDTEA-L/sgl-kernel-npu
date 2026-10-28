@@ -21,8 +21,8 @@
 relay communicator，隔离 ADDRESS/TOKEN/DONE 通知和 CCU 资源。两条 relay stream 和通信组
 在初始化时创建一次，dynamic 不会逐批重建。初始化成功不代表硬件已经验证可重叠执行。
 
-每个 chunk 是“每条原始 relay 流至多 chunk_rows 行”的一个批次，默认每流 2 MiB（向下按行
-对齐，至少一行），不是整个机器合计 2 MiB。同一 relay 的多条流可能拼成更大的单次传输。
+每个 chunk 是“每条原始 relay 流至多 chunk_rows 行”的一个批次，默认每流 8 MiB（向下按行
+对齐，至少一行），不是整个机器合计 8 MiB。同一 relay 的多条流可能拼成更大的单次传输。
 **首版的 ready 粒度是一个 chunk 批次的 CCU AllToAllV 完成握手，仍等待该批次所有 peer；
 不是某一个 packet 到达就直接触发，也不是单次融合 CCU kernel。** 但是不再等待 direct，
 也不等待整条消息的所有第一跳完成；第二跳块 j 与第一跳块 j+1 没有依赖，可以重叠。
@@ -73,8 +73,10 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-**已安装前版 bound-direct route 包的机器：本次流水线更新只改 Python，无需重编 C++ 或重装 route。**
-执行下面 CPU 测试后直接去第 3 节；后面的构建命令仅供首次安装/旧包缺 ABI 的环境使用。
+**从 `4ebb7e3` 升级也必须重编并安装 DeepEP 扩展和 route 包，再执行第 3、4 节。**
+本次修复 C++ 错误宏重复调用、零行 tensor 的持久 backing，并增加 route 失败阶段日志。
+worker 强制要求扩展导出 `A5DeepEpPipelineWorkspaceAbiVersion=1`；缺失时会在建组前退出，
+不能只拉 Python 代码后继续使用旧 wheel。2/4 卡 API 与原有 ABI 版本不变。
 
 CPU 测试包含：精确单流分配、组间下界、早停、容量/预算/阈值、非法输入、拓扑关联、
 150 组随机流量独立 oracle、结果汇总拒绝缺失 rank，以及 Torch CPU 下八线程执行器验证。
@@ -85,6 +87,7 @@ cd /home/l00934901/sgl-kernel-npu
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_heuristic_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_pipeline_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_alltoallv_cpu.py' -v
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_error_check_cpu.py' -v
 ```
 
 本分支新增可选的 direct EID/die 绑定校验，**需要重编并安装 route 自定义包**。
@@ -103,7 +106,9 @@ readlink -f /usr/local/Ascend/cann
 export HCCL_REPO=/home/l00934901/hccl
 mkdir -p /home/l00934901/profiling
 A5_BUILD_DIR=$(mktemp -d /home/l00934901/profiling/a5-heuristic-build.XXXXXX)
-bash scripts/build_a5_ccu_urma_route_probe.sh --install > "$A5_BUILD_DIR/build.log" 2>&1 || {
+mkdir -p "$A5_BUILD_DIR/tmp"
+export TMPDIR="$A5_BUILD_DIR/tmp"
+bash scripts/build_a5_ccu_urma_route_probe.sh --install --install-path /usr/local/Ascend/cann-9.1.T560 > "$A5_BUILD_DIR/build.log" 2>&1 || {
   tail -100 "$A5_BUILD_DIR/build.log"; exit 1;
 }
 export A5_CCU_ROUTE_PROBE_LIB=/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
@@ -116,12 +121,26 @@ for name in ('A5CcuBoundDirectAbiVersion', 'A5CcuAllToAllVAbiVersion'):
     assert fn() == 1, name
 print('BOUND_DIRECT_AND_ALLTOALLV_ABI_PASS')
 PY
+# 必须重新构建/安装 DeepEP wheel；日志和临时目录放个人 profiling 目录。
+touch "$A5_BUILD_DIR/wheel-build-started"
+DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu bash build.sh -a deepep Ascend950 \
+  > "$A5_BUILD_DIR/deepep-build.log" 2>&1 || {
+  tail -100 "$A5_BUILD_DIR/deepep-build.log"; exit 1;
+}
+mapfile -t A5_WHEELS < <(find "$PWD/output" -maxdepth 1 -name 'deep_ep-*.whl' \
+  -newer "$A5_BUILD_DIR/wheel-build-started" -print)
+if [ "${#A5_WHEELS[@]}" -ne 1 ]; then
+  echo "没有唯一的新 wheel，请检查 $A5_BUILD_DIR/deepep-build.log" >&2
+  exit 1
+fi
+python3 -m pip install --force-reinstall --no-cache-dir --no-deps "${A5_WHEELS[0]}"
+echo "构建日志：$A5_BUILD_DIR"
 )
 ```
 
-DeepEP C++ API 没变，实验 worker 从本次 checkout 加载新 Python 模块，原有已安装
-DeepEP 扩展可继续使用。未来在模型环境通过 `deep_ep.heuristic_alltoallv` 导入时，
-需要把本分支 Python 包一同构建/安装，不能只更新 route SO。
+DeepEP C++ 调用接口保持兼容，但本次修改了内部错误处理和零行 backing，必须使用新编译的扩展。
+实验 worker 从 checkout 加载新 Python 模块；模型环境通过 `deep_ep.heuristic_alltoallv` 导入时，
+也必须安装包含本分支 Python 模块的 wheel。
 旧分支第 6 步的 ABI/Meta 预检、第 7 步的 2/4 卡旧测试仍适用。
 
 ## 3. 八卡正确性
@@ -180,7 +199,8 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode multipath --case single_ho
 `--mode` 只决定计时对象；每次仍会先验证 direct/multipath/native，防止跳过正确性。
 prepared 和 dynamic 分别预热各自完整路径 3 次，每轮各调用 10 次，共 4 轮。
 `both` 模式采用 AB/BA/AB/BA 顺序，dynamic 不再固定先 direct、后 multipath。
-prepared 每批末等待完成；dynamic 每次等待完成后才能释放该次临时工作区。
+prepared 每批末等待完成；dynamic 每次等待完成。pipeline 工作区和 event 由 context 持有，
+同一容量内重复准备只更新布局；容量增长时先等待旧工作完成再换池。
 `--warmup/--iters/--dynamic-iters/--rounds` 可调整；性能比较建议偶数轮。
 下面把占位路径替换为上面真实输出的目录，不要把名字原样执行：
 
@@ -221,22 +241,22 @@ dynamic 的 multipath 标签仍包括规划/布局开销；其比值不能解释
 | `schedule.chunks` / `chunk_bytes_per_flow` | pipeline 的批次数、每条 relay 流的分块大小 |
 | `schedule.ccu_calls_per_execute` | pipeline 真分流时为 1+2×chunks；无分流为 1 |
 | `plan.relay_bytes` | 需要第二跳转发的数据量 |
-| `schedule.scratch_bytes_per_rank` | 候选分流工作区；实际分配以 `execution.scratch_bytes_per_rank` 为准 |
+| `schedule.scratch_bytes_per_rank` | 当前布局的逻辑工作区；pipeline 实际池容量见各 rank 的 `memory_samples[].workspace.reserved_bytes`，包含零行 backing 和容量余量 |
 | `planner_max_rank_us` | 单次 CPU 贪心规划的最慢 rank 耗时，不含计数交换/布局/分配 |
 | `prepared` | 已准备计划/工作区；包含 pack、全部 CCU 调用、event 依赖、unpack 和完成等待 |
-| `dynamic` | device 上行数 all-gather、转 CPU 同步、规划、布局、临时分配、执行与完成等待 |
+| `dynamic` | device 上行数 all-gather、转 CPU 同步、规划、布局、工作区准备、执行与完成等待；pipeline 在容量内复用池，serial 仍逐次分配 |
 
 prepared、dynamic 均逐轮取八 rank 最大值，再对轮求均值，同时保留每轮值、median/min/max。
 `dynamic.slowest_rank_components_round_us` 记录当轮总耗时最慢 rank 的三个分项：
 `counts_gather_sync_us`、`plan_workspace_us`、`execute_completion_us`。
 分项不是分别取各 rank 最大值；这种做法会拼接出不存在的总耗时。host 调度/对象清理等
 小量开销包含在总耗时中，因此分项和不必严格等于总时间。
-测量协议升级为 2，比较器拒绝与旧协议或不同 sync/policy 的结果混合做性能比。
+测量协议升级为 3（明确 pipeline 池化工作区口径），比较器拒绝与旧协议或不同 sync/policy 的结果混合做性能比。
 都是 host wall-clock；不是 CCU 内核 event 时间。不包括 router、模型 pack/unpack、专家计算；
 这里的 pack/unpack 专指新增 relay 执行器内部的分片整理。原生 HCCL 只作正确性参考；
 主要性能 baseline 是同一个 CCU direct-only AllToAllV。
 
-动态测试每次重新规划同一个输入矩阵，不使用缓存；验证“变化矩阵”的正确性由第 3 步覆盖。
+动态测试每次重新规划同一个输入矩阵，不缓存路由决策；只复用工作区和 event 容量；验证“变化矩阵”的正确性由第 3 步覆盖。
 prepared 与 dynamic 的同步方式不同，只在同一口径内比较 direct/multipath。
 
 旧 serial 实现特别是单热点流，尽管累计链路峰值从 32 降到 16 MiB，两阶段分别需要传 16 MiB，
@@ -252,7 +272,7 @@ asymmetric 255→1065 us；cut 无 relay 却出现 dynamic 3051→1490 us。
 不能从这些数据单独量化每个因素的贡献，新版通过以下对照区分：
 
 ```bash
-# 先完成第 3 节；本次只改 Python，无需重新编译 C++/安装 route 包。
+# 先完成第 2 节构建和第 3 节正确性。
 # 同一输入，对比去掉设备同步前后；两次仍各自包含 direct baseline。
 bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync device
 bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync stream
@@ -277,41 +297,66 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --c
 
 即使选择 auto，正确性阶段也额外强制验证真实 relay 路径，避免回退掩盖实现错误。
 
-### 4.2 流水线复测（本次重点）
+### 4.2 流水线稳定性与性能复测（本次重点）
 
-先通过第 3 节，再分别测 baseline/direct 与真实分流，两次参数完全一致：
+先完成第 2 节重编安装和第 3 节正确性。首先用原失败参数复测，保留 2 MiB、
+4 轮、每轮 3 次动态预热和 10 次动态测量，共 52 次动态执行；不要靠缩短迭代绕过失败：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode direct --case single_hot --chunk-bytes 2097152
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152
-# 用第 4 节 --compare 命令比较两个实际输出目录。
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152 \
+  --rounds 4 --warmup 3 --dynamic-iters 10
 ```
 
-然后在同一 worker 中交替测量，减少跨运行差异：
+成功必须包含 `EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`。检查 `run.log` 的 `PIPELINE_MEMORY`：
+固定输入的 `before_dynamic` 到每轮末，`workspace.generation`、`tensor_allocations`、
+`event_allocations`、`addresses` 应不变。RSS/HBM 的实际值也被记录，观察预热后是否趋稳；
+池计数稳定并不保证底层 HCCL 没有其他资源增长。若仍崩溃，优先找本次新增的
+`ALLTOALLV_STAGE_FAILED`、`ALLTOALLV_EXECUTE_FAILED` 和 `PIPELINE_TRANSFER_FAILED`，
+它们保留第一次返回码及失败 lane/chunk。`EP8_PHASE` 带 rank、PID 和时间戳，区分建组、
+correctness、prepared、dynamic 与销毁阶段，便于对齐 plog。
+单独的 `GetEndpointInfo -> 6` 也可能来自可选属性查询，不能只按“最早 ERROR”认定致命原因。
+
+通过后可进一步长跑，并验证有竞争流和无 relay 对照：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case single_hot --chunk-bytes 2097152
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case competing --chunk-bytes 2097152
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case asymmetric --chunk-bytes 2097152
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152 --dynamic-iters 100
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case competing --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case asymmetric --chunk-bytes 8388608
 bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case cut
 ```
 
-默认 single_hot 中 direct 16 MiB，relay 16 MiB 拆成 8 个 2 MiB 批次，CCU 调用共 17 次。
-允许 direct 与两跳流水线推进；仍有 pipeline 填充/排空、每批握手及 pack/unpack 开销。
-因此不保证 2 倍加速。建议再扫 `--chunk-bytes 524288/1048576/4194304`（逐个传实际整数），
-小块启动多，大块流水线填充较慢。`--max-chunks` 默认 128，超过就明确报错，避免失控提交；
-两组 relay 缓冲槽的大小由最大批次确定，不随批次数线性增长，direct 缓冲独立分配。
+性能比较使用 8 MiB 作为起始实验配置，分别运行 baseline/direct 与真实分流，两次参数完全一致：
 
-输出应有 `PIPELINE_LANES`（三个不同 group）以及 execution/schedule 中的
-`participant_hbm_pipelined_ccu`、`buffer_slots=2`、实际 chunks。
-通信组/stream/CCU 资源初始化不计入 prepared 或 dynamic，它们在模型初始化时创建一次。
-dynamic 仍包括每批 C 交换、CPU 规划、布局、双缓冲和 event 准备、执行完成。
-额外两个 HCCL 通信组会消耗额外运行时资源/缓冲；若建链失败，保留 run.log 定位，
-不会自动复用同一个通知通道或降级后继续声称并发。
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode direct --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 8388608
+# 用第 4 节 --compare 命令比较两个实际输出目录，均位于 /home/l00934901/profiling。
+# 再做同进程交替测量：
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case single_hot --chunk-bytes 8388608
+```
 
-目前 CPU 模拟已验证没有 direct→relay 的依赖边；设备上是否实际重叠、加速多少，
-仍须新机器复测。默认不打 profiler。比较工具拒绝把不同 executor/chunk 设置当作
-同配置的独立 direct/multipath 对比；跨 executor 分别读取各自 summary 中的 baseline 和分流值。
+用户提供的旧版低迭代测量中，single_hot 的 2/4/8 MiB 分块分别约 2199/1210/690 us，
+direct 约 665 us。**这些数据尚未证明多路径加速。** 默认从 2 改成 8 MiB 是减少批次启动开销，
+不是性能保证；2 MiB 保留作稳定性回归与负收益对照。可用 2/4/8/16 MiB 扫描，每个配置都
+用相同参数分别跑 direct/multipath，不减少迭代数掩盖不稳定。
+
+single_hot 中 direct 16 MiB，relay 16 MiB；8 MiB 分块为 2 批次、5 次 CCU 调用，
+2 MiB 为 8 批次、17 次调用。当前每批都有 collective 握手、host launch、pack/unpack，
+允许 direct 与两跳流水线推进，但尚不是单次融合 CCU kernel。估算出的每批开销包含
+多种因素，不能单独归因某个 kernel。物理流量从 32 增到 48 MiB 也不能单独证明抢同一链路：
+full mesh 的 i→j、i→k、k→j 可以是不同边，是否争用 IO die、HBM 等共享资源还需设备证据。
+
+输出应有 `PIPELINE_LANES`（三个不同 group）和 `participant_hbm_pipelined_ccu`。
+三个 group/handle 只在初始化创建一次，dynamic 不调用 `dist.new_group`。
+context 持有 10 个工作区张量（direct 两个、双缓冲各四个），按各槽容量高水位复用；
+零行 rank 也有持久 backing，避免每次 CCU 调用创建临时占位张量。
+容量按 2 的幂增长，若超过 scratch 限额则用精确容量；所有 rank 根据同一个 C 做全局检查。
+仅容量增长时同步调用者 stream、释放旧 view 并扩容；旧 prepared 再执行时绑定新池。
+每个 context 固定 dtype 和行形状，容量不足不能静默改变计划或独立降级。
+
+设备上是否真正重叠、加速多少仍以复测为准。默认不打 profiler；比较器拒绝不同协议、
+executor/chunk 设置的独立结果做同配置比较。若 dynamic 无收益，模型仍应使用 direct baseline。
 
 ## 5. 输入真实路由矩阵
 
@@ -360,10 +405,10 @@ context = PipelineContext.create(buffer, handle, manifest,
 C = gather_routing_counts(local_counts, group=ep_group)
 plan = make_plan(C, row_bytes, topology["allowed_relays"], max_actions=56)
 prepared = PreparedPipelinedAllToAllV(context, plan, packed_send,
-                                     chunk_bytes=2 << 20, max_scratch_bytes=1 << 30)
+                                     chunk_bytes=8 << 20, max_scratch_bytes=1 << 30)
 prepared.execute(packed_send, packed_recv)
 # packed_recv 的后续使用必须在 context 的调用者 stream 上，或显式建立 event 依赖。
-# workspace/context 必须存活到执行完成；下一批可复用 context，但 C 变化需重新准备。
+# context 必须存活到执行完成；下一批复用工作区容量，C 变化仍需重新准备布局。
 
 ```
 
@@ -408,7 +453,7 @@ context/对象只允许同一调用者 stream 有序复用，不支持多个 hos
 新机器账号目录是 `/home/l00934901`，runner 默认不会使用开发机路径或 `/tmp` 存结果。
 
 
-### 性能修正验证记录
+### 历史记录：串行性能修正
 
 本次修正只涉及 Python 执行器、CPU/NPU 测试、统计和文档；2/4 卡及 C++ 算子接口不变。
 新增随机矩阵串行成本下界验证、相邻拷贝边界、v2 逐轮最慢 rank 汇总，以及 stream/device、
@@ -417,7 +462,7 @@ force/auto 两组开关的 CPU 八线程数据正确性回归。新机 NPU 排�
 修正后开发侧：115 项 CPU 回归无失败（宿主机缺 Torch 跳过 1 项）；容器内 12 项新增模块回归全部通过，补齐实际执行器八线程测试。Python 语法和 diff 检查通过。未 push；无新机修正后的 NPU 耗时数据。
 
 
-### 流水线实现验证记录
+### 历史记录：4ebb7e3 首版流水线
 
 本次新增 `python/deep_ep/deep_ep/pipelined_alltoallv.py`；worker 默认 pipeline，旧 serial 可选。
 保留原始 C 输入接口、组内单 relay 贪心以及 2/4 卡旧接口。没有改动 C++ ABI。
@@ -429,3 +474,20 @@ payload、变化矩阵与 storage）。CPU 模拟不替代目标机 CCU 的多 c
 开发侧本次验证：119 项 CPU 回归无失败（3 项依赖 Torch 的测试在宿主机跳过）；
 `cam_lyw_dev_91` 内流水线 4 项、原贪心执行器 12 项全部通过，补齐这 3 项。
 日志：开发机 `/home/liuyuanwen/profiling/a5-pipeline/`；新机输出仍为 `/home/l00934901/profiling`。
+
+### dynamic 稳定性修正（2026-10-28）
+
+目标机 `4ebb7e3` 的第 3 节 7×8 rank 正确性已由用户验证；第 4.2 节真实 relay 的 dynamic
+在默认参数下崩溃，不能因小规模 correctness 通过就声称长期稳定。
+本次确认错误宏在失败时重复求值，可能重复提交 execute 并把错误码误报为 0；已改为只调用一次。
+工作区/event 改由 context 复用，并修复零行 view 的 bridge backing 使用；这些措施减少地址创建与
+资源生命周期抖动，但第一次底层失败的原因仍需新日志验证，不能预先声称已证实为资源耗尽。
+
+新增 CPU 回归会编译实际错误宏，验证“第一次返回 6、第二次成功”时只调用一次且保留 6；
+另用 64 次变化矩阵和 payload 的八 rank 异步执行，检查输出正确、零行 backing 存在，且工作区
+地址、张量分配数和 event 数在容量内不增长。容量增长和原双缓冲依赖也继续检查。
+开发容器完整 CPU 回归 122 项全部通过、无跳过，包括实际 Torch CPU 执行器和宏编译测试。
+日志见 `/home/liuyuanwen/profiling/a5-pipeline-stability/container-cpu.log`。
+route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成功；目标机 T560 上
+默认 52 次/长跑仍须按第 4.2 节复测，不能把开发编译等同于硬件修复已验证。
+开发日志：`/home/liuyuanwen/profiling/a5-pipeline-stability/`。未 push。

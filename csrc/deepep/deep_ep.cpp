@@ -823,6 +823,7 @@ torch::Tensor ccu_urma_peer_plan_alltoall_meta(const torch::Tensor &send, int64_
 }
 
 extern "C" __attribute__((visibility("default"))) int A5DeepEpAllToAllVAbiVersion() { return 1; }
+extern "C" __attribute__((visibility("default"))) int A5DeepEpPipelineWorkspaceAbiVersion() { return 1; }
 namespace {
 using AllToAllVExecute = HcclResult (*)(void *, void *, uint64_t, uint64_t, uint64_t, uint32_t,
     HcclComm, aclrtStream, uint64_t, const uint64_t *, uint32_t);
@@ -859,14 +860,27 @@ void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64
 {
     const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, counts);
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send));
-    // Empty tensors can have null data_ptr(). Allocate real, non-aliasing token
-    // backing; recordStream keeps these temporary sentinels alive for this stream.
-    auto input = send.numel() ? send : torch::empty({1}, send.options());
-    auto output = recv.numel() ? recv : torch::empty({1}, recv.options());
+    // Zero-row views can own nonempty persistent backing (pipeline arena).
+    // Reuse its BASE address/capacity: no payload will access this direction.
+    // Ordinary storage-less empty tensors retain the old temporary fallback.
+    auto input = send.numel() || send.storage().nbytes() ? send : torch::empty({1}, send.options());
+    auto output = recv.numel() || recv.storage().nbytes() ? recv : torch::empty({1}, recv.options());
+    auto *inputPtr = send.numel() ? input.data_ptr() : input.storage().data_ptr().get();
+    auto *outputPtr = recv.numel() ? output.data_ptr() : output.storage().data_ptr().get();
+    const uint64_t inputBytes = send.numel() ? input.nbytes() : input.storage().nbytes();
+    const uint64_t outputBytes = recv.numel() ? output.nbytes() : output.storage().nbytes();
     auto stream = OrderedCcuTensorStream(input, output);
     static auto execute = reinterpret_cast<AllToAllVExecute>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVExecute"));
-    HCCL_CHECK(execute(input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
-        checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64));
+    const auto status = execute(inputPtr, outputPtr, inputBytes, outputBytes,
+        checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64);
+    if (status != HCCL_SUCCESS) {
+        std::fprintf(stderr, "ALLTOALLV_EXECUTE_FAILED rank=%ld handle=%ld stream=%p status=%d "
+            "send=%p recv=%p send_capacity=%lu recv_capacity=%lu row_bytes=%lu\n",
+            static_cast<long>(rank), static_cast<long>(handle), stream, static_cast<int>(status),
+            inputPtr, outputPtr, inputBytes, outputBytes, checked.rowBytes);
+        std::fflush(stderr);
+    }
+    HCCL_CHECK(status);
 }
 } // namespace
 int64_t Buffer::prepare_ccu_urma_peer_plan_alltoallv(const std::string &id, const std::string &manifest)

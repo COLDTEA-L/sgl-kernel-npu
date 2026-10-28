@@ -6,6 +6,7 @@ No direct completion or full-message first-hop barrier gates second-hop launch.
 """
 from dataclasses import dataclass
 from math import prod
+import weakref
 try:
     from .heuristic_alltoallv import N, _uint, _offsets, _coalesce_spans, build_schedule
 except ImportError:  # repository test workers also import this module directly
@@ -63,7 +64,7 @@ class PipelineSchedule:
                     scratch_bytes_per_rank=[self.scratch_rows(r) * self.plan.row_bytes for r in range(N)])
 
 
-def build_pipeline_schedule(plan, *, chunk_bytes=2 << 20, max_chunks=128):
+def build_pipeline_schedule(plan, *, chunk_bytes=8 << 20, max_chunks=128):
     # Reuse the serial planner's validation, but NOT its two-stage layout.
     build_schedule(plan)
     rows = max(1, _uint(chunk_bytes, 'chunk_bytes', 1) // plan.row_bytes)
@@ -112,6 +113,7 @@ class _NpuRuntime:
         self.torch = torch
 
     def current(self): return self.torch.npu.current_stream()
+    def synchronize(self, stream): stream.synchronize()
     def stream(self, stream): return self.torch.npu.stream(stream)
     def event(self): return self.torch.npu.Event()
     def record(self, event, stream): event.record(stream)
@@ -148,6 +150,59 @@ class PipelineContext:
         self.runtime = _runtime or _NpuRuntime()
         self.owned_groups = []
         self.closed = False
+        self._prepared = weakref.WeakSet()
+        self._arena, self._capacities, self._signature = [], None, None
+        self._start, self._ready, self._done = None, [], []
+        self.generation = self.allocations = self.event_allocations = 0
+
+    def reserve(self, schedule, example, limit):
+        """Bounded high-water workspace/event pool, independent of route-matrix cache.
+
+        Counts/offsets are rebuilt every batch. Reallocation happens only on
+        capacity growth, after prior work completes; live prepared plans drop
+        old views and rebind lazily. One dtype/row shape per context.
+        """
+        import torch
+        signature = (example.device, example.dtype, tuple(example.shape[1:]))
+        if self._signature is not None and self._signature != signature:
+            raise ValueError('pipeline context payload dtype/row shape changed; create a new context')
+        rb = schedule.plan.row_bytes
+        needed = []
+        for r in range(N):
+            dc = schedule.direct_counts
+            # Allocate real backing even for zero-row ranks. The bridge uses
+            # this stable storage for tokens instead of new empty sentinels.
+            row = [sum(dc[r * N:(r + 1) * N]), sum(dc[r::N]), *schedule.pool_sizes(r), *schedule.pool_sizes(r)]
+            needed.append([max(1, n) for n in row])
+        previous = self._capacities or [[0] * 10 for _ in range(N)]
+        exact = [[max(a, b) for a, b in zip(old, new)] for old, new in zip(previous, needed)]
+        capacities = [[1 << (n - 1).bit_length() for n in row] for row in exact]
+        if any(sum(row) * rb > limit for row in capacities):
+            capacities = exact
+        if any(sum(row) * rb > limit for row in capacities):
+            raise ValueError('pipeline context high-water workspace exceeds max_scratch_bytes')
+        if capacities != self._capacities:
+            if self._arena:
+                self.runtime.synchronize(self.lanes[0].stream)
+                for prepared in self._prepared:
+                    prepared._invalidate_views()
+                self._arena = []
+            self._arena = [torch.empty((n, *signature[2]), dtype=signature[1], device=signature[0])
+                           for n in capacities[self.rank]]
+            self.allocations += len(self._arena)
+            self.generation += 1
+            self._capacities, self._signature = capacities, signature
+        if self._start is None:
+            self._start = self.runtime.event(); self.event_allocations += 1
+        while len(self._ready) < len(schedule.chunks):
+            self._ready.append(self.runtime.event()); self._done.append(self.runtime.event())
+            self.event_allocations += 2
+
+    def workspace_stats(self):
+        return dict(generation=self.generation, tensor_allocations=self.allocations,
+                    event_allocations=self.event_allocations,
+                    reserved_bytes=sum(t.numel() * t.element_size() for t in self._arena),
+                    addresses=[t.data_ptr() for t in self._arena])
 
     @classmethod
     def create(cls, direct_buffer, direct_handle, manifest, *, group_ranks, pg_kwargs=None):
@@ -192,6 +247,10 @@ class PipelineContext:
         for group in reversed(self.owned_groups):
             dist.destroy_process_group(group)
         self.owned_groups.clear()
+        for prepared in self._prepared:
+            prepared._invalidate_views()
+        self._arena = []
+        self._start, self._ready, self._done = None, [], []
         self.closed = True
 
 
@@ -202,7 +261,7 @@ class PreparedPipelinedAllToAllV:
     may change per invocation but must have matching shape/dtype/device. Reuse on
     that stream is ordered; do not free this object before completion.
     """
-    def __init__(self, context, plan, example_send, *, chunk_bytes=2 << 20,
+    def __init__(self, context, plan, example_send, *, chunk_bytes=8 << 20,
                  max_chunks=128, max_scratch_bytes=1 << 30):
         import torch
         self.context, self.plan, self.rank = context, plan, context.rank
@@ -230,30 +289,55 @@ class PreparedPipelinedAllToAllV:
                              reason='pipelined_relay' if plan.uses_relay else 'no_relay_candidate',
                              **self.schedule.report())
         self.counts = list(plan.counts)
-        self.start = self.runtime.event()
-        self.ready = [self.runtime.event() for _ in self.schedule.chunks]
-        self.done = [self.runtime.event() for _ in self.schedule.chunks]
+        self._bound_generation = -1
         if not self.uses_relay:
             self.workspace = []
             return
-        def alloc(n): return torch.empty((n, *self.tail), dtype=self.dtype, device=self.device)
+        context.reserve(self.schedule, example_send, limit)
+        context._prepared.add(self)
+        self.start = context._start
+        self.ready = context._ready[:len(self.schedule.chunks)]
+        self.done = context._done[:len(self.schedule.chunks)]
         dc = self.schedule.direct_counts
-        self.direct_send = alloc(sum(dc[self.rank * N:(self.rank + 1) * N]))
-        self.direct_recv = alloc(sum(dc[self.rank::N]))
-        self.pool = [[alloc(n) for n in self.schedule.pool_sizes(self.rank)] for _ in range(2)]
-        self.workspace = [self.direct_send, self.direct_recv] + [v for slot in self.pool for v in slot]
         self.direct_counts = list(dc)
         self.pack_direct = _coalesce_spans([(src, ps, n) for s, d, n, src, dst, ps, pr
                                            in self.schedule.direct_pieces if s == self.rank])
         self.unpack_direct = _coalesce_spans([(pr, dst, n) for s, d, n, src, dst, ps, pr
                                              in self.schedule.direct_pieces if d == self.rank])
-        self.chunks = []
-        for j, chunk in enumerate(self.schedule.chunks):
-            tensors = tuple(v.narrow(0, 0, n) for v, n in zip(self.pool[j % 2], chunk.sizes(self.rank)))
+        self._chunk_specs = []
+        for chunk in self.schedule.chunks:
             pack = _coalesce_spans([(p.source, p.first_send, p.rows) for p in chunk.pieces if p.src == self.rank])
             forward = _coalesce_spans([(p.first_recv, p.second_send, p.rows) for p in chunk.pieces if p.relay == self.rank])
             unpack = _coalesce_spans([(p.second_recv, p.final, p.rows) for p in chunk.pieces if p.dst == self.rank])
-            self.chunks.append((tensors, list(chunk.first_counts), list(chunk.second_counts), pack, forward, unpack))
+            self._chunk_specs.append((chunk, list(chunk.first_counts), list(chunk.second_counts), pack, forward, unpack))
+        self._bind_views()
+
+    def _invalidate_views(self):
+        self.direct_send = self.direct_recv = None
+        self.pool = self.workspace = self.chunks = []
+        self._bound_generation = -1
+
+    def _bind_views(self):
+        arena = self.context._arena
+        dc = self.schedule.direct_counts
+        self.direct_send = arena[0].narrow(0, 0, sum(dc[self.rank * N:(self.rank + 1) * N]))
+        self.direct_recv = arena[1].narrow(0, 0, sum(dc[self.rank::N]))
+        sizes = self.schedule.pool_sizes(self.rank)
+        self.pool = [[arena[2 + slot * 4 + i].narrow(0, 0, n) for i, n in enumerate(sizes)] for slot in range(2)]
+        self.workspace = [self.direct_send, self.direct_recv] + [v for slot in self.pool for v in slot]
+        self.chunks = []
+        for j, (chunk, fc, sc, pack, forward, unpack) in enumerate(self._chunk_specs):
+            tensors = tuple(v.narrow(0, 0, n) for v, n in zip(self.pool[j % 2], chunk.sizes(self.rank)))
+            self.chunks.append((tensors, fc, sc, pack, forward, unpack))
+        self._bound_generation = self.context.generation
+
+    def _transfer(self, lane, send, recv, counts, stage):
+        try:
+            self.runtime.transfer(lane, send, recv, counts)
+        except RuntimeError as exc:
+            raise RuntimeError(f'PIPELINE_TRANSFER_FAILED stage={stage} rank={self.rank} '
+                               f'handle={lane.handle} generation={self.context.generation} '
+                               f'send_rows={len(send)} recv_rows={len(recv)}') from exc
 
     def execute(self, send, recv):
         rt = self.runtime
@@ -271,18 +355,19 @@ class PreparedPipelinedAllToAllV:
         if not self.uses_relay:
             rt.transfer(direct, send, recv, self.counts)
             return recv
+        if self._bound_generation != self.context.generation:
+            self._bind_views()
         # Record BEFORE direct packing/communication. Both relay streams wait
         # only for the input producer (and previous invocation's final joins).
         rt.record(self.start, direct.stream)
         rt.wait(first.stream, self.start)
         rt.wait(second.stream, self.start)
         rt.retain(send, first.stream); rt.retain(recv, second.stream)
-        for slot in self.pool:
-            for tensor in slot:
-                rt.retain(tensor, first.stream); rt.retain(tensor, second.stream)
+        # Context owns all pool storage until close or synchronized capacity
+        # growth. Do not retire/re-record every internal tensor on both lanes.
         for src, dst, n in self.pack_direct:
             rt.copy(self.direct_send, dst, send, src, n)
-        rt.transfer(direct, self.direct_send, self.direct_recv, self.direct_counts)
+        self._transfer(direct, self.direct_send, self.direct_recv, self.direct_counts, "direct")
         for src, dst, n in self.unpack_direct:
             rt.copy(recv, dst, self.direct_recv, src, n)
         for j, (tensors, fc, sc, pack, forward, unpack) in enumerate(self.chunks):
@@ -294,13 +379,13 @@ class PreparedPipelinedAllToAllV:
                     rt.wait(first.stream, self.done[j - 2])
                 for src, dst, n in pack:
                     rt.copy(fs, dst, send, src, n)
-                rt.transfer(first, fs, fr, fc)
+                self._transfer(first, fs, fr, fc, f"first_chunk_{j}")
                 rt.record(self.ready[j], first.stream)
             with rt.stream(second.stream):
                 rt.wait(second.stream, self.ready[j])
                 for src, dst, n in forward:
                     rt.copy(ss, dst, fr, src, n)
-                rt.transfer(second, ss, sr, sc)
+                self._transfer(second, ss, sr, sc, f"second_chunk_{j}")
                 for src, dst, n in unpack:
                     rt.copy(recv, dst, sr, src, n)
                 rt.record(self.done[j], second.stream)

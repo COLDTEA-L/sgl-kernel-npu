@@ -2,7 +2,7 @@
 """EP8 direct vs participant-relay CCU correctness and eager timing, no profiler."""
 import argparse
 import ctypes
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -59,7 +59,7 @@ def main():
     p.add_argument('--rounds', type=int, default=4)
     p.add_argument('--dynamic-iters', type=int, default=10)
     p.add_argument('--executor', choices=('pipeline', 'serial'), default='pipeline')
-    p.add_argument('--chunk-bytes', type=int, default=2 << 20,
+    p.add_argument('--chunk-bytes', type=int, default=8 << 20,
                    help='max bytes per original relayed flow in each chunk round, row-aligned')
     p.add_argument('--max-chunks', type=int, default=128)
     p.add_argument('--executor-sync', choices=('stream', 'device'), default='stream',
@@ -99,7 +99,19 @@ def main():
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
     if marker() != 1: raise RuntimeError('rebuild/install route: bound-direct ABI missing')
+    if args.executor == 'pipeline':
+        bridge = ctypes.CDLL(str(extension), mode=ctypes.RTLD_GLOBAL)
+        try:
+            workspace_abi = bridge.A5DeepEpPipelineWorkspaceAbiVersion
+            workspace_abi.restype = ctypes.c_int
+            if workspace_abi() != 1: raise AttributeError('wrong workspace ABI')
+        except AttributeError as exc:
+            raise RuntimeError('rebuild/install DeepEP extension: pipeline workspace ABI 1 is required') from exc
     rank = int(os.environ['RANK'])
+    def phase(name, **fields):
+        print('EP8_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
+              time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
+    phase('process_group_begin')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     dist.init_process_group('hccl', timeout=timedelta(seconds=180), **ccu_pg_kwargs(torch_npu))
     # Reject mismatched test configuration before preparing any CCU plan.
@@ -111,11 +123,15 @@ def main():
         raise ValueError('ranks disagree on counts/topology/options')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     log_ccu_communicator(buffer.moe_all_to_all_group_name)
+    phase('direct_plan_begin')
     handle = buffer.prepare_ccu_urma_peer_plan_alltoallv('ep8-heuristic', str(args.manifest.resolve()))
+    phase('direct_plan_ready')
     pipeline = None
     if args.executor == 'pipeline':
+        phase('relay_context_begin')
         pipeline = PipelineContext.create(buffer, handle, args.manifest.resolve(),
                                           group_ranks=list(range(8)), pg_kwargs=ccu_pg_kwargs(torch_npu))
+        phase('relay_context_ready')
         print('PIPELINE_LANES ' + json.dumps(dict(rank=rank, groups=[
             lane.buffer.moe_all_to_all_group_name for lane in pipeline.lanes],
             lanes=['direct', 'first_hop', 'second_hop'])), flush=True)
@@ -125,7 +141,16 @@ def main():
                            max_actions=args.max_actions, relay_capacity_bytes=[args.relay_capacity_mib << 20] * 8)
     selected = ('direct', 'multipath') if args.mode == 'both' else (args.mode,)
     reports = []
+    def memory_sample(phase):
+        # Small host-side diagnostic snapshots, outside timed regions. No profiler.
+        rss = int(Path('/proc/self/statm').read_text().split()[1]) * os.sysconf('SC_PAGE_SIZE')
+        sample = dict(phase=phase, rss_bytes=rss, npu_allocated_bytes=torch.npu.memory_allocated(),
+                      npu_reserved_bytes=torch.npu.memory_reserved())
+        if pipeline: sample['workspace'] = pipeline.workspace_stats()
+        print('PIPELINE_MEMORY ' + json.dumps(dict(rank=rank, **sample)), flush=True)
+        return sample
     for case_name, counts in cases:
+        phase('correctness_begin', case=case_name)
         begin = time.perf_counter()
         plan = make_plan(counts, row_bytes, allowed, **planner_options)
         planner_us = (time.perf_counter() - begin) * 1e6
@@ -201,7 +226,7 @@ def main():
                     raise AssertionError(f'queued stream ordering failure rank={rank}')
             dist.barrier()
         # Small correctness cases must still exercise >2 chunks and both slot
-        # reuses. Default 2 MiB chunks would make them a one-round pipeline.
+        # reuses. Default 8 MiB chunks would make them a one-round pipeline.
         checked_chunks = [len(prepared.schedule.chunks)] if pipeline else []
         if pipeline and plan.uses_relay and len(prepared.schedule.chunks) < min(5, args.max_chunks):
             target = min(5, args.max_chunks)
@@ -213,6 +238,7 @@ def main():
             torch.npu.synchronize(); check('multipath', 23)
             checked_chunks.append(len(probe.schedule.chunks))
             del probe
+        phase('prepared_begin', case=case_name)
         timings = {name: [] for name in selected}
         for round_id in range(args.rounds):
             order = selected if round_id % 2 == 0 else tuple(reversed(selected))
@@ -230,6 +256,8 @@ def main():
                 check(name, epoch)
         # Same device-resident packed row counters feed both dynamic paths.
         local_counts = torch.tensor(sends, dtype=torch.int64, device='npu')
+        phase('prepared_complete', case=case_name)
+        memory_samples = [memory_sample(case_name + ':before_dynamic')]
         dynamic_rounds = {name: [] for name in selected}
         components = {name: [] for name in selected}
         def dynamic_once(name):
@@ -256,8 +284,10 @@ def main():
                 set_payload(0)
                 # Warm the SAME counts collective + planner/allocator + executor
                 # path, rather than only warming prepared payload communication.
+                phase('dynamic_warmup_begin', case=case_name, mode=name, round=round_id)
                 for _ in range(args.warmup): dynamic_once(name)
                 dist.barrier(); torch.npu.synchronize()
+                phase('dynamic_measure_begin', case=case_name, mode=name, round=round_id)
                 totals = [0., 0., 0.]
                 begin = time.perf_counter()
                 for _ in range(args.dynamic_iters):
@@ -268,17 +298,20 @@ def main():
                                                   'execute_completion_us'),
                                                  (v / args.dynamic_iters for v in totals))))
                 check(name, 0)
+                phase('dynamic_round_complete', case=case_name, mode=name, round=round_id)
+                memory_samples.append(memory_sample(f'{case_name}:dynamic_round_{round_id}:{name}'))
         dynamic = {name: sum(v) / len(v) for name, v in dynamic_rounds.items()}
         report = dict(case=case_name, correctness='PASS', plan=plan.report(), schedule=schedule.report(),
                       planner_us=planner_us, prepared_round_us=timings, dynamic_mean_us=dynamic,
                       dynamic_round_us=dynamic_rounds, dynamic_components_round_us=components,
                       execution=prepared.decision, executor_sync=args.executor_sync,
-                      pipeline_correctness_chunk_counts=checked_chunks,
+                      pipeline_correctness_chunk_counts=checked_chunks, memory_samples=memory_samples,
                       fingerprint=plan.fingerprint)
         reports.append(report)
         print('EP8_HEURISTIC_CASE ' + json.dumps(dict(rank=rank, case=case_name, actions=len(plan.actions),
                                                     prepared_round_us=timings, dynamic_mean_us=dynamic)), flush=True)
     torch.npu.synchronize()
+    phase('teardown_begin')
     destroy = route.HcclCcuUrmaPeerPlanDestroy
     destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
     def destroy_checked(value):
@@ -289,13 +322,14 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=2, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=3, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
                                  chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks),
                   mode=args.mode, backend=('participant_hbm_pipelined_ccu' if pipeline else 'participant_hbm_two_stage_ccu'), cases=reports,
                   timing_scope='host_wall_submit_and_device_completion',
-                  dynamic_scope='device_counts_gather_cpu_sync_plan_workspace_execute_completion')
+                  dynamic_scope=('device_counts_gather_cpu_sync_replan_pooled_workspace_execute_completion' if pipeline else
+                                 'device_counts_gather_cpu_sync_plan_workspace_execute_completion'))
     temp = args.run_dir / f'rank{rank}.json.tmp'
     temp.write_text(json.dumps(result, indent=2) + '\n')
     temp.replace(args.run_dir / f'rank{rank}.json')
