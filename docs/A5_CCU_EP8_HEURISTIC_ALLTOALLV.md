@@ -5,18 +5,34 @@
 新算法仅用于八卡；relay 只能是同一通信组内、且不同于源和目的的 rank。
 2/4 卡等长多路径 API、组外 relay 规则及原执行路径保留，不使用这个规划器。
 
-本版是 **组内 HBM 转发、两阶段 CCU AllToAllV 的 eager 实验实现**：
-第一阶段发送直连片段与 relay 片段；第二阶段由 relay 转发；最后恢复原来的
-source-major 接收布局。组内转发不复用旧 2/4 卡的组外 UB source-route 技巧。
-不是单次融合 CCU launch，也没有重叠两阶段、消除 pack/unpack 或接入 vLLM。
-每次计时包含实际分片整理、两次 CCU 通信和结果恢复，不把通信子阶段冒充完整耗时。
-默认 `--executor-sync stream`：利用现有 C++ `OrderedCcuTensorStream` 在直接提交
-ACL/HCOMM 前清空 Torch host 提交队列的机制，以及 CCU 在当前 stream 上的完成排序，
-去掉原版四次全设备同步。die-1 路径已有返回主 stream 的完成通知。这里清空 host 队列
-不等于等待整个设备。相邻且源/目的都连续的分片拷贝会合并，仍保留必要 pack/unpack。
-`--executor-sync device` 保留旧四次设备同步，用于对照；不是流水线或融合执行。
-新增连续 producer→CCU→Torch consumer→下一次调用的无中间设备同步正确性检查，
-必须先在目标 T560/torch_npu 环境通过，不能用 CPU 测试代替设备排序验证。
+本版默认 `--executor pipeline`，执行 **direct 独立推进 + relay 分块双缓冲流水线**。
+候选 relay 仍由原来的单 relay 贪心算法选择，输入仍是本批实际 packed 行数 C[8][8]。
+新增实现使用现有 CCU direct AllToAllV API，不改 2/4 卡接口，不用组外 relay。
+
+```text
+调用者 stream：输入就绪 ── direct pack / CCU / unpack ─────────── 等待 relay 完成 → 消费
+                             （与下面两条通道无完成依赖）
+第一跳 stream：块 0 → 块 1 → [槽 0 可复用后] 块 2 → 块 3 ...
+                   ↘ ready 0 ↘ ready 1        ↘ ready 2
+第二跳 stream：     转发块 0 → 转发块 1 → 转发块 2 ... → done
+```
+
+三条通道使用三个不同 HCCL communicator：原 direct communicator，加两个相同 EP8 成员的
+relay communicator，隔离 ADDRESS/TOKEN/DONE 通知和 CCU 资源。两条 relay stream 和通信组
+在初始化时创建一次，dynamic 不会逐批重建。初始化成功不代表硬件已经验证可重叠执行。
+
+每个 chunk 是“每条原始 relay 流至多 chunk_rows 行”的一个批次，默认每流 2 MiB（向下按行
+对齐，至少一行），不是整个机器合计 2 MiB。同一 relay 的多条流可能拼成更大的单次传输。
+**首版的 ready 粒度是一个 chunk 批次的 CCU AllToAllV 完成握手，仍等待该批次所有 peer；
+不是某一个 packet 到达就直接触发，也不是单次融合 CCU kernel。** 但是不再等待 direct，
+也不等待整条消息的所有第一跳完成；第二跳块 j 与第一跳块 j+1 没有依赖，可以重叠。
+两组槽位复用由第二跳完成（含 unpack）的 event 保护，防止覆盖仍在读取的数据。
+最终调用者 stream 等待第二跳末块，所以紧跟的 Torch consumer 能看到完整输出。
+
+`--executor serial` 保留之前的两阶段串行参考实现；其 `--executor-sync device` 保留四次
+全设备同步，`stream` 依靠同一 stream 的排序。pipeline 只允许 `stream + force`，不会套用
+串行成本模型或悄悄回退。没有 relay 的矩阵仍只执行一次 direct。
+执行期没有全设备同步；计时末尾、正确性检查和显式释放资源时会等待完成。
 
 所有新机测试输出默认放在 `/home/l00934901/profiling/a5-ep8-heuristic.*`，
 包括机器拓扑、计划、日志、八个 rank 的 JSON、汇总、比较和 TMPDIR；不采集 profiler trace。
@@ -57,6 +73,9 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
+**已安装前版 bound-direct route 包的机器：本次流水线更新只改 Python，无需重编 C++ 或重装 route。**
+执行下面 CPU 测试后直接去第 3 节；后面的构建命令仅供首次安装/旧包缺 ABI 的环境使用。
+
 CPU 测试包含：精确单流分配、组间下界、早停、容量/预算/阈值、非法输入、拓扑关联、
 150 组随机流量独立 oracle、结果汇总拒绝缺失 rank，以及 Torch CPU 下八线程执行器验证。
 Torch CPU 测试不申请 NPU；没有 Torch 时该项会明确显示 skipped。
@@ -64,6 +83,7 @@ Torch CPU 测试不申请 NPU；没有 Torch 时该项会明确显示 skipped。
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_heuristic_cpu.py' -v
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_pipeline_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_alltoallv_cpu.py' -v
 ```
 
@@ -115,15 +135,20 @@ DeepEP 扩展可继续使用。未来在模型环境通过 `deep_ep.heuristic_al
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
-  --suite correctness --dtype float32 --width 257 --row-scale 1 \
+  --executor pipeline --suite correctness --dtype float32 --width 257 --row-scale 1 \
   --warmup 1 --iters 2 --rounds 1 --dynamic-iters 1
 ```
 
 一次依次测试 zero、self、single_hot、competing、asymmetric、uniform、cut 七个矩阵，
-复用同一个 CCU handle，同时变化矩阵、buffer 和 payload。每个 case 校验 direct、
+复用固定的三个 lane/handle，同时变化矩阵、buffer 和 payload。每个 case 校验 direct、
 multipath、原生 HCCL 与独立 CPU oracle，检查输入不被修改和前后 guard。
 包含空发送 rank、空接收 rank、零长度方向及独立 self 偏移。
 CPU 测试还覆盖禁止路径、阈值、relay 容量和一次分流后负载变化。
+小矩阵会额外自动选择更小的 chunk，尽可能形成 5 个批次，覆盖双缓冲槽多次复用；
+结果记录 `pipeline_correctness_chunk_counts`。连续三次改变 payload、通信后立即 clone
+输出，中间不做设备同步，检查 producer→跨 stream relay→consumer 的依赖。
+CPU 异步 DAG 模拟还故意延迟 direct，让第二跳先于 direct 完成，检测错误屏障、
+缺失 ready/reuse/join，以及同一个 context 连续处理变化矩阵与张量存储。
 
 成功必须看到 `EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`：八个 rank 均 PASS、输出完整、
 plan fingerprint 相同且 launcher 正常退出。只看到建链成功或某一个 rank PASS 不算通过。
@@ -192,11 +217,13 @@ dynamic 的 multipath 标签仍包括规划/布局开销；其比值不能解释
 | `plan.direct_peak_bytes` | 全部直连时的最大有向链路字节数 |
 | `plan.planned_link_peak_bytes` | 两阶段流量累计到物理边后得到的峰值，不是运行时间 |
 | `plan.cut_lower_bound_bytes` | 等带宽 full mesh、完整行切分的全分组下界 |
-| `schedule.phase_peak_sum_bytes` | 两阶段各自峰值之和，反映阶段串行的限制 |
+| `schedule.phase_peak_sum_bytes` | 仅 serial：两阶段各自峰值之和 |
+| `schedule.chunks` / `chunk_bytes_per_flow` | pipeline 的批次数、每条 relay 流的分块大小 |
+| `schedule.ccu_calls_per_execute` | pipeline 真分流时为 1+2×chunks；无分流为 1 |
 | `plan.relay_bytes` | 需要第二跳转发的数据量 |
 | `schedule.scratch_bytes_per_rank` | 候选分流工作区；实际分配以 `execution.scratch_bytes_per_rank` 为准 |
 | `planner_max_rank_us` | 单次 CPU 贪心规划的最慢 rank 耗时，不含计数交换/布局/分配 |
-| `prepared` | 已准备计划/工作区；真正分流时包含 pack、两次 CCU、unpack 和完成等待 |
+| `prepared` | 已准备计划/工作区；包含 pack、全部 CCU 调用、event 依赖、unpack 和完成等待 |
 | `dynamic` | device 上行数 all-gather、转 CPU 同步、规划、布局、临时分配、执行与完成等待 |
 
 prepared、dynamic 均逐轮取八 rank 最大值，再对轮求均值，同时保留每轮值、median/min/max。
@@ -212,12 +239,12 @@ prepared、dynamic 均逐轮取八 rank 最大值，再对轮求均值，同时�
 动态测试每次重新规划同一个输入矩阵，不使用缓存；验证“变化矩阵”的正确性由第 3 步覆盖。
 prepared 与 dynamic 的同步方式不同，只在同一口径内比较 direct/multipath。
 
-特别是单热点流，尽管累计链路峰值从 32 降到 16 MiB，两阶段分别需要传 16 MiB，
-加上 pack/unpack 和额外 launch，这个原型可能比 direct 更慢。这是有效的实验结论，
+旧 serial 实现特别是单热点流，尽管累计链路峰值从 32 降到 16 MiB，两阶段分别需要传 16 MiB，
+加上 pack/unpack 和额外 launch，这个串行原型可能比 direct 更慢。这是有效的实验结论，
 不能只根据 32→16 推导 2 倍加速。若 dynamic 无收益，真实模型应继续 direct，
-再决定是否值得实现融合/流水线版本；本版不会声称已获得性能收益。
+流水线是否解决该瓶颈以本版复测为准，不能仅凭减少理论峰值声称性能收益。
 
-### 4.1 本次劣化定位与复测
+### 4.1 旧串行劣化定位及参考对照
 
 实测旧版 single_hot prepared 约 664→905 us，competing 820→1106 us，
 asymmetric 255→1065 us；cut 无 relay 却出现 dynamic 3051→1490 us。
@@ -227,28 +254,64 @@ asymmetric 255→1065 us；cut 无 relay 却出现 dynamic 3051→1490 us。
 ```bash
 # 先完成第 3 节；本次只改 Python，无需重新编译 C++/安装 route 包。
 # 同一输入，对比去掉设备同步前后；两次仍各自包含 direct baseline。
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case single_hot --executor-sync device
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case single_hot --executor-sync stream
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case asymmetric --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync device
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case asymmetric --executor-sync stream
 # 无分流 A/A 控制：prepared 应接近，dynamic 不用于声称多路径收益。
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case cut --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case cut --executor-sync stream
 ```
 
 默认 `--multipath-policy force` 真正执行贪心产生的分流，便于观察真实性能，绝不把
-热点 case 偷换成 direct 再宣称加速。另提供面向接入的 `--multipath-policy auto`：
+热点 case 偷换成 direct 再宣称加速。serial 参考实现另提供 `--multipath-policy auto`：
 根据执行结构选择；执行决策与候选路由同时输出。
 当前串行执行器对任何分流都有 `max(stage1) + max(stage2) >= max(original)`：
 取最大原始流 n，其直连 n-x 必须经过阶段一，转发 x 必须经过阶段二，因此两阶段峰值
 之和至少为 n。此等带宽模型尚未计额外拷贝、launch 或 HBM/IO die 共享资源。
-**所以当前 auto 会拒绝所有候选分流、显式回退 direct。这个回退不是多路径加速。**
+**所以 serial 的 auto 会拒绝所有候选分流、显式回退 direct。这个回退不是多路径加速。pipeline 不使用此模型。**
 只有换成真正重叠的流水线/融合执行器，才应替换这一成本模型。去掉同步可以降低
 额外开销，却不会消除串行两跳本身的限制；新机是否变快必须重测。
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case single_hot --multipath-policy auto
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --multipath-policy auto
 ```
 
 即使选择 auto，正确性阶段也额外强制验证真实 relay 路径，避免回退掩盖实现错误。
+
+### 4.2 流水线复测（本次重点）
+
+先通过第 3 节，再分别测 baseline/direct 与真实分流，两次参数完全一致：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode direct --case single_hot --chunk-bytes 2097152
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152
+# 用第 4 节 --compare 命令比较两个实际输出目录。
+```
+
+然后在同一 worker 中交替测量，减少跨运行差异：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case single_hot --chunk-bytes 2097152
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case competing --chunk-bytes 2097152
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case asymmetric --chunk-bytes 2097152
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case cut
+```
+
+默认 single_hot 中 direct 16 MiB，relay 16 MiB 拆成 8 个 2 MiB 批次，CCU 调用共 17 次。
+允许 direct 与两跳流水线推进；仍有 pipeline 填充/排空、每批握手及 pack/unpack 开销。
+因此不保证 2 倍加速。建议再扫 `--chunk-bytes 524288/1048576/4194304`（逐个传实际整数），
+小块启动多，大块流水线填充较慢。`--max-chunks` 默认 128，超过就明确报错，避免失控提交；
+两组 relay 缓冲槽的大小由最大批次确定，不随批次数线性增长，direct 缓冲独立分配。
+
+输出应有 `PIPELINE_LANES`（三个不同 group）以及 execution/schedule 中的
+`participant_hbm_pipelined_ccu`、`buffer_slots=2`、实际 chunks。
+通信组/stream/CCU 资源初始化不计入 prepared 或 dynamic，它们在模型初始化时创建一次。
+dynamic 仍包括每批 C 交换、CPU 规划、布局、双缓冲和 event 准备、执行完成。
+额外两个 HCCL 通信组会消耗额外运行时资源/缓冲；若建链失败，保留 run.log 定位，
+不会自动复用同一个通知通道或降级后继续声称并发。
+
+目前 CPU 模拟已验证没有 direct→relay 的依赖边；设备上是否实际重叠、加速多少，
+仍须新机器复测。默认不打 profiler。比较工具拒绝把不同 executor/chunk 设置当作
+同配置的独立 direct/multipath 对比；跨 executor 分别读取各自 summary 中的 baseline 和分流值。
 
 ## 5. 输入真实路由矩阵
 
@@ -284,28 +347,35 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both \
 未来模型调用的接口（伪调用环境需要已有 EP8 Buffer、绑定 manifest 和张量）：
 
 ```python
-from deep_ep.heuristic_alltoallv import make_plan, PreparedAllToAllV, gather_routing_counts
+from deep_ep.heuristic_alltoallv import make_plan, gather_routing_counts
+from deep_ep.pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV
 
-# local_counts: 本 rank 的实际 packed 行数，device int64[8]。
-# 若模型已持有一致的全局 host C，可直接传 C，避免重复交换。
+# 模型初始化：同一 EP8 的成员以相同顺序建立两组 relay communicator。
+# ep_world_ranks 是 WORLD rank，必须与原 EP group 顺序一致，不是物理设备 ID。
+context = PipelineContext.create(buffer, handle, manifest,
+                                 group_ranks=ep_world_ranks)
+
+# 每批：local_counts 是实际 packed 行数，device int64[8]。
+# 若已持有一致的全局 host C，可直接传入，避免重复交换。
 C = gather_routing_counts(local_counts, group=ep_group)
-plan = make_plan(C, row_bytes, topology["allowed_relays"],
-                 min_chunk_bytes=1, min_gain_bytes=0, max_actions=56)
-prepared = PreparedAllToAllV(buffer, handle, ep_rank, plan, packed_send,
-                            max_scratch_bytes=1 << 30, sync_mode="stream", policy="auto")
-print(prepared.decision)  # 候选分流与实际执行分开；本版 auto 会回退 direct。
+plan = make_plan(C, row_bytes, topology["allowed_relays"], max_actions=56)
+prepared = PreparedPipelinedAllToAllV(context, plan, packed_send,
+                                     chunk_bytes=2 << 20, max_scratch_bytes=1 << 30)
 prepared.execute(packed_send, packed_recv)
+# packed_recv 的后续使用必须在 context 的调用者 stream 上，或显式建立 event 依赖。
+# workspace/context 必须存活到执行完成；下一批可复用 context，但 C 变化需重新准备。
+
 ```
 
 `make_plan` 只接受 host 整数，显式拒绝隐式读取 GPU tensor。
 `gather_routing_counts` 是同步参考适配器，包含 all-gather 和 D2H 等待；其开销已在 dynamic 计时中体现。
-全部 rank 必须使用相同矩阵、候选路径和参数；模型在进入通信前必须建立这一一致性。
+全部 rank 必须使用相同矩阵、候选路径、chunk 大小/上限和参数；模型在进入通信前必须建立这一一致性。
 测试 worker 有配置一致性检查，模型不能依靠某个 rank 自己更改阈值或自动回退。
 输入按目的 rank 排列，输出按原始源 rank 排列，relay suffix 最终写回该源对应区间；
 self 单独从原输入偏移复制到正确接收偏移。算子不修改专家权重和 token 恢复映射。
 
 计划和 workspace 对应当前矩阵，矩阵变化必须重新准备；固定计划可重复执行变化的 payload。
-对象只允许同一 stream 有序复用，不支持跨 stream 并发；销毁/换工作区前保证先前执行完成。
+context/对象只允许同一调用者 stream 有序复用，不支持多个 host 调用者并发；销毁/换工作区前保证先前执行完成。
 现阶段是 eager 接口，未支持图捕获或动态 token 数的图重放，也未修改 vLLM-Ascend。
 
 ## 6. 贪心选择和停止条件
@@ -345,3 +415,17 @@ self 单独从原输入偏移复制到正确接收偏移。算子不修改专家
 force/auto 两组开关的 CPU 八线程数据正确性回归。新机 NPU 排序/性能结果仍待第 3、4.1 节复测。
 
 修正后开发侧：115 项 CPU 回归无失败（宿主机缺 Torch 跳过 1 项）；容器内 12 项新增模块回归全部通过，补齐实际执行器八线程测试。Python 语法和 diff 检查通过。未 push；无新机修正后的 NPU 耗时数据。
+
+
+### 流水线实现验证记录
+
+本次新增 `python/deep_ep/deep_ep/pipelined_alltoallv.py`；worker 默认 pipeline，旧 serial 可选。
+保留原始 C 输入接口、组内单 relay 贪心以及 2/4 卡旧接口。没有改动 C++ ABI。
+验证包括布局独立 oracle、100 组随机矩阵、非整除分块、零行、自拷贝、容量限制，
+以及真实 Torch CPU 张量的异步 DAG 执行（延迟 direct、交错两跳、复用槽位、反复修改
+payload、变化矩阵与 storage）。CPU 模拟不替代目标机 CCU 的多 communicator/stream 验证。
+新机尚未执行本次流水线版本，不预先报告 NPU 正确性通过或性能收益。
+
+开发侧本次验证：119 项 CPU 回归无失败（3 项依赖 Torch 的测试在宿主机跳过）；
+`cam_lyw_dev_91` 内流水线 4 项、原贪心执行器 12 项全部通过，补齐这 3 项。
+日志：开发机 `/home/liuyuanwen/profiling/a5-pipeline/`；新机输出仍为 `/home/l00934901/profiling`。

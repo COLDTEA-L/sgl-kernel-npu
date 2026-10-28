@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from heuristic_alltoallv import (make_plan, build_schedule, normalize_counts, normalize_relays,
                                 PreparedAllToAllV, gather_routing_counts)
+from pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV, build_pipeline_schedule
 
 
 def synthetic(name, scale):
@@ -57,6 +58,10 @@ def main():
     p.add_argument('--iters', type=int, default=10)
     p.add_argument('--rounds', type=int, default=4)
     p.add_argument('--dynamic-iters', type=int, default=10)
+    p.add_argument('--executor', choices=('pipeline', 'serial'), default='pipeline')
+    p.add_argument('--chunk-bytes', type=int, default=2 << 20,
+                   help='max bytes per original relayed flow in each chunk round, row-aligned')
+    p.add_argument('--max-chunks', type=int, default=128)
     p.add_argument('--executor-sync', choices=('stream', 'device'), default='stream',
                    help='stream ordering or old four device fences for A/B diagnosis')
     p.add_argument('--multipath-policy', choices=('force', 'auto'), default='force',
@@ -66,6 +71,10 @@ def main():
             args.warmup < 0 or min(args.iters, args.rounds, args.dynamic_iters, args.max_scratch_mib) < 1
             or args.relay_capacity_mib < 0):
         p.error('requires EP8, positive sizes/iterations and nonnegative warmup/capacity')
+    if args.executor == 'pipeline' and (args.multipath_policy != 'force' or args.executor_sync != 'stream'):
+        p.error('pipeline requires --multipath-policy force --executor-sync stream; serial auto model is inapplicable')
+    if args.chunk_bytes < 1 or args.max_chunks < 1:
+        p.error('chunk-bytes/max-chunks must be positive')
     topology = json.loads(args.topology_json.read_text())
     if topology['version'] != 1 or topology['executor'] != 'participant_hbm_two_stage_ccu':
         raise ValueError('wrong topology schema/executor')
@@ -103,6 +112,13 @@ def main():
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     log_ccu_communicator(buffer.moe_all_to_all_group_name)
     handle = buffer.prepare_ccu_urma_peer_plan_alltoallv('ep8-heuristic', str(args.manifest.resolve()))
+    pipeline = None
+    if args.executor == 'pipeline':
+        pipeline = PipelineContext.create(buffer, handle, args.manifest.resolve(),
+                                          group_ranks=list(range(8)), pg_kwargs=ccu_pg_kwargs(torch_npu))
+        print('PIPELINE_LANES ' + json.dumps(dict(rank=rank, groups=[
+            lane.buffer.moe_all_to_all_group_name for lane in pipeline.lanes],
+            lanes=['direct', 'first_hop', 'second_hop'])), flush=True)
     dtype = getattr(torch, args.dtype)
     row_bytes = torch.empty((), dtype=dtype).element_size() * args.width
     planner_options = dict(min_chunk_bytes=args.min_chunk_bytes, min_gain_bytes=args.min_gain_bytes,
@@ -113,8 +129,9 @@ def main():
         begin = time.perf_counter()
         plan = make_plan(counts, row_bytes, allowed, **planner_options)
         planner_us = (time.perf_counter() - begin) * 1e6
-        schedule = build_schedule(plan)
-        if plan.uses_relay and any(sum(schedule.scratch_rows(r)) * row_bytes > (args.max_scratch_mib << 20) for r in range(8)):
+        schedule = (build_pipeline_schedule(plan, chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks)
+                    if pipeline else build_schedule(plan))
+        if plan.uses_relay and max(schedule.report()['scratch_bytes_per_rank']) > (args.max_scratch_mib << 20):
             raise ValueError('workspace exceeds per-rank bound before launching data collectives')
         sends = list(counts[rank * 8:rank * 8 + 8]); recvs = list(counts[rank::8])
         def payload(s):
@@ -128,10 +145,17 @@ def main():
         stores = {name: torch.full((expected.numel() + 2 * guard,), -17, dtype=dtype, device='npu')
                   for name in ('direct', 'multipath', 'native')}
         outputs = {name: storage[guard:-guard].reshape(sum(recvs), args.width) for name, storage in stores.items()}
-        prepare_options = dict(max_scratch_bytes=args.max_scratch_mib << 20,
-                               sync_mode=args.executor_sync, policy=args.multipath_policy)
-        prepared = PreparedAllToAllV(buffer, handle, rank, plan, send, **prepare_options)
-        forced = (prepared if args.multipath_policy == 'force' else
+        prepare_options = dict(max_scratch_bytes=args.max_scratch_mib << 20)
+        if pipeline:
+            prepare_options.update(chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks)
+            def prepare(current_plan):
+                return PreparedPipelinedAllToAllV(pipeline, current_plan, send, **prepare_options)
+        else:
+            prepare_options.update(sync_mode=args.executor_sync, policy=args.multipath_policy)
+            def prepare(current_plan):
+                return PreparedAllToAllV(buffer, handle, rank, current_plan, send, **prepare_options)
+        prepared = prepare(plan)
+        forced = (prepared if pipeline or args.multipath_policy == 'force' else
                   PreparedAllToAllV(buffer, handle, rank, plan, send,
                                    **dict(prepare_options, policy='force')))
         # No-relay prepared timing is an explicit A/A control, using the same
@@ -176,6 +200,19 @@ def main():
                 if not torch.equal(snapshot.cpu(), expected + queued_epoch):
                     raise AssertionError(f'queued stream ordering failure rank={rank}')
             dist.barrier()
+        # Small correctness cases must still exercise >2 chunks and both slot
+        # reuses. Default 2 MiB chunks would make them a one-round pipeline.
+        checked_chunks = [len(prepared.schedule.chunks)] if pipeline else []
+        if pipeline and plan.uses_relay and len(prepared.schedule.chunks) < min(5, args.max_chunks):
+            target = min(5, args.max_chunks)
+            probe_rows = max(1, (max(plan.relay_rows) + target - 1) // target)
+            probe = PreparedPipelinedAllToAllV(pipeline, plan, send,
+                         **dict(prepare_options, chunk_bytes=probe_rows * row_bytes))
+            set_payload(23)
+            probe.execute(send, outputs['multipath'])
+            torch.npu.synchronize(); check('multipath', 23)
+            checked_chunks.append(len(probe.schedule.chunks))
+            del probe
         timings = {name: [] for name in selected}
         for round_id in range(args.rounds):
             order = selected if round_id % 2 == 0 else tuple(reversed(selected))
@@ -205,8 +242,7 @@ def main():
                 buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, current_counts)
             else:
                 current_plan = make_plan(current, row_bytes, allowed, **planner_options)
-                current_prepared = PreparedAllToAllV(buffer, handle, rank, current_plan, send,
-                                                    **prepare_options)
+                current_prepared = prepare(current_plan)
                 ready_at = time.perf_counter()
                 current_prepared.execute(send, outputs[name])
             # Completion is part of BOTH paths; temporary workspace remains live.
@@ -237,6 +273,7 @@ def main():
                       planner_us=planner_us, prepared_round_us=timings, dynamic_mean_us=dynamic,
                       dynamic_round_us=dynamic_rounds, dynamic_components_round_us=components,
                       execution=prepared.decision, executor_sync=args.executor_sync,
+                      pipeline_correctness_chunk_counts=checked_chunks,
                       fingerprint=plan.fingerprint)
         reports.append(report)
         print('EP8_HEURISTIC_CASE ' + json.dumps(dict(rank=rank, case=case_name, actions=len(plan.actions),
@@ -244,14 +281,19 @@ def main():
     torch.npu.synchronize()
     destroy = route.HcclCcuUrmaPeerPlanDestroy
     destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
-    if destroy(handle) != 0: raise RuntimeError('plan destroy failed')
+    def destroy_checked(value):
+        if destroy(value) != 0: raise RuntimeError('plan destroy failed')
+    if pipeline:
+        pipeline.close(destroy_checked)
+    destroy_checked(handle)
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
                   benchmark=dict(protocol=2, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
-                                 multipath_policy=args.multipath_policy),
-                  mode=args.mode, backend='participant_hbm_two_stage_ccu', cases=reports,
+                                 multipath_policy=args.multipath_policy, executor=args.executor,
+                                 chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks),
+                  mode=args.mode, backend=('participant_hbm_pipelined_ccu' if pipeline else 'participant_hbm_two_stage_ccu'), cases=reports,
                   timing_scope='host_wall_submit_and_device_completion',
                   dynamic_scope='device_counts_gather_cpu_sync_plan_workspace_execute_completion')
     temp = args.run_dir / f'rank{rank}.json.tmp'
