@@ -1,3 +1,4 @@
+#include "ccu_payload.hpp"
 #include "../../examples/a5_ccu_urma_route_probe/common/alltoallv_layout.h"
 #include <memory>
 #include <cstdint>
@@ -35,10 +36,13 @@ extern "C" __attribute__((visibility("default"))) int A5DeepEpExplicitMultipathA
     return 12;
 }
 
+extern "C" __attribute__((visibility("default"))) int A5DeepEpFp8PayloadAbiVersion() { return 1; }
+
 namespace deep_ep {
 namespace {
 HcclDataType CcuPayloadType(const torch::Tensor &tensor)
 {
+    if (IsCcuFp8(tensor.scalar_type())) return HCCL_DATA_TYPE_INT8;  // same one-byte wire size
     switch (tensor.scalar_type()) {
         case at::kHalf: return HCCL_DATA_TYPE_FP16;
         case at::kBFloat16: return HCCL_DATA_TYPE_BFP16;
@@ -46,7 +50,7 @@ HcclDataType CcuPayloadType(const torch::Tensor &tensor)
         case at::kChar: return HCCL_DATA_TYPE_INT8;
         case at::kInt: return HCCL_DATA_TYPE_INT32;
         default:
-            TORCH_CHECK(false, "CCU AllToAll supports float16, bfloat16, float32, int8, int32; got ",
+            TORCH_CHECK(false, "CCU AllToAll supports float16, bfloat16, float32, int8, int32 and FP8 e4m3/e5m2; got ",
                         tensor.scalar_type());
     }
     return HCCL_DATA_TYPE_RESERVED;

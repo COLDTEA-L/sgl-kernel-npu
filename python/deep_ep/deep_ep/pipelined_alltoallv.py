@@ -13,6 +13,11 @@ try:
 except ImportError:  # repository test workers also import this module directly
     from heuristic_alltoallv import N, _uint, _offsets, _coalesce_spans, validate_plan
 
+try:
+    from .ccu_payload import payload_dtypes, copy_payload_
+except ImportError:
+    from ccu_payload import payload_dtypes, copy_payload_
+
 
 class RelayPiece(NamedTuple):
     src: int
@@ -150,7 +155,7 @@ class _NpuRuntime:
     def wait(self, stream, event): stream.wait_event(event)
     def retain(self, tensor, stream):
         if tensor.numel(): tensor.record_stream(stream)
-    def copy(self, dst, di, src, si, n): dst.narrow(0, di, n).copy_(src.narrow(0, si, n))
+    def copy(self, dst, di, src, si, n): copy_payload_(dst.narrow(0, di, n), src.narrow(0, si, n))
     def copy_spans(self, dst, src, spans): self.native_copy(src, dst, spans)
     def transfer(self, lane, send, recv, counts, storage_counts=None):
         if storage_counts is None:
@@ -315,7 +320,7 @@ class PreparedPipelinedAllToAllV:
             raise ValueError('prepare requires an open context on its caller stream')
         if example_send.dim() < 1 or not example_send.is_contiguous():
             raise ValueError('invalid send shape/strides')
-        if example_send.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.int32):
+        if example_send.dtype not in payload_dtypes():
             raise ValueError('unsupported payload dtype')
         self.tail, self.dtype, self.device = tuple(example_send.shape[1:]), example_send.dtype, example_send.device
         if prod(self.tail) * example_send.element_size() != plan.row_bytes:

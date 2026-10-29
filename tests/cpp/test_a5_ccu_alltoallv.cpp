@@ -85,7 +85,7 @@ int main()
         }
         auto transfer=counts;
         if(epoch%2) for(size_t f=0;f<64;++f) transfer[f]/=2;
-        const uint64_t rowBytes=std::array<uint64_t,5>{{1,2,4,14,514}}[epoch%5];
+        const uint64_t rowBytes=std::array<uint64_t,6>{{1,2,4,14,257,514}}[epoch%6];
         std::array<AllToAllVLayout,8> layouts;
         std::array<std::vector<unsigned char>,8> input, output, original;
         std::array<hcomm::CcuRep::Env,8> envs;

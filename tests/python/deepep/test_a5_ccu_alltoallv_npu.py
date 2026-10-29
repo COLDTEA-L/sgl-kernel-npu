@@ -8,6 +8,12 @@ import os
 import statistics
 import time
 from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
+from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, shifted_payload,
+    full_payload, fill_payload_, equal_payload, guards_intact, cat_payload,
+    byte_payload_view, copy_payload_, fp8_dtypes)
 
 
 def count_matrix(case, epoch):
@@ -30,7 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32", "int8", "int32"), default="float32")
+    parser.add_argument("--dtype", choices=PAYLOAD_DTYPE_NAMES, default="float32")
     parser.add_argument("--width", type=int, default=257)
     parser.add_argument("--row-scale", type=int, default=1)
     parser.add_argument("--benchmark", action="store_true",
@@ -61,6 +67,11 @@ def main():
     destroy = route.HcclCcuUrmaPeerPlanDestroy
     destroy.argtypes = [ctypes.c_uint64]
     destroy.restype = ctypes.c_int
+    dtype = getattr(torch, args.dtype)
+    if dtype in fp8_dtypes():
+        marker = getattr(bridge, 'A5DeepEpFp8PayloadAbiVersion', None)
+        if marker is None or marker() != 1:
+            raise RuntimeError('rebuild/install DeepEP: FP8 payload ABI 1 required')
     rank = int(os.environ["RANK"])
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     args.run_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +80,6 @@ def main():
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     log_ccu_communicator(buffer.moe_all_to_all_group_name)
     handle = buffer.prepare_ccu_urma_peer_plan_alltoallv("ep8-direct", str(args.manifest.resolve()))
-    dtype = getattr(torch, args.dtype)
     guard = 37
     checked = 0
     timings = {}
@@ -83,16 +93,15 @@ def main():
 
             def payload(source):
                 rows = sum(matrix[source])
-                values = torch.arange(rows * args.width, dtype=torch.int64).reshape(rows, args.width)
-                return ((values * 7 + source * 11 + epoch * 13 + case) % 97).to(dtype)
+                return make_payload(rows, args.width, source, dtype, epoch * 13 + case)
 
             source = payload(rank)
-            send_storage = torch.full((source.numel() + 2 * guard,), -19, device="npu", dtype=dtype)
-            recv_storage = torch.full((sum(recvs) * args.width + 2 * guard,), -17, device="npu", dtype=dtype)
+            send_storage = full_payload((source.numel() + 2 * guard,), -19, dtype, "npu")
+            recv_storage = full_payload((sum(recvs) * args.width + 2 * guard,), -17, dtype, "npu")
             send = send_storage[guard:guard + source.numel()].reshape(sum(sends), args.width)
             recv = recv_storage[guard:guard + sum(recvs) * args.width].reshape(sum(recvs), args.width)
-            send.copy_(source)
-            input_snapshot = send_storage.cpu()
+            copy_payload_(send, source)
+            input_snapshot = byte_payload_view(send_storage).cpu()
             dist.barrier()
             buffer.ccu_urma_peer_plan_alltoallv_out(send, recv, handle, counts)
             torch.npu.synchronize()
@@ -100,19 +109,18 @@ def main():
             for s in range(8):
                 start = sum(matrix[s][:rank])
                 pieces.append(payload(s)[start:start + matrix[s][rank]])
-            expected = torch.cat(pieces, dim=0)
-            if not torch.equal(recv.cpu(), expected):
+            expected = cat_payload(pieces)
+            if not equal_payload(recv, expected):
                 raise AssertionError(f"CCU mismatch rank={rank} epoch={epoch} case={case}")
-            if not torch.equal(send_storage.cpu(), input_snapshot):
+            if not torch.equal(byte_payload_view(send_storage).cpu(), input_snapshot):
                 raise AssertionError("input or input guards modified")
-            output_snapshot = recv_storage.cpu()
-            if not ((output_snapshot[:guard] == -17).all() and (output_snapshot[-guard:] == -17).all()):
+            if not guards_intact(recv_storage, guard, -17):
                 raise AssertionError("output guard modified")
             # Native reference on the same expanded row layout, including zeros.
             native = torch.empty_like(recv)
-            dist.all_to_all_single(native, send, output_split_sizes=recvs, input_split_sizes=sends)
+            dist.all_to_all_single(byte_payload_view(native), byte_payload_view(send), output_split_sizes=recvs, input_split_sizes=sends)
             torch.npu.synchronize()
-            if not torch.equal(native.cpu(), expected):
+            if not equal_payload(native, expected):
                 raise AssertionError("native AllToAllV reference mismatch")
             dist.barrier()
             checked += 1
@@ -127,7 +135,7 @@ def main():
                                                   for d in range(8) if s != d) * row_bytes)
                 operations = {
                     "custom": lambda: buffer.ccu_urma_peer_plan_alltoallv_out(send, recv, handle, counts),
-                    "native": lambda: dist.all_to_all_single(native, send,
+                    "native": lambda: dist.all_to_all_single(byte_payload_view(native), byte_payload_view(send),
                         output_split_sizes=recvs, input_split_sizes=sends),
                 }
                 timings = {name: [] for name in operations}
@@ -141,8 +149,8 @@ def main():
                             op()
                         torch.npu.synchronize()
                         # New payload and poisoned output avoid accepting a stale warmup result.
-                        send.copy_(source + ((round_id + 1) % 7))
-                        output.fill_(-17)
+                        copy_payload_(send, shifted_payload(source, (round_id + 1) % 7))
+                        fill_payload_(output, -17)
                         torch.npu.synchronize()
                         dist.barrier()
                         torch.npu.synchronize()
@@ -152,15 +160,13 @@ def main():
                         torch.npu.synchronize()
                         elapsed_us = (time.perf_counter() - begin) * 1e6 / args.iters
                         timings[name].append(elapsed_us)
-                        if not torch.equal(output.cpu(), expected + ((round_id + 1) % 7)):
+                        if not equal_payload(output, shifted_payload(expected, (round_id + 1) % 7)):
                             raise AssertionError(f"timed {name} mismatch rank={rank} round={round_id}")
-                        if not torch.equal(send_storage.cpu()[guard:-guard],
-                                           (source + ((round_id + 1) % 7)).flatten()):
+                        if not equal_payload(send_storage[guard:-guard],
+                                           shifted_payload(source, (round_id + 1) % 7).flatten()):
                             raise AssertionError("timed input modified")
                         for storage, sentinel in ((send_storage, -19), (recv_storage, -17)):
-                            snapshot = storage.cpu()
-                            if not ((snapshot[:guard] == sentinel).all() and
-                                    (snapshot[-guard:] == sentinel).all()):
+                            if not guards_intact(storage, guard, sentinel):
                                 raise AssertionError("timed guard modified")
                         dist.barrier()
     torch.npu.synchronize()

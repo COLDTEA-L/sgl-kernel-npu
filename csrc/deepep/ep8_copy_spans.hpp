@@ -1,5 +1,6 @@
 #pragma once
 #include "ep8_relay_planner.hpp"
+#include "ccu_payload.hpp"
 #include <ATen/ATen.h>
 
 namespace deep_ep::ep8 {
@@ -48,7 +49,8 @@ inline void CopySpansOut(const at::Tensor& src, at::Tensor dst, const CopySpans&
         TORCH_CHECK(a <= b ? b - a >= src.nbytes() : a - b >= dst.nbytes(),
                     "EP8 copy: overlapping buffers");
     }
+    auto srcBytes = CcuByteView(src), dstBytes = CcuByteView(dst);
     for (const auto& p : copies.spans) if (p[2])
-        dst.narrow(0, p[1], p[2]).copy_(src.narrow(0, p[0], p[2]));
+        dstBytes.narrow(0, p[1], p[2]).copy_(srcBytes.narrow(0, p[0], p[2]));
 }
 } // namespace deep_ep::ep8

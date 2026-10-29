@@ -97,8 +97,7 @@ private:
         TORCH_CHECK(!closed_ && !poisoned_, "native pipeline is closed or failed; recreate context");
         rt_->Check(t);
         TORCH_CHECK(t.dim() >= 1 && t.is_contiguous(), "invalid pipeline tensor shape/strides");
-        TORCH_CHECK(t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16 || t.scalar_type() == at::kFloat ||
-                    t.scalar_type() == at::kChar || t.scalar_type() == at::kInt, "unsupported pipeline dtype");
+        TORCH_CHECK(IsCcuPayload(t.scalar_type()), "unsupported pipeline dtype");
         U bytes = t.element_size();
         for (int i = 1; i < t.dim(); ++i) {
             TORCH_CHECK(t.size(i) > 0 && static_cast<U>(t.size(i)) <= Max / bytes, "invalid row shape");

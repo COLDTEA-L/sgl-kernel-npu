@@ -10,6 +10,11 @@ import json
 from math import prod
 from numbers import Integral
 
+try:
+    from .ccu_payload import payload_dtypes, copy_payload_
+except ImportError:
+    from ccu_payload import payload_dtypes, copy_payload_
+
 N = 8
 MAX_I64 = (1 << 63) - 1
 
@@ -391,7 +396,7 @@ class PreparedAllToAllV:
         self.rank = _uint(rank, 'rank')
         if self.rank >= N or example_send.dim() < 1 or not example_send.is_contiguous():
             raise ValueError('invalid rank or noncontiguous send tensor')
-        if example_send.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.int32):
+        if example_send.dtype not in payload_dtypes():
             raise ValueError('unsupported payload dtype')
         if getattr(buffer, 'rank', rank) != rank or getattr(buffer, 'group_size', N) != N:
             raise ValueError('prepared rank/group differs from EP8 Buffer')
@@ -445,23 +450,23 @@ class PreparedAllToAllV:
             return op(send, recv, self.handle, self.counts)
         first_send, first_recv, second_send, second_recv = self.workspace
         for src, dst, n in self.pack_spans:
-            first_send.narrow(0, dst, n).copy_(send.narrow(0, src, n))
+            copy_payload_(first_send.narrow(0, dst, n), send.narrow(0, src, n))
         # Existing CCU kernel publishes all peers before waiting, including zero
         # directions, and completes remote writes before its done handshake.
         self._phase_fence()
         op(first_send, first_recv, self.handle, self.first_counts)
         self._phase_fence()
         for src, dst, n in self.forward_spans:
-            second_send.narrow(0, dst, n).copy_(first_recv.narrow(0, src, n))
+            copy_payload_(second_send.narrow(0, dst, n), first_recv.narrow(0, src, n))
         self._phase_fence()
         op(second_send, second_recv, self.handle, self.second_counts)
         self._phase_fence()
         for tensor, spans in ((first_recv, self.direct_spans), (second_recv, self.relay_spans)):
             for src, dst, n in spans:
-                recv.narrow(0, dst, n).copy_(tensor.narrow(0, src, n))
+                copy_payload_(recv.narrow(0, dst, n), tensor.narrow(0, src, n))
         src, dst, n = self.schedule.self_offsets[self.rank]
         if n:
-            recv.narrow(0, dst, n).copy_(send.narrow(0, src, n))
+            copy_payload_(recv.narrow(0, dst, n), send.narrow(0, src, n))
         return recv
 
 

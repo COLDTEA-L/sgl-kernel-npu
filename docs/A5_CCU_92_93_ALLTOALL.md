@@ -169,3 +169,46 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_dfx_cpu.py'
 缺少 Torch 的用例会明确 skipped。local-copy 诊断也已迁移公开接口；旧 `--builder-only` 不再提供脱离实例的构图证明，无 NPU host 生命周期检查使用构建目录的 `a5_ccu_public_host_test`。
 
 开发机本轮 CPU 套件共 59 项：54 通过、5 项因缺少 Torch 跳过；另有 1 项基于真实 SDK 头文件的 host mock ctest 通过。结果在 `/home/liuyuanwen/profiling/cann92-ccu-abi-wJLnOX/a5-public-cpu.8SPBR4`，route 编译与 ctest 日志在同级 `route-build`。没有新硬件吞吐或延迟数据。
+
+## 9. FP8 payload 支持
+
+EP8 direct、serial 参考执行器、Python/C++ pipeline 支持 `float8_e4m3fn`、`float8_e5m2`、`float8_e4m3fnuz`、`float8_e5m2fnuz`。接口输入/输出保持原始 dtype，按每元素 1 字节计算 row_bytes。C++ CCU 入口映射到同宽 INT8 传输类型；relay pack/forward/unpack 和原生 HCCL baseline 使用无拷贝 uint8 view，保持所有位模式，不进行数值转换、量化或反量化。没有新增每次注册或建链。
+
+这是通信 payload 兼容；模型权重 FP8 不代表该处激活必定 FP8，接入时以实际输入 tensor 为准。独立 scale tensor 不会被隐式打包，调用方仍须按对应路由传递 scale；本次不实现 payload/scale 融合通信。2/4 卡既有调用接口和测试类型不变。
+
+拉取新提交后，按 **§4 重建并安装 DeepEP wheel**。旧 wheel 会被新增的 `A5DeepEpFp8PayloadAbiVersion=1` 检查拒绝。route 本次未改动，已安装本分支公开 API route 的环境无需仅为 FP8 重建 route。
+
+先沿用 §6 的环境变量，执行两种主要格式的七类正确性测试：
+
+```bash
+for A5_FP8 in float8_e4m3fn float8_e5m2; do
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    --routing-policy greedy --executor pipeline --pipeline-host cpp \
+    --suite correctness --mode all --dtype "$A5_FP8" --width 257 --row-scale 1 \
+    --warmup 1 --iters 2 --rounds 1 --dynamic-iters 1
+done
+```
+
+每次均要求 `EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`。检查原始 256 种字节模式（含 NaN、正负零）、输入及输出保护区、非零 storage offset、独立 self 偏移、零长度和多批次 slot 复用。FP8 校验按字节比较，避免 NaN 浮点比较或转换舍入掩盖错误。其他两种 fnuz 格式也可使用相同命令。
+
+再对实际目标格式执行长跑和性能比较：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --routing-policy greedy --executor pipeline --pipeline-host cpp \
+  --mode all --case single_hot --dtype float8_e4m3fn \
+  --width 4096 --row-scale 256 --chunk-bytes 8388608 \
+  --warmup 3 --iters 10 --rounds 4 --dynamic-iters 100
+```
+
+此配置 0→4 原始流为 `32 × 256 × 4096 × 1 = 32 MiB`，与旧 FP16 缺省案例的跨卡字节数相同。FP8 若仍使用 row-scale 128，则该流为 16 MiB；比较时必须区分相同行数与相同字节数。每行 FP8 payload 字节数为 width，8MiB 参数仍是每条 relay 流的 chunk 上限。
+
+CPU 检查：
+
+```bash
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_fp8_cpu.py'
+```
+
+需要支持上述 FP8 类型的 Torch 和 g++；其中一个用例直接编译真实 ATen + 生产 C++ copy/pipeline host，检查原始字节、保护区、错误 span 不提前写入，以及 400 次 host 动态调用时 workspace 不新增分配。另一个用例用八 rank 异步 CPU DAG 检查四种格式、变动矩阵和 relay 双缓冲复用。它们不证明 NPU/驱动上的 dtype view 或通信正确性；仍需上述目标机测试。
+
+本次 FP8 开发验证在 `cam_lyw_92` 的独立 CPU Torch 2.10 venv 中完成，未修改其他容器或 9.1 安装。10 组核心 CPU 套件共 **62 项全部通过**，包含 FP8 的真实 ATen C++ 编译/链接和四格式异步 DAG 测试；源文件语法检查通过。日志：`/home/liuyuanwen/profiling/a5-fp8-validation/a5-public-cpu.i4NJm7`。完整 DeepEP wheel 仍须在带 torch_npu 的目标 9.3 环境按 §4 编译；尚无 FP8 NPU 实测结果。

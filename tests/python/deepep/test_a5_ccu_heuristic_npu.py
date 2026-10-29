@@ -12,6 +12,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
+from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, shifted_payload,
+    full_payload, fill_payload_, equal_payload, guards_intact, clone_payload,
+    cat_payload, byte_payload_view, copy_payload_, fp8_dtypes)
 from heuristic_alltoallv import (make_plan, RelayPlanner, FastRelayPlanner, build_schedule, normalize_counts, normalize_relays,
                                 PreparedAllToAllV, gather_routing_counts)
 from pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV, build_pipeline_schedule
@@ -46,7 +49,7 @@ def main():
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--suite', choices=('benchmark', 'correctness'), default='benchmark')
     p.add_argument('--mode', choices=('all', 'native', 'both', 'direct', 'multipath'), default='both')
-    p.add_argument('--dtype', choices=('float16', 'bfloat16', 'float32', 'int8', 'int32'), default='float16')
+    p.add_argument('--dtype', choices=PAYLOAD_DTYPE_NAMES, default='float16')
     p.add_argument('--width', type=int, default=4096)
     p.add_argument('--row-scale', type=int, default=128)
     p.add_argument('--min-chunk-bytes', type=int, default=1)
@@ -155,6 +158,11 @@ def main():
         if dfx_abi() != 2: raise AttributeError('public SDK reporting ABI 2 required')
     except AttributeError as exc:
         raise RuntimeError('rebuild/install route: public SDK reporting ABI 2 is required') from exc
+    dtype = getattr(torch, args.dtype)
+    if dtype in fp8_dtypes():
+        marker = getattr(ctypes.CDLL(str(extension), mode=ctypes.RTLD_GLOBAL), 'A5DeepEpFp8PayloadAbiVersion', None)
+        if marker is None or marker() != 1:
+            raise RuntimeError('rebuild/install DeepEP: FP8 payload ABI 1 required')
     rank = int(os.environ['RANK'])
     def phase(name, **fields):
         print('EP8_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
@@ -183,7 +191,6 @@ def main():
         print('PIPELINE_LANES ' + json.dumps(dict(rank=rank, groups=[
             lane.buffer.moe_all_to_all_group_name for lane in pipeline.lanes],
             lanes=['direct', 'first_hop', 'second_hop'])), flush=True)
-    dtype = getattr(torch, args.dtype)
     row_bytes = torch.empty((), dtype=dtype).element_size() * args.width
     planner_options = dict(min_chunk_bytes=args.min_chunk_bytes, min_gain_bytes=args.min_gain_bytes,
                            max_actions=args.max_actions, relay_capacity_bytes=[args.relay_capacity_mib << 20] * 8)
@@ -215,7 +222,7 @@ def main():
     def native_alltoallv(send, recv, input_splits, output_splits):
         # Same payload API / Work.wait contract as vLLM Ascend async_all_to_all.
         # Outputs are preallocated for EVERY mode; wrapper allocation is excluded.
-        work = dist.all_to_all_single(recv, send, input_split_sizes=input_splits,
+        work = dist.all_to_all_single(byte_payload_view(recv), byte_payload_view(send), input_split_sizes=input_splits,
                                       output_split_sizes=output_splits, group=dist.group.WORLD,
                                       async_op=True)
         work.wait()
@@ -250,13 +257,13 @@ def main():
         sends = list(counts[rank * 8:rank * 8 + 8]); recvs = list(counts[rank::8])
         def payload(s):
             n = sum(counts[s * 8:s * 8 + 8])
-            return ((torch.arange(n * args.width, dtype=torch.int64).reshape(n, args.width) * 7 + s * 11) % 97).to(dtype)
+            return make_payload(n, args.width, s, dtype)
         source = payload(rank)
-        expected = torch.cat([payload(s)[sum(counts[s * 8:s * 8 + rank]):sum(counts[s * 8:s * 8 + rank]) + counts[s * 8 + rank]] for s in range(8)], dim=0)
+        expected = cat_payload([payload(s)[sum(counts[s * 8:s * 8 + rank]):sum(counts[s * 8:s * 8 + rank]) + counts[s * 8 + rank]] for s in range(8)])
         guard = 37
-        input_store = torch.full((source.numel() + 2 * guard,), -19, dtype=dtype, device='npu')
+        input_store = full_payload((source.numel() + 2 * guard,), -19, dtype, 'npu')
         send = input_store[guard:-guard].reshape(sum(sends), args.width)
-        stores = {name: torch.full((expected.numel() + 2 * guard,), -17, dtype=dtype, device='npu')
+        stores = {name: full_payload((expected.numel() + 2 * guard,), -17, dtype, 'npu')
                   for name in ('direct', 'multipath', 'native')}
         outputs = {name: storage[guard:-guard].reshape(sum(recvs), args.width) for name, storage in stores.items()}
         prepare_options = dict(max_scratch_bytes=args.max_scratch_mib << 20)
@@ -305,16 +312,15 @@ def main():
                    multipath=selected_multi,
                    native=lambda: native_alltoallv(send, outputs['native'], sends, recvs))
         def set_payload(epoch):
-            send.copy_(source + epoch)
-            for output in outputs.values(): output.fill_(-17)
+            copy_payload_(send, shifted_payload(source, epoch))
+            for output in outputs.values(): fill_payload_(output, -17)
             torch.npu.synchronize()
         def check(name, epoch):
-            if not torch.equal(outputs[name].cpu(), expected + epoch):
+            if not equal_payload(outputs[name], shifted_payload(expected, epoch)):
                 raise AssertionError(f'{case_name} {name} mismatch rank={rank} epoch={epoch}')
-            if not torch.equal(send.cpu(), source + epoch): raise AssertionError('input modified')
+            if not equal_payload(send, shifted_payload(source, epoch)): raise AssertionError('input modified')
             for storage, sentinel in ((input_store, -19), (stores[name], -17)):
-                cpu = storage.cpu()
-                if not ((cpu[:guard] == sentinel).all() and (cpu[-guard:] == sentinel).all()):
+                if not guards_intact(storage, guard, sentinel):
                     raise AssertionError('guard modified')
         # All modes prove against native and an independently built host oracle.
         for epoch in range(2):
@@ -329,13 +335,13 @@ def main():
             # that the ordinary per-call correctness sync would otherwise hide.
             snapshots = []
             for queued_epoch in (epoch + 7, epoch + 13, epoch + 19):
-                send.copy_(source + queued_epoch)
+                copy_payload_(send, shifted_payload(source, queued_epoch))
                 if cpp is not None: cpp.execute(cpp_prepared, send, outputs['multipath'])
                 else: forced.execute(send, outputs['multipath'])
-                snapshots.append((queued_epoch, outputs['multipath'].clone()))
+                snapshots.append((queued_epoch, clone_payload(outputs['multipath'])))
             torch.npu.synchronize()
             for queued_epoch, snapshot in snapshots:
-                if not torch.equal(snapshot.cpu(), expected + queued_epoch):
+                if not equal_payload(snapshot, shifted_payload(expected, queued_epoch)):
                     raise AssertionError(f'queued stream ordering failure rank={rank}')
             if cpp is not None:
                 set_payload(epoch)
@@ -370,7 +376,7 @@ def main():
                 set_payload(epoch)
                 for _ in range(args.warmup): ops[name]()
                 torch.npu.synchronize()
-                outputs[name].fill_(-17)
+                fill_payload_(outputs[name], -17)
                 dist.barrier(); torch.npu.synchronize()
                 begin = time.perf_counter()
                 for _ in range(args.iters): ops[name]()
@@ -484,6 +490,7 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
+                  payload_transport=('uint8_bitwise' if dtype in fp8_dtypes() else 'typed'),
                   benchmark=dict(protocol=11, pipeline_host=args.pipeline_host,
                                  cpp_copy_mode=(args.cpp_copy_mode if cpp is not None else 'unused'), planner=args.planner, routing_policy=args.routing_policy,
                                  fast_link_gbps=args.fast_link_gbps, fast_extra_us=args.fast_extra_us,
