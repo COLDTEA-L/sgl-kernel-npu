@@ -14,7 +14,7 @@ from dataclasses import replace
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
-from heuristic_alltoallv import RelayPlanner, make_plan, MAX_I64, _coalesce_spans
+from heuristic_alltoallv import RelayPlanner, FastRelayPlanner, make_plan, MAX_I64, _coalesce_spans
 from pipelined_alltoallv import build_pipeline_schedule
 from test_a5_ccu_pipeline_cpu import ALL, simulate
 
@@ -57,6 +57,78 @@ class NativePlannerTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
+
+    def test_fast_admission_defaults_and_large_hotspot(self):
+        from test_a5_ccu_heuristic_npu import synthetic
+        planner = FastRelayPlanner(8192, ALL, native_module=self.native)
+        for name in ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'):
+            result = planner.select(synthetic(name, 128))
+            self.assertFalse(result.uses_relay, name)
+            self.assertEqual(result.candidate_evaluations, 0, name)
+        # Decisions use counts, never a synthetic-case label. 64 MiB original
+        # hotspot admits at these configurable costs; it has exactly one relay.
+        c = synthetic('single_hot', 256)
+        decision = planner.select(c)
+        self.assertTrue(decision.uses_relay)
+        self.assertGreater(decision.predicted_saving_us, 20)
+        self.assertLessEqual(decision.candidate_evaluations, 24)
+        plan = planner.materialize(decision)
+        self.assertEqual(len(plan.actions), 1)
+        schedule = build_pipeline_schedule(plan, chunk_bytes=decision.chunk_bytes)
+        self.assertLessEqual(len(schedule.chunks), 2)
+        self.assertGreater(decision.chunk_bytes, 8 << 20)
+        self.assertEqual(plan.counts, c)
+
+    def test_fast_randomized_conservation_topology_capacity_and_payload(self):
+        rng = random.Random(8971)
+        for trial in range(300):
+            c = [rng.randrange(4) for _ in range(64)]
+            f = rng.choice([i for i in range(64) if i // 8 != i % 8])
+            c[f] += rng.randrange(10, 61)
+            allowed = [sorted(rng.sample(v, rng.randrange(len(v) + 1))) for v in ALL]
+            caps = [rng.randrange(1, 41) * 8 for _ in range(8)]
+            planner = FastRelayPlanner(8, allowed, native_module=self.native,
+                        chunk_bytes=24, extra_us=0, min_saving_us=0, relay_capacity_bytes=caps)
+            decision = planner.select(c)
+            plan = planner.materialize(decision)
+            self.assertLessEqual(len(plan.actions), 1)
+            self.assertLessEqual(decision.candidate_evaluations, 24)
+            original = [n if i // 8 != i % 8 else 0 for i, n in enumerate(c)]
+            self.assertEqual(sum(plan.link_rows), sum(original) + sum(plan.relay_rows))
+            if decision.uses_relay:
+                self.assertIn(decision.relay, allowed[decision.flow])
+                self.assertLessEqual(decision.rows * 8, caps[decision.relay])
+                self.assertLess(max(plan.link_rows), max(original))
+                self.assertLessEqual(len(build_pipeline_schedule(plan, chunk_bytes=decision.chunk_bytes).chunks), 2)
+            if trial < 80:
+                simulate(plan, decision.chunk_bytes or 24)
+            # Same static selector processes a different real matrix every call.
+            changed = list(c); changed[f] = 0
+            second = planner.select(changed)
+            self.assertEqual(planner.materialize(second).counts, tuple(changed))
+            self.assertEqual(planner.materialize(decision).counts, tuple(c))
+
+    def test_fast_boundaries_and_no_implicit_tensor_conversion(self):
+        planner = FastRelayPlanner(1, ALL, native_module=self.native,
+                                   extra_us=0, min_saving_us=0, chunk_bytes=1)
+        c = [0] * 64; c[7] = MAX_I64
+        d = planner.select(c)
+        p = planner.materialize(d)
+        self.assertTrue(d.uses_relay)
+        self.assertLessEqual(d.chunk_bytes, MAX_I64)
+        self.assertEqual(p.counts, tuple(c))
+        for value in (-1, True, 1.5, MAX_I64 + 1):
+            invalid = [0] * 64; invalid[1] = value
+            with self.assertRaises((ValueError, OverflowError)): planner.select(invalid)
+        for invalid in ([0] * 63, [0] * 8, [[0] * 7] * 8, object()):
+            with self.assertRaises(ValueError): planner.select(invalid)
+        self.assertEqual(planner.select([[0] * 8 for _ in range(8)]).reason, 'no_remote_traffic')
+        c = [0] * 64; c[1] = 90
+        none = FastRelayPlanner(1, [()] * 64, native_module=self.native, extra_us=0, min_saving_us=0)
+        self.assertFalse(none.select(c).uses_relay)
+        with self.assertRaises(ValueError): none.materialize(planner.select(c))
+        for opts in (dict(link_gbps=0), dict(extra_us=-1), dict(min_saving_us=float('nan'))):
+            with self.assertRaises(ValueError): FastRelayPlanner(1, ALL, native_module=self.native, **opts)
 
     def compare(self, c, rb, allowed, options, chunk_bytes):
         reference = make_plan(c, rb, allowed, **options)

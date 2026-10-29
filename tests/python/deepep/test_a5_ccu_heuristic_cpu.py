@@ -241,6 +241,29 @@ class PlannerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'measured native'):
                 compare_runs(root, root, 'native')
 
+    def test_fast_native_fallback_summary_is_not_relay_speedup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'results').mkdir()
+            (root / 'exit.status').write_text('0')
+            for rank in range(8):
+                values = {'native': [8.], 'multipath': [8.]}
+                case = dict(case='hot', correctness='PASS', fingerprint='same',
+                            plan={'fingerprint': 'same'}, schedule={}, planner_us=1,
+                            prepared_round_us=values, dynamic_round_us=values,
+                            dynamic_mean_us={m: 8. for m in values},
+                            dynamic_components_round_us={m: [dict(execute=8.)] for m in values},
+                            dynamic_backend_calls=dict(native=4, pipeline=0, custom_direct=0),
+                            execution=dict(executed_relay=False, selected_backend='native'), executor_sync='stream')
+                result = dict(rank=rank, ranks=8, correctness='PASS', mode='all', dtype='float16',
+                              width=8, backend='test', timing_scope='test', dynamic_scope='test',
+                              benchmark=dict(protocol=9, routing_policy='fast'), cases=[case])
+                (root / 'results' / f'rank{rank}.json').write_text(json.dumps(result))
+            summary = summarize(root)['cases'][0]
+            self.assertIn('NATIVE_FALLBACK', summary['analysis'])
+            self.assertNotIn('custom direct', summary['analysis'])
+            self.assertEqual(summary['dynamic_backend_calls_per_rank'][0]['pipeline'], 0)
+            self.assertFalse(compare_runs(root, root, 'native')[0]['multipath_speedup_claim_allowed'])
+
     def test_topology_join_and_missing_live_eid(self):
         devices = list(reversed(range(8))); entries, edges = [], []
         for s in range(8):

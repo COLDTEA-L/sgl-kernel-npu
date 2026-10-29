@@ -143,6 +143,41 @@ class RelayPlanner:
                          self._native.layout)
 
 
+class FastRelayPlanner:
+    """Bounded C++ admission policy for changing real packed counts.
+
+    select() returns a small decision. If false, call native HCCL immediately;
+    do NOT materialize a RoutePlan or prepare pipeline workspace. Cost defaults
+    are conservative estimates from this machine family, not latency guarantees.
+    """
+    def __init__(self, row_bytes, allowed_relays, *, native_module,
+                 chunk_bytes=8 << 20, link_gbps=50., extra_us=500., min_saving_us=20.,
+                 relay_capacity_bytes=None):
+        if getattr(native_module, 'ep8_fast_selector_abi', None) != 1:
+            raise RuntimeError('rebuild/install DeepEP: ep8_fast_selector_abi=1 required')
+        self._layout = RelayPlanner(row_bytes, allowed_relays, native_module=native_module,
+                                   relay_capacity_bytes=relay_capacity_bytes)
+        self.row_bytes = self._layout.row_bytes
+        self._selector = native_module.Ep8FastSelector(
+            self._layout.relays, self.row_bytes,
+            () if relay_capacity_bytes is None else self._layout.options['relay_capacity_bytes'],
+            _uint(chunk_bytes, 'chunk_bytes', 1), float(link_gbps), float(extra_us), float(min_saving_us))
+
+    def select(self, counts):
+        return self._selector.select(counts)
+
+    def materialize(self, decision):
+        c, chosen, moved, loads, actions, evaluations, reason = self._selector.materialize(decision)
+        return RoutePlan(c, self.row_bytes, chosen, moved, loads, actions, evaluations, reason,
+                         self._layout._native.layout)
+
+    @staticmethod
+    def report(decision):
+        return {key: getattr(decision, key) for key in
+                ('uses_relay', 'reason', 'flow', 'relay', 'rows', 'chunk_bytes',
+                 'candidate_evaluations', 'predicted_direct_us', 'predicted_relay_us', 'predicted_saving_us')}
+
+
 def make_plan(counts, row_bytes, allowed_relays, *, min_chunk_bytes=1,
               min_gain_bytes=0, max_actions=56, relay_capacity_bytes=None):
     """Greedy O(N^5), at most one distinct relay/action per original flow.

@@ -18,6 +18,7 @@ def main():
     extension = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(extension)
     assert extension.ep8_relay_planner_abi == 2
+    assert extension.ep8_fast_selector_abi == 1
     def copy(src, dst, spans):
         extension.ep8_copy_spans_out(src, dst, extension.Ep8CopySpans(spans))
 
@@ -41,6 +42,21 @@ def main():
                 for name in methods:
                     with self.subTest(method=name):
                         getattr(pipeline_tests.PipelineTests(name), name)()
+
+        def test_production_fast_selector_changing_counts(self):
+            import test_a5_ccu_pipeline_cpu as pipeline_tests
+            from heuristic_alltoallv import FastRelayPlanner
+            fast = FastRelayPlanner(8, pipeline_tests.ALL, native_module=extension,
+                                    chunk_bytes=24, extra_us=0, min_saving_us=0)
+            for i in range(24):
+                c = [0] * 64
+                c[(i % 7) * 8 + 7] = 60 + i
+                decision = fast.select(c)
+                self.assertTrue(decision.uses_relay)
+                plan = fast.materialize(decision)
+                self.assertEqual(plan.counts, tuple(c))
+                pipeline_tests.simulate(plan, decision.chunk_bytes)
+            self.assertFalse(fast.select([0] * 64).uses_relay)
 
         def test_workspace_views_slots_storage_and_bounds(self):
             arena = [torch.zeros((10, 4)) for _ in range(8)]

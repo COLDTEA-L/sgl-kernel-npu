@@ -5,16 +5,21 @@
 新算法仅用于八卡；relay 只能是同一通信组内、且不同于源和目的的 rank。
 2/4 卡等长多路径 API、组外 relay 规则及原执行路径保留，不使用这个规划器。
 
-本版默认 `--executor pipeline`，执行 **direct 独立推进 + relay 分块双缓冲流水线**。
-候选 relay 仍由原来的单 relay 贪心算法选择，输入仍是本批实际 packed 行数 C[8][8]。
+本版新增并默认 `--routing-policy fast`：C++筛选单热点，预计净收益不足即调用原生HCCL。
+`--routing-policy greedy` 保留之前的贪心实验。新版本复测按第2节安装、第3节旧执行器正确性、
+第4.9节新策略验证。以下第3～4.8节命令已显式固定greedy，避免默认值变化混淆历史对照。
+
+被新策略允许的流仍使用 `--executor pipeline`，执行 **direct 独立推进 + relay 分块双缓冲流水线**。
+fast每批仅选最多一条流/一个relay；greedy保留逐流贪心。两者输入都是本批实际packed行数C[8][8]。
 新增实现使用现有 CCU direct AllToAllV API，不改 2/4 卡接口，不用组外 relay。
 
-本次默认 `--planner native`：C++ 固定数组贪心选路和分块布局，静态拓扑校验一次。
+默认 `--planner native`：C++筛选/选路和分块布局，静态拓扑校验一次。
+以下关于与Python相同relay决策的说明仅适用于`--routing-policy greedy`。
 各rank拷贝段的筛选/合并以及pack/forward/unpack逐段提交也在C++中完成；
 工作区及分块张量视图也由C++一次构造。Python仍负责context生命周期和stream/event编排，
 并非完整C++执行器。
 `--planner python` 保留原参考实现。两者选择相同 relay、分流行数和偏移；原生扫描顺序不同，
-诊断用候选评估次数可能不同。每轮 C 都会重新处理，没有固定路由缓存，也没有自动关闭 relay。
+诊断用候选评估次数可能不同。每轮 C 都会重新处理，没有固定路由缓存；fast会明确拒绝预计不合算的relay。
 
 ```text
 调用者 stream：输入就绪 ── direct CCU（原偏移直接读写） ─────────── 等待 relay 完成 → 消费
@@ -28,12 +33,14 @@
 relay communicator，隔离 ADDRESS/TOKEN/DONE 通知和 CCU 资源。两条 relay stream 和通信组
 在初始化时创建一次，dynamic 不会逐批重建。初始化成功不代表硬件已经验证可重叠执行。
 
-每个 chunk 是“每条原始 relay 流至多 chunk_rows 行”的一个批次，默认每流 8 MiB（向下按行
+greedy的每个chunk是“每条原始relay流至多chunk_rows行”的一个批次，默认每流8 MiB（向下按行
 对齐，至少一行），不是整个机器合计 8 MiB。同一 relay 的多条流可能拼成更大的单次传输。
 `8388608`严格是8MiB。默认FP16、width=4096时每行8192B，一块为1024个packed行，
 不是1024个未展开的模型token。默认single_hot的0→4原始流为32MiB：16MiB直传、
 16MiB分成两个8MiB块经过relay。源rank0另有3MiB self，因此其原输入总量为35MiB；
 热点流在网络上产生16MiB直传+16MiB第一跳+16MiB第二跳=48MiB，不能将chunk大小当作总量。
+fast将8MiB作为基础分块大小，大热点会增大到约转发量的一半以控制在两批内；
+实际值见`execution.admission.chunk_bytes`。下文固定8MiB解释针对greedy。
 **首版的 ready 粒度是一个 chunk 批次的 CCU AllToAllV 完成握手，仍等待该批次所有 peer；
 不是某一个 packet 到达就直接触发，也不是单次融合 CCU kernel。** 但是不再等待 direct，
 也不等待整条消息的所有第一跳完成；第二跳块 j 与第一跳块 j+1 没有依赖，可以重叠。
@@ -84,14 +91,14 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-**这次必须重新构建并安装 DeepEP wheel**：增加 C++ `Ep8RelayPlanner` 和 Python 扩展属性
+**这次必须重新构建并安装 DeepEP wheel**：新增C++ `Ep8FastSelector`，保留规划/执行扩展属性
 `ep8_relay_planner_abi=2`、`ep8_copy_spans_out`和`ep8_bind_workspace_views`。
-默认 native worker 会在建组前检查，
-包括刚安装过`c8c7288` ABI 1 wheel的环境，也须重装本版wheel；不会悄悄回退到Python。
+fast还要求`ep8_fast_selector_abi=1`。默认native worker会在建组前检查，
+即使已安装`d0e6e98` wheel，也须重装本版wheel以获得fast selector；不会悄悄回退到Python。
 已经安装 `b3a5a5b` 或更新 route 包（`A5CcuEp8DfxAbiVersion=1`）时，route 不需要重新构建；
 下方保留完整双包流程，可跳过 route 的构建命令但保留 ABI 检查。
 从 `973aafb` 或更早版本升级时，DeepEP 和 route 都按完整流程构建安装。
-先执行本节、再执行第 3 节、4.8 节和 4.4 节长跑。2/4 卡接口不变。
+先执行本节、再执行第3节和第4.9节（含新策略长跑）；4.4节保留旧greedy长跑。2/4卡接口不变。
 
 本次增加 EP8 die-1 的持久 event 通知桥，以及按原始段偏移传输 direct 前缀的接口。
 worker 要求 `A5DeepEpPipelineWorkspaceAbiVersion=2`，route 要求
@@ -181,7 +188,7 @@ DeepEP C++ 调用接口保持兼容，本次增加 host-only 规划绑定，必�
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy \
   --executor pipeline --suite correctness --dtype float32 --width 257 --row-scale 1 \
   --warmup 1 --iters 2 --rounds 1 --dynamic-iters 1
 ```
@@ -225,8 +232,8 @@ AllToAllV 分支的 payload API。`direct` 是我们的自定义 CCU direct-only
 分别运行 native 和 multipath；参数相同，输出都放个人 profiling 目录：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode native --case single_hot --chunk-bytes 8388608
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode multipath --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode native --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode multipath --case single_hot --chunk-bytes 8388608
 # 用两次实际输出目录替换 NATIVE_RUN / MULTIPATH_RUN
 python3 scripts/summarize_a5_ccu_heuristic.py --baseline native --compare \
   /home/l00934901/profiling/a5-ep8-heuristic.NATIVE_RUN \
@@ -236,7 +243,7 @@ python3 scripts/summarize_a5_ccu_heuristic.py --baseline native --compare \
 同进程三路测量用 `--mode all`，建议6轮以覆盖全部六种测量顺序：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode all --case single_hot --rounds 6 --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode all --case single_hot --rounds 6 --chunk-bytes 8388608
 ```
 
 输出同时包含 `native_over_multipath` 和 `direct_over_multipath`。
@@ -253,8 +260,8 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode all --case single_hot --ro
 以下保留 custom direct 消融实验。两次使用完全相同的参数：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode direct --case single_hot
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode multipath --case single_hot
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode direct --case single_hot
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode multipath --case single_hot
 ```
 
 `--mode` 只决定计时对象；每次仍会先验证 direct/multipath/native，防止跳过正确性。
@@ -278,10 +285,10 @@ python3 scripts/summarize_a5_ccu_heuristic.py --compare \
 为了降低跨运行波动，推荐再在同一个 worker 中交替顺序测量：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case single_hot
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case asymmetric
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case competing
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both --case cut
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode both --case single_hot
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode both --case asymmetric
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode both --case competing
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode both --case cut
 ```
 
 asymmetric 对应之前第九步矩阵：默认八卡含 self 244 MiB、跨卡 214 MiB、最大原始流 10 MiB。
@@ -336,11 +343,11 @@ asymmetric 255→1065 us；cut 无 relay 却出现 dynamic 3051→1490 us。
 ```bash
 # 先完成第 2 节构建和第 3 节正确性。
 # 同一输入，对比去掉设备同步前后；两次仍各自包含 direct baseline。
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync device
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --executor-sync stream
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case asymmetric --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor serial --mode both --case single_hot --executor-sync device
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor serial --mode both --case single_hot --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor serial --mode both --case asymmetric --executor-sync stream
 # 无分流 A/A 控制：prepared 应接近，dynamic 不用于声称多路径收益。
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case cut --executor-sync stream
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor serial --mode both --case cut --executor-sync stream
 ```
 
 默认 `--multipath-policy force` 真正执行贪心产生的分流，便于观察真实性能，绝不把
@@ -354,7 +361,7 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --c
 额外开销，却不会消除串行两跳本身的限制；新机是否变快必须重测。
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --case single_hot --multipath-policy auto
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor serial --mode both --case single_hot --multipath-policy auto
 ```
 
 即使选择 auto，正确性阶段也额外强制验证真实 relay 路径，避免回退掩盖实现错误。
@@ -366,7 +373,7 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor serial --mode both --c
 4 轮、每轮 3 次动态预热和 10 次动态测量，共 52 次动态执行；不要靠缩短迭代绕过失败：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy \
   --executor pipeline --thread-bridge event --mode multipath --case single_hot --chunk-bytes 2097152 \
   --rounds 4 --warmup 3 --dynamic-iters 10
 ```
@@ -383,20 +390,20 @@ correctness、prepared、dynamic 与销毁阶段，便于对齐 plog。
 通过后可进一步长跑，并验证有竞争流和无 relay 对照：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152 --dynamic-iters 100
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case competing --chunk-bytes 8388608
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case asymmetric --chunk-bytes 8388608
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case cut
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode multipath --case single_hot --chunk-bytes 2097152 --dynamic-iters 100
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode both --case competing --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode both --case asymmetric --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode both --case cut
 ```
 
 性能比较使用 8 MiB 作为起始实验配置，分别运行 baseline/direct 与真实分流，两次参数完全一致：
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode direct --case single_hot --chunk-bytes 8388608
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode multipath --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode direct --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode multipath --case single_hot --chunk-bytes 8388608
 # 用第 4 节 --compare 命令比较两个实际输出目录，均位于 /home/l00934901/profiling。
 # 再做同进程交替测量：
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --executor pipeline --mode both --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --executor pipeline --mode both --case single_hot --chunk-bytes 8388608
 ```
 
 用户提供的旧版低迭代测量中，single_hot 的 2/4/8 MiB 分块分别约 2199/1210/690 us，
@@ -461,7 +468,7 @@ caller record ready → route wait ready → CCU launch → route record done �
 
 ```bash
 for A5_CHUNK in 1048576 2097152 4194304 8388608 16777216; do
-  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy \
     --executor pipeline --thread-bridge event --mode both --case single_hot \
     --chunk-bytes "$A5_CHUNK"
 done
@@ -511,7 +518,7 @@ dynamic `prepare()` 仅重新构建 Python 布局，不销毁/重建通信域。
 `event_route_done` 以前还会重复打印 launch 的错误，本版消除这个重复阶段误导。
 
 DFX修复提交 `b3a5a5b` 的 benchmark protocol 为5；native性能baseline版本为6，
-首版C++规划为7，当前C++拷贝描述/提交版为 **8**。必须重新获取比较数据，
+首版C++规划为7，C++拷贝描述/提交版为8，当前fast策略版为 **9**。必须重新获取比较数据，
 比较工具拒绝跨protocol或不同planner的结果。
 DFX 注册也有 host 成本，本修复不承诺性能提升。
 
@@ -519,7 +526,7 @@ DFX 注册也有 host 成本，本修复不承诺性能提升。
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy \
   --executor pipeline --thread-bridge event --mode multipath --case single_hot \
   --chunk-bytes 2097152 --rounds 4 --warmup 3 --dynamic-iters 100
 ```
@@ -652,7 +659,7 @@ python3 scripts/benchmark_a5_ep8_planner.py \
 cd /home/l00934901/sgl-kernel-npu
 for A5_PLANNER in python native; do
   for A5_CASE in single_hot competing asymmetric cut uniform self zero; do
-    bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy \
       --executor pipeline --planner "$A5_PLANNER" --mode all --case "$A5_CASE" \
       --rounds 6 --chunk-bytes 8388608
   done
@@ -682,6 +689,108 @@ H=4096、K=6、N=1024、BF16对应每源rank打包48MiB，均匀时每个目的r
 其中跨卡42MiB；W8A8 activation dispatch减半，另交换scale。6MiB不是整组或每卡总量。
 模型通信分支也需确认确实为ALLTOALL，而不是MC2/FUSED_MC2/ALLGATHER。
 
+
+### 4.9 单热点快速筛选：原生回退与固定预算（本版）
+
+旧greedy减少链路峰值却忽略host开销及第二跳尾部。用户最新数据中single_hot的
+prepared优势77.5µs，而dynamic仍多465.2µs；这两种计时的差额不能精确拆成规划耗时。
+此前C++选路已降到几十µs，继续精简56轮循环也不能消除无relay时布局/工作区准备。
+双方dynamic都做计数gather/D2H，不能将这项全部算成多路径额外成本。
+
+新策略仅扫描一次64项，找出最大跨卡流A及其余边的最大值M，最多枚举该流6个relay，
+每个relay试4个分流量，合计不超过24个候选。没有56轮更新、排序、穷举cut或路由缓存。
+对候选relay，h=max(C[s,k],C[k,d])；转发x行、每块q行时使用成本代理：
+
+```text
+q = max(基础块行数, ceil(x/2))          # 最多两批
+native_proxy = A * row_bytes / B
+relay_proxy = max(M, A-x, h+x+min(x,q)) * row_bytes / B + H
+只有 native_proxy - relay_proxy > margin 才允许转发
+```
+
+B默认50GB/s（50000B/µs），H默认500µs，margin默认20µs，分别由
+`--fast-link-gbps`、`--fast-extra-us`、`--fast-min-saving-us`控制。
+H是基于现有dynamic结果设置的初始额外成本预算，包含未建模的准备、提交和拷贝成本，
+**不是实时测量，不是已校准的硬件常数**。代理也未精确描述HBM/共享物理资源的争抢，
+不能保证获准的case一定加速；必须以新机实测判断。
+
+两批且空闲relay时，平衡A-x与x+x/2得到x约2A/5，不再强制对半。
+实际只试gap/3、2gap/5、基础块、两倍基础块，分别按整行/容量约束裁剪，
+每条候选路径只含通信组内合法relay。全局剩余峰值M不下降时，不为局部流量改善而转发。
+先用max可能收益min(A-M, 2A/5)进行门控，低于H+margin立即返回；不是声称这是
+所有可能路由算法的收益上界，只是此处单流、最多两批成本代理的乐观界。
+
+默认参数预期：原七个case全部选择native；single_hot放大至64MiB、128MiB才可能选择relay。
+这不是按case名称特判：只读取当前C、拓扑和成本配置。不可把七个case的回退结果称作多路径加速。
+拒绝时不materialize RoutePlan、不build layout、不创建工作区视图，直接执行与native baseline
+同一个`dist.all_to_all_single(async_op=True)`及`Work.wait()`。仍有一次筛选的额外开销，
+不能承诺逐次延迟完全等于原生。通信域、channel、kernel及高水位工作区继续复用。
+
+本版protocol=9，记录routing_policy/成本配置/实际chunk/后端和动态后端调用数；
+不能与旧protocol或不同策略结果直接`--compare`。greedy仍可通过显式选项复现旧结果。
+`--planner python`和serial对照须使用`--routing-policy greedy`。
+
+重编安装第2节wheel（route不变），先跑快速策略的七case正确性：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --routing-policy fast --suite correctness --mode all --rounds 1 --warmup 1 --iters 2 --dynamic-iters 2
+```
+
+正确性阶段同时强制跑旧greedy relay及多块复用检查，不会因fast全部回退而跳过relay验证。
+再比较七case的dynamic回退开销，并扫描大热点的收益边界（无profiling）：
+
+```bash
+for A5_CASE in single_hot competing asymmetric cut uniform self zero; do
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    --routing-policy fast --mode all --case "$A5_CASE" --rounds 6 --dynamic-iters 100
+done
+# 默认每行8192B：scale128/256/512对应single_hot原始热点32/64/128MiB。
+for A5_SCALE in 128 256 512; do
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    --routing-policy fast --mode all --case single_hot --row-scale "$A5_SCALE" \
+    --rounds 6 --dynamic-iters 100
+done
+```
+
+检查`execution.selected_backend`、`execution.admission`及`dynamic_backend_calls_per_rank`
+（后者包括dynamic预热及测量，不包括正确性和prepared调用）。
+拒绝的case重点看筛选耗时和native/multipath dynamic差值；prepared是native/native A/A。
+获准的case必须检查正确性、实际relay、prepared和dynamic；默认64MiB是否有收益仍待实测。
+若大热点也劣化，应提高H/缩小使用范围，不应把模型预测当作已验证性能。
+
+单独两次运行的原生baseline对照（参数和策略相同）：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --routing-policy fast --mode native --case single_hot --row-scale 256 --rounds 6
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --routing-policy fast --mode multipath --case single_hot --row-scale 256 --rounds 6
+# 将下方路径替换为上面输出的两个实际结果目录。
+python3 scripts/summarize_a5_ccu_heuristic.py --baseline native --compare \
+  /home/l00934901/profiling/实际native目录 /home/l00934901/profiling/实际multipath目录
+```
+
+面向模型的host接口（与上面的成本决策相同，C必须是本批真实packed行数）：
+
+```python
+selector = FastRelayPlanner(row_bytes, allowed_relays, native_module=deep_ep_cpp)
+decision = selector.select(C)
+if not decision.uses_relay:
+    # 直接复用模型已有的原生AllToAllV及split sizes；不准备pipeline。
+    native_alltoallv(send, recv, send_splits, recv_splits)
+else:
+    plan = selector.materialize(decision)
+    prepared = PreparedPipelinedAllToAllV(context, plan, send, chunk_bytes=decision.chunk_bytes)
+    prepared.execute(send, recv)
+```
+
+selector/context在通信组初始化时创建一次。所有rank必须使用相同C、拓扑和成本参数，
+一致地选择后端。复用模型已产生的计数，不额外添加本微基准的gather/D2H；
+本次尚未修改vLLM Ascend模型调用点。C++核心为`ep8_fast_selector.hpp`，没有Python选路循环。
+
+
 ## 5. 输入真实路由矩阵
 
 外部矩阵文件格式如下，`counts` 必须是实际 dispatch 打包后的行数；也支持扁平 64 项：
@@ -703,7 +812,7 @@ H=4096、K=6、N=1024、BF16对应每源rank打包48MiB，均匀时每个目的r
 ```
 
 ```bash
-bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both \
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --routing-policy greedy --mode both \
   --matrix-json /home/l00934901/profiling/router_counts.json \
   --dtype bfloat16 --width 4096
 ```
@@ -918,3 +1027,26 @@ CPU准备包括layout、池检查、rank0张量视图构造，不包括数据传
 
 准备计时使用rank0 CPU张量，未执行传输；不含模型计数gather/D2H，
 也未测量NPU拷贝提交。不能将这些数直接从新机dynamic总时间中扣除。
+
+### 本版开发验证：fast 单热点筛选（2026-10-29）
+
+- `cam_lyw_dev_91`实际DeepEP扩展编译通过；`ep8_fast_selector_abi=1`。route及2/4卡接口不变。
+- 135项CPU回归通过；新增的汇总标记检查连同其他heuristic回归15项通过。
+- 实际扩展的7项CPU检查通过，覆盖连续变化C的fast选择/布局/搬运模拟及原生拷贝helper。
+- 随机fast测试覆盖300组拓扑/容量/矩阵，检查组内relay、行数守恒、全局峰值下降、
+  最多24候选/1动作/2批；另检查零/self、非法输入及int64上界。
+- 实际扩展、500次交替C的CPU数据如下；不含gather/D2H和设备传输：
+
+| 输入 | 旧C++ greedy选路+CPU准备 µs | fast筛选 µs | fast筛选+按需CPU准备 µs | 决策 |
+|---|---:|---:|---:|---|
+| single_hot 32MiB | 111.0 | 1.83 | 2.05 | native |
+| competing | 133.5 | 1.83 | 2.17 | native |
+| asymmetric | 137.9 | 1.93 | 2.09 | native |
+| single_hot 64MiB | 140.0 | 4.24 | 116.2 | 1 relay / 2批 |
+| single_hot 128MiB | 210.8 | 4.36 | 120.8 | 1 relay / 2批 |
+
+原七case的fast工作区统计均为0分配、0事件、0容量；获准热点复用持久双缓冲池。
+64MiB的预测净收益仅36.7µs，属于需要重点验证的边界，不能据此宣称已加速。
+开发机无目标NPU执行验证；新机请执行第4.9节。所有日志与数据在
+`/home/l00934901/profiling/a5-ep8-fast-dev/`，包括`cpu-tests.log`、`summary-tests.log`、
+`production-binding-tests.log`、`deepep-build.log`、`timing.json`和`timing.log`。

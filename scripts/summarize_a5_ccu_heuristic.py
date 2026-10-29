@@ -82,7 +82,12 @@ def summarize(root):
                 summary['analysis'] = ('dynamic multipath faster than ' + baseline + ' on this workload' if
                                        summary['dynamic'][baseline + '_over_multipath'] > 1 else
                                        'no dynamic speedup over ' + baseline + ' on this workload')
-            if protocol >= 2 and not case['execution']['executed_relay']:
+            if protocol >= 9:
+                summary['dynamic_backend_calls_per_rank'] = [c['dynamic_backend_calls'] for c in all_cases]
+            if protocol >= 9 and case['execution'].get('selected_backend') == 'native':
+                summary['analysis'] = ('NATIVE_FALLBACK: no relay; prepared native/multipath is A/A. '
+                                       'Dynamic includes bounded admission; this is NOT a multipath speedup.')
+            elif protocol >= 2 and not case['execution']['executed_relay']:
                 summary['analysis'] = ('NO_RELAY_EXECUTED: multipath executes custom direct; '
                                        'native comparison measures implementation differences, not relay gains. '
                                        'direct/multipath prepared is A/A; dynamic includes planner overhead. NOT multipath speedup.')

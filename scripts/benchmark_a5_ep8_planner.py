@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / 'tests/python/deepep'))
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from test_a5_ccu_native_planner_cpu import load_native_planner, ALL
 from test_a5_ccu_heuristic_npu import synthetic
-from heuristic_alltoallv import RelayPlanner
+from heuristic_alltoallv import RelayPlanner, FastRelayPlanner
 from pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV, build_pipeline_schedule
 
 
@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('/home/l00934901/profiling/a5-ep8-planner.json'))
     parser.add_argument('--iters', type=int, default=200)
+    parser.add_argument('--fast-extra-us', type=float, default=500.)
     parser.add_argument('--extension', type=Path,
                         help='optional production DeepEP SO; also measures native workspace-view binding on CPU')
     args = parser.parse_args()
@@ -50,8 +51,9 @@ def main():
             spec.loader.exec_module(native)
         else:
             native = load_native_planner(directory)
-        for name in ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'):
-            c = synthetic(name, 128)
+        for name in ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut',
+                     'single_hot_64mib', 'single_hot_128mib'):
+            c = synthetic('single_hot', 256 if name.endswith('64mib') else 512) if name.endswith('mib') else synthetic(name, 128)
             row = dict(case=name)
             for backend, module in (('python', None), ('native', native)):
                 planner = RelayPlanner(8192, ALL, native_module=module,
@@ -79,11 +81,26 @@ def main():
                     layout_us=measure(lambda i: build_pipeline_schedule(plans[i % 2], chunk_bytes=8 << 20)),
                     prepare_cpu_rank0_us=measure(prepare),
                     actions=len(plan.actions), candidate_evaluations=plan.candidate_evaluations)
+            fast = FastRelayPlanner(8192, ALL, native_module=native, extra_us=args.fast_extra_us,
+                                    relay_capacity_bytes=[1024 << 20] * 8)
+            # Use a separate persistent context; rejected calls must not prepare
+            # any pipeline object or mutate its arena allocation counters.
+            fast_context = PipelineContext(lanes, _runtime=Runtime())
+            fast_context.runtime.bind_workspace_views = getattr(native, 'ep8_bind_workspace_views', None)
+            def fast_prepare(i):
+                decision = fast.select(matrices[i % 2])
+                if not decision.uses_relay: return None
+                return PreparedPipelinedAllToAllV(fast_context, fast.materialize(decision), inputs[i % 2],
+                                                  chunk_bytes=decision.chunk_bytes)
+            decision = fast.select(c)
+            row['fast'] = dict(select_us=measure(lambda i: fast.select(matrices[i % 2])),
+                              select_prepare_cpu_rank0_us=measure(fast_prepare),
+                              selection=fast.report(decision), workspace=fast_context.workspace_stats())
             results.append(row)
             print(json.dumps(row), flush=True)
     args.output.write_text(json.dumps(dict(scope='CPU only; layout_us is INCLUDED in prepare_cpu_rank0_us',
                                           native_workspace_views=bool(args.extension),
-                                          alternating_counts=True, iters=args.iters, cases=results), indent=2) + '\n')
+                                          alternating_counts=True, fast_extra_us=args.fast_extra_us, iters=args.iters, cases=results), indent=2) + '\n')
 
 
 if __name__ == '__main__': main()
