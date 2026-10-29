@@ -119,6 +119,12 @@ def main():
             if workspace_abi() != 2: raise AttributeError('wrong workspace ABI')
         except AttributeError as exc:
             raise RuntimeError('rebuild/install DeepEP extension: pipeline workspace ABI 2 is required') from exc
+    try:
+        dfx_abi = route.A5CcuEp8DfxAbiVersion
+        dfx_abi.restype = ctypes.c_int
+        if dfx_abi() != 1: raise AttributeError('wrong DFX ABI')
+    except AttributeError as exc:
+        raise RuntimeError('rebuild/install route: EP8 DFX registration ABI 1 is required') from exc
     rank = int(os.environ['RANK'])
     def phase(name, **fields):
         print('EP8_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
@@ -334,7 +340,7 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=4, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=5, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
                                  chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge),

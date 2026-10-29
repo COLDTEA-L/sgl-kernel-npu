@@ -3,6 +3,7 @@
 #include "data_type.h"
 #include "self_copy_lane.h"
 #include "thread_event_bridge.h"
+#include "ep8_dfx.h"
 #include <cstring>
 #include "route_kernel.h"
 #include "alltoallv_kernel.h"
@@ -25,6 +26,7 @@ struct PeerPreparedPlan {
     int32_t device = -1;
     uint32_t rankSize = 0;
     bool allToAllV = false;
+    std::shared_ptr<Ep8Dfx> dfx;
     std::string id, content;
     uint32_t availableCards = 0;
     ChannelSyncMode syncMode = ChannelSyncMode::BASELINE;
@@ -195,6 +197,10 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
         }
         if (id == 0) {
             id = nextHandle.fetch_add(1);
+            if (allToAllV) {
+                const auto dfxStatus = Ep8Dfx::Create(comm, id, &plan.dfx);
+                if (dfxStatus != HCCL_SUCCESS) return dfxStatus;
+            }
             plans.emplace(id, plan);
             inserted = true;
         }
@@ -307,6 +313,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
     if (!send || !recv || !stream || !counts) return checkedStatus(HCCL_E_PTR, "entry_pointer");
     PeerPlanResources resources;
     std::shared_ptr<ThreadEventBridge> bridge;
+    std::shared_ptr<Ep8Dfx> dfx;
     HcclComm owner;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
@@ -318,6 +325,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
         if (bound == found->second.streams.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
         resources = bound->second; owner = found->second.comm;
+        dfx = found->second.dfx;
         const auto bridgeFound = found->second.bridges.find(reinterpret_cast<uintptr_t>(stream));
         if (bridgeFound != found->second.bridges.end()) bridge = bridgeFound->second;
     }
@@ -333,27 +341,39 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
     const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
     AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout);
-    auto status = HCCL_SUCCESS;
-    if (bridge) {
-        status = checkedStatus(bridge->Begin(), "event_route_start");
+    if (!dfx) return checkedStatus(HCCL_E_PTR, "dfx_context");
+    uint64_t payloadBytes = layout.selfBytes;
+    for (auto bytes : layout.pathBytes) payloadBytes += bytes; // bounded by validated storage layout
+    return dfx->Run(rank, reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
+        sendCapacity, recvCapacity, payloadBytes, [&]() -> HcclResult {
+        auto status = HCCL_SUCCESS;
+        if (bridge) {
+            status = checkedStatus(bridge->Begin(), "event_route_start");
+            if (status != HCCL_SUCCESS) return status;
+        } else if (r.routeThread != r.mainThread) {
+            status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0)), "record_route_start");
+            if (status != HCCL_SUCCESS) return status;
+            status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
+            if (status != HCCL_SUCCESS) return status;
+        }
+        status = checkedStatus(HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task), "kernel_launch");
+        if (bridge) {
+            const auto finishStatus = bridge->Finish(status);
+            // Finish preserves a failed launch and poisons the bridge; do not log
+            // that same failure again as an event failure. Never retry a launch.
+            return status != HCCL_SUCCESS ? status : checkedStatus(finishStatus, "event_route_done");
+        }
+        if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
+        status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800)), "wait_route_done");
         if (status != HCCL_SUCCESS) return status;
-    } else if (r.routeThread != r.mainThread) {
-        status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.mainThread, r.routeThread, 0)), "record_route_start");
-        if (status != HCCL_SUCCESS) return status;
-        status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
-        if (status != HCCL_SUCCESS) return status;
-    }
-    status = checkedStatus(HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task), "kernel_launch");
-    if (bridge) return checkedStatus(bridge->Finish(status), "event_route_done");
-    if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return status;
-    status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800)), "wait_route_done");
-    if (status != HCCL_SUCCESS) return status;
-    return checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)), "record_route_done");
+        return checkedStatus(static_cast<HcclResult>(HcommThreadNotifyRecordOnThread(r.routeThread, r.mainThread, 0)), "record_route_done");
+    });
 }
 
 // Additive ABI: the old contiguous interface remains unchanged.
 extern "C" int A5CcuAllToAllVLayoutAbiVersion() { return 1; }
 extern "C" int A5CcuEp8ThreadBridgeAbiVersion() { return 1; }
+extern "C" int A5CcuEp8DfxAbiVersion() { return 1; }
 extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
     uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
     HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count)

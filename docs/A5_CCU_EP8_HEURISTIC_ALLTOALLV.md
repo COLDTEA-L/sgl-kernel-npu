@@ -73,7 +73,12 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-**从 `9cd5091` 升级也必须重编并安装 DeepEP 扩展和 route 包，再执行第 3、4 节。**
+**本版从 `973aafb` 升级必须重新构建/安装 route 包；该版本的 DeepEP workspace ABI 2 可继续使用。**
+从更早版本升级仍须重编 DeepEP 和 route。先执行本节，再执行第 3、4.2 节。
+本版补上每次 EP8 CCU 提交前的 DFX 算子注册，增加 route `A5CcuEp8DfxAbiVersion=1`；
+worker 在建组前检查该标记。direct、serial 和 pipeline 共用该修复，2/4 卡不变。
+下面保留完整双包构建流程；已经安装 `973aafb` wheel 时可跳过 wheel 重编安装部分。
+
 本次增加 EP8 die-1 的持久 event 通知桥，以及按原始段偏移传输 direct 前缀的接口。
 worker 要求 `A5DeepEpPipelineWorkspaceAbiVersion=2`，route 要求
 `A5CcuAllToAllVLayoutAbiVersion=1`、`A5CcuEp8ThreadBridgeAbiVersion=1`；缺失时在建组前退出，
@@ -90,6 +95,7 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_pipeline_cpu
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_alltoallv_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_error_check_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_thread_bridge_cpu.py' -v
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_dfx_cpu.py' -v
 ```
 
 本分支新增可选的 direct EID/die 绑定校验，**需要重编并安装 route 自定义包**。
@@ -118,11 +124,12 @@ python3 - <<'PY'
 import ctypes, os
 lib = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'], mode=ctypes.RTLD_GLOBAL)
 for name in ('A5CcuBoundDirectAbiVersion', 'A5CcuAllToAllVAbiVersion',
-             'A5CcuAllToAllVLayoutAbiVersion', 'A5CcuEp8ThreadBridgeAbiVersion'):
+             'A5CcuAllToAllVLayoutAbiVersion', 'A5CcuEp8ThreadBridgeAbiVersion',
+             'A5CcuEp8DfxAbiVersion'):
     fn = getattr(lib, name)
     fn.restype = ctypes.c_int
     assert fn() == 1, name
-print('BOUND_DIRECT_ALLTOALLV_LAYOUT_AND_BRIDGE_ABI_PASS')
+print('BOUND_DIRECT_ALLTOALLV_LAYOUT_BRIDGE_AND_DFX_ABI_PASS')
 PY
 # 必须重新构建/安装 DeepEP wheel；日志和临时目录放个人 profiling 目录。
 touch "$A5_BUILD_DIR/wheel-build-started"
@@ -413,6 +420,78 @@ done
 若新 bridge 仍失败，保留当前 run.log 和 plog，优先看 `EP8_EVENT_BRIDGE_FAILED` 的原始 ACL 返回码；
 若仍看到 `record_route_done`，先确认此次实际选择是否为旧的 `--thread-bridge hcomm`。
 
+### 4.4 973aafb 长跑失败：缺少 DFX 算子注册（2026-10-29）
+
+新机报告确认 `973aafb` 的七个正确性 case、2 MiB / 52 次 dynamic 三次重复通过；
+`--dynamic-iters 100` 在 round 1 失败。真正的返回链为：
+
+```text
+ReportHcclTaskDetails: taskInfo.dfxOpInfo_->comm_ is nullptr
+  -> AddTaskInfoCallback -> SaveDfxTaskInfo
+  -> HcclReportCcuProfilingInfo -> HcclCcuKernelLaunch: status=2
+```
+
+本仓库此前直接调用 CCU launch，漏掉了原生算子执行前的
+`HcclDfxRegOpInfoByCommId`。两个 relay 通信组/handle 在 context 初始化时创建一次，
+dynamic `prepare()` 仅重新构建 Python 布局，不销毁/重建通信域。
+公开 HCOMM 源码显示注册接口会创建本次 DFX 信息并填入对应 `collComm`，
+缺少注册时 mirror task manager 中的默认信息可以一直带有空 `comm_`。
+任务上报可能延后至队列回调，解释了“前面调用通过、之后集中失败”。
+
+参考源码快照 `9c43030e1a02c00ce82f9f5b66845cfe8f9f91bc`（用于核对机制，非声称与 T560 二进制完全一致）：
+
+- [注册接口填入 comm_](https://github.com/hicann/hcomm/blob/9c43030e1a02c00ce82f9f5b66845cfe8f9f91bc/src/base_comm/primitives/api_c_adpt/cpu_primitives_c_adpt.cc#L740)
+- [任务队列满时触发回调](https://github.com/hicann/hcomm/blob/9c43030e1a02c00ce82f9f5b66845cfe8f9f91bc/src/legacy/ascend950/framework/dfx/common/mirror_task_manager.cc#L43)
+- [检查 comm_ 早于 profiling 开关判断](https://github.com/hicann/hcomm/blob/9c43030e1a02c00ce82f9f5b66845cfe8f9f91bc/src/legacy/ascend950/framework/dfx/profiling/profiling_handler.cc#L150)
+
+该快照 circular queue 上限确为 2048，但队列按 stream 管理，且一个 CCU API 调用可能
+产生多个底层 task；**不能用三个 lane 的合计调用数直接断言精确失败阈值为 2048**。
+关闭 profiler trace 不会跳过上面的空指针检查，不提供未经核实的 DFX_DISABLE 环境变量。
+开发机 9.1.0-beta.1 的 `libhcomm.so` 反汇编显示 `rtCCULaunch` 在 profiling 上报前调用。
+因此上报失败不能证明 kernel 尚未提交，更不能吞掉错误或重试同一传输。
+
+本版对每次 EP8 调用（包括 direct baseline 和零行 rank）注册有效的本次 DFX 信息，
+使用安装 SDK 的 `HcclDfxOpInfo`，通过真实 communicator 名称调用官方注册接口。
+注册失败则不提交本次 stream/event/kernel；成功后只提交一次。每次重新注册，以免
+同一 communicator 上原生 collective 改写当前 op 信息。无需每轮重建通信域或扩大队列。
+`EP8_DFX ... stage=registered status=0` 应在每个 lane 首次执行时出现。
+失败时打印该 plan 的尝试序号、group、handle、stage 和首次错误；序号不是底层 task 数。
+`event_route_done` 以前还会重复打印 launch 的错误，本版消除这个重复阶段误导。
+
+本版 benchmark protocol 为 **5**；必须重新获取 direct 和 multipath 两份数据，
+不能与 protocol 4 的计时混比。DFX 注册也有 host 成本，本修复不承诺性能提升。
+
+复测顺序：第 2 节安装新 route、第 3 节正确性，然后执行第 4.2 节的 2 MiB 短测及下面长测：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --executor pipeline --thread-bridge event --mode multipath --case single_hot \
+  --chunk-bytes 2097152 --rounds 4 --warmup 3 --dynamic-iters 100
+```
+
+这是 4×(3+100)=412 次 dynamic execute，不是总计 100 次；还包括正确性/prepared 调用。
+应完整通过所有轮次并出现 `EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`，同时检查 plog 中
+不再出现 `dfxOpInfo_->comm_ is nullptr`（含退出时的清理阶段）。之后再按第 4.2 节重测
+8 MiB direct/multipath、both 和其他 case；结果仍写 `/home/l00934901/profiling`。
+新机运行结果尚待回传，CPU 模型及编译通过不等于长跑已修复。
+
+### 4.5 8 MiB 单热点收益预期与已测边界
+
+32 MiB 单热点对半分流时，direct 为 16 MiB，relay 为两个 8 MiB 块。
+在三条有向边独立且带宽均为 B、没有提交/拷贝/握手开销的假设下，
+direct 用时 16/B，两跳流水用时 (2+1)×8/B=24/B，整体为 24/B；纯直传为 32/B。
+因此该方案理想耗时降低 **25%**（加速比 1.33×）；20% 可以作为目标，不是实测保证。
+以 direct 666 µs 为例，1.20× 对应 555 µs；耗时降低20%对应533 µs。
+不能把666 µs全部当作链路传输时间来精确预测最终耗时。
+
+`973aafb` 的8 MiB多次实测 multipath约566–705 µs，direct约664–670 µs：
+中位数593 µs对应约11%耗时降低、1.13×加速；有退化到不加速的运行。
+competing约0.97×、asymmetric约0.35×，dynamic仍全面负收益。
+这些是历史实测，不应写成新版本稳定1.2×或推荐模型直接启用。
+目前每次8 MiB执行需5次CCU collective，并保留relay pack/forward/unpack和全peer块完成握手。
+后续优化应分解这些开销及跨rank提交偏斜；总物理字节增加50%本身不证明独立链路不能获益。
+
 ## 5. 输入真实路由矩阵
 
 外部矩阵文件格式如下，`counts` 必须是实际 dispatch 打包后的行数；也支持扁平 64 项：
@@ -549,7 +628,7 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 默认 52 次/长跑仍须按第 4.2 节复测，不能把开发编译等同于硬件修复已验证。
 开发日志：`/home/liuyuanwen/profiling/a5-pipeline-stability/`。未 push。
 
-### 本版开发验证：通知桥与 direct 原偏移
+### 历史记录：973aafb 通知桥与 direct 原偏移
 
 开发容器 CPU 全套回归 124 项通过，无跳过；route 和 DeepEP 扩展编译成功。
 最终整数校验快路径另通过 13 项规划/执行回归；编译产物 ABI 验证通过，
@@ -571,3 +650,17 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 这些是开发机 CPU 微基准，不能直接作为新机 dynamic 延迟或加速比。
 本版仍含 device counts 收集、D2H 和 Python 规划，尚未解决模型接入的全部规划开销。
 日志：开发机 `/home/liuyuanwen/profiling/a5-pipeline-v4/`；新机输出继续在 `/home/l00934901/profiling`。
+
+### 本版开发验证：EP8 DFX 注册（2026-10-29）
+
+- `cam_lyw_dev_91` CPU 回归：125 项通过，无 skipped。
+- 新增测试直接编译生产 `ep8_dfx.h`：模拟旧路径到延迟上报时失败；修复路径三个 lane
+  各执行9000次、跨过多次2048项模型队列回调，检查元数据被外部调用替换后重新注册、
+  零payload、注册失败不提交、提交失败仅调用一次，以及新旧两种SDK公开结构体字段。
+  该测试只验证调用协议，不是T560二进制或NPU长测替代品。
+- route 包在开发机 CANN 9.1.0-beta.1 构建成功，动态加载并校验
+  `A5CcuEp8DfxAbiVersion=1`、layout=1、thread-bridge=1。
+- Python语法、指导文档17个bash代码块语法及 `git diff --check` 通过。
+- 没有修改DeepEP二进制代码；workspace ABI仍为2。本次没有NPU稳定性/性能实测。
+- 开发机日志：`/home/liuyuanwen/profiling/a5-pipeline-v5/{cpu-tests.log,route-build.log}`。
+  新机输出仍为 `/home/l00934901/profiling`。
