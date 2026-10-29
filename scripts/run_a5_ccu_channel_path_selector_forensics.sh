@@ -83,8 +83,8 @@ fi
 env -u LD_PRELOAD urma_admin show >"$run_dir/inventory/urma_admin_show.txt" 2>&1 || true
 
 for library in \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhccl.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhcomm.so \
     /usr/local/Ascend/driver/lib64/driver/libascend_hal.so \
     /lib64/liburma.so /lib64/urma/liburma-udma.so \
     /usr/lib64/liburma.so /usr/lib64/urma/liburma-udma.so; do

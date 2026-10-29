@@ -77,7 +77,8 @@ def main():
     route_library = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     deep_library = ctypes.CDLL(str(extension_path))
     abi_versions = {}
-    for library, symbol, minimum in ((route_library, "A5CcuPeerPlanAbiVersion", 3),
+    for library, symbol, minimum in ((route_library, "A5CcuPublicApiAbiVersion", 1),
+                                    (route_library, "A5CcuPeerPlanAbiVersion", 3),
                                     (deep_library, "A5DeepEpPeerPlanAbiVersion", 2),
                                     (route_library, "A5CcuCopyOverlapAbiVersion", 1)):
         version = getattr(library, symbol)

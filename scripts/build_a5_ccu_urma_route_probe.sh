@@ -1,299 +1,56 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd "${script_dir}/.." && pwd)
-project_dir="${repo_root}/examples/a5_ccu_urma_route_probe"
-install_after_build=0
-install_path=""
-
+# CANN 9.2/9.3 branch: standalone public SDK build, no HCCL source checkout.
+set -Eeuo pipefail
+A5_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+A5_CANN=${A5_CANN_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}}
+A5_INSTALL=0
+A5_PREFIX=""
+A5_BUILD=${A5_BUILD_DIR:-/home/l00934901/profiling/a5-public-route-build}
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --install) install_after_build=1; shift ;;
-        --install-path) install_path=$2; shift 2 ;;
-        *) echo "Unknown argument: $1" >&2; exit 2 ;;
-    esac
+  case "$1" in
+    --install) A5_INSTALL=1; shift ;;
+    --install-path) A5_PREFIX=$2; shift 2 ;;
+    --cann-path) A5_CANN=$2; shift 2 ;;
+    --build-dir) A5_BUILD=$2; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
 done
-
-if [[ -n "${HCCL_REPO:-}" ]]; then
-    hccl_repo=${HCCL_REPO}
-elif [[ -x /home/l00934901/hccl/build.sh ]]; then
-    hccl_repo=/home/l00934901/hccl
-else
-    hccl_repo=/home/liuyuanwen/hccl
-fi
-
-if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
-    source /usr/local/Ascend/cann/set_env.sh
-elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-fi
-
-[[ -x "${hccl_repo}/build.sh" ]] || {
-    echo "HCCL build.sh not found: ${hccl_repo}/build.sh" >&2
-    echo "Set HCCL_REPO to the HCCL source directory." >&2
-    exit 1
+A5_CANN=$(realpath "$A5_CANN")
+[[ -f "$A5_CANN/include/hcomm/ccu/ccu_launch.h" ]] || {
+  echo "Public CCU headers missing: $A5_CANN; use the original branch for 9.1" >&2; exit 1;
 }
-
-echo "CANN home : ${ASCEND_HOME_PATH:-not-set}"
-echo "HCCL repo : ${hccl_repo}"
-echo "Probe src : ${project_dir}"
-
-temporary_cann_cmake_link=""
-bridge_path=""
-cann_cmake_dir="${hccl_repo}/third_party/cann-cmake"
-if [[ ! -f "${cann_cmake_dir}/function/prepare.cmake" ]]; then
-    for cached_cann_cmake in \
-        "${hccl_repo}/build_device/_deps/cann-cmake-src" \
-        "${hccl_repo}/build/_deps/cann-cmake-src"
-    do
-        if [[ -f "${cached_cann_cmake}/function/prepare.cmake" ]]; then
-            if [[ -e "${cann_cmake_dir}" || -L "${cann_cmake_dir}" ]]; then
-                echo "Invalid incomplete cann-cmake cache: ${cann_cmake_dir}" >&2
-                echo "Move that path aside, or populate it with a complete cann-cmake checkout." >&2
-                exit 1
-            fi
-            mkdir -p "${hccl_repo}/third_party"
-            ln -s "${cached_cann_cmake}" "${cann_cmake_dir}"
-            temporary_cann_cmake_link="${cann_cmake_dir}"
-            echo "Offline cann-cmake: ${cached_cann_cmake}"
-            break
-        fi
-    done
+set +u
+source "$A5_CANN/set_env.sh"
+set -u
+A5_PREFIX=${A5_PREFIX:-$A5_CANN}
+mkdir -p "$A5_BUILD"
+cmake -S "$A5_REPO/examples/a5_ccu_urma_route_probe" -B "$A5_BUILD" \
+  -DASCEND_CANN_PACKAGE_PATH="$A5_CANN" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DA5_CCU_BUILD_HOST_TESTS=ON \
+  -DCUSTOM_OPS_OPP_LIB_PATH=opp/vendors/cust/lib64 \
+  -DCUSTOM_OPS_OPP_INC_PATH=opp/vendors/cust/include \
+  2>&1 | tee "$A5_BUILD/configure.log"
+cmake --build "$A5_BUILD" --parallel 4 2>&1 | tee "$A5_BUILD/build.log"
+ctest --test-dir "$A5_BUILD" --output-on-failure 2>&1 | tee "$A5_BUILD/host-test.log"
+A5_LIB="$A5_BUILD/liba5_ccu_urma_route_probe.so"
+nm -D -C --undefined-only "$A5_LIB" > "$A5_BUILD/undefined.txt"
+if grep -Eq 'hcomm::CcuRep::|hcomm::CcuKernel|HcclCcuKernel|HcclDfxRegOpInfoByCommId' "$A5_BUILD/undefined.txt"; then
+  echo "PUBLIC_ROUTE_BUILD_FAILED legacy dependency" >&2; exit 1
 fi
-
-cleanup()
-{
-    if [[ -n "${bridge_path}" && -d "${bridge_path}" ]]; then
-        rm -rf -- "${bridge_path}"
-    fi
-    if [[ -n "${temporary_cann_cmake_link}" && -L "${temporary_cann_cmake_link}" ]]; then
-        rm -f -- "${temporary_cann_cmake_link}"
-    fi
-}
-trap cleanup EXIT
-
-# Some secured server images apply different transparent-encryption policies to
-# the HCCL and sgl-kernel-npu workspaces.  Copying text sources into a temporary
-# directory below HCCL can therefore expose ciphertext to cmake.  HCCL invokes
-# add_subdirectory(CUSTOM_OPS_PATH) without a binary directory, so the custom-op
-# tree must still appear below HCCL.  Make an in-tree hard-link farm: no source
-# bytes are copied, while CMake still sees an ordinary in-tree directory.
-project_cmake="${project_dir}/CMakeLists.txt"
-[[ -s "${project_cmake}" ]] || {
-    echo "Missing custom-op CMakeLists.txt: ${project_cmake}" >&2
-    exit 1
-}
-
-if ! python3 - "${project_dir}" <<'PY'
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-text_names = {"CMakeLists.txt", "Makefile"}
-text_suffixes = {".cmake", ".cc", ".cpp", ".h", ".hpp", ".md"}
-bad = []
-for path in sorted(root.rglob("*")):
-    if not path.is_file():
-        continue
-    if path.name not in text_names and path.suffix not in text_suffixes:
-        continue
-    try:
-        path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        bad.append((path, exc))
-
-for path, exc in bad:
-    print(f"Custom-op source is not readable UTF-8 text: {path}: {exc}", file=sys.stderr)
-raise SystemExit(1 if bad else 0)
-PY
-then
-    echo "Restore the complete examples/a5_ccu_urma_route_probe directory from Git before building." >&2
-    exit 1
+python3 - "$A5_LIB" <<'CHECK_ABI'
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)
+for name, expected in [('A5CcuPublicApiAbiVersion', 1), ('A5CcuUrmaPreparedPlanAbiVersion', 16),
+                       ('A5CcuPeerPlanAbiVersion', 5), ('A5CcuAllToAllVAbiVersion', 1),
+                       ('A5CcuAllToAllVLayoutAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)]:
+    fn = getattr(lib, name)
+    fn.restype = ctypes.c_int
+    actual = fn()
+    if actual != expected: raise RuntimeError(f'{name}: expected {expected}, got {actual}')
+    print(f'PUBLIC_ROUTE_ABI {name}={actual}')
+print('PUBLIC_ROUTE_LOAD_PASS')
+CHECK_ABI
+if [[ "$A5_INSTALL" == 1 ]]; then
+  cmake --install "$A5_BUILD" --prefix "$A5_PREFIX" --component hccl
 fi
-
-first_byte=$(LC_ALL=C head -c 1 "${project_cmake}" || true)
-if [[ "${first_byte}" != "#" && "${first_byte}" != "c" ]]; then
-    echo "Custom-op CMakeLists.txt is not readable text: ${project_cmake}" >&2
-    file "${project_cmake}" >&2 || true
-    od -An -tx1 -N32 "${project_cmake}" >&2 || true
-    exit 1
-fi
-bridge_path=$(mktemp -d "${hccl_repo}/.a5_ccu_urma_route_probe.XXXXXX")
-if ! cp -al "${project_dir}/." "${bridge_path}/"; then
-    echo "Failed to hard-link the custom-op tree into ${hccl_repo}." >&2
-    echo "The HCCL and sgl-kernel-npu repositories must be on the same filesystem." >&2
-    exit 1
-fi
-
-bridge_cmake="${bridge_path}/CMakeLists.txt"
-if ! cmp -s "${project_cmake}" "${bridge_cmake}"; then
-    echo "Custom-op staging changed CMakeLists.txt contents: ${bridge_cmake}" >&2
-    file "${project_cmake}" "${bridge_cmake}" >&2 || true
-    od -An -tx1 -N32 "${project_cmake}" >&2 || true
-    od -An -tx1 -N32 "${bridge_cmake}" >&2 || true
-    exit 1
-fi
-
-source_inode=$(stat -c '%d:%i' "${project_cmake}")
-bridge_inode=$(stat -c '%d:%i' "${bridge_cmake}")
-if [[ "${source_inode}" != "${bridge_inode}" ]]; then
-    echo "Custom-op staging is not a hard link: source=${source_inode} staged=${bridge_inode}" >&2
-    exit 1
-fi
-
-bridge_relative=${bridge_path#"${hccl_repo}/"}
-echo "Custom ops source : ${project_dir}"
-echo "Hard-link staging : ${bridge_path}"
-
-cd "${hccl_repo}"
-bash build.sh \
-    --vendor=cust \
-    --ops=ccu_urma_route_probe \
-    --custom_ops_path="${bridge_relative}"
-
-latest_package=$(
-    find "${hccl_repo}/build_out" -maxdepth 1 -type f \
-        -name '*ccu_urma_route_probe*.run' -printf '%T@ %p\n' 2>/dev/null |
-        sort -nr | head -n 1 | cut -d' ' -f2-
-)
-[[ -n "${latest_package}" ]] || {
-    echo "Build completed but no route-probe .run package was found." >&2
-    exit 1
-}
-
-echo "Build succeeded. Latest package:"
-echo "${latest_package}"
-
-built_library=$(
-    find "${hccl_repo}/build" -type f \
-        -path '*/makeself_staging/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so' \
-        -printf '%T@ %p\n' 2>/dev/null |
-        sort -nr | head -n 1 | cut -d' ' -f2-
-)
-[[ -f "${built_library}" ]] || {
-    echo "Packaged route-probe library was not found below ${hccl_repo}/build." >&2
-    exit 1
-}
-required_symbols=(
-    A5CcuAllToAllVAbiVersion
-    HcclCcuUrmaPeerPlanAllToAllVCreate
-    HcclCcuUrmaPeerPlanAllToAllVExecute
-    HcclCcuUrmaMultiRouteAllToAll
-    HcclCcuUrmaExplicitMultipathPlanCreate
-    HcclCcuUrmaExplicitMultipathPlanBindStream
-    HcclCcuUrmaExplicitMultipathPlanExecute
-    HcclCcuUrmaExplicitMultipathPlanExecuteV2
-    A5CcuUrmaPreparedPlanAbiVersion
-    A5CcuPeerPlanAbiVersion
-    A5CcuChannelSyncAbiVersion
-    A5CcuCopyOverlapAbiVersion
-    A5CcuCopyOverlapSupported
-    HcclCcuUrmaPeerPlanDestroy
-    HcclCcuUrmaExplicitMultipathPlanDestroy
-    HcclCcuUrmaPeerPlanCreate
-    HcclCcuUrmaPeerPlanBindStream
-    HcclCcuUrmaPeerPlanExecute
-    HcclCcuUrmaCommandBlockWorkerCreate
-    HcclCcuUrmaCommandBlockWorkerStop
-    A5CcuHbmCommandPunctureAbiVersion
-)
-for required_symbol in "${required_symbols[@]}"; do
-    nm -D "${built_library}" | grep " ${required_symbol}$" >/dev/null || {
-        echo "Packaged route probe is missing ${required_symbol}: ${built_library}" >&2
-        exit 1
-    }
-done
-verify_prepared_plan_abi()
-{
-    local library_path=$1
-    python3 - "${library_path}" <<'PY'
-import ctypes
-import pathlib
-import sys
-
-library_path = pathlib.Path(sys.argv[1]).resolve()
-library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
-version = library.A5CcuUrmaPreparedPlanAbiVersion
-version.restype = ctypes.c_int
-actual = version()
-print(f"Verified prepared-plan ABI: {actual} ({library_path})")
-if actual < 14:
-    raise SystemExit(f"prepared-plan ABI {actual} is stale; expected >= 14 (self-copy overlap)")
-peer_version = library.A5CcuPeerPlanAbiVersion
-peer_version.restype = ctypes.c_int
-peer_actual = peer_version()
-print(f"Verified peer-plan ABI: {peer_actual} ({library_path})")
-if peer_actual < 3:
-    raise SystemExit(f"peer-plan ABI {peer_actual} is stale; expected >= 3 (self-copy overlap)")
-sync_version = library.A5CcuChannelSyncAbiVersion
-sync_version.restype = ctypes.c_int
-sync_actual = sync_version()
-print(f"Verified Channel-sync ABI: {sync_actual} ({library_path})")
-if sync_actual < 1:
-    raise SystemExit("channel sync ABI is stale; expected >= 1")
-v_version = library.A5CcuAllToAllVAbiVersion
-v_version.restype = ctypes.c_int
-v_actual = v_version()
-print(f"Verified AllToAllV ABI: {v_actual} ({library_path})")
-if v_actual != 1:
-    raise SystemExit("AllToAllV ABI mismatch; expected 1")
-PY
-}
-verify_prepared_plan_abi "${built_library}"
-echo "Verified packaged library: ${built_library}"
-
-if (( install_after_build == 0 )); then
-    echo "Run this script again with --install to install into the active CANN tree."
-    exit 0
-fi
-
-if [[ -z "${install_path}" ]]; then
-    [[ -n "${ASCEND_HOME_PATH:-}" ]] || {
-        echo "ASCEND_HOME_PATH is not set; pass --install-path explicitly." >&2
-        exit 1
-    }
-    install_path=$(readlink -f "${ASCEND_HOME_PATH}")
-fi
-[[ -d "${install_path}/opp" ]] || {
-    echo "Invalid CANN install path: ${install_path}" >&2
-    exit 1
-}
-
-echo "Installing into CANN: ${install_path}"
-env -u ASCEND_CUSTOM_OPP_PATH -u ASCEND_OPP_PATH \
-    "${latest_package}" --quiet --install "--install-path=${install_path}"
-
-installed_header="${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
-installed_library="${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
-test -f "${installed_header}"
-test -f "${installed_library}"
-
-# Some existing custom-package registrations return success without replacing
-# an older file in opp/vendors/cust.  The user explicitly requested --install,
-# so make the installed artifact byte-identical to the package just built.
-if ! cmp -s "${built_library}" "${installed_library}"; then
-    echo "Package installer left a stale route library; replacing it with the verified build."
-    /usr/bin/install -m 0755 "${built_library}" "${installed_library}"
-    built_vendor_dir=$(dirname "$(dirname "${built_library}")")
-    /usr/bin/install -m 0644 \
-        "${built_vendor_dir}/include/a5_ccu_urma_route_probe.h" \
-        "${installed_header}"
-    /usr/bin/install -m 0644 \
-        "${built_vendor_dir}/include/a5_uvs_source_route_provider.h" \
-        "${install_path}/opp/vendors/cust/include/a5_uvs_source_route_provider.h"
-fi
-
-for required_symbol in "${required_symbols[@]}"; do
-    nm -D "${installed_library}" | grep " ${required_symbol}$" >/dev/null || {
-        echo "Installed route probe is missing ${required_symbol}: ${installed_library}" >&2
-        exit 1
-    }
-done
-verify_prepared_plan_abi "${installed_library}"
-cmp -s "${built_library}" "${installed_library}" || {
-    echo "Installed route probe does not match the package build: ${installed_library}" >&2
-    exit 1
-}
-echo "Installed header: ${install_path}/opp/vendors/cust/include/a5_ccu_urma_route_probe.h"
-echo "Installed library: ${install_path}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+echo "PUBLIC_ROUTE_BUILD_PASS library=$A5_LIB"

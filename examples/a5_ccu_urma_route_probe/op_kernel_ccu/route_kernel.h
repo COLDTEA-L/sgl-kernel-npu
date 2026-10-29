@@ -10,12 +10,12 @@
 
 namespace a5_ccu_urma_probe {
 
-class RouteKernelArg : public hcomm::CcuKernelArg {
+class RouteKernelArg : public a5ccu::CcuKernelArg {
 public:
     RouteKernelArg(const std::vector<ChannelHandle> &channels,
                    const std::vector<uint32_t> &routeIndices, bool localCopy = false, bool groupCopy = true,
                    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE);
-    hcomm::CcuKernelSignature GetKernelSignature() const override;
+    a5ccu::CcuKernelSignature GetKernelSignature() const override;
     bool localCopy() const { return localCopy_; }
     bool groupCopy() const { return localCopy_ && groupCopy_; }
     ChannelSyncMode syncMode() const { return syncMode_; }
@@ -27,7 +27,7 @@ private:
     ChannelSyncMode syncMode_ = ChannelSyncMode::BASELINE;
 };
 
-class RouteTaskArg : public hcomm::CcuTaskArg {
+class RouteTaskArg : public a5ccu::CcuTaskArg {
 public:
     RouteTaskArg(uint64_t inputAddr, uint64_t outputAddr, uint64_t inputToken,
                  uint64_t outputToken, const std::vector<uint64_t> &sourceOffsets,
@@ -52,21 +52,21 @@ public:
 
 class RouteKernel : public GroupedLocalCopyKernel {
 public:
-    explicit RouteKernel(const hcomm::CcuKernelArg &arg)
+    explicit RouteKernel(const a5ccu::CcuKernelArg &arg)
         : GroupedLocalCopyKernel(arg), localCopy_(dynamic_cast<const RouteKernelArg &>(arg).localCopy()),
           groupCopy_(dynamic_cast<const RouteKernelArg &>(arg).groupCopy()),
           syncMode_(dynamic_cast<const RouteKernelArg &>(arg).syncMode()) {}
 
 protected:
     HcclResult Algorithm() override;
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg &arg) override;
 private:
     bool localCopy_ = false;
     bool groupCopy_ = false;
     ChannelSyncMode syncMode_ = ChannelSyncMode::BASELINE;
 };
 
-std::unique_ptr<hcomm::CcuKernel> CreateRouteKernel(const hcomm::CcuKernelArg &arg);
+std::unique_ptr<a5ccu::CcuKernel> CreateRouteKernel(const a5ccu::CcuKernelArg &arg);
 
 } // namespace a5_ccu_urma_probe
 

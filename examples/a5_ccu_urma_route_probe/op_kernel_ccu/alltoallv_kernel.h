@@ -4,12 +4,12 @@
 #include "../common/alltoallv_layout.h"
 #include <memory>
 namespace a5_ccu_urma_probe {
-class AllToAllVKernelArg : public hcomm::CcuKernelArg {
+class AllToAllVKernelArg : public a5ccu::CcuKernelArg {
 public:
     explicit AllToAllVKernelArg(const std::vector<ChannelHandle> &input) { channels = input; }
-    hcomm::CcuKernelSignature GetKernelSignature() const override;
+    a5ccu::CcuKernelSignature GetKernelSignature() const override;
 };
-class AllToAllVTaskArg : public hcomm::CcuTaskArg {
+class AllToAllVTaskArg : public a5ccu::CcuTaskArg {
 public:
     uint64_t input, output, inputToken, outputToken;
     AllToAllVLayout layout;
@@ -18,11 +18,11 @@ public:
 };
 class AllToAllVKernel : public GroupedLocalCopyKernel {
 public:
-    explicit AllToAllVKernel(const hcomm::CcuKernelArg &arg) : GroupedLocalCopyKernel(arg) {}
+    explicit AllToAllVKernel(const a5ccu::CcuKernelArg &arg) : GroupedLocalCopyKernel(arg) {}
 protected:
     HcclResult Algorithm() override;
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg &arg) override;
 };
-std::unique_ptr<hcomm::CcuKernel> CreateAllToAllVKernel(const hcomm::CcuKernelArg &arg);
+std::unique_ptr<a5ccu::CcuKernel> CreateAllToAllVKernel(const a5ccu::CcuKernelArg &arg);
 } // namespace a5_ccu_urma_probe
 #endif

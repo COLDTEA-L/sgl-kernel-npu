@@ -8,7 +8,7 @@ group_slices_kib=32
 changed=3
 queued=20
 timeout_seconds=300
-cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
+cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}
 output_root=/home/l00934901/profiling
 builder_only=0
 benchmark=0
@@ -106,12 +106,13 @@ for case in json.load(open(sys.argv[1]))['cases']:
 PY
 binary="${run_dir}/bin/local_copy_probe"
 # Standalone executable: do not install SO/wheel or overwrite the production op.
-if ! g++ -std=c++14 -Wall -Wextra -Werror -DHOST_COMPILE -D_GLIBCXX_USE_CXX11_ABI=0 \
+if ! g++ -std=c++14 -Wall -Wextra -Werror -DHOST_COMPILE  \
     -I"${repo}/examples/a5_ccu_urma_route_probe/testcase" \
-    -I"${cann_root}/include" -I"${cann_root}/include/hccl" -I"${cann_root}/include/hcomm" \
+    -I"${repo}/examples/a5_ccu_urma_route_probe/common" -I"${cann_root}/include/hcomm/ccu" -I"${cann_root}/include" -I"${cann_root}/include/hccl" -I"${cann_root}/include/hcomm" \
     -I"${cann_root}/pkg_inc" -I"${cann_root}/pkg_inc/hcomm" -I"${cann_root}/pkg_inc/hcomm/ccu" \
     "${repo}/examples/a5_ccu_urma_route_probe/testcase/local_copy_probe.cc" \
     "${repo}/examples/a5_ccu_urma_route_probe/op_kernel_ccu/grouped_local_copy_kernel.cc" \
+    "${repo}/examples/a5_ccu_urma_route_probe/op_host/public_ccu.cc" \
     -L"${cann_root}/lib64" -Wl,-rpath,"${cann_root}/lib64" \
     -Wl,--no-as-needed -lhccl -lhcomm -lascendcl -lmsprofiler -Wl,--as-needed -ldl -pthread \
     -o "$binary" > "${run_dir}/build.log" 2>&1; then

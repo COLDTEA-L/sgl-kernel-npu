@@ -66,7 +66,7 @@ done
 }
 
 cd "${repo_root}"
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source /usr/local/Ascend/cann-9.3.0/set_env.sh
 # The installed DeepEP vendor script prepends to ASCEND_CUSTOM_OPP_PATH without
 # a ${var:-} guard.  It is safe to source, but is not nounset-clean.
 set +u

@@ -1,3 +1,5 @@
+> 本文保留独立两卡 smoke 的说明。完整 2/4 卡及 EP8 迁移现位于 `feature/a5-ccu-92-93-alltoall`，部署按 [A5_CCU_92_93_ALLTOALL.md](A5_CCU_92_93_ALLTOALL.md) 执行；验证边界以该文档为准。
+
 # CCU 公开接口迁移：9.2 编译验证与 9.3 两卡入口
 
 分支：`feature/a5-ccu-public-api-smoke`，基于 `370a14d`。

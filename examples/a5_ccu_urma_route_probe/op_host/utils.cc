@@ -8,7 +8,7 @@
 
 #include <hccl/hccl_rank_graph.h>
 #include <hcomm/hcomm_res.h>
-#include <hcomm/ccu/hccl_ccu_res.h>
+#include "../common/public_ccu.h"
 
 #include <cerrno>
 #include <algorithm>
@@ -1045,6 +1045,13 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
 
     std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread begin\n", rank);
     std::fflush(stdout);
+    // Public Query may lazily initialize the communicator-owned instance.
+    // Do it before thread/channel acquisition, not only at registration.
+    CcuInsHandle publicInstance = 0;
+    uint32_t publicInstanceCount = 1;
+    status = HcclCommQueryCcuIns(comm, &publicInstance, &publicInstanceCount);
+    if (status != HCCL_SUCCESS) return status;
+    if (!publicInstance || publicInstanceCount != 1) return HCCL_E_UNAVAIL;
     status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream,
                                         THREAD_NOTIFY_NUM, &created.mainThread);
     std::printf("[A5 CCU URMA][rank=%u] acquire main CCU thread end: status=%d thread=%lu\n",
@@ -1183,21 +1190,21 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
         created.ccuSelfCopy = localCopy; created.ccuGroupCopy=groupCopy;
         kernelName = created.ccuSelfCopy ? "local_and_remote" : "route_write";
         RouteKernelArg kernelArg(created.channels, routeIndices, localCopy, groupCopy, syncMode);
-        hcomm::KernelCreator creator = CreateRouteKernel;
-        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+        a5ccu::KernelCreator creator = CreateRouteKernel;
+        registerStatus = a5ccu::RegisterKernel(comm, created.dieId, &kernel, &creator, &kernelArg);
     } else if (kernelKind == RouteKernelKind::COMMAND_BLOCK_WORKER) {
         kernelName = "command_block_worker";
         CommandBlockWorkerKernelArg kernelArg(
             created.channels, routeIndices, created.weights,
             plan->commandBlockAddress, commandRegisterMode);
-        hcomm::KernelCreator creator = CreateCommandBlockWorkerKernel;
-        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+        a5ccu::KernelCreator creator = CreateCommandBlockWorkerKernel;
+        registerStatus = a5ccu::RegisterKernel(comm, created.dieId, &kernel, &creator, &kernelArg);
     } else {
         const bool serialized = kernelKind == RouteKernelKind::ALLTOALL_SERIAL;
         kernelName = serialized ? "alltoall_serial" : "alltoall_concurrent";
         AllToAllMultiRouteKernelArg kernelArg(created.channels, routeIndices, serialized);
-        hcomm::KernelCreator creator = CreateAllToAllMultiRouteKernel;
-        registerStatus = HcclCcuKernelRegister(comm, &kernel, &creator, &kernelArg);
+        a5ccu::KernelCreator creator = CreateAllToAllMultiRouteKernel;
+        registerStatus = a5ccu::RegisterKernel(comm, created.dieId, &kernel, &creator, &kernelArg);
     }
     std::printf("[A5 CCU URMA][rank=%u] register %s end: status=%d kernel=%lu\n",
                 rank, kernelName, static_cast<int>(registerStatus),
@@ -1208,15 +1215,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     }
     created.kernel = kernel;
 
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish begin\n", rank);
-    std::fflush(stdout);
-    status = HcclCcuKernelRegisterFinish(comm);
-    std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelRegisterFinish end: status=%d\n",
-                rank, static_cast<int>(status));
-    std::fflush(stdout);
-    if (status != HCCL_SUCCESS) {
-        return status;
-    }
+    // RegisterKernel completed the public Start/Register/End transaction.
 
     g_cache.comm = comm;
     g_cache.stream = stream;
@@ -1315,6 +1314,11 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
         descs.empty() || (allToAllV ? 10 : r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);
     // Thread resources must exist before ChannelAcquire on every rank.
+    CcuInsHandle publicInstance = 0;
+    uint32_t publicInstanceCount = 1;
+    status = HcclCommQueryCcuIns(comm, &publicInstance, &publicInstanceCount);
+    if (status != HCCL_SUCCESS) return status;
+    if (!publicInstance || publicInstanceCount != 1) return HCCL_E_UNAVAIL;
     status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread);
     if (status != HCCL_SUCCESS) return status;
     r.routeThread = r.mainThread;
@@ -1338,16 +1342,14 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
         if (states[i] != 0 || !handles.insert(r.channels[i]).second) return HCCL_E_RUNTIME;
     }
     RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy, syncMode);
-    hcomm::KernelCreator creator = CreateRouteKernel;
+    a5ccu::KernelCreator creator = CreateRouteKernel;
     if (allToAllV) {
         AllToAllVKernelArg vArg(r.channels);
-        hcomm::KernelCreator vCreator = CreateAllToAllVKernel;
-        status = HcclCcuKernelRegister(comm, &r.kernel, &vCreator, &vArg);
+        a5ccu::KernelCreator vCreator = CreateAllToAllVKernel;
+        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg);
     } else {
-        status = HcclCcuKernelRegister(comm, &r.kernel, &creator, &arg);
+        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &creator, &arg);
     }
-    if (status != HCCL_SUCCESS) return status;
-    status = HcclCcuKernelRegisterFinish(comm);
     if (status != HCCL_SUCCESS) return status;
     std::printf("CHANNEL_SYNC_PLAN rank=%u mode=%s channels=%zu\n",
         r.rank, ChannelSyncName(syncMode), r.channels.size());

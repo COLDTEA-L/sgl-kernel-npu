@@ -7,7 +7,7 @@
 #include <cstring>
 #include "route_kernel.h"
 #include "alltoallv_kernel.h"
-#include <hcomm/ccu/hccl_ccu_res.h>
+#include "../common/public_ccu.h"
 #include <hcomm/hcomm_res.h>
 #include <atomic>
 #include <fstream>
@@ -268,8 +268,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
         !DisjointBufferRanges(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
                               layout.totalBytes)) return HCCL_E_PARA;
     if (r.ccuGroupCopy && layout.peerBytes > GROUP_MAX_BYTES) return HCCL_E_PARA;
-    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), layout.totalBytes);
-    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), layout.totalBytes);
+    const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), layout.totalBytes);
+    const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), layout.totalBytes);
     auto *input = static_cast<unsigned char *>(send);
     auto *output = static_cast<unsigned char *>(recv);
     SelfCopyGuard copy(r.selfCopy);
@@ -287,7 +287,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
     RouteTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout.sourceOffsets, layout.remoteOffsets, layout.pathBytes,
         layout.selfOffset, layout.peerBytes);
-    status = HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task);
+    status = a5ccu::LaunchKernel(owner, r.routeThread, r.kernel, &task);
     if (status != HCCL_SUCCESS || r.routeThread == r.mainThread) return copy.Finish(status);
     status = static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.mainThread, 0, 1800));
     if (status != HCCL_SUCCESS) return status;
@@ -337,8 +337,8 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
         !DisjointAllToAllVBuffers(reinterpret_cast<uint64_t>(send), sendCapacity,
             reinterpret_cast<uint64_t>(recv), recvCapacity, layout) || layout.selfBytes > GROUP_MAX_BYTES)
         return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
-    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), sendCapacity);
-    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
+    const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), sendCapacity);
+    const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
     AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout);
     if (!dfx) return checkedStatus(HCCL_E_PTR, "dfx_context");
@@ -356,7 +356,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
             status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
             if (status != HCCL_SUCCESS) return status;
         }
-        status = checkedStatus(HcclCcuKernelLaunch(owner, r.routeThread, r.kernel, &task), "kernel_launch");
+        status = checkedStatus(a5ccu::LaunchKernel(owner, r.routeThread, r.kernel, &task), "kernel_launch");
         if (bridge) {
             const auto finishStatus = bridge->Finish(status);
             // Finish preserves a failed launch and poisons the bridge; do not log
@@ -373,7 +373,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
 // Additive ABI: the old contiguous interface remains unchanged.
 extern "C" int A5CcuAllToAllVLayoutAbiVersion() { return 1; }
 extern "C" int A5CcuEp8ThreadBridgeAbiVersion() { return 1; }
-extern "C" int A5CcuEp8DfxAbiVersion() { return 1; }
+extern "C" int A5CcuEp8DfxAbiVersion() { return 2; }
 extern "C" HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
     uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
     HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count)

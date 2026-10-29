@@ -4,7 +4,7 @@ set -Ee -o pipefail
 A5_BENCH_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$A5_BENCH_REPO"
 source scripts/a5_ccu_test_env.sh
-a5_ccu_prepare_test_env "${A5_CANN_PATH:-/usr/local/Ascend/cann-9.1.T560}" "$A5_BENCH_REPO"
+a5_ccu_prepare_test_env "${A5_CANN_PATH:-/usr/local/Ascend/cann-9.3.0}" "$A5_BENCH_REPO"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export A5_CCU_CHANNEL_SYNC_MODE=baseline
 export A5_CCU_PG_MODE=env

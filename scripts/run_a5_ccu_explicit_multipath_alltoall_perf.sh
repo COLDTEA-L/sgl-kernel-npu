@@ -27,7 +27,7 @@ validate_every_iteration=0
 replay_path_weights=""
 cases=native0,native2,direct_plus_2relay,direct_plus_4relay,direct_plus_6relay
 hccl_lib_dir=${A5_EXPLICIT_HCCL_LIB_DIR:-}
-cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
+cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -190,7 +190,7 @@ if (( need_legacy || need_prepared )); then
     if [[ -z "${route_probe_lib}" ]]; then
         for candidate in \
             "${cann_root}/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so" \
-            /usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
+            /usr/local/Ascend/cann-9.3.0/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so
         do
             if [[ -f "${candidate}" ]]; then
                 route_probe_lib=${candidate}

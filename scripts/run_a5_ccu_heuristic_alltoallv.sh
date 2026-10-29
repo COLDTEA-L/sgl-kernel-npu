@@ -4,7 +4,7 @@ set -Ee -o pipefail
 A5_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$A5_REPO"
 source scripts/a5_ccu_test_env.sh
-A5_HEURISTIC_CANN=${A5_CANN_PATH:-/usr/local/Ascend/cann-9.1.T560}
+A5_HEURISTIC_CANN=${A5_CANN_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}}
 a5_ccu_prepare_test_env "$A5_HEURISTIC_CANN" "$A5_REPO"
 export A5_CCU_ROUTE_PROBE_LIB=${A5_CCU_ROUTE_PROBE_LIB:-$A5_HEURISTIC_CANN/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so}
 export ASCEND_RT_VISIBLE_DEVICES=${A5_DEVICES:-0,1,2,3,4,5,6,7}

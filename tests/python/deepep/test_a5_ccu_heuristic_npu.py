@@ -126,6 +126,9 @@ def main():
     if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 2:
         raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=2 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
+    public_api = route.A5CcuPublicApiAbiVersion
+    public_api.restype = ctypes.c_int
+    if public_api() != 1: raise RuntimeError('public CCU SDK backend ABI 1 is required')
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
     if marker() != 1: raise RuntimeError('rebuild/install route: bound-direct ABI missing')
@@ -149,9 +152,9 @@ def main():
     try:
         dfx_abi = route.A5CcuEp8DfxAbiVersion
         dfx_abi.restype = ctypes.c_int
-        if dfx_abi() != 1: raise AttributeError('wrong DFX ABI')
+        if dfx_abi() != 2: raise AttributeError('public SDK reporting ABI 2 required')
     except AttributeError as exc:
-        raise RuntimeError('rebuild/install route: EP8 DFX registration ABI 1 is required') from exc
+        raise RuntimeError('rebuild/install route: public SDK reporting ABI 2 is required') from exc
     rank = int(os.environ['RANK'])
     def phase(name, **fields):
         print('EP8_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,

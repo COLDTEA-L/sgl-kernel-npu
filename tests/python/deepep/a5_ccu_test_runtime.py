@@ -167,7 +167,7 @@ def prepare_runtime(entrypoint, require_route_library=True):
     if os.environ.get("ASCEND_HOME_PATH"):
         candidates.append(Path(os.environ["ASCEND_HOME_PATH"]) /
                           "opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so")
-    candidates.append(Path("/usr/local/Ascend/cann-9.1.T560/opp/vendors/cust/lib64/"
+    candidates.append(Path("/usr/local/Ascend/cann-9.3.0/opp/vendors/cust/lib64/"
                            "liba5_ccu_urma_route_probe.so"))
     route_lib = next((path.resolve() for path in candidates if path.is_file()), None)
     if require_route_library and route_lib is None:

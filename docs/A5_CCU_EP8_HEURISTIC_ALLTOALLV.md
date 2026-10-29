@@ -1,3 +1,5 @@
+> 当前 9.2/9.3 分支的构建与验证请先执行 [A5_CCU_92_93_ALLTOALL.md](A5_CCU_92_93_ALLTOALL.md)。以下是原 9.1 分支的历史实验说明；不要执行其中的 T560 安装命令或旧 DFX=1 检查。
+
 # EP8 单 relay 贪心 AllToAllV：接口、正确性和性能对比
 
 分支：`feature/a5-ccu-8rank-heuristic-alltoallv`，基于已通过新机测试的

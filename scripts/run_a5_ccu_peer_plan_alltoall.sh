@@ -21,7 +21,7 @@ graph=none
 sync_mode=per-call
 profile=0
 shutdown_native=0
-cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
+cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}
 output_root=/home/l00934901/profiling
 machine_args=(--query-timeout 15)
 while (($#)); do

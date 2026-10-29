@@ -28,9 +28,9 @@ RouteKernelArg::RouteKernelArg(const std::vector<ChannelHandle> &inputChannels,
     channels = inputChannels;
 }
 
-hcomm::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
+a5ccu::CcuKernelSignature RouteKernelArg::GetKernelSignature() const
 {
-    hcomm::CcuKernelSignature signature;
+    a5ccu::CcuKernelSignature signature;
     signature.Append(MakePathKernelSignature(groupCopy() ? "A5CcuUrmaGroupedSelf8x32KV1" :
         localCopy_ ? "A5CcuUrmaLocalAndRemoteV1" :
         "A5CcuUrmaMultiRouteV2", routeIndices_, channels));
@@ -45,18 +45,18 @@ HcclResult RouteKernel::Algorithm()
         return HCCL_E_PARA;
     }
 
-    hcomm::CcuRep::Variable localInput = CreateVariable();
-    hcomm::CcuRep::Variable localOutput = CreateVariable();
-    hcomm::CcuRep::Variable localInputToken = CreateVariable();
-    hcomm::CcuRep::Variable localOutputToken = CreateVariable();
+    a5ccu::CcuRep::Variable localInput = CreateVariable();
+    a5ccu::CcuRep::Variable localOutput = CreateVariable();
+    a5ccu::CcuRep::Variable localInputToken = CreateVariable();
+    a5ccu::CcuRep::Variable localOutputToken = CreateVariable();
     Load(localInput);
     Load(localOutput);
     Load(localInputToken);
     Load(localOutputToken);
 
-    hcomm::CcuRep::Variable selfOffset;
-    hcomm::CcuRep::Variable selfBytes;
-    std::array<hcomm::CcuRep::Variable,4> selfGo;
+    a5ccu::CcuRep::Variable selfOffset;
+    a5ccu::CcuRep::Variable selfBytes;
+    std::array<a5ccu::CcuRep::Variable,4> selfGo;
     if (localCopy_) {
         selfOffset = CreateVariable();
         Load(selfOffset);
@@ -65,11 +65,11 @@ HcclResult RouteKernel::Algorithm()
         } else { selfBytes=CreateVariable(); Load(selfBytes); }
     }
 
-    std::vector<hcomm::CcuRep::Variable> sourceOffsets;
-    std::vector<hcomm::CcuRep::Variable> remoteOffsets;
-    std::vector<hcomm::CcuRep::Variable> pathBytes;
-    std::vector<hcomm::CcuRep::Variable> remoteOutputs;
-    std::vector<hcomm::CcuRep::Variable> remoteTokens;
+    std::vector<a5ccu::CcuRep::Variable> sourceOffsets;
+    std::vector<a5ccu::CcuRep::Variable> remoteOffsets;
+    std::vector<a5ccu::CcuRep::Variable> pathBytes;
+    std::vector<a5ccu::CcuRep::Variable> remoteOutputs;
+    std::vector<a5ccu::CcuRep::Variable> remoteTokens;
     sourceOffsets.reserve(channels_.size());
     remoteOffsets.reserve(channels_.size());
     pathBytes.reserve(channels_.size());
@@ -97,11 +97,11 @@ HcclResult RouteKernel::Algorithm()
     // Separate local completion resource; not a Channel notify slot. Submit
     // before peer waits, but DO NOT wait for it before submitting WriteNb.
     // The host validated self row vs incoming peer rows are disjoint.
-    hcomm::CcuRep::CompletedEvent localEvent;
+    a5ccu::CcuRep::CompletedEvent localEvent;
     if (localCopy_ && !groupCopy_) {
         localEvent = CreateCompletedEvent();
-        hcomm::CcuRep::LocalAddr src = CreateLocalAddr();
-        hcomm::CcuRep::LocalAddr dst = CreateLocalAddr();
+        a5ccu::CcuRep::LocalAddr src = CreateLocalAddr();
+        a5ccu::CcuRep::LocalAddr dst = CreateLocalAddr();
         src.addr = localInput; src.addr += selfOffset; src.token = localInputToken;
         dst.addr = localOutput; dst.addr += selfOffset; dst.token = localOutputToken;
         CCU_KERNEL_CHECK(LocalCopyNb(dst, src, selfBytes, localEvent));
@@ -116,17 +116,17 @@ HcclResult RouteKernel::Algorithm()
         for (size_t i = 0; i < channels_.size(); ++i) CCU_KERNEL_CHECK(waitMetadata(i));
     }
 
-    std::vector<hcomm::CcuRep::CompletedEvent> events;
+    std::vector<a5ccu::CcuRep::CompletedEvent> events;
     events.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
         // Ordered interpreter, NOT an out-of-order readiness scheduler.
         // Do not wait for write completion here: submit every path first.
         if (syncMode_ == ChannelSyncMode::PACKED_READY) CCU_KERNEL_CHECK(waitMetadata(i));
-        hcomm::CcuRep::LocalAddr source = CreateLocalAddr();
+        a5ccu::CcuRep::LocalAddr source = CreateLocalAddr();
         source.addr = localInput;
         source.addr += sourceOffsets[i];
         source.token = localInputToken;
-        hcomm::CcuRep::RemoteAddr destination = CreateRemoteAddr();
+        a5ccu::CcuRep::RemoteAddr destination = CreateRemoteAddr();
         destination.addr = remoteOutputs[i];
         destination.addr += remoteOffsets[i];
         destination.token = remoteTokens[i];
@@ -153,7 +153,7 @@ HcclResult RouteKernel::Algorithm()
     return HCCL_SUCCESS;
 }
 
-std::vector<uint64_t> RouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
+std::vector<uint64_t> RouteKernel::GeneArgs(const a5ccu::CcuTaskArg &arg)
 {
     const auto *taskArg = dynamic_cast<const RouteTaskArg *>(&arg);
     if (taskArg == nullptr || taskArg->pathBytes.size() != channels_.size() ||
@@ -181,9 +181,9 @@ std::vector<uint64_t> RouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
     return args;
 }
 
-std::unique_ptr<hcomm::CcuKernel> CreateRouteKernel(const hcomm::CcuKernelArg &arg)
+std::unique_ptr<a5ccu::CcuKernel> CreateRouteKernel(const a5ccu::CcuKernelArg &arg)
 {
-    return std::unique_ptr<hcomm::CcuKernel>(new RouteKernel(arg));
+    return std::unique_ptr<a5ccu::CcuKernel>(new RouteKernel(arg));
 }
 
 } // namespace a5_ccu_urma_probe

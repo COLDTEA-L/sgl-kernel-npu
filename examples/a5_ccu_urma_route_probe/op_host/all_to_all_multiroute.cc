@@ -7,7 +7,7 @@
 #include "self_copy_lane.h"
 #include "../common/path_layout.h"
 
-#include <hcomm/ccu/hccl_ccu_res.h>
+#include "../common/public_ccu.h"
 #include <hcomm/hcomm_res.h>
 
 #include <cstdint>
@@ -184,9 +184,9 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
     }
     const uint64_t bytes = layout.peerBytes;
     const uint64_t totalBytes = layout.totalBytes;
-    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
-    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
 
     AllToAllMultiRouteTaskArg taskArg(
@@ -212,7 +212,7 @@ HcclResult LaunchPreparedAllToAll(void *sendBuf, void *recvBuf,
                     static_cast<unsigned long>(bytes), resources.channels.size(),
                     serialized ? "serial" : "concurrent");
     }
-    status = HcclCcuKernelLaunch(
+    status = a5ccu::LaunchKernel(
         comm, resources.routeThread, resources.kernel, &taskArg);
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
         return status;
@@ -255,9 +255,9 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
     const uint64_t totalBytes = layout.totalBytes;
     auto *input = static_cast<unsigned char *>(sendBuf);
     auto *output = static_cast<unsigned char *>(recvBuf);
-    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
-    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
     RouteTaskArg taskArg(
         reinterpret_cast<uint64_t>(sendBuf), reinterpret_cast<uint64_t>(recvBuf),
@@ -280,7 +280,7 @@ HcclResult LaunchPreparedRouteAllToAll(void *sendBuf, void *recvBuf,
         if (status != HCCL_SUCCESS) return status;
     }
 
-    status = HcclCcuKernelLaunch(
+    status = a5ccu::LaunchKernel(
         comm, resources.routeThread, resources.kernel, &taskArg);
     if (status != HCCL_SUCCESS || resources.routeThread == resources.mainThread) {
         return copy.Finish(status);
@@ -705,9 +705,9 @@ extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
     std::vector<uint64_t> initial(COMMAND_WORDS, 0U);
     const uint64_t totalBytes = elementsPerPeer * resources.rankSize * sizeof(float);
     initial[COMMAND_MAGIC] = COMMAND_BLOCK_MAGIC;
-    initial[COMMAND_INPUT_TOKEN] = hcomm::CcuRep::GetTokenInfo(
+    initial[COMMAND_INPUT_TOKEN] = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), totalBytes);
-    initial[COMMAND_OUTPUT_TOKEN] = hcomm::CcuRep::GetTokenInfo(
+    initial[COMMAND_OUTPUT_TOKEN] = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), totalBytes);
     const aclError copyStatus = aclrtMemcpyAsync(
         commandBlock, commandBlockBytes, initial.data(),
@@ -729,7 +729,7 @@ extern "C" HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
     }
 
     CommandBlockWorkerTaskArg taskArg(reinterpret_cast<uint64_t>(commandBlock));
-    status = HcclCcuKernelLaunch(
+    status = a5ccu::LaunchKernel(
         comm, resources.routeThread, resources.kernel, &taskArg);
     if (status != HCCL_SUCCESS) return status;
 

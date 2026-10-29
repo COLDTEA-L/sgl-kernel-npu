@@ -1,14 +1,14 @@
 #include "alltoallv_kernel.h"
 #include "../common/path_layout.h"
 namespace a5_ccu_urma_probe {
-namespace CcuRep = hcomm::CcuRep;
+namespace CcuRep = a5ccu::CcuRep;
 namespace {
 constexpr uint32_t ADDRESS_SLOT = 0, TOKEN_SLOT = 1, DONE_SLOT = 2, MASK = 1;
 #define V_CHECK(call) do { const auto s = (call); if (s != HCCL_SUCCESS) return s; } while (0)
 }
-hcomm::CcuKernelSignature AllToAllVKernelArg::GetKernelSignature() const
+a5ccu::CcuKernelSignature AllToAllVKernelArg::GetKernelSignature() const
 {
-    hcomm::CcuKernelSignature signature;
+    a5ccu::CcuKernelSignature signature;
     signature.Append(MakePathKernelSignature("A5CcuDirectAllToAllV8BaselineV1", {}, channels));
     return signature;
 }
@@ -20,12 +20,12 @@ HcclResult AllToAllVKernel::Algorithm()
     auto selfSource = CreateVariable(), selfDestination = CreateVariable();
     Load(input); Load(output); Load(inputToken); Load(outputToken);
     Load(selfSource); Load(selfDestination);
-    std::array<hcomm::CcuRep::Variable, 4> go;
-    for (auto &v : go) { v = CreateVariable(); Load(v); }
-    std::vector<hcomm::CcuRep::Variable> source(7), destination(7), bytes(7), remoteOutput(7), remoteToken(7);
-    std::vector<hcomm::CcuRep::CompletedEvent> events(7);
+    std::array<a5ccu::CcuRep::Variable, 4> go;
+    // Public Variable default construction already allocates an XN resource.
+    for (auto &v : go) Load(v);
+    std::vector<a5ccu::CcuRep::Variable> source(7), destination(7), bytes(7), remoteOutput(7), remoteToken(7);
+    std::vector<a5ccu::CcuRep::CompletedEvent> events(7);
     for (size_t i = 0; i < 7; ++i) {
-        source[i] = CreateVariable(); destination[i] = CreateVariable(); bytes[i] = CreateVariable();
         Load(source[i]); Load(destination[i]); Load(bytes[i]);
         V_CHECK(CreateVariable(channels_[i], ADDRESS_SLOT, &remoteOutput[i]));
         V_CHECK(CreateVariable(channels_[i], TOKEN_SLOT, &remoteToken[i]));
@@ -59,7 +59,7 @@ HcclResult AllToAllVKernel::Algorithm()
     for (auto channel : channels_) V_CHECK(NotifyWait(channel, DONE_SLOT, MASK));
     return HCCL_SUCCESS;
 }
-std::vector<uint64_t> AllToAllVKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
+std::vector<uint64_t> AllToAllVKernel::GeneArgs(const a5ccu::CcuTaskArg &arg)
 {
     const auto *task = dynamic_cast<const AllToAllVTaskArg *>(&arg);
     if (!task || task->layout.sourceOffsets.size() != 7 || task->layout.remoteOffsets.size() != 7 ||
@@ -75,7 +75,7 @@ std::vector<uint64_t> AllToAllVKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
     }
     return args;
 }
-std::unique_ptr<hcomm::CcuKernel> CreateAllToAllVKernel(const hcomm::CcuKernelArg &arg)
-{ return std::unique_ptr<hcomm::CcuKernel>(new AllToAllVKernel(arg)); }
+std::unique_ptr<a5ccu::CcuKernel> CreateAllToAllVKernel(const a5ccu::CcuKernelArg &arg)
+{ return std::unique_ptr<a5ccu::CcuKernel>(new AllToAllVKernel(arg)); }
 #undef V_CHECK
 } // namespace a5_ccu_urma_probe

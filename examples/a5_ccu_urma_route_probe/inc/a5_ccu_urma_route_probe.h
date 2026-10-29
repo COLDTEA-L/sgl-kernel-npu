@@ -20,6 +20,10 @@
 extern "C" {
 #endif
 
+/** Public CCU SDK backend marker: 1 requires CANN public HcommCcu* APIs.
+ * The original 9.1 branch does not export this capability. */
+int A5CcuPublicApiAbiVersion(void);
+
 HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCount, HcclDataType dataType, HcclComm comm,
                                aclrtStream stream);
 

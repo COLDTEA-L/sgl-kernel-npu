@@ -1,7 +1,7 @@
 #ifndef A5_CCU_URMA_COMMAND_BLOCK_WORKER_KERNEL_H
 #define A5_CCU_URMA_COMMAND_BLOCK_WORKER_KERNEL_H
 
-#include <hcomm/ccu/ccu_kernel.h>
+#include "public_ccu.h"
 
 #include <cstdint>
 #include <memory>
@@ -49,14 +49,14 @@ enum class CommandWorkerRegisterMode : uint32_t {
     LOOP_HBM = 3,
 };
 
-class CommandBlockWorkerKernelArg : public hcomm::CcuKernelArg {
+class CommandBlockWorkerKernelArg : public a5ccu::CcuKernelArg {
 public:
     CommandBlockWorkerKernelArg(const std::vector<ChannelHandle> &channels,
                                 const std::vector<uint32_t> &routeIndices,
                                 const std::vector<uint32_t> &weights,
                                 uint64_t commandBlockAddress,
                                 CommandWorkerRegisterMode registerMode);
-    hcomm::CcuKernelSignature GetKernelSignature() const override;
+    a5ccu::CcuKernelSignature GetKernelSignature() const override;
     uint64_t GetCommandBlockAddress() const { return commandBlockAddress_; }
     CommandWorkerRegisterMode GetRegisterMode() const { return registerMode_; }
 
@@ -67,28 +67,28 @@ private:
     CommandWorkerRegisterMode registerMode_ = CommandWorkerRegisterMode::FULL;
 };
 
-class CommandBlockWorkerTaskArg : public hcomm::CcuTaskArg {
+class CommandBlockWorkerTaskArg : public a5ccu::CcuTaskArg {
 public:
     explicit CommandBlockWorkerTaskArg(uint64_t commandBlockAddr)
         : commandBlockAddr(commandBlockAddr) {}
     uint64_t commandBlockAddr;
 };
 
-class CommandBlockWorkerKernel : public hcomm::CcuKernel {
+class CommandBlockWorkerKernel : public a5ccu::CcuKernel {
 public:
-    explicit CommandBlockWorkerKernel(const hcomm::CcuKernelArg &arg);
+    explicit CommandBlockWorkerKernel(const a5ccu::CcuKernelArg &arg);
 
 protected:
     HcclResult Algorithm() override;
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg &arg) override;
 
 private:
     uint64_t commandBlockAddress_ = 0;
     CommandWorkerRegisterMode registerMode_ = CommandWorkerRegisterMode::FULL;
 };
 
-std::unique_ptr<hcomm::CcuKernel> CreateCommandBlockWorkerKernel(
-    const hcomm::CcuKernelArg &arg);
+std::unique_ptr<a5ccu::CcuKernel> CreateCommandBlockWorkerKernel(
+    const a5ccu::CcuKernelArg &arg);
 
 } // namespace a5_ccu_urma_probe
 

@@ -4,7 +4,7 @@
 #include "../../examples/a5_ccu_urma_route_probe/op_kernel_ccu/grouped_local_copy_kernel.h"
 namespace a5_ccu_urma_probe {
 HcclResult GroupedLocalCopyKernel::GroupedLocalCopy(hcomm::CcuRep::LocalAddr dst,
-    hcomm::CcuRep::LocalAddr src,const std::array<hcomm::CcuRep::Variable,4> &go,
+    hcomm::CcuRep::LocalAddr src,std::array<hcomm::CcuRep::Variable,4> go,
     const GroupCopyConfig &config)
 {
     hcomm::Instruction i; i.op="group_local"; i.dst=dst.addr; i.src=src.addr;
