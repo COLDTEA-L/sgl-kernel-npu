@@ -203,6 +203,44 @@ class PlannerTests(unittest.TestCase):
             (root / 'results' / 'rank7.json').write_text(json.dumps(result))
             with self.assertRaises(ValueError): summarize(root)
 
+    def test_native_baseline_three_way_and_metadata_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'results').mkdir()
+            (root / 'exit.status').write_text('0')
+            for rank in range(8):
+                values = {'native': [8., 8.], 'direct': [20., 20.], 'multipath': [10., 10.]}
+                case = dict(case='hot', correctness='PASS', fingerprint='same',
+                            plan={'fingerprint': 'same'}, schedule={}, planner_us=1,
+                            prepared_round_us=values, dynamic_round_us=values,
+                            dynamic_mean_us={m: v[0] for m, v in values.items()},
+                            dynamic_components_round_us={m: [dict(execute=v) for v in vs]
+                                                         for m, vs in values.items()},
+                            execution={'executed_relay': True}, executor_sync='stream')
+                result = dict(rank=rank, ranks=8, correctness='PASS', mode='all', dtype='float16',
+                              width=8, backend='test', timing_scope='test', dynamic_scope='test',
+                              benchmark={'protocol': 6, 'hccl_expansion_mode': 'CCU_SCHED'}, cases=[case])
+                (root / 'results' / f'rank{rank}.json').write_text(json.dumps(result))
+            summary = summarize(root)['cases'][0]
+            self.assertEqual(summary['prepared']['native_over_multipath'], 0.8)
+            self.assertEqual(summary['prepared']['direct_over_multipath'], 2.)
+            self.assertIn('no dynamic speedup over native', summary['analysis'])
+            self.assertEqual(compare_runs(root, root, 'native')[0]['prepared']['native_us'], 8.)
+            self.assertEqual(compare_runs(root, root)[0]['prepared']['direct_us'], 20.)
+            with self.assertRaises(ValueError): compare_runs(root, root, 'bad')
+            result['benchmark']['hccl_expansion_mode'] = 'AIV'
+            (root / 'results' / 'rank7.json').write_text(json.dumps(result))
+            with self.assertRaisesRegex(ValueError, 'benchmark'): summarize(root)
+            # A correctness-only native run must not be mistaken for a timing sample.
+            result['benchmark']['hccl_expansion_mode'] = 'CCU_SCHED'
+            for rank in range(8):
+                result['rank'] = rank
+                for key in ('prepared_round_us', 'dynamic_round_us', 'dynamic_mean_us',
+                            'dynamic_components_round_us'):
+                    result['cases'][0][key].pop('native', None)
+                (root / 'results' / f'rank{rank}.json').write_text(json.dumps(result))
+            with self.assertRaisesRegex(ValueError, 'measured native'):
+                compare_runs(root, root, 'native')
+
     def test_topology_join_and_missing_live_eid(self):
         devices = list(reversed(range(8))); entries, edges = [], []
         for s in range(8):

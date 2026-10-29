@@ -73,6 +73,11 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
+已安装 `b3a5a5b` 的 route 和 workspace ABI 2 wheel 时，本次native baseline仅更新Python测试、
+比较器和文档，不需要再次编译二进制；拉取后先执行下面CPU回归，再按第4节计时。
+从 `973aafb` 或更早版本升级仍按下述构建要求执行。
+
+
 **本版从 `973aafb` 升级必须重新构建/安装 route 包；该版本的 DeepEP workspace ABI 2 可继续使用。**
 从更早版本升级仍须重编 DeepEP 和 route。先执行本节，再执行第 3、4.2 节。
 本版补上每次 EP8 CCU 提交前的 DFX 算子注册，增加 route `A5CcuEp8DfxAbiVersion=1`；
@@ -192,14 +197,47 @@ export A5_HCCN_TOOL=/usr/local/Ascend/driver/tools/hccn_tool
 export A5_DEVICES=0,1,2,3,4,5,6,7
 ```
 
-## 4. direct 和多路径分别计时，再比较
+## 4. 原生 HCCL baseline、custom direct 对照和多路径比较
 
 默认 `single_hot`：`C[0,4]=32*128` 行，另有 rank 0 和 3 的 self 行。
 FP16、hidden width=4096，每行 8192 B；跨卡总量 32 MiB，含 self 共 36 MiB。
 默认贪心把热点流分成 16 MiB direct + 16 MiB 经一个组内 relay。
 原始跨卡有效载荷仍是 32 MiB，但物理发送总量增至 48 MiB。
 
-分别执行，两次使用完全相同的参数。保存终端打印的两个结果目录：
+**主要性能 baseline 改为原生 HCCL AllToAllV。** `native` 调用
+`dist.all_to_all_single(..., async_op=True)` 后 `Work.wait()`，对齐 vLLM Ascend
+AllToAllV 分支的 payload API。`direct` 是我们的自定义 CCU direct-only，仅用于隔离分流收益。
+原生 HCCL 的物理选路由库决定，不能把 native 等同为“所有字节都走直连”。
+
+分别运行 native 和 multipath；参数相同，输出都放个人 profiling 目录：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode native --case single_hot --chunk-bytes 8388608
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode multipath --case single_hot --chunk-bytes 8388608
+# 用两次实际输出目录替换 NATIVE_RUN / MULTIPATH_RUN
+python3 scripts/summarize_a5_ccu_heuristic.py --baseline native --compare \
+  /home/l00934901/profiling/a5-ep8-heuristic.NATIVE_RUN \
+  /home/l00934901/profiling/a5-ep8-heuristic.MULTIPATH_RUN
+```
+
+同进程三路测量用 `--mode all`，建议6轮以覆盖全部六种测量顺序：
+
+```bash
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode all --case single_hot --rounds 6 --chunk-bytes 8388608
+```
+
+输出同时包含 `native_over_multipath` 和 `direct_over_multipath`。
+只有超过 native 才说明此通信负载下有替换收益；超过 custom direct 不足以证明。
+`--mode both` 保留原来的 direct/multipath 两路比较；`--compare` 默认仍为direct以兼容旧命令，
+主baseline比较必须指定 `--baseline native`。
+
+**边界**：所有模式预分配输出，测量包含提交/完成等待，排除模型wrapper输出分配和router、
+专家计算、模型permute/unpermute。此runner固定 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 并清除
+`HCCL_ALGO`；结果记录这两个值、HCCL_BUFFSIZE及Torch版本。它是同配置下的原生HCCL
+通信层baseline；若模型部署使用不同engine/算法配置，还必须另做部署配置下的原生对照，
+不能将此结果直接称为DeepSeek 4.1端到端加速。
+
+以下保留 custom direct 消融实验。两次使用完全相同的参数：
 
 ```bash
 bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode direct --case single_hot
@@ -261,10 +299,11 @@ prepared、dynamic 均逐轮取八 rank 最大值，再对轮求均值，同时�
 `counts_gather_sync_us`、`plan_workspace_us`、`execute_completion_us`。
 分项不是分别取各 rank 最大值；这种做法会拼接出不存在的总耗时。host 调度/对象清理等
 小量开销包含在总耗时中，因此分项和不必严格等于总时间。
-测量协议升级为 4（原偏移 direct、通知桥选择与池化工作区），比较器拒绝与旧协议或不同 sync/policy 的结果混合做性能比。
+测量协议为 6（原生HCCL计时及环境指纹），比较器拒绝与旧协议、不同runtime配置或不同sync/policy的结果混合做性能比。
 都是 host wall-clock；不是 CCU 内核 event 时间。不包括 router、模型 pack/unpack、专家计算；
-这里的 pack/unpack 专指新增 relay 执行器内部的分片整理。原生 HCCL 只作正确性参考；
-主要性能 baseline 是同一个 CCU direct-only AllToAllV。
+这里的 pack/unpack 专指新增 relay 执行器内部的分片整理。native已经参与性能计时，
+custom direct仅作内部消融对照。native/direct动态分支没有贪心规划，但三路都测量同一套
+合成8×8计数all-gather+D2H；这部分是微基准约定，不是对模型额外通信量的断言。
 
 动态测试每次重新规划同一个输入矩阵，不缓存路由决策；只复用工作区和 event 容量；验证“变化矩阵”的正确性由第 3 步覆盖。
 prepared 与 dynamic 的同步方式不同，只在同一口径内比较 direct/multipath。
@@ -458,7 +497,7 @@ dynamic `prepare()` 仅重新构建 Python 布局，不销毁/重建通信域。
 失败时打印该 plan 的尝试序号、group、handle、stage 和首次错误；序号不是底层 task 数。
 `event_route_done` 以前还会重复打印 launch 的错误，本版消除这个重复阶段误导。
 
-本版 benchmark protocol 为 **5**；必须重新获取 direct 和 multipath 两份数据，
+DFX修复提交 `b3a5a5b` 的 benchmark protocol 为5；加入native性能baseline后为 **6**。必须重新获取比较数据，
 不能与 protocol 4 的计时混比。DFX 注册也有 host 成本，本修复不承诺性能提升。
 
 复测顺序：第 2 节安装新 route、第 3 节正确性，然后执行第 4.2 节的 2 MiB 短测及下面长测：
@@ -491,6 +530,67 @@ competing约0.97×、asymmetric约0.35×，dynamic仍全面负收益。
 这些是历史实测，不应写成新版本稳定1.2×或推荐模型直接启用。
 目前每次8 MiB执行需5次CCU collective，并保留relay pack/forward/unpack和全peer块完成握手。
 后续优化应分解这些开销及跨rank提交偏斜；总物理字节增加50%本身不证明独立链路不能获益。
+
+### 4.6 100次测试及资源复用的准确含义
+
+`--dynamic-iters 100` 使用默认 `--rounds 4 --warmup 3`，表示每个被测模式执行
+4×(3+100)=412次dynamic调用；此前还执行正确性，以及4×(3+10)=52次prepared调用。
+它不是总共100次，更不是建100次通信域。`--rounds 1 --dynamic-iters 100` 才是一轮
+100次计时调用（另有3次预热、正确性和prepared阶段）。`--mode all` 对三个模式分别计数。
+
+| 对象 | 生命周期 |
+|---|---|
+| direct及两个relay HCCL通信域 | context初始化时创建，测试结束时销毁 |
+| channel/commlink、CCU thread和kernel handle | 按通信域及绑定stream准备一次，计时循环复用 |
+| relay工作区和event | context高水位池复用，仅容量增长时扩容 |
+| Python路由plan与offset布局 | prepared复用；dynamic按本批C重算，不重新注册CCU kernel |
+| `HcclDfxRegOpInfoByCommId` | 每次CCU调用更新本次op元数据，不是建链或kernel编译/注册 |
+
+DFX注册不仅填comm，也产生本次op信息；原生collective可能替换同通信域当前信息，
+且dynamic的字节数/地址可以变化，因此当前遵循原生HCCL每次执行前注册的契约。
+不能用“一次非空comm”替代每次算子元数据的生命周期。若未来测得该调用成本显著，
+应验证SDK支持的预绑定/fast-launch接口后再优化，不能直接移除刚补的注册。
+
+### 4.7 DeepSeek 4.1目标调用链（源码核对，尚未接入模型）
+
+核对仓库 `/home/liuyuanwen/vllm-ascend-dsv41`，提交
+`56debc194a42d473f8c456d4850369442d694c8f`：
+
+```text
+vllm_ascend/models/deepseek_v41/model.py:236 FusedMoEFactory
+  -> 已选中的 ALLTOALL 通信实现
+  -> ops/fused_moe/moe_comm_method.py:263 AlltoAllCommImpl
+  -> ops/fused_moe/token_dispatcher.py:442 TokenDispatcherWithAll2AllV
+  -> ops/fused_moe/moe_utils.py:66 async_all_to_all
+  -> dist.all_to_all_single(..., input_split_sizes, output_split_sizes, async_op=True)
+  -> Work.wait()
+```
+
+Dispatch发送排好序的hidden rows；combine交换input/output splits，返回源rank。
+量化dispatch还会用同样splits交换dynamic_scale。新算子应替换这段payload通信，
+保留原token排序、专家计算和加权还原；实际row_bytes要取量化后的dtype/形状，不能固定8192。
+combine的计数方向为dispatch的转置；scale与activation的row_bytes不同，不能无条件复用切片计划。
+
+A5采用 `CAPACITY_AND_WORLD_SIZE` 选择策略（hardware_profile.py:346）：
+启用且支持的FUSED_MC2可优先走MegaMoE；小token批次可能走MC2；较大批次若
+`world_size_across_dp <= num_experts_per_tok` 会选ALLGATHER，否则才是ALLTOALL。
+还有EP关闭、LoRA等分支。因此“DeepSeek4.1+prefill”本身不能证明选中了AllToAllV，
+最终需核对部署TP/DP/EP、top-k、fused配置与实际MoECommType。当前不修改模型分支选择。
+
+`TokenDispatcherWithAll2AllV._preprocess`（token_dispatcher.py:616）已经all-gather
+各源rank的expert计数，得到E[source, expert]。按现有连续expert分组，EP8可直接计算：
+
+```python
+# 已有全局expert计数，不另发一次all-gather；L为每rank的local expert数
+C = E.reshape(8, 8, L).sum(dim=2)
+input_splits = C[rank, :]
+output_splits = C[:, rank]
+```
+
+未来对接应复用这份计数及已有D2H边界，再传给`make_plan`；当前dynamic微基准独立生成
+device行计数并all-gather，不能把它的全部开销当成模型必然新增开销。
+router已知不等于通信计划可永久复用：每批C变化时仍要更新长度/offset/分流方案，
+通信域、channel、kernel和工作区则继续复用。
 
 ## 5. 输入真实路由矩阵
 
@@ -651,7 +751,7 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 本版仍含 device counts 收集、D2H 和 Python 规划，尚未解决模型接入的全部规划开销。
 日志：开发机 `/home/liuyuanwen/profiling/a5-pipeline-v4/`；新机输出继续在 `/home/l00934901/profiling`。
 
-### 本版开发验证：EP8 DFX 注册（2026-10-29）
+### 历史记录：b3a5a5b EP8 DFX 注册（2026-10-29）
 
 - `cam_lyw_dev_91` CPU 回归：125 项通过，无 skipped。
 - 新增测试直接编译生产 `ep8_dfx.h`：模拟旧路径到延迟上报时失败；修复路径三个 lane
@@ -664,3 +764,12 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 - 没有修改DeepEP二进制代码；workspace ABI仍为2。本次没有NPU稳定性/性能实测。
 - 开发机日志：`/home/liuyuanwen/profiling/a5-pipeline-v5/{cpu-tests.log,route-build.log}`。
   新机输出仍为 `/home/l00934901/profiling`。
+
+### 本版开发验证：原生 HCCL baseline（2026-10-29）
+
+- 只修改测试、汇总与文档，未修改vLLM Ascend模型仓库、route或DeepEP二进制。
+- 开发容器14项planner/执行器/汇总CPU回归通过；新增三路对比测试确保“胜过custom direct、
+  但慢于native”不被报告为替换收益，并拒绝缺失native计时和runtime配置不一致的输入。
+- worker参数入口、Python语法、文档19个bash代码块及 `git diff --check` 通过。
+- 新的native/all测量尚未在目标NPU运行，未产生新的性能或长跑稳定性结论。
+- 开发日志：`/home/liuyuanwen/profiling/a5-pipeline-v5/native-baseline-tests.log`。

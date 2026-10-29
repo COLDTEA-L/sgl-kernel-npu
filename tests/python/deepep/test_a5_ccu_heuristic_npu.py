@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""EP8 direct vs participant-relay CCU correctness and eager timing, no profiler."""
+"""EP8 native HCCL / custom direct / relay correctness and payload timing."""
 import argparse
 import ctypes
 from datetime import datetime, timedelta
@@ -45,7 +45,7 @@ def main():
     p.add_argument('--matrix-json', type=Path, help='{"counts":8x8 or flat64}; packed rows, no histogram')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--suite', choices=('benchmark', 'correctness'), default='benchmark')
-    p.add_argument('--mode', choices=('both', 'direct', 'multipath'), default='both')
+    p.add_argument('--mode', choices=('all', 'native', 'both', 'direct', 'multipath'), default='both')
     p.add_argument('--dtype', choices=('float16', 'bfloat16', 'float32', 'int8', 'int32'), default='float16')
     p.add_argument('--width', type=int, default=4096)
     p.add_argument('--row-scale', type=int, default=128)
@@ -157,7 +157,24 @@ def main():
     row_bytes = torch.empty((), dtype=dtype).element_size() * args.width
     planner_options = dict(min_chunk_bytes=args.min_chunk_bytes, min_gain_bytes=args.min_gain_bytes,
                            max_actions=args.max_actions, relay_capacity_bytes=[args.relay_capacity_mib << 20] * 8)
-    selected = ('direct', 'multipath') if args.mode == 'both' else (args.mode,)
+    selected = (('native', 'direct', 'multipath') if args.mode == 'all' else
+                ('direct', 'multipath') if args.mode == 'both' else (args.mode,))
+    def measurement_order(round_id):
+        # all: six rounds cover all six permutations; both retains AB/BA.
+        if len(selected) == 3:
+            offset = round_id % 3
+            order = selected[offset:] + selected[:offset]
+        else:
+            order = selected
+        return order if round_id % 2 == 0 else tuple(reversed(order))
+    def native_alltoallv(send, recv, input_splits, output_splits):
+        # Same payload API / Work.wait contract as vLLM Ascend async_all_to_all.
+        # Outputs are preallocated for EVERY mode; wrapper allocation is excluded.
+        work = dist.all_to_all_single(recv, send, input_split_sizes=input_splits,
+                                      output_split_sizes=output_splits, group=dist.group.WORLD,
+                                      async_op=True)
+        work.wait()
+
     reports = []
     def memory_sample(phase):
         # Small host-side diagnostic snapshots, outside timed regions. No profiler.
@@ -209,7 +226,7 @@ def main():
             return buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs['multipath'], handle, list(counts))
         ops = dict(direct=lambda: buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs['direct'], handle, list(counts)),
                    multipath=selected_multi,
-                   native=lambda: dist.all_to_all_single(outputs['native'], send, input_split_sizes=sends, output_split_sizes=recvs))
+                   native=lambda: native_alltoallv(send, outputs['native'], sends, recvs))
         def set_payload(epoch):
             send.copy_(source + epoch)
             for output in outputs.values(): output.fill_(-17)
@@ -259,7 +276,7 @@ def main():
         phase('prepared_begin', case=case_name)
         timings = {name: [] for name in selected}
         for round_id in range(args.rounds):
-            order = selected if round_id % 2 == 0 else tuple(reversed(selected))
+            order = measurement_order(round_id)
             epoch = 2 + round_id % 5
             for name in order:
                 set_payload(epoch)
@@ -282,7 +299,12 @@ def main():
             start = time.perf_counter()
             current = gather_routing_counts(local_counts)
             gathered_at = time.perf_counter()
-            if name == 'direct':
+            if name == 'native':
+                current_sends = list(current[rank * 8:(rank + 1) * 8])
+                current_recvs = list(current[rank::8])
+                ready_at = time.perf_counter()
+                native_alltoallv(send, outputs[name], current_sends, current_recvs)
+            elif name == 'direct':
                 current_counts = list(current)
                 ready_at = time.perf_counter()
                 buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, current_counts)
@@ -297,7 +319,7 @@ def main():
             return ((gathered_at - start) * 1e6, (ready_at - gathered_at) * 1e6,
                     (finished - ready_at) * 1e6)
         for round_id in range(args.rounds):
-            order = selected if round_id % 2 == 0 else tuple(reversed(selected))
+            order = measurement_order(round_id)
             for name in order:
                 set_payload(0)
                 # Warm the SAME counts collective + planner/allocator + executor
@@ -340,10 +362,15 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=5, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=6, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
-                                 chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge),
+                                 chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge,
+                                 native_api='all_to_all_single_async_work_wait_preallocated',
+                                 hccl_expansion_mode=os.environ.get('HCCL_OP_EXPANSION_MODE'),
+                                 hccl_algo=os.environ.get('HCCL_ALGO'),
+                                 hccl_buffsize=os.environ.get('HCCL_BUFFSIZE'),
+                                 torch_version=str(torch.__version__), torch_npu_version=str(torch_npu.__version__)),
                   mode=args.mode, backend=('participant_hbm_pipelined_ccu' if pipeline else 'participant_hbm_two_stage_ccu'), cases=reports,
                   timing_scope='host_wall_submit_and_device_completion',
                   dynamic_scope=('device_counts_gather_cpu_sync_replan_pooled_workspace_execute_completion' if pipeline else

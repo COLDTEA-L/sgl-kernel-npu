@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require eight completed workers and compare direct/multipath with identical input."""
+"""Require eight completed workers; compare native or direct baseline to multipath."""
 import argparse
 import json
 import math
@@ -71,22 +71,28 @@ def summarize(root):
                 if 'slowest_rank_round_us' in entry:
                     samples = entry['slowest_rank_round_us']
                     entry.update(median_us=statistics.median(samples), min_us=min(samples), max_us=max(samples))
-        if modes == {'direct', 'multipath'}:
-            for scope in ('prepared', 'dynamic'):
-                summary[scope]['direct_over_multipath'] = (summary[scope]['direct']['mean_us'] /
-                                                          summary[scope]['multipath']['mean_us'])
-            summary['analysis'] = ('dynamic multipath faster on this workload' if
-                                   summary['dynamic']['direct_over_multipath'] > 1 else
-                                   'no dynamic speedup; retain direct for this workload')
+        if 'multipath' in modes:
+            for baseline in ('direct', 'native'):
+                if baseline not in modes: continue
+                for scope in ('prepared', 'dynamic'):
+                    summary[scope][baseline + '_over_multipath'] = (
+                        summary[scope][baseline]['mean_us'] / summary[scope]['multipath']['mean_us'])
+            baseline = 'native' if 'native' in modes else 'direct' if 'direct' in modes else None
+            if baseline:
+                summary['analysis'] = ('dynamic multipath faster than ' + baseline + ' on this workload' if
+                                       summary['dynamic'][baseline + '_over_multipath'] > 1 else
+                                       'no dynamic speedup over ' + baseline + ' on this workload')
             if protocol >= 2 and not case['execution']['executed_relay']:
-                summary['analysis'] = ('NO_RELAY_EXECUTED: prepared is a direct/direct control; '
-                                       'dynamic includes planner overhead. Ratio is NOT multipath speedup.')
+                summary['analysis'] = ('NO_RELAY_EXECUTED: multipath executes custom direct; '
+                                       'native comparison measures implementation differences, not relay gains. '
+                                       'direct/multipath prepared is A/A; dynamic includes planner overhead. NOT multipath speedup.')
         output['cases'].append(summary)
     return output
 
 
-def compare_runs(direct_root, multipath_root):
-    direct, multi = summarize(direct_root), summarize(multipath_root)
+def compare_runs(baseline_root, multipath_root, baseline='direct'):
+    if baseline not in ('direct', 'native'): raise ValueError('baseline must be direct or native')
+    direct, multi = summarize(baseline_root), summarize(multipath_root)
     for key in ('dtype', 'width', 'backend', 'timing_scope', 'dynamic_scope', 'benchmark'):
         if direct[key] != multi[key]: raise ValueError(f'comparison differs in {key}')
     if [c['case'] for c in direct['cases']] != [c['case'] for c in multi['cases']]:
@@ -95,13 +101,15 @@ def compare_runs(direct_root, multipath_root):
     for d, m in zip(direct['cases'], multi['cases']):
         if d['plan']['fingerprint'] != m['plan']['fingerprint']:
             raise ValueError('comparison counts/row bytes/relay plan differ')
-        row = dict(case=d['case'])
+        row = dict(case=d['case'], baseline=baseline)
         if 'execution' in m:
             row['execution'] = m['execution']
             row['multipath_speedup_claim_allowed'] = m['execution']['executed_relay']
         for scope in ('prepared', 'dynamic'):
-            dt, mt = d[scope]['direct']['mean_us'], m[scope]['multipath']['mean_us']
-            row[scope] = dict(direct_us=dt, multipath_us=mt, direct_over_multipath=dt / mt)
+            if baseline not in d[scope] or 'multipath' not in m[scope]:
+                raise ValueError('comparison requires measured ' + baseline + ' and multipath timings')
+            dt, mt = d[scope][baseline]['mean_us'], m[scope]['multipath']['mean_us']
+            row[scope] = {baseline + '_us': dt, 'multipath_us': mt, baseline + '_over_multipath': dt / mt}
         result.append(row)
     return result
 
@@ -109,10 +117,12 @@ def compare_runs(direct_root, multipath_root):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('run_dir', type=Path, nargs='?')
-    p.add_argument('--compare', type=Path, nargs=2, metavar=('DIRECT_RUN', 'MULTIPATH_RUN'))
+    p.add_argument('--compare', type=Path, nargs=2, metavar=('BASELINE_RUN', 'MULTIPATH_RUN'))
+    p.add_argument('--baseline', choices=('native', 'direct'), default='direct',
+                   help='native is the HCCL payload baseline; direct preserves legacy comparison commands')
     args = p.parse_args()
     if args.compare:
-        comparison = compare_runs(*args.compare)
+        comparison = compare_runs(*args.compare, baseline=args.baseline)
         (args.compare[1] / 'comparison.json').write_text(json.dumps(comparison, indent=2) + '\n')
         print(json.dumps(comparison, indent=2))
         return
