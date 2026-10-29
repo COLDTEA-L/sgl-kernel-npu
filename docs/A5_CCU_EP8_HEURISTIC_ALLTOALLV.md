@@ -9,6 +9,10 @@
 候选 relay 仍由原来的单 relay 贪心算法选择，输入仍是本批实际 packed 行数 C[8][8]。
 新增实现使用现有 CCU direct AllToAllV API，不改 2/4 卡接口，不用组外 relay。
 
+本次默认 `--planner native`：C++ 固定数组贪心选路和分块布局，静态拓扑校验一次。
+`--planner python` 保留原参考实现。两者选择相同 relay、分流行数和偏移；原生扫描顺序不同，
+诊断用候选评估次数可能不同。每轮 C 都会重新处理，没有固定路由缓存，也没有自动关闭 relay。
+
 ```text
 调用者 stream：输入就绪 ── direct CCU（原偏移直接读写） ─────────── 等待 relay 完成 → 消费
                              （与下面两条通道无完成依赖）
@@ -73,16 +77,12 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-已安装 `b3a5a5b` 的 route 和 workspace ABI 2 wheel 时，本次native baseline仅更新Python测试、
-比较器和文档，不需要再次编译二进制；拉取后先执行下面CPU回归，再按第4节计时。
-从 `973aafb` 或更早版本升级仍按下述构建要求执行。
-
-
-**本版从 `973aafb` 升级必须重新构建/安装 route 包；该版本的 DeepEP workspace ABI 2 可继续使用。**
-从更早版本升级仍须重编 DeepEP 和 route。先执行本节，再执行第 3、4.2 节。
-本版补上每次 EP8 CCU 提交前的 DFX 算子注册，增加 route `A5CcuEp8DfxAbiVersion=1`；
-worker 在建组前检查该标记。direct、serial 和 pipeline 共用该修复，2/4 卡不变。
-下面保留完整双包构建流程；已经安装 `973aafb` wheel 时可跳过 wheel 重编安装部分。
+**这次必须重新构建并安装 DeepEP wheel**：增加 C++ `Ep8RelayPlanner` 和 Python 扩展属性
+`ep8_relay_planner_abi=1`。默认 native worker 会在建组前检查，旧 wheel 不会悄悄回退到 Python。
+已经安装 `b3a5a5b` 或更新 route 包（`A5CcuEp8DfxAbiVersion=1`）时，route 不需要重新构建；
+下方保留完整双包流程，可跳过 route 的构建命令但保留 ABI 检查。
+从 `973aafb` 或更早版本升级时，DeepEP 和 route 都按完整流程构建安装。
+先执行本节、再执行第 3 节、4.8 节和 4.4 节长跑。2/4 卡接口不变。
 
 本次增加 EP8 die-1 的持久 event 通知桥，以及按原始段偏移传输 direct 前缀的接口。
 worker 要求 `A5DeepEpPipelineWorkspaceAbiVersion=2`，route 要求
@@ -95,15 +95,19 @@ Torch CPU 测试不申请 NPU；没有 Torch 时该项会明确显示 skipped。
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
+mkdir -p /home/l00934901/profiling/a5-ep8-cpu/tmp
+export TMPDIR=/home/l00934901/profiling/a5-ep8-cpu/tmp
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_heuristic_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_pipeline_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_alltoallv_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_error_check_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_thread_bridge_cpu.py' -v
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_dfx_cpu.py' -v
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_native_planner_cpu.py' -v
 ```
 
-本分支新增可选的 direct EID/die 绑定校验，**需要重编并安装 route 自定义包**。
+首次升级到包含 direct EID/die 绑定校验的版本，需重编并安装 route 自定义包；
+已安装并通过下面全部 route ABI 检查时，本次仅需重编 DeepEP wheel。
 旧 manifest 的 `src_eid=-,dst_eid=-` 保持原行为，新生成的 manifest 使用真实绑定，
 HCCL 实际 hop=1 端点与绑定不一致时直接报 `PEER_PLAN_BOUND_DIRECT_MISMATCH`，不会猜路径。
 新 worker 强制检查 `A5CcuBoundDirectAbiVersion=1`，避免旧 SO 忽略绑定。
@@ -153,7 +157,7 @@ echo "构建日志：$A5_BUILD_DIR"
 )
 ```
 
-DeepEP C++ 调用接口保持兼容，但本次增加了按原始布局传输的接口，必须使用新编译的扩展。
+DeepEP C++ 调用接口保持兼容，本次增加 host-only 规划绑定，必须使用新编译的扩展。
 实验 worker 从 checkout 加载新 Python 模块；模型环境通过 `deep_ep.heuristic_alltoallv` 导入时，
 也必须安装包含本分支 Python 模块的 wheel。
 旧分支第 6 步的 ABI/Meta 预检、第 7 步的 2/4 卡旧测试仍适用。
@@ -497,8 +501,9 @@ dynamic `prepare()` 仅重新构建 Python 布局，不销毁/重建通信域。
 失败时打印该 plan 的尝试序号、group、handle、stage 和首次错误；序号不是底层 task 数。
 `event_route_done` 以前还会重复打印 launch 的错误，本版消除这个重复阶段误导。
 
-DFX修复提交 `b3a5a5b` 的 benchmark protocol 为5；加入native性能baseline后为 **6**。必须重新获取比较数据，
-不能与 protocol 4 的计时混比。DFX 注册也有 host 成本，本修复不承诺性能提升。
+DFX修复提交 `b3a5a5b` 的 benchmark protocol 为5；native性能baseline版本为6，
+当前C++规划版为 **7**。必须重新获取比较数据，比较工具拒绝跨protocol或不同planner的结果。
+DFX 注册也有 host 成本，本修复不承诺性能提升。
 
 复测顺序：第 2 节安装新 route、第 3 节正确性，然后执行第 4.2 节的 2 MiB 短测及下面长测：
 
@@ -592,6 +597,72 @@ device行计数并all-gather，不能把它的全部开销当成模型必然新�
 router已知不等于通信计划可永久复用：每批C变化时仍要更新长度/offset/分流方案，
 通信域、channel、kernel和工作区则继续复用。
 
+### 4.8 C++ 规划/布局优化与 dynamic 分项复测（2026-10-29）
+
+用户的七场景扫描中，single_hot prepared 为 native 666.1 µs / multipath 598.3 µs，
+dynamic 则为1068.7 / 1861.6 µs；asymmetric dynamic为674.1 / 2809.3 µs。
+不能把dynamic总耗时称作规划耗时，也不能把双方都有的计数gather/D2H全算作多路径额外成本。
+本版的变更为：
+
+1. `RelayPlanner` 在初始化时校验拓扑和选路选项，C++以64个relay位掩码保存；每批仅输入C。
+2. C++固定数组扫描代替Python每轮列表构建、排序、生成器和候选tuple；严格保留
+   `(当前边负载, 局部峰值收益, -源rank, -目的rank, -relay)` 的决策与整数行对齐。
+3. 在C++计算direct/两跳偏移、分块pieces、八rank行数和双缓冲容量；Python只包装返回值。
+4. 工作区容量充足时跳过高水位容量列表的重复构造；通信域/channel/kernel仍只初始化一次。
+5. 默认不缓存C、不裁剪relay动作、不改变min_gain阈值，保持真实变化路由语义；
+   `--planner python` 是参考实现。无relay、容量、非对称长度、self偏移、零长度规则保留。
+
+**这次不改变数据面**：pack/forward/unpack、每块collective及event依赖仍然存在。
+它主要针对dynamic规划开销，不声称解决asymmetric prepared劣化，也不保证小流量分流有收益。
+
+完成第2节wheel重装和第3节正确性后，可先跑不占卡的CPU对照：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+python3 scripts/benchmark_a5_ep8_planner.py \
+  --output /home/l00934901/profiling/a5-ep8-planner.json --iters 500
+```
+
+该脚本编译与生产扩展相同的host-only绑定，不加载NPU后端。交替输入两个C，
+测试贪心、布局和CPU张量视图准备；zero自然不变。`layout_us`已包含于`prepare_cpu_rank0_us`，
+不能再相加。结果不能当成NPU端到端加速比。
+
+然后以相同参数执行两种规划器的全场景扫描（默认8MiB分块）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+for A5_PLANNER in python native; do
+  for A5_CASE in single_hot competing asymmetric cut uniform self zero; do
+    bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+      --executor pipeline --planner "$A5_PLANNER" --mode all --case "$A5_CASE" \
+      --rounds 6 --chunk-bytes 8388608
+  done
+done
+```
+
+每个native规划用例会在计时前逐rank打印`EP8_PLANNER_EQUIVALENCE_PASS`，
+核对现场拓扑上的C++与Python动作及负载完全一致，然后执行原有三种通信实现的正确性检查。
+最终必须有`EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`。之后执行4.4节100次长跑。
+
+在`results/rank*.json`和summary的dynamic分项中读取：
+
+- `counts_gather_sync_us`：双方都有的计数获取和D2H；
+- `planner_us`：当前C的选路；native/direct模式为0；
+- `layout_workspace_us`：选路之后的布局、参数/视图准备；
+- `plan_workspace_us = planner_us + layout_workspace_us`，是父项，勿重复累计；
+- `execute_completion_us`：提交并等待完成，包含跨rank到达偏斜，不是纯链路时间。
+
+summary保留每轮总耗时最慢rank的各分项，不把不同rank的独立最大值相加。
+不同planner的扫描用于分项分析；`--compare`仍只接受相同planner/protocol。
+正式native HCCL与multipath比较，两次独立运行均使用`--planner native`，按第4节
+`--baseline native --compare NATIVE_DIR MULTIPATH_DIR`执行。所有结果在个人profiling目录。
+
+DP8/TP1的N是每个DP实例当前进入该MoE的token数，不再除以8；它随chunked prefill、
+调度负载、prefix cache命中而变。模型配置H/K尚未确认时，只能作条件估算：
+H=4096、K=6、N=1024、BF16对应每源rank打包48MiB，均匀时每个目的rank6MiB，
+其中跨卡42MiB；W8A8 activation dispatch减半，另交换scale。6MiB不是整组或每卡总量。
+模型通信分支也需确认确实为ALLTOALL，而不是MC2/FUSED_MC2/ALLGATHER。
+
 ## 5. 输入真实路由矩阵
 
 外部矩阵文件格式如下，`counts` 必须是实际 dispatch 打包后的行数；也支持扁平 64 项：
@@ -626,18 +697,21 @@ bash scripts/run_a5_ccu_heuristic_alltoallv.sh --mode both \
 未来模型调用的接口（伪调用环境需要已有 EP8 Buffer、绑定 manifest 和张量）：
 
 ```python
-from deep_ep.heuristic_alltoallv import make_plan, gather_routing_counts
+import deep_ep
+from deep_ep.heuristic_alltoallv import RelayPlanner, gather_routing_counts
 from deep_ep.pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV
 
 # 模型初始化：同一 EP8 的成员以相同顺序建立两组 relay communicator。
 # ep_world_ranks 是 WORLD rank，必须与原 EP group 顺序一致，不是物理设备 ID。
 context = PipelineContext.create(buffer, handle, manifest,
                                  group_ranks=ep_world_ranks)
+planner = RelayPlanner(row_bytes, topology["allowed_relays"], max_actions=56,
+                       native_module=deep_ep.deep_ep_cpp)
 
 # 每批：local_counts 是实际 packed 行数，device int64[8]。
 # 若已持有一致的全局 host C，可直接传入，避免重复交换。
 C = gather_routing_counts(local_counts, group=ep_group)
-plan = make_plan(C, row_bytes, topology["allowed_relays"], max_actions=56)
+plan = planner.plan(C)
 prepared = PreparedPipelinedAllToAllV(context, plan, packed_send,
                                      chunk_bytes=8 << 20, max_scratch_bytes=1 << 30)
 prepared.execute(packed_send, packed_recv)
@@ -646,7 +720,8 @@ prepared.execute(packed_send, packed_recv)
 
 ```
 
-`make_plan` 只接受 host 整数，显式拒绝隐式读取 GPU tensor。
+`planner.plan`和参考`make_plan`只接受host整数，显式拒绝隐式读取GPU tensor。
+planner只保存静态拓扑、row_bytes和选路选项；模型逐批传入真实C，不复用旧C对应的路由。
 `gather_routing_counts` 是同步参考适配器，包含 all-gather 和 D2H 等待；其开销已在 dynamic 计时中体现。
 全部 rank 必须使用相同矩阵、候选路径、chunk 大小/上限和参数；模型在进入通信前必须建立这一一致性。
 测试 worker 有配置一致性检查，模型不能依靠某个 rank 自己更改阈值或自动回退。
@@ -765,7 +840,7 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 - 开发机日志：`/home/liuyuanwen/profiling/a5-pipeline-v5/{cpu-tests.log,route-build.log}`。
   新机输出仍为 `/home/l00934901/profiling`。
 
-### 本版开发验证：原生 HCCL baseline（2026-10-29）
+### 历史开发验证：原生 HCCL baseline（2026-10-29）
 
 - 只修改测试、汇总与文档，未修改vLLM Ascend模型仓库、route或DeepEP二进制。
 - 开发容器14项planner/执行器/汇总CPU回归通过；新增三路对比测试确保“胜过custom direct、
@@ -773,3 +848,31 @@ route 自定义包与 deep_ep_cpp 已在开发容器 CANN 9.1.0-beta.1 编译成
 - worker参数入口、Python语法、文档19个bash代码块及 `git diff --check` 通过。
 - 新的native/all测量尚未在目标NPU运行，未产生新的性能或长跑稳定性结论。
 - 开发日志：`/home/liuyuanwen/profiling/a5-pipeline-v5/native-baseline-tests.log`。
+
+### 本版开发验证：C++ 规划与布局（2026-10-29）
+
+- 开发容器实际名称是`cam_lyw_dev_91`，CANN 9.1.0-beta.1，Python 3.11 / Torch 2.8。
+- 131项CPU回归全部通过，包括1000组随机矩阵、候选子集、容量、阈值、预算、零/self、
+  整数上界、逐项layout对比；同一个planner连续处理200个变化C；native布局通过
+  流水线依赖、排队payload、64次变化矩阵工作区复用及扩容后旧对象重绑定测试。
+- DeepEP实际扩展`cmake --build build --target deep_ep_cpp -j4`编译成功；动态加载该SO，
+  检查`ep8_relay_planner_abi=1`并对100个变化C及布局与Python核对通过。
+- host-only对照使用生产绑定头文件、500次迭代、交替C、全mesh六候选relay、8MiB分块。
+  两个实现共享本版工作区快速检查；不缓存路由。下表为开发机CPU，非新机NPU计时。
+
+| case | Python选路 µs | C++选路（含Python边界）µs | Python选路+CPU准备 µs | C++选路+CPU准备 µs |
+|---|---:|---:|---:|---:|
+| zero | 186.2 | 17.4 | 275.0 | 44.7 |
+| single_hot | 197.1 | 17.8 | 476.9 | 129.4 |
+| competing | 228.2 | 19.1 | 598.6 | 161.3 |
+| asymmetric | 1068.7 | 26.7 | 1342.8 | 163.5 |
+| uniform | 453.2 | 19.2 | 552.8 | 61.4 |
+
+CPU准备包括layout、池检查、rank0张量视图构造，不包括数据传输。
+原生规划的候选评估顺序与Python不同，asymmetric为1002 vs 630次，但31个动作、
+每个分流量和所有偏移完全相同。无需为减少诊断计数重新引入Python排序。
+剩余Python视图/拷贝描述构建仍有开销，不能据此保证dynamic比native HCCL快。
+新机NPU全场景和100次长测尚未执行；route包没有改动，2/4卡接口不变。
+
+开发机日志和CPU数据：`/home/l00934901/profiling/a5-ep8-planner-dev/`
+下的`cpu-tests.log`、`deepep-build.log`、`timing.json`、`timing.log`。

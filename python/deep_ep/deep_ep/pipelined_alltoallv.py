@@ -7,14 +7,14 @@ No direct completion or full-message first-hop barrier gates second-hop launch.
 from dataclasses import dataclass, field
 from math import prod
 import weakref
+from typing import NamedTuple
 try:
     from .heuristic_alltoallv import N, _uint, _offsets, _coalesce_spans, validate_plan
 except ImportError:  # repository test workers also import this module directly
     from heuristic_alltoallv import N, _uint, _offsets, _coalesce_spans, validate_plan
 
 
-@dataclass(frozen=True)
-class RelayPiece:
+class RelayPiece(NamedTuple):
     src: int
     dst: int
     relay: int
@@ -33,9 +33,11 @@ class Chunk:
     second_counts: tuple
     pieces: tuple
 
-    rank_sizes: tuple = field(init=False, repr=False)
+    rank_sizes: tuple = field(default=None, repr=False)
 
     def __post_init__(self):
+        if self.rank_sizes is not None:
+            return
         object.__setattr__(self, 'rank_sizes', tuple(
             (sum(self.first_counts[r * N:(r + 1) * N]), sum(self.first_counts[r::N]),
              sum(self.second_counts[r * N:(r + 1) * N]), sum(self.second_counts[r::N])) for r in range(N)))
@@ -52,9 +54,11 @@ class PipelineSchedule:
     direct_pieces: tuple  # src, dst, rows, original source/final, packed source/final
     chunks: tuple
 
-    rank_pool_sizes: tuple = field(init=False, repr=False)
+    rank_pool_sizes: tuple = field(default=None, repr=False)
 
     def __post_init__(self):
+        if self.rank_pool_sizes is not None:
+            return
         object.__setattr__(self, 'rank_pool_sizes', tuple(tuple(
             max((c.sizes(r)[i] for c in self.chunks), default=0) for i in range(4)) for r in range(N)))
 
@@ -76,6 +80,13 @@ class PipelineSchedule:
 
 
 def build_pipeline_schedule(plan, *, chunk_bytes=8 << 20, max_chunks=128):
+    if plan._native_layout is not None:
+        rows, direct, pieces, chunks, pools = plan._native_layout(
+            plan.counts, plan.relay_rank, plan.relay_rows,
+            _uint(chunk_bytes, 'chunk_bytes', 1), _uint(max_chunks, 'max_chunks', 1))
+        return PipelineSchedule(plan, rows, direct, pieces,
+                                tuple(Chunk(fc, sc, tuple(RelayPiece(*p) for p in ps), sizes)
+                                      for fc, sc, ps, sizes in chunks), pools)
     # Reuse the serial planner's validation, but NOT its two-stage layout.
     validate_plan(plan)
     rows = max(1, _uint(chunk_bytes, 'chunk_bytes', 1) // plan.row_bytes)
@@ -181,6 +192,14 @@ class PipelineContext:
         if self._signature is not None and self._signature != signature:
             raise ValueError('pipeline context payload dtype/row shape changed; create a new context')
         rb = schedule.plan.row_bytes
+        # Most dynamic calls fit the high-water pool. Avoid recreating 8x8
+        # capacity lists and rounding each element when nothing must grow.
+        if (self._capacities is not None and len(self._ready) >= len(schedule.chunks)
+                and all(max(1, n) <= self._capacities[r][i]
+                        for r in range(N) for i, n in enumerate(schedule.pool_sizes(r)))):
+            if any(sum(row) * rb > limit for row in self._capacities):
+                raise ValueError('pipeline context high-water workspace exceeds max_scratch_bytes')
+            return
         needed = []
         for r in range(N):
             # Allocate real backing even for zero-row ranks. The bridge uses

@@ -8,6 +8,7 @@
 #include "deep_ep.hpp"
 #include "config.hpp"
 #include "event.hpp"
+#include "ep8_relay_planner_bindings.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
@@ -47,6 +48,7 @@ TORCH_LIBRARY_IMPL(deep_ep, Meta, m)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    deep_ep::ep8::BindPlanner(m);
     pybind11::class_<deep_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(), py::arg("num_sms") = 20,
              py::arg("num_max_nvl_chunked_send_tokens") = 6, py::arg("num_max_nvl_chunked_recv_tokens") = 256,

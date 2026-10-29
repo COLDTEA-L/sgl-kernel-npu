@@ -12,7 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
-from heuristic_alltoallv import (make_plan, build_schedule, normalize_counts, normalize_relays,
+from heuristic_alltoallv import (make_plan, RelayPlanner, build_schedule, normalize_counts, normalize_relays,
                                 PreparedAllToAllV, gather_routing_counts)
 from pipelined_alltoallv import PipelineContext, PreparedPipelinedAllToAllV, build_pipeline_schedule
 
@@ -52,6 +52,8 @@ def main():
     p.add_argument('--min-chunk-bytes', type=int, default=1)
     p.add_argument('--min-gain-bytes', type=int, default=0)
     p.add_argument('--max-actions', type=int, default=56)
+    p.add_argument('--planner', choices=('native', 'python'), default='native',
+                   help='native C++ planner/layout or the original Python reference')
     p.add_argument('--max-scratch-mib', type=int, default=1024)
     p.add_argument('--relay-capacity-mib', type=int, default=1024)
     p.add_argument('--warmup', type=int, default=3)
@@ -98,6 +100,9 @@ def main():
     import torch.distributed as dist
     import torch_npu
     deep_ep, _ = import_deep_ep(extension)
+    native_planner_module = sys.modules.get('deep_ep_cpp') if args.planner == 'native' else None
+    if args.planner == 'native' and getattr(native_planner_module, 'ep8_relay_planner_abi', None) != 1:
+        raise RuntimeError('rebuild/install DeepEP wheel: ep8_relay_planner_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
@@ -157,6 +162,7 @@ def main():
     row_bytes = torch.empty((), dtype=dtype).element_size() * args.width
     planner_options = dict(min_chunk_bytes=args.min_chunk_bytes, min_gain_bytes=args.min_gain_bytes,
                            max_actions=args.max_actions, relay_capacity_bytes=[args.relay_capacity_mib << 20] * 8)
+    planner = RelayPlanner(row_bytes, allowed, native_module=native_planner_module, **planner_options)
     selected = (('native', 'direct', 'multipath') if args.mode == 'all' else
                 ('direct', 'multipath') if args.mode == 'both' else (args.mode,))
     def measurement_order(round_id):
@@ -187,8 +193,14 @@ def main():
     for case_name, counts in cases:
         phase('correctness_begin', case=case_name)
         begin = time.perf_counter()
-        plan = make_plan(counts, row_bytes, allowed, **planner_options)
+        plan = planner.plan(counts)
         planner_us = (time.perf_counter() - begin) * 1e6
+        if args.planner == 'native':
+            reference = make_plan(counts, row_bytes, allowed, **planner_options)
+            for key in ('counts', 'relay_rank', 'relay_rows', 'link_rows', 'actions', 'stop_reason'):
+                if getattr(plan, key) != getattr(reference, key):
+                    raise AssertionError(f'native/reference planner disagreement: {case_name} {key}')
+            print(f'EP8_PLANNER_EQUIVALENCE_PASS rank={rank} case={case_name}', flush=True)
         schedule = (build_pipeline_schedule(plan, chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks)
                     if pipeline else build_schedule(plan))
         if plan.uses_relay and max(schedule.report()['scratch_bytes_per_rank']) > (args.max_scratch_mib << 20):
@@ -303,13 +315,16 @@ def main():
                 current_sends = list(current[rank * 8:(rank + 1) * 8])
                 current_recvs = list(current[rank::8])
                 ready_at = time.perf_counter()
+                planned_at = gathered_at
                 native_alltoallv(send, outputs[name], current_sends, current_recvs)
             elif name == 'direct':
                 current_counts = list(current)
                 ready_at = time.perf_counter()
+                planned_at = gathered_at
                 buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, current_counts)
             else:
-                current_plan = make_plan(current, row_bytes, allowed, **planner_options)
+                current_plan = planner.plan(current)
+                planned_at = time.perf_counter()
                 current_prepared = prepare(current_plan)
                 ready_at = time.perf_counter()
                 current_prepared.execute(send, outputs[name])
@@ -317,7 +332,8 @@ def main():
             torch.npu.synchronize()
             finished = time.perf_counter()
             return ((gathered_at - start) * 1e6, (ready_at - gathered_at) * 1e6,
-                    (finished - ready_at) * 1e6)
+                    (finished - ready_at) * 1e6, (planned_at - gathered_at) * 1e6,
+                    (ready_at - planned_at) * 1e6)
         for round_id in range(args.rounds):
             order = measurement_order(round_id)
             for name in order:
@@ -328,14 +344,14 @@ def main():
                 for _ in range(args.warmup): dynamic_once(name)
                 dist.barrier(); torch.npu.synchronize()
                 phase('dynamic_measure_begin', case=case_name, mode=name, round=round_id)
-                totals = [0., 0., 0.]
+                totals = [0.] * 5
                 begin = time.perf_counter()
                 for _ in range(args.dynamic_iters):
                     sample = dynamic_once(name)
-                    for i in range(3): totals[i] += sample[i]
+                    for i in range(5): totals[i] += sample[i]
                 dynamic_rounds[name].append((time.perf_counter() - begin) * 1e6 / args.dynamic_iters)
                 components[name].append(dict(zip(('counts_gather_sync_us', 'plan_workspace_us',
-                                                  'execute_completion_us'),
+                                                  'execute_completion_us', 'planner_us', 'layout_workspace_us'),
                                                  (v / args.dynamic_iters for v in totals))))
                 check(name, 0)
                 phase('dynamic_round_complete', case=case_name, mode=name, round=round_id)
@@ -362,7 +378,7 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=6, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=7, planner=args.planner, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
                                  chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge,

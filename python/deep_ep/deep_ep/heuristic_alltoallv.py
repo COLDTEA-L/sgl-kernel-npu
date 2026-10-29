@@ -4,7 +4,7 @@ This module is import-safe without Torch. Counts are *packed rows*, not expert
 hit counts. Every rank supplies the same 8x8 matrix in communicator rank order.
 The executor forwards through participant HBM; it is not UB source routing.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from math import prod
@@ -77,6 +77,7 @@ class RoutePlan:
     actions: tuple                # (src, dst, relay, moved_rows, local_gain_rows)
     candidate_evaluations: int
     stop_reason: str
+    _native_layout: object = field(default=None, repr=False, compare=False)
 
     @property
     def uses_relay(self):
@@ -101,6 +102,45 @@ class RoutePlan:
                     transmitted_network_bytes=sum(self.link_rows) * self.row_bytes,
                     cut_lower_bound_bytes=lower * self.row_bytes,
                     bottleneck_cut=[r for r in range(N) if mask & (1 << r)])
+
+
+class RelayPlanner:
+    """Persistent host planner; actual counts may change on EVERY invocation.
+
+    native_module is the loaded deep_ep_cpp extension (or the CPU test module).
+    None selects the original Python oracle explicitly, never a silent fallback.
+    This object owns only static topology/options, no counts or plan cache.
+    """
+    def __init__(self, row_bytes, allowed_relays, *, min_chunk_bytes=1, min_gain_bytes=0,
+                 max_actions=56, relay_capacity_bytes=None, native_module=None):
+        self.row_bytes = _uint(row_bytes, 'row_bytes', 1)
+        self.relays = normalize_relays(allowed_relays)
+        self.options = dict(min_chunk_bytes=_uint(min_chunk_bytes, 'min_chunk_bytes', 1),
+                            min_gain_bytes=_uint(min_gain_bytes, 'min_gain_bytes'),
+                            max_actions=_uint(max_actions, 'max_actions'))
+        if self.options['max_actions'] > 56:
+            raise ValueError('max_actions must not exceed 56')
+        if relay_capacity_bytes is not None:
+            if len(relay_capacity_bytes) != N:
+                raise ValueError('relay_capacity_bytes needs one value per rank')
+            relay_capacity_bytes = tuple(_uint(v, 'relay capacity') for v in relay_capacity_bytes)
+        self.options['relay_capacity_bytes'] = relay_capacity_bytes
+        self._native = None
+        if native_module is not None:
+            if getattr(native_module, 'ep8_relay_planner_abi', None) != 1:
+                raise RuntimeError('rebuild/install DeepEP: ep8_relay_planner_abi=1 required')
+            self._native = native_module.Ep8RelayPlanner(
+                self.relays, self.row_bytes, min_chunk_bytes, min_gain_bytes, max_actions,
+                () if relay_capacity_bytes is None else relay_capacity_bytes)
+        self.backend = 'native' if self._native is not None else 'python'
+
+    def plan(self, counts):
+        if self._native is None:
+            return make_plan(counts, self.row_bytes, self.relays, **self.options)
+        c = normalize_counts(counts)
+        c, chosen, moved, loads, actions, evaluations, reason = self._native.plan(c)
+        return RoutePlan(c, self.row_bytes, chosen, moved, loads, actions, evaluations, reason,
+                         self._native.layout)
 
 
 def make_plan(counts, row_bytes, allowed_relays, *, min_chunk_bytes=1,
