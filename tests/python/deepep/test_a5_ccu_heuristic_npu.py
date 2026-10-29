@@ -67,6 +67,8 @@ def main():
     p.add_argument('--rounds', type=int, default=4)
     p.add_argument('--dynamic-iters', type=int, default=10)
     p.add_argument('--executor', choices=('pipeline', 'serial'), default='pipeline')
+    p.add_argument('--cpp-copy-mode', choices=('auto', 'staged'), default='auto',
+                   help='C++ auto aliases contiguous intervals; staged keeps all pack/forward/unpack copies')
     p.add_argument('--pipeline-host', choices=('python', 'cpp'), default='python',
                    help='cpp keeps greedy plan/layout/views and stream/event submission inside one extension call')
     p.add_argument('--chunk-bytes', type=int, default=8 << 20,
@@ -121,8 +123,8 @@ def main():
         raise RuntimeError('rebuild/install DeepEP wheel: planner ABI 2, span copies and workspace views required')
     if args.routing_policy == 'fast' and getattr(native_planner_module, 'ep8_fast_selector_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: fast selector ABI 1 required')
-    if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 1:
-        raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=1 required')
+    if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 2:
+        raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=2 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
@@ -190,7 +192,8 @@ def main():
             if args.routing_policy == 'fast' else None)
     def create_cpp_context(chunk_bytes):
         ctx = native_planner_module.ep8_pipeline_create(planner._native, rank, chunk_bytes,
-                                                        args.max_chunks, args.max_scratch_mib << 20)
+                                                        args.max_chunks, args.max_scratch_mib << 20,
+                                                        bypass_copies=args.cpp_copy_mode == 'auto')
         for li, lane in enumerate(pipeline.lanes):
             with torch.npu.stream(lane.stream):
                 ctx.attach_lane(li, lane.buffer.runtime, lane.handle)
@@ -277,6 +280,10 @@ def main():
             # Correctness must exercise actual relay even if admission rejects it.
             forced = prepare(planner.plan(counts), args.chunk_bytes)
         execution = dict(prepared.decision)
+        if cpp_prepared is not None:
+            cpp_copies = cpp_prepared.copy_report()
+            print('EP8_CPP_COPIES ' + json.dumps(dict(rank=rank, case=case_name,
+                  mode=args.cpp_copy_mode, **cpp_copies)), flush=True)
         execution['selected_backend'] = (('pipeline' if pipeline else 'serial') if prepared.uses_relay else
                                          'native' if fast is not None else 'custom_direct')
         if fast is not None:
@@ -455,7 +462,8 @@ def main():
                       dynamic_round_us=dynamic_rounds, dynamic_components_round_us=components,
                       execution=execution, dynamic_backend_calls=dynamic_backends, executor_sync=args.executor_sync,
                       pipeline_correctness_chunk_counts=checked_chunks, memory_samples=memory_samples,
-                      fingerprint=plan.fingerprint)
+                      fingerprint=plan.fingerprint,
+                      cpp_copies=(cpp_copies if cpp_prepared is not None else None))
         reports.append(report)
         print('EP8_HEURISTIC_CASE ' + json.dumps(dict(rank=rank, case=case_name, actions=len(plan.actions),
                                                     prepared_round_us=timings, dynamic_mean_us=dynamic)), flush=True)
@@ -473,10 +481,13 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=10, pipeline_host=args.pipeline_host, planner=args.planner, routing_policy=args.routing_policy,
+                  benchmark=dict(protocol=11, pipeline_host=args.pipeline_host,
+                                 cpp_copy_mode=(args.cpp_copy_mode if cpp is not None else 'unused'), planner=args.planner, routing_policy=args.routing_policy,
                                  fast_link_gbps=args.fast_link_gbps, fast_extra_us=args.fast_extra_us,
                                  fast_min_saving_us=args.fast_min_saving_us, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
-                                 copy_submission=('native_spans' if pipeline and args.planner == 'native' else 'python'),
+                                 copy_submission=(('cpp_contiguous_alias' if args.cpp_copy_mode == 'auto' else 'cpp_staged')
+                                                  if cpp is not None else
+                                                  'native_spans' if pipeline and args.planner == 'native' else 'python'),
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
                                  chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge,

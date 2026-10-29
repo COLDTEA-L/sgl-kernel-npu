@@ -109,8 +109,14 @@ public:
     U RowBytes() const { return rowBytes_; }
 
     Plan Make(const Matrix& counts) const {
+        Plan p; MakeInto(counts, p); return p;
+    }
+
+    // Reuse host storage, but recompute every decision for the actual matrix.
+    void MakeInto(const Matrix& counts, Plan& p) const {
         CheckCounts(counts, rowBytes_);
-        Plan p; p.counts = counts; p.relays.fill(-1);
+        p.counts = counts; p.relays.fill(-1); p.moved.fill(0);
+        p.actions.clear(); p.evaluations = 0; p.exhausted = false;
         for (size_t f = 0; f < 64; ++f) p.loads[f] = f / 8 == f % 8 ? 0 : counts[f];
         std::array<U, 8> used{};
         p.actions.reserve(56);
@@ -143,15 +149,20 @@ public:
             p.loads[bestK * 8 + bestF % 8] += bestX;
             p.actions.push_back({bestF / 8, bestF % 8, bestK, bestX, bestGain});
         }
-        return p;
     }
 
     Layout Build(const Matrix& counts, const Relays& relays, const Matrix& moved,
                  U chunkBytes, U maxChunks, int rank = -1) const {
+        Layout out; BuildInto(counts, relays, moved, chunkBytes, maxChunks, rank, out, false); return out;
+    }
+
+    void BuildInto(const Matrix& counts, const Relays& relays, const Matrix& moved,
+                   U chunkBytes, U maxChunks, int rank, Layout& out, bool compact) const {
         CheckCounts(counts, rowBytes_);
         if (!chunkBytes || chunkBytes > Max || !maxChunks || maxChunks > Max || rank < -1 || rank >= 8)
             throw std::invalid_argument("invalid chunk bounds");
-        Layout out; out.chunkRows = std::max<U>(1, chunkBytes / rowBytes_);
+        out.chunkRows = std::max<U>(1, chunkBytes / rowBytes_);
+        out.directPieces.clear(); out.pools = {};
         U maxMoved = 0;
         for (size_t f = 0; f < 64; ++f) {
             int k = relays[f];
@@ -162,23 +173,30 @@ public:
         U numChunks = maxMoved / out.chunkRows + (maxMoved % out.chunkRows != 0);
         if (numChunks > maxChunks) throw std::invalid_argument("relay chunk count exceeds max_chunks");
         auto [src, dst] = Offsets(counts);
-        auto [ds, dr] = Offsets(out.direct);
-        for (size_t f = 0; f < 64; ++f) if (out.direct[f])
-            out.directPieces.push_back({f / 8, f % 8, out.direct[f], src[f], dst[f], ds[f], dr[f]});
-        out.chunks.reserve(numChunks);
+        if (!compact) {
+            auto [ds, dr] = Offsets(out.direct);
+            for (size_t f = 0; f < 64; ++f) if (out.direct[f])
+                out.directPieces.push_back({f / 8, f % 8, out.direct[f], src[f], dst[f], ds[f], dr[f]});
+        }
+        out.chunks.resize(numChunks);
         for (U j = 0; j < numChunks; ++j) {
-            Chunk chunk;
+            auto& chunk = out.chunks[j];
+            chunk.first.fill(0); chunk.second.fill(0); chunk.sizes = {}; chunk.pieces.clear();
+            for (auto& copies : chunk.localCopies) copies.spans.clear();
+            std::array<std::array<U, 10>, 56> pieces;
+            size_t pieceCount = 0;
             for (size_t f = 0; f < 64; ++f) {
                 if (moved[f] <= j * out.chunkRows) continue;
                 U n = std::min(out.chunkRows, moved[f] - j * out.chunkRows);
                 U s = f / 8, d = f % 8, k = static_cast<U>(relays[f]);
                 U offset = out.direct[f] + j * out.chunkRows;
-                chunk.pieces.push_back({s, d, k, n, src[f] + offset, dst[f] + offset, 0, 0, 0, 0});
+                pieces[pieceCount++] = {s, d, k, n, src[f] + offset, dst[f] + offset, 0, 0, 0, 0};
                 chunk.first[s * 8 + k] += n; chunk.second[k * 8 + d] += n;
             }
             auto [fs, fr] = Offsets(chunk.first); auto [ss, sr] = Offsets(chunk.second);
             Matrix fu{}, su{};
-            for (auto& p : chunk.pieces) {
+            for (size_t index = 0; index < pieceCount; ++index) {
+                auto& p = pieces[index];
                 U a = p[0] * 8 + p[2], b = p[2] * 8 + p[1];
                 p[6] = fs[a] + fu[a]; p[7] = fr[a] + fu[a];
                 p[8] = ss[b] + su[b]; p[9] = sr[b] + su[b];
@@ -189,6 +207,7 @@ public:
                     if (p[1] == static_cast<U>(rank)) chunk.localCopies[2].spans.push_back({p[9], p[5], p[3]});
                 }
             }
+            if (!compact) chunk.pieces.assign(pieces.begin(), pieces.begin() + pieceCount);
             if (rank >= 0) for (auto& copies : chunk.localCopies) copies.Coalesce();
             for (size_t f = 0; f < 64; ++f) {
                 chunk.sizes[f / 8][0] += chunk.first[f];
@@ -198,9 +217,7 @@ public:
             }
             for (size_t r = 0; r < 8; ++r) for (size_t i = 0; i < 4; ++i)
                 out.pools[r][i] = std::max(out.pools[r][i], chunk.sizes[r][i]);
-            out.chunks.push_back(std::move(chunk));
         }
-        return out;
     }
 private:
     U rowBytes_, chunkRows_, minGain_, maxActions_;

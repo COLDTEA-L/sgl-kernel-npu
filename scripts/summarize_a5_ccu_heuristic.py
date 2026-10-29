@@ -35,6 +35,8 @@ def summarize(root):
             raise ValueError('inconsistent measured modes')
         summary = dict(case=case['case'], plan=case['plan'], schedule=case['schedule'],
                        planner_max_rank_us=max(c['planner_us'] for c in all_cases), prepared={}, dynamic={})
+        if protocol >= 11 and first['benchmark'].get('pipeline_host') == 'cpp':
+            summary['cpp_copies_per_rank'] = [c['cpp_copies'] for c in all_cases]
         if protocol >= 2:
             summary['execution'] = case['execution']
             summary['executor_sync'] = case['executor_sync']

@@ -6,7 +6,7 @@
 2/4 卡等长多路径 API、组外 relay 规则及原执行路径保留，不使用这个规划器。
 
 本版新增`--pipeline-host cpp`，把真实greedy多路径的布局、工作区和提交流程一起放进C++。
-本轮复测直接执行第2节构建和第4.10节；该节显式使用greedy，不靠native回退。
+本轮复测直接执行第2节构建和第4.11节；该节显式使用greedy，不靠native回退。
 
 保留上一版默认 `--routing-policy fast`：C++筛选单热点，预计净收益不足即调用原生HCCL。
 `--routing-policy greedy` 保留之前的贪心实验。新版本复测按第2节安装、第3节旧执行器正确性、
@@ -94,14 +94,14 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-**这次必须重新构建并安装 DeepEP wheel**：新增`ep8_pipeline_host_abi=1`，保留规划/执行扩展属性
+**这次必须重新构建并安装 DeepEP wheel**：要求`ep8_pipeline_host_abi=2`，保留规划/执行扩展属性
 `ep8_relay_planner_abi=2`、`ep8_copy_spans_out`和`ep8_bind_workspace_views`。
 fast还要求`ep8_fast_selector_abi=1`。默认native worker会在建组前检查，
-即使已安装`19db1f8` wheel，也须重装本版wheel以获得C++执行器；指定cpp时不会悄悄回退到Python。
+即使已安装`4298068` wheel，也须重装本版wheel以获得连续区间直接收发和dynamic对象复用；指定cpp时不会悄悄回退到Python。
 已经安装 `b3a5a5b` 或更新 route 包（`A5CcuEp8DfxAbiVersion=1`）时，route 不需要重新构建；
 下方保留完整双包流程，可跳过 route 的构建命令但保留 ABI 检查。
 从 `973aafb` 或更早版本升级时，DeepEP 和 route 都按完整流程构建安装。
-先执行本节、再执行第3节和第4.9节（含新策略长跑）；4.4节保留旧greedy长跑。2/4卡接口不变。
+本轮先执行本节，再执行第4.11节的正确性和长跑；4.9节保留fast回退策略对照。2/4卡接口不变。
 
 本次增加 EP8 die-1 的持久 event 通知桥，以及按原始段偏移传输 direct 前缀的接口。
 worker 要求 `A5DeepEpPipelineWorkspaceAbiVersion=2`，route 要求
@@ -844,7 +844,7 @@ for A5_HOST_IMPL in python cpp; do
 done
 ```
 
-`benchmark.pipeline_host`明确区分两种实现，protocol=10。每个run内的native是同一原生API；
+`benchmark.pipeline_host`明确区分两种实现，当前protocol=11（4298068为10）。每个run内的native是同一原生API；
 不能跨host实现直接用旧`--compare`，它会拒绝metadata不一致。跨实现比较各自summary中的
 native/multipath与分项；若独立两次做native baseline对照，两次都指定相同pipeline-host。
 CPP的`planner_us`与`layout_workspace_us`来自内部host计时，`execute_completion_us`包含剩余
@@ -882,6 +882,74 @@ cpp.run(C, send, recv)
 
 不能在三个lane未挂接、调用stream改变、外层通信域已销毁或多个host线程同时使用时执行。
 初版尚未接入vLLM模型调用点，也不宣称支持图捕获；目标机需完成上述NPU验证。
+
+
+
+### 4.11 连续区间直接收发与dynamic host复用
+
+本版`--pipeline-host cpp --routing-policy greedy`仍实际执行同一greedy relay计划，
+不改变分流行数、relay选择、chunk大小或CCU collective次数，也不增加native回退。
+C++的`--cpp-copy-mode auto`是本版默认值，`staged`保留所有中间拷贝供对照。
+这与旧serial执行器的`--multipath-policy auto`、fast的native回退无关。
+
+当某rank某chunk的拷贝段完整覆盖一个连续且顺序一致的区间时：
+
+- pack：第一跳直接读取本轮send张量中的对应区间。
+- forward：第二跳直接读取第一跳的接收工作区。
+- unpack：第二跳直接写入本轮recv张量的最终区间。
+
+多段有间隙或顺序不匹配时保留原有拷贝，不凭相同总长度跳过搬运。
+每轮重新绑定当前send/recv地址，不能缓存上一批payload指针。
+输入ready、第一跳完成、槽复用和最终consumer join的事件依赖保持不变。
+零行send/recv使用两个独立持久占位存储，满足vendor对实际backing容量不重叠的要求。
+工作区继续按原布局预留，以支持后续变化矩阵；跳过拷贝不代表工作区容量也被释放。
+
+同时，dynamic的`run()`复用计划容器、布局vector容量和尺寸未变化的工作区视图，
+每轮仍用实际C重新计算全部决策。C++执行器省略不用的全局directPieces/pieces对象，
+没有复用旧路由答案；公开planner布局接口保留完整元数据供Python及正确性对照。
+
+先按第2节重建安装wheel；route包无需因本次改动重建。正确性先跑两种模式：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+for A5_COPY_MODE in staged auto; do
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    --pipeline-host cpp --routing-policy greedy --cpp-copy-mode "$A5_COPY_MODE" \
+    --suite correctness --mode all --row-scale 2 \
+    --rounds 1 --warmup 1 --iters 2 --dynamic-iters 2
+done
+```
+
+两次都必须有`EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`。然后按同样参数、同一数据量
+对比staged与auto，每次run都保留原生HCCL baseline，不开profiling：
+
+```bash
+for A5_COPY_MODE in staged auto; do
+  for A5_CASE in single_hot competing asymmetric cut uniform self zero; do
+    bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+      --pipeline-host cpp --routing-policy greedy --cpp-copy-mode "$A5_COPY_MODE" \
+      --mode all --case "$A5_CASE" --chunk-bytes 8388608 \
+      --rounds 6 --warmup 3 --iters 10 --dynamic-iters 100
+  done
+done
+```
+
+结果继续保存在`/home/l00934901/profiling/a5-ep8-heuristic.*`。
+比较每次summary里的`dynamic.native_over_multipath`和各分项，再比较两种copy模式的
+multipath时间。不要把不同copy模式的目录交给旧`--compare`冒充同参数baseline；
+metadata会拒绝。staged/auto共用新的host复用优化，两者主要隔离“消除搬运”的影响；
+要比较整个版本差异，另外保留4298068的同参数数据。
+
+日志`EP8_CPP_COPIES`及summary的`cpp_copies_per_rank`给出每个rank的三项统计，
+数组顺序均为pack/forward/unpack：`original_spans`、`bypassed_spans`、`bypassed_bytes`。
+这些是一次prepared计划每次执行可省去的本地拷贝，不是链路字节数，也不是耗时预测。
+单热点应能省去三个阶段的payload搬运；分散布局可能仅省去部分。
+该统计来自本次计划的静态描述，不在计时循环内逐条打日志。
+
+小prefill尺寸扫描继续使用第4.10节的1–32MiB命令，追加`--cpp-copy-mode auto`。
+若要看小数据量的拷贝优化效果，再用`staged`跑同样扫描。
+最终是否胜过native以新机dynamic结果为准；仍有`1+2*chunks`次CCU collective，
+并未实现设备侧融合或减少链路传输字节。
 
 
 ## 5. 输入真实路由矩阵
@@ -1163,3 +1231,35 @@ CPU准备包括layout、池检查、rank0张量视图构造，不包括数据传
 这组CPU数据保持真实relay方案，和第4.9节native回退不是同一实验。
 日志：`/home/l00934901/profiling/a5-ep8-cpp-pipeline-dev/`，包括`build-final.log`、
 `cpu-tests.log`、`bindings.log`、`cpp-driver-tests-final.log`、`timing.json`。
+
+### 本版开发验证：连续区间直接收发（2026-10-29）
+
+- `cam_lyw_dev_91`的实际DeepEP扩展编译成功，`ep8_pipeline_host_abi=2`。
+- 40项planner/layout/pipeline/native baseline/AllToAllV CPU回归通过；实际扩展7项拷贝绑定检查通过。
+- 实际C++提交驱动6项检查通过：变化矩阵、连续排队且payload地址变化、双缓冲槽复用、
+  扩容后旧prepared句柄、失败后禁止重试、非零storage offset及输出guards。
+  Trace runtime额外核对vendor零行backing容量不重叠规则。
+- protocol11的rank-local拷贝统计汇总检查通过；29段文档bash命令语法检查通过。
+- 500次交替实际C、开发机CPU、8MiB分块，rank0耗时如下；前两列包含Python绑定入口，
+  最后一列只统计`run()`内部选路+布局阶段，不含绑定、设备提交或完成等待。
+
+| case | 4298068 prepare µs | 本版 prepare µs | 本版 dynamic内部选路+布局 µs |
+|---|---:|---:|---:|
+| single_hot | 21.3 | 4.4 | 1.9 |
+| competing | 26.9 | 9.3 | 2.7 |
+| asymmetric | 22.1 | 12.6 | 11.0 |
+
+同默认synthetic行数及chunk行数，8rank合计每次执行的拷贝段审计：
+
+| case | staged | auto | 省去段数 |
+|---|---:|---:|---:|
+| single_hot | 6 | 0 | 6 |
+| competing | 27 | 8 | 19 |
+| asymmetric | 87 | 86 | 1 |
+
+CPU审计使用8字节行，保持正式4096宽FP16/8MiB配置的行数与分块行数一致，
+不能把审计的字节数或运行时间当成NPU性能。asymmetric布局分散，本次主要改善其host准备，
+设备搬运几乎不减。目标机NPU动态收益尚未测量，不能由CPU数字推导。
+日志位于`/home/l00934901/profiling/a5-ep8-copy-bypass-dev/`：
+`build-final.log`、`cpu-tests.log`、`bindings.log`、`summary-test.log`、
+`cpp-driver-tests-final.log`、`timing-final.json`。

@@ -96,12 +96,21 @@ def main():
             row['fast'] = dict(select_us=measure(lambda i: fast.select(matrices[i % 2])),
                               select_prepare_cpu_rank0_us=measure(fast_prepare),
                               selection=fast.report(decision), workspace=fast_context.workspace_stats())
-            if args.extension and getattr(native, 'ep8_pipeline_host_abi', None) == 1:
+            if args.extension and getattr(native, 'ep8_pipeline_host_abi', None) == 2:
                 opaque_planner = RelayPlanner(8192, ALL, native_module=native,
                                               relay_capacity_bytes=[1024 << 20] * 8)
                 opaque = native.ep8_pipeline_create(opaque_planner._native, 0, 8 << 20, 128, 1 << 30, True)
                 row['cpp_host'] = dict(plan_prepare_cpu_rank0_us=measure(
                     lambda i: opaque.prepare(matrices[i % 2], inputs[i % 2])), workspace=opaque.stats())
+                outputs = tuple(torch.empty((sum(v[::8]), 4096), dtype=torch.float16) for v in matrices)
+                phase_samples = []
+                for i in range(args.iters + 10):
+                    phases = opaque.run(matrices[i % 2], inputs[i % 2], outputs[i % 2])
+                    opaque.take_trace()  # do not retain tensors/trace entries across iterations
+                    if i >= 10: phase_samples.append(phases[0] + phases[1])
+                row['cpp_host']['dynamic_plan_layout_cpu_rank0_us'] = sum(phase_samples) / len(phase_samples)
+                row['cpp_host']['copy_report_rank0'] = opaque.prepare(c, inputs[0]).copy_report()
+                row['cpp_host']['workspace'] = opaque.stats()
                 opaque.close()
             results.append(row)
             print(json.dumps(row), flush=True)

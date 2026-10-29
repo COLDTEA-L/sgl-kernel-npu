@@ -227,6 +227,15 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(compare_runs(root, root, 'native')[0]['prepared']['native_us'], 8.)
             self.assertEqual(compare_runs(root, root)[0]['prepared']['direct_us'], 20.)
             with self.assertRaises(ValueError): compare_runs(root, root, 'bad')
+            # Copy decisions are rank-local diagnostics, not a divergent policy.
+            for rank in range(8):
+                result['rank'] = rank
+                result['benchmark'].update(protocol=11, pipeline_host='cpp', cpp_copy_mode='auto')
+                result['cases'][0]['cpp_copies'] = dict(bypassed_spans=[rank, 0, 0])
+                result['cases'][0]['dynamic_backend_calls'] = dict(pipeline=2, native=2, custom_direct=2)
+                (root / 'results' / f'rank{rank}.json').write_text(json.dumps(result))
+            self.assertEqual(summarize(root)['cases'][0]['cpp_copies_per_rank'],
+                             [dict(bypassed_spans=[r, 0, 0]) for r in range(8)])
             result['benchmark']['hccl_expansion_mode'] = 'AIV'
             (root / 'results' / 'rank7.json').write_text(json.dumps(result))
             with self.assertRaisesRegex(ValueError, 'benchmark'): summarize(root)

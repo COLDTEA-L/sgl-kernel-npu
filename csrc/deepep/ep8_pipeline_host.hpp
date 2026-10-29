@@ -20,21 +20,28 @@ struct PipelineRuntime {
     virtual void Copy(const at::Tensor&, const at::Tensor&, const CopySpans&) = 0;
     virtual void Transfer(const at::Tensor&, const at::Tensor&, const Matrix&, const Matrix*, U) = 0;
 };
+struct PipelineCopyBinding {
+    // -1 means stage through workspace. Nonnegative values are row offsets.
+    int64_t pack = -1, forward = -1, unpack = -1;
+};
 struct PipelinePrepared {
     Plan plan;
     Layout layout;
     std::vector<ChunkViews> views;
+    std::vector<PipelineCopyBinding> copyBindings;
+    std::array<U, 3> bypassSpans{}, bypassBytes{};
     U sendRows = 0, recvRows = 0, generation = 0;
     const void* owner = nullptr;
+    bool tracked = false;
     bool UsesRelay() const { return !layout.chunks.empty(); }
 };
 
 class PipelineHost {
 public:
     PipelineHost(const Planner& planner, int rank, U chunkBytes, U maxChunks, U maxScratch,
-                 std::shared_ptr<PipelineRuntime> runtime)
+                 std::shared_ptr<PipelineRuntime> runtime, bool bypassCopies = true)
         : planner_(planner), rank_(rank), rowBytes_(planner.RowBytes()), chunkBytes_(chunkBytes),
-          maxChunks_(maxChunks), limit_(maxScratch), rt_(std::move(runtime)) {
+          maxChunks_(maxChunks), limit_(maxScratch), rt_(std::move(runtime)), bypassCopies_(bypassCopies) {
         TORCH_CHECK(rank >= 0 && rank < 8 && chunkBytes && chunkBytes <= Max && maxChunks && maxChunks <= Max && maxScratch,
                     "invalid native pipeline configuration");
     }
@@ -55,7 +62,8 @@ public:
     // Timings are host-only phase durations, not device completion or profiling.
     std::array<double, 3> Run(const Matrix& counts, const at::Tensor& send, const at::Tensor& recv) {
         auto lock = Lock(); Check(send);
-        auto p = Build(counts, send);
+        if (!dynamic_) dynamic_ = std::make_shared<PipelinePrepared>();
+        auto p = Build(counts, send, dynamic_);
         Validate(p, send, recv);
         auto start = Clock::now(); Submit(*p, send, recv);
         return {lastPlanUs_, lastLayoutUs_, Micros(start)};
@@ -64,14 +72,15 @@ public:
         auto lock = Lock();
         if (closed_) return;
         rt_->Sync();  // all lanes, also after a partially submitted failure
-        Invalidate(); arena_.clear(); zero_ = at::Tensor(); reservedBytes_ = 0;
+        Invalidate(); dynamic_.reset(); arena_.clear(); zeroView_ = at::Tensor(); zeroRecvView_ = at::Tensor();
+        zero_ = at::Tensor(); zeroRecv_ = at::Tensor(); reservedBytes_ = 0;
         closed_ = true;
     }
     std::array<U, 7> Stats() const {
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         TORCH_CHECK(lock.owns_lock(), "cannot inspect native pipeline during host submission");
         return {generation_, allocations_, events_, reservedBytes_, poisoned_ ? 1u : 0u,
-                zero_.defined() ? static_cast<U>(zero_.nbytes()) : 0u, closed_ ? 1u : 0u};
+                zero_.defined() ? static_cast<U>(zero_.nbytes() + zeroRecv_.nbytes()) : 0u, closed_ ? 1u : 0u};
     }
     const std::shared_ptr<PipelineRuntime>& Runtime() const { return rt_; }
 private:
@@ -102,23 +111,33 @@ private:
         } else {
             auto sizes = t.sizes().vec(); sizes[0] = 1;
             zero_ = at::empty(sizes, t.options());
-            rt_->Retain(zero_, 0);
+            // Vendor validates disjoint backing CAPACITIES even for zero rows.
+            // Keep separate send/receive sentinels, never one shared empty view.
+            zeroRecv_ = at::empty(sizes, t.options());
+            zeroView_ = zero_.narrow(0, 0, 0); zeroRecvView_ = zeroRecv_.narrow(0, 0, 0);
+            rt_->Retain(zero_, 0); rt_->Retain(zeroRecv_, 0);
         }
     }
-    std::shared_ptr<PipelinePrepared> Build(const Matrix& counts, const at::Tensor& example) {
+    std::shared_ptr<PipelinePrepared> Build(const Matrix& counts, const at::Tensor& example,
+                                            std::shared_ptr<PipelinePrepared> reuse = {}) {
         auto begin = Clock::now();
-        auto p = std::make_shared<PipelinePrepared>();
-        p->plan = planner_.Make(counts);
+        auto p = reuse ? reuse : std::make_shared<PipelinePrepared>();
+        bool tracked = p->tracked;
+        planner_.MakeInto(counts, p->plan);
         lastPlanUs_ = Micros(begin); begin = Clock::now();
-        p->owner = this;
+        p->sendRows = p->recvRows = 0;
         for (int k = 0; k < 8; ++k) { p->sendRows += counts[rank_ * 8 + k]; p->recvRows += counts[k * 8 + rank_]; }
         TORCH_CHECK(p->sendRows == static_cast<U>(example.size(0)), "send rows differ from current matrix");
-        p->layout = planner_.Build(counts, p->plan.relays, p->plan.moved, chunkBytes_, maxChunks_, rank_);
+        planner_.BuildInto(counts, p->plan.relays, p->plan.moved, chunkBytes_, maxChunks_, rank_, p->layout, true);
+        DescribeCopies(*p);
         if (p->UsesRelay()) {
             Reserve(p->layout, example); Bind(*p);
-            live_.erase(std::remove_if(live_.begin(), live_.end(), [](const auto& w) { return w.expired(); }), live_.end());
-            live_.push_back(p);
+            if (!tracked) {
+                live_.erase(std::remove_if(live_.begin(), live_.end(), [](const auto& w) { return w.expired(); }), live_.end());
+                live_.push_back(p); p->tracked = true;
+            }
         }
+        p->owner = this;
         lastLayoutUs_ = Micros(begin);
         return p;
     }
@@ -161,10 +180,44 @@ private:
         size_t needed = 1 + 2 * layout.chunks.size();
         rt_->Events(needed); events_ = std::max<U>(events_, needed);
     }
+    void DescribeCopies(PipelinePrepared& p) {
+        p.copyBindings.resize(p.layout.chunks.size());
+        p.bypassSpans = {}; p.bypassBytes = {};
+        for (size_t j = 0; j < p.layout.chunks.size(); ++j) {
+            const auto& c = p.layout.chunks[j]; auto& b = p.copyBindings[j]; b = {};
+            if (!bypassCopies_) continue;
+            const auto& pack = c.localCopies[0].spans;
+            const auto& forward = c.localCopies[1].spans;
+            const auto& unpack = c.localCopies[2].spans;
+            // Only full, contiguous, correctly ordered intervals can alias.
+            // Coalescing has already merged exactly adjacent source/dest spans.
+            if (pack.size() == 1 && pack[0][1] == 0 && pack[0][2] == c.sizes[rank_][0]) b.pack = pack[0][0];
+            if (forward.size() == 1 && forward[0][0] == 0 && forward[0][1] == 0 &&
+                forward[0][2] == c.sizes[rank_][1] && forward[0][2] == c.sizes[rank_][2]) b.forward = 0;
+            if (unpack.size() == 1 && unpack[0][0] == 0 && unpack[0][2] == c.sizes[rank_][3]) b.unpack = unpack[0][1];
+            const std::array<int64_t, 3> offsets{b.pack, b.forward, b.unpack};
+            for (int i = 0; i < 3; ++i) if (offsets[i] >= 0) {
+                ++p.bypassSpans[i]; p.bypassBytes[i] += c.localCopies[i].spans[0][2] * rowBytes_;
+            }
+        }
+    }
     void Bind(PipelinePrepared& p) {
-        std::vector<std::array<U, 4>> sizes;
-        for (const auto& c : p.layout.chunks) sizes.push_back(c.sizes[rank_]);
-        p.views = BindWorkspaceViews(arena_, p.layout.pools[rank_], sizes).second;
+        p.views.resize(p.layout.chunks.size());
+        for (size_t j = 0; j < p.layout.chunks.size(); ++j) {
+            const auto& sizes = p.layout.chunks[j].sizes[rank_];
+            const auto& b = p.copyBindings[j]; auto& views = p.views[j];
+            for (int i = 0; i < 4; ++i) {
+                if ((i == 0 && b.pack >= 0) || (i == 2 && b.forward >= 0) || (i == 3 && b.unpack >= 0)) {
+                    views[i] = at::Tensor(); continue; // bound to current payload at submission
+                }
+                if (!sizes[i]) { views[i] = i % 2 ? zeroRecvView_ : zeroView_; continue; }
+                // Reuse unchanged workspace views on a dynamic call. Never
+                // mutate a TensorImpl that queued work may still reference.
+                if (p.generation == generation_ && views[i].defined() &&
+                    views[i].size(0) == static_cast<int64_t>(sizes[i])) continue;
+                views[i] = arena_[(j % 2) * 4 + i].narrow(0, 0, sizes[i]);
+            }
+        }
         p.generation = generation_;
     }
     void Validate(const std::shared_ptr<PipelinePrepared>& p, const at::Tensor& send, const at::Tensor& recv) {
@@ -181,8 +234,8 @@ private:
     }
     void Submit(PipelinePrepared& p, const at::Tensor& src, const at::Tensor& dst) {
         // Keep real backing for zero-row calls; no per-iteration sentinel allocation.
-        auto send = src.storage().nbytes() ? src : zero_.narrow(0, 0, 0);
-        auto recv = dst.storage().nbytes() ? dst : zero_.narrow(0, 0, 0);
+        auto send = src.storage().nbytes() ? src : zeroView_;
+        auto recv = dst.storage().nbytes() ? dst : zeroRecvView_;
         struct Restore { PipelineRuntime& rt; ~Restore() { try { rt.Lane(0); } catch (...) {} } } restore{*rt_};
         int batch = -1;
         try {
@@ -197,13 +250,17 @@ private:
                 size_t ready = 1 + 2*j, done = ready + 1;
                 rt_->Lane(1);
                 if (j >= 2) rt_->Wait(done - 4, 1);
-                rt_->Copy(send, v[0], chunk.localCopies[0]);
-                rt_->Transfer(v[0], v[1], chunk.first, nullptr, rowBytes_);
+                const auto& b = p.copyBindings[j];
+                auto firstSend = b.pack >= 0 ? send.narrow(0, b.pack, chunk.sizes[rank_][0]) : v[0];
+                if (b.pack < 0) rt_->Copy(send, firstSend, chunk.localCopies[0]);
+                rt_->Transfer(firstSend, v[1], chunk.first, nullptr, rowBytes_);
                 rt_->Record(ready, 1);
                 rt_->Lane(2); rt_->Wait(ready, 2);
-                rt_->Copy(v[1], v[2], chunk.localCopies[1]);
-                rt_->Transfer(v[2], v[3], chunk.second, nullptr, rowBytes_);
-                rt_->Copy(v[3], recv, chunk.localCopies[2]);
+                auto secondSend = b.forward >= 0 ? v[1] : v[2];
+                auto secondRecv = b.unpack >= 0 ? recv.narrow(0, b.unpack, chunk.sizes[rank_][3]) : v[3];
+                if (b.forward < 0) rt_->Copy(v[1], secondSend, chunk.localCopies[1]);
+                rt_->Transfer(secondSend, secondRecv, chunk.second, nullptr, rowBytes_);
+                if (b.unpack < 0) rt_->Copy(secondRecv, recv, chunk.localCopies[2]);
                 rt_->Record(done, 2);
             }
             rt_->Wait(2 * p.layout.chunks.size(), 0);
@@ -219,12 +276,13 @@ private:
     U rowBytes_, chunkBytes_, maxChunks_, limit_;
     std::shared_ptr<PipelineRuntime> rt_;
     mutable std::mutex mutex_;
-    at::Tensor zero_;
+    at::Tensor zero_, zeroView_, zeroRecv_, zeroRecvView_;
+    std::shared_ptr<PipelinePrepared> dynamic_;
     std::vector<at::Tensor> arena_;
     Sizes capacities_{};
     std::vector<std::weak_ptr<PipelinePrepared>> live_;
     U generation_ = 0, allocations_ = 0, events_ = 0, reservedBytes_ = 0;
     double lastPlanUs_ = 0, lastLayoutUs_ = 0;
-    bool closed_ = false, poisoned_ = false;
+    bool closed_ = false, poisoned_ = false, bypassCopies_ = true;
 };
 } // namespace deep_ep::ep8

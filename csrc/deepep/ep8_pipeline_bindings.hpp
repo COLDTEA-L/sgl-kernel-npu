@@ -30,6 +30,14 @@ public:
     }
     void Transfer(const at::Tensor& src, const at::Tensor& dst, const Matrix& c, const Matrix* storage, U) override {
         TORCH_CHECK(failAfter < 0 || --failAfter != 0, "injected pipeline submission failure");
+        // Mirror vendor DisjointAllToAllVBuffers, including zero-row backing.
+        auto address = [](const at::Tensor& t) {
+            return reinterpret_cast<uintptr_t>(t.numel() ? t.data_ptr() : t.storage().data_ptr().get());
+        };
+        auto capacity = [](const at::Tensor& t) { return t.numel() ? t.nbytes() : t.storage().nbytes(); };
+        auto a = address(src), b = address(dst), an = capacity(src), bn = capacity(dst);
+        TORCH_CHECK(a && b && an && bn && (a <= b ? an <= b-a : bn <= a-b),
+                    "trace vendor buffer capacity overlap (including zero rows)");
         PipelineTrace t{3, active}; t.src = src; t.dst = dst; t.counts = c;
         if (storage) { t.hasStorage = true; t.storage = *storage; }
         trace.push_back(std::move(t));
@@ -37,10 +45,20 @@ public:
 };
 inline void BindPipeline(pybind11::module_& m) {
     namespace py = pybind11;
-    m.attr("ep8_pipeline_host_abi") = 1;
+    m.attr("ep8_pipeline_host_abi") = 2;
     py::class_<PipelinePrepared, std::shared_ptr<PipelinePrepared>>(m, "Ep8PipelinePrepared")
         .def_property_readonly("uses_relay", &PipelinePrepared::UsesRelay)
         .def_property_readonly("chunks", [](const PipelinePrepared& p) { return p.layout.chunks.size(); })
+        .def("copy_report", [](const PipelinePrepared& p) {
+            py::dict d;
+            d["bypassed_spans"] = p.bypassSpans; d["bypassed_bytes"] = p.bypassBytes;
+            std::array<U, 3> spans{}, bytes{};
+            for (const auto& c : p.layout.chunks) for (int i = 0; i < 3; ++i)
+                for (const auto& v : c.localCopies[i].spans) { ++spans[i]; bytes[i] += v[2]; }
+            // Rows are useful across dtype/width; bytes above use actual rowBytes.
+            d["original_spans"] = spans; d["original_rows"] = bytes;
+            return d;
+        })
         .def("describe", [](const PipelinePrepared& p) {
             return py::make_tuple(Scalars(p.plan.counts), Scalars(p.plan.relays), Scalars(p.plan.moved), Rows(p.plan.actions));
         });
@@ -78,12 +96,12 @@ inline void BindPipeline(pybind11::module_& m) {
             auto rt = dynamic_cast<TracePipelineRuntime*>(h.Runtime().get()); TORCH_CHECK(rt, "CPU trace only");
             rt->failAfter = transfers;
         });
-    m.def("ep8_pipeline_create", [](const Planner& planner, int rank, U chunk, U maxChunks, U limit, bool cpuTrace) {
+    m.def("ep8_pipeline_create", [](const Planner& planner, int rank, U chunk, U maxChunks, U limit, bool cpuTrace, bool bypassCopies) {
         std::shared_ptr<PipelineRuntime> rt;
         if (cpuTrace) rt = std::make_shared<TracePipelineRuntime>();
         else rt = std::make_shared<NpuPipelineRuntime>(rank);
-        return std::make_shared<PipelineHost>(planner, rank, chunk, maxChunks, limit, std::move(rt));
+        return std::make_shared<PipelineHost>(planner, rank, chunk, maxChunks, limit, std::move(rt), bypassCopies);
     }, py::arg("planner"), py::arg("rank"), py::arg("chunk_bytes") = 8 << 20,
-       py::arg("max_chunks") = 128, py::arg("max_scratch_bytes") = 1 << 30, py::arg("cpu_trace") = false);
+       py::arg("max_chunks") = 128, py::arg("max_scratch_bytes") = 1 << 30, py::arg("cpu_trace") = false, py::arg("bypass_copies") = true);
 }
 } // namespace deep_ep::ep8

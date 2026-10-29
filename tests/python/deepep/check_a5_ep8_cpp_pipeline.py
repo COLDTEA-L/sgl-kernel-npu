@@ -23,14 +23,14 @@ def main():
     from heuristic_alltoallv import RelayPlanner
     spec = importlib.util.spec_from_file_location('deep_ep_cpp', args.extension.resolve(strict=True))
     ext = importlib.util.module_from_spec(spec); spec.loader.exec_module(ext)
-    assert ext.ep8_pipeline_host_abi == 1
+    assert ext.ep8_pipeline_host_abi == 2
     planner = RelayPlanner(8, ref.ALL, native_module=ext)
 
-    def context(rank, chunk=24, limit=1 << 20):
-        return ext.ep8_pipeline_create(planner._native, rank, chunk, 128, limit, True)
+    def context(rank, chunk=24, limit=1 << 20, bypass=True):
+        return ext.ep8_pipeline_create(planner._native, rank, chunk, 128, limit, True, bypass)
 
-    def replay(ctx, rt, events):
-        for op in ctx.take_trace():
+    def replay(ctx, rt, events, trace=None):
+        for op in ctx.take_trace() if trace is None else trace:
             tag, lane = op[:2]; stream = (rt.rank, lane)
             if tag in (0, 1):
                 event = events.setdefault(op[2], rt.event())
@@ -127,6 +127,67 @@ def main():
                 self.assertEqual(ctx.stats()['reserved_bytes'], 0)
                 self.assertTrue(ctx.stats()['closed'])
             with self.assertRaises(RuntimeError): contexts[0].prepare(small, sends[0])
+
+        def test_copy_bypass_matches_staging_with_offset_guards(self):
+            from test_a5_ccu_heuristic_npu import synthetic
+            matrices = [synthetic(n, 128) for n in ('single_hot', 'competing', 'asymmetric', 'cut', 'uniform', 'self', 'zero')]
+            # Same row counts/chunk rows as width=4096 fp16 + 8MiB chunks,
+            # using 8-byte CPU rows to keep this audit small.
+            # Keep actual source/output views non-base-aligned; validate guards
+            # and exact bytes with multiple chunks and disjoint direct writes.
+            for name, c in zip(('single_hot', 'competing', 'asymmetric', 'cut', 'uniform', 'self', 'zero'), matrices):
+                results = []
+                for bypass in (False, True):
+                    contexts = [context(r, 8192, bypass=bypass) for r in range(8)]
+                    engine = ref.Engine(); copied = 0; original = 0; removed = 0
+                    sends, recv, expected = payloads(c, 1)
+                    guards = []
+                    for r, ctx in enumerate(contexts):
+                        ss = torch.full((sends[r].size(0)+6, 2), -111.)
+                        rr = torch.full((recv[r].size(0)+10, 2), -222.)
+                        ss[3:-3].copy_(sends[r]); sends[r] = ss[3:-3]; recv[r] = rr[5:-5]
+                        guards.append((ss, rr))
+                        p = ctx.prepare(c, sends[r]); report = p.copy_report()
+                        original += sum(report['original_spans']); removed += sum(report['bypassed_spans'])
+                        ctx.execute(p, sends[r], recv[r]); trace = ctx.take_trace()
+                        copied += sum(len(op[4]) for op in trace if op[0] == 2)
+                        replay(ctx, ref.FakeRuntime(engine,r), {}, trace)
+                    self.assertEqual(copied, original - removed)
+                    engine.run(41)
+                    for a,b in zip(recv, expected): self.assertTrue(torch.equal(a,b), name)
+                    for ss,rr in guards:
+                        self.assertTrue(torch.all(ss[:3] == -111) and torch.all(ss[-3:] == -111))
+                        self.assertTrue(torch.all(rr[:5] == -222) and torch.all(rr[-5:] == -222))
+                    results.append((copied, removed))
+                    for ctx in contexts: ctx.close()
+                print(f'EP8_CPP_COPY_AUDIT case={name} staged_spans={results[0][0]} auto_spans={results[1][0]} bypassed={results[1][1]}', flush=True)
+                if name == 'single_hot':
+                    self.assertGreater(results[0][0], 0)
+                    self.assertEqual(results[1][0], 0)  # all three HBM copy stages removed
+                if name == 'asymmetric': self.assertGreater(results[1][0], 0)  # scattered layout still stages
+
+        def test_dynamic_queued_changing_matrices_and_payload_addresses(self):
+            contexts = [context(r, 24) for r in range(8)]
+            rng = random.Random(8192)
+            matrices = [[rng.randrange(1, 10) for _ in range(64)] for _ in range(6)]
+            # Reserve the high-water union before queuing; the CPU trace
+            # deliberately does not model blocking synchronization on growth.
+            for c in matrices:
+                sends,_,_ = payloads(c, 0)
+                for r,ctx in enumerate(contexts): ctx.prepare(c, sends[r])
+            engine = ref.Engine(); events = [{} for _ in range(8)]; snapshots = []
+            runtimes = [ref.FakeRuntime(engine,r) for r in range(8)]
+            generations = [ctx.stats()['generation'] for ctx in contexts]
+            for epoch,c in enumerate(matrices):
+                sends,recv,expected = payloads(c, epoch)
+                for r,ctx in enumerate(contexts):
+                    ctx.run(c,sends[r],recv[r]); replay(ctx,runtimes[r],events[r])
+                snapshots.append((recv,expected))
+            self.assertEqual(generations, [ctx.stats()['generation'] for ctx in contexts])
+            engine.run(29)
+            for recv,expected in snapshots:
+                for a,b in zip(recv,expected): self.assertTrue(torch.equal(a,b))
+            for ctx in contexts: ctx.close()
 
         def test_global_capacity_and_failed_submission_poison_context(self):
             c = [0]*64; c[4] = 40
