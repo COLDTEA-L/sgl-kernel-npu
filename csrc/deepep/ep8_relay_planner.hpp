@@ -15,7 +15,27 @@ using Matrix = std::array<U, 64>;
 using Relays = std::array<int, 64>;
 using Action = std::array<U, 5>;
 using Sizes = std::array<std::array<U, 4>, 8>;
+using Span = std::array<U, 3>;  // source row, destination row, row count
 constexpr U Max = static_cast<U>(std::numeric_limits<int64_t>::max());
+
+struct CopySpans {
+    std::vector<Span> spans;
+    CopySpans() = default;
+    explicit CopySpans(std::vector<Span> values) : spans(std::move(values)) {}
+    void Coalesce() {
+        std::sort(spans.begin(), spans.end());
+        size_t used = 0;
+        for (const auto value : spans) {
+            if (used && spans[used - 1][0] + spans[used - 1][2] == value[0] &&
+                spans[used - 1][1] + spans[used - 1][2] == value[1]) {
+                spans[used - 1][2] += value[2];
+            } else {
+                spans[used++] = value;
+            }
+        }
+        spans.resize(used);
+    }
+};
 
 struct Plan {
     Matrix counts{}, moved{}, loads{};
@@ -29,6 +49,7 @@ struct Chunk {
     Matrix first{}, second{};
     std::vector<std::array<U, 10>> pieces;
     Sizes sizes{};
+    std::array<CopySpans, 3> localCopies;  // pack, forward, unpack
 };
 
 struct Layout {
@@ -124,9 +145,9 @@ public:
     }
 
     Layout Build(const Matrix& counts, const Relays& relays, const Matrix& moved,
-                 U chunkBytes, U maxChunks) const {
+                 U chunkBytes, U maxChunks, int rank = -1) const {
         CheckCounts(counts, rowBytes_);
-        if (!chunkBytes || chunkBytes > Max || !maxChunks || maxChunks > Max)
+        if (!chunkBytes || chunkBytes > Max || !maxChunks || maxChunks > Max || rank < -1 || rank >= 8)
             throw std::invalid_argument("invalid chunk bounds");
         Layout out; out.chunkRows = std::max<U>(1, chunkBytes / rowBytes_);
         U maxMoved = 0;
@@ -160,7 +181,13 @@ public:
                 p[6] = fs[a] + fu[a]; p[7] = fr[a] + fu[a];
                 p[8] = ss[b] + su[b]; p[9] = sr[b] + su[b];
                 fu[a] += p[3]; su[b] += p[3];
+                if (rank >= 0) {
+                    if (p[0] == static_cast<U>(rank)) chunk.localCopies[0].spans.push_back({p[4], p[6], p[3]});
+                    if (p[2] == static_cast<U>(rank)) chunk.localCopies[1].spans.push_back({p[7], p[8], p[3]});
+                    if (p[1] == static_cast<U>(rank)) chunk.localCopies[2].spans.push_back({p[9], p[5], p[3]});
+                }
             }
+            if (rank >= 0) for (auto& copies : chunk.localCopies) copies.Coalesce();
             for (size_t f = 0; f < 64; ++f) {
                 chunk.sizes[f / 8][0] += chunk.first[f];
                 chunk.sizes[f % 8][1] += chunk.first[f];

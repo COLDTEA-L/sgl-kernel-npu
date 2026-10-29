@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CPU-only timing of production native bindings vs Python; no route cache/NPU."""
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('/home/l00934901/profiling/a5-ep8-planner.json'))
     parser.add_argument('--iters', type=int, default=200)
+    parser.add_argument('--extension', type=Path,
+                        help='optional production DeepEP SO; also measures native workspace-view binding on CPU')
     args = parser.parse_args()
     if args.iters < 1: parser.error('--iters must be positive')
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +43,13 @@ def main():
         return (time.perf_counter() - start) * 1e6 / args.iters
     results = []
     with tempfile.TemporaryDirectory(prefix='planner-build-', dir=args.output.parent) as directory:
-        native = load_native_planner(directory)
+        if args.extension:
+            import torch_npu
+            spec = importlib.util.spec_from_file_location('deep_ep_cpp', args.extension.resolve(strict=True))
+            native = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native)
+        else:
+            native = load_native_planner(directory)
         for name in ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'):
             c = synthetic(name, 128)
             row = dict(case=name)
@@ -60,6 +69,7 @@ def main():
                                         moe_all_to_all_group_name='lane' + str(i)),
                                          handle=i + 1, stream=i) for i in range(3)]
                 context = PipelineContext(lanes, _runtime=Runtime())
+                context.runtime.bind_workspace_views = getattr(module, 'ep8_bind_workspace_views', None)
                 inputs = tuple(torch.empty((sum(v[:8]), 4096), dtype=torch.float16) for v in matrices)
                 def prepare(i):
                     return PreparedPipelinedAllToAllV(context, plans[i % 2], inputs[i % 2], chunk_bytes=8 << 20)
@@ -72,6 +82,7 @@ def main():
             results.append(row)
             print(json.dumps(row), flush=True)
     args.output.write_text(json.dumps(dict(scope='CPU only; layout_us is INCLUDED in prepare_cpu_rank0_us',
+                                          native_workspace_views=bool(args.extension),
                                           alternating_counts=True, iters=args.iters, cases=results), indent=2) + '\n')
 
 

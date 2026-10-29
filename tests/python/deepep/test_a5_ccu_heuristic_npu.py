@@ -53,7 +53,7 @@ def main():
     p.add_argument('--min-gain-bytes', type=int, default=0)
     p.add_argument('--max-actions', type=int, default=56)
     p.add_argument('--planner', choices=('native', 'python'), default='native',
-                   help='native C++ planner/layout or the original Python reference')
+                   help='native C++ planner/layout/copy submission or the Python reference')
     p.add_argument('--max-scratch-mib', type=int, default=1024)
     p.add_argument('--relay-capacity-mib', type=int, default=1024)
     p.add_argument('--warmup', type=int, default=3)
@@ -101,8 +101,10 @@ def main():
     import torch_npu
     deep_ep, _ = import_deep_ep(extension)
     native_planner_module = sys.modules.get('deep_ep_cpp') if args.planner == 'native' else None
-    if args.planner == 'native' and getattr(native_planner_module, 'ep8_relay_planner_abi', None) != 1:
-        raise RuntimeError('rebuild/install DeepEP wheel: ep8_relay_planner_abi=1 required')
+    if args.planner == 'native' and (getattr(native_planner_module, 'ep8_relay_planner_abi', None) != 2
+                                   or not hasattr(native_planner_module, 'ep8_copy_spans_out')
+                                   or not hasattr(native_planner_module, 'ep8_bind_workspace_views')):
+        raise RuntimeError('rebuild/install DeepEP wheel: planner ABI 2, span copies and workspace views required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
@@ -378,7 +380,8 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=7, planner=args.planner, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                  benchmark=dict(protocol=8, planner=args.planner, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
+                                 copy_submission=('native_spans' if pipeline and args.planner == 'native' else 'python'),
                                  dynamic_iters=args.dynamic_iters, executor_sync=args.executor_sync,
                                  multipath_policy=args.multipath_policy, executor=args.executor,
                                  chunk_bytes=args.chunk_bytes, max_chunks=args.max_chunks, thread_bridge=args.thread_bridge,

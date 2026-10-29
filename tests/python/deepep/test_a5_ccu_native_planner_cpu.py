@@ -14,7 +14,7 @@ from dataclasses import replace
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
-from heuristic_alltoallv import RelayPlanner, make_plan, MAX_I64
+from heuristic_alltoallv import RelayPlanner, make_plan, MAX_I64, _coalesce_spans
 from pipelined_alltoallv import build_pipeline_schedule
 from test_a5_ccu_pipeline_cpu import ALL, simulate
 
@@ -127,6 +127,24 @@ class NativePlannerTests(unittest.TestCase):
         with self.assertRaises(ValueError): RelayPlanner(8192, invalid, native_module=self.native)
         with self.assertRaises(RuntimeError): RelayPlanner(8192, ALL, native_module=object())
         with self.assertRaises(ValueError): self.native.Ep8RelayPlanner(invalid, 8192, 1, 0, 56, [])
+
+    def test_native_copy_descriptors_match_reference_all_ranks(self):
+        rng = random.Random(91)
+        planner = RelayPlanner(14, ALL, native_module=self.native)
+        for _ in range(100):
+            p = planner.plan([rng.randrange(31) if rng.random() < .8 else 0 for _ in range(64)])
+            for rank in range(8):
+                schedule = build_pipeline_schedule(p, chunk_bytes=7 * 14, rank=rank)
+                for chunk in schedule.chunks:
+                    expected = (
+                        _coalesce_spans([(v.source, v.first_send, v.rows) for v in chunk.pieces if v.src == rank]),
+                        _coalesce_spans([(v.first_recv, v.second_send, v.rows) for v in chunk.pieces if v.relay == rank]),
+                        _coalesce_spans([(v.second_recv, v.final, v.rows) for v in chunk.pieces if v.dst == rank]))
+                    self.assertEqual(tuple([tuple(s) for s in c] for c in chunk.copy_spans), expected)
+                    for copies in chunk.copy_spans:
+                        self.assertFalse(hasattr(copies, 'append'))
+        with self.assertRaises(ValueError): build_pipeline_schedule(p, rank=8)
+        with self.assertRaises(ValueError): build_pipeline_schedule(p, rank=-1)
 
     def test_native_layout_in_async_executor_and_growing_reused_workspace(self):
         import test_a5_ccu_pipeline_cpu as pipeline_tests

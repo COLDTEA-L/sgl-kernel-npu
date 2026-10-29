@@ -34,6 +34,7 @@ class Chunk:
     pieces: tuple
 
     rank_sizes: tuple = field(default=None, repr=False)
+    copy_spans: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.rank_sizes is not None:
@@ -79,14 +80,17 @@ class PipelineSchedule:
                     scratch_bytes_per_rank=[self.scratch_rows(r) * self.plan.row_bytes for r in range(N)])
 
 
-def build_pipeline_schedule(plan, *, chunk_bytes=8 << 20, max_chunks=128):
+def build_pipeline_schedule(plan, *, chunk_bytes=8 << 20, max_chunks=128, rank=None):
+    if rank is not None and _uint(rank, 'rank') >= N:
+        raise ValueError('rank must be an EP8 participant')
     if plan._native_layout is not None:
         rows, direct, pieces, chunks, pools = plan._native_layout(
             plan.counts, plan.relay_rank, plan.relay_rows,
-            _uint(chunk_bytes, 'chunk_bytes', 1), _uint(max_chunks, 'max_chunks', 1))
+            _uint(chunk_bytes, 'chunk_bytes', 1), _uint(max_chunks, 'max_chunks', 1),
+            -1 if rank is None else rank)
         return PipelineSchedule(plan, rows, direct, pieces,
-                                tuple(Chunk(fc, sc, tuple(RelayPiece(*p) for p in ps), sizes)
-                                      for fc, sc, ps, sizes in chunks), pools)
+                                tuple(Chunk(fc, sc, tuple(RelayPiece(*p) for p in ps), sizes, copies)
+                                      for fc, sc, ps, sizes, copies in chunks), pools)
     # Reuse the serial planner's validation, but NOT its two-stage layout.
     validate_plan(plan)
     rows = max(1, _uint(chunk_bytes, 'chunk_bytes', 1) // plan.row_bytes)
@@ -132,7 +136,11 @@ class PipelineLane:
 class _NpuRuntime:
     def __init__(self):
         import torch
+        import sys
         self.torch = torch
+        module = sys.modules.get('deep_ep_cpp') or sys.modules.get('deep_ep.deep_ep_cpp')
+        self.native_copy = getattr(module, 'ep8_copy_spans_out', None)
+        self.bind_workspace_views = getattr(module, 'ep8_bind_workspace_views', None)
 
     def current(self): return self.torch.npu.current_stream()
     def synchronize(self, stream): stream.synchronize()
@@ -143,6 +151,7 @@ class _NpuRuntime:
     def retain(self, tensor, stream):
         if tensor.numel(): tensor.record_stream(stream)
     def copy(self, dst, di, src, si, n): dst.narrow(0, di, n).copy_(src.narrow(0, si, n))
+    def copy_spans(self, dst, src, spans): self.native_copy(src, dst, spans)
     def transfer(self, lane, send, recv, counts, storage_counts=None):
         if storage_counts is None:
             lane.buffer.ccu_urma_peer_plan_alltoallv_out(send, recv, lane.handle, counts)
@@ -298,6 +307,10 @@ class PreparedPipelinedAllToAllV:
         import torch
         self.context, self.plan, self.rank = context, plan, context.rank
         self.runtime = context.runtime
+        self._native_copies = plan._native_layout is not None
+        if self._native_copies and isinstance(self.runtime, _NpuRuntime) and (
+                self.runtime.native_copy is None or self.runtime.bind_workspace_views is None):
+            raise RuntimeError('rebuild/install DeepEP: native span copies and workspace views required')
         if context.closed or self.runtime.current() != context.lanes[0].stream:
             raise ValueError('prepare requires an open context on its caller stream')
         if example_send.dim() < 1 or not example_send.is_contiguous():
@@ -311,7 +324,7 @@ class PreparedPipelinedAllToAllV:
         self.recv_rows = sum(plan.counts[self.rank::N])
         if example_send.shape[0] != self.send_rows:
             raise ValueError('send rows differ from plan')
-        self.schedule = build_pipeline_schedule(plan, chunk_bytes=chunk_bytes, max_chunks=max_chunks)
+        self.schedule = build_pipeline_schedule(plan, chunk_bytes=chunk_bytes, max_chunks=max_chunks, rank=self.rank)
         limit = _uint(max_scratch_bytes, 'max_scratch_bytes')
         # Same global check on ALL ranks, before any collective is enqueued.
         if any(self.schedule.scratch_rows(r) * plan.row_bytes > limit for r in range(N)):
@@ -334,9 +347,12 @@ class PreparedPipelinedAllToAllV:
         self.direct_counts = list(dc)
         self._chunk_specs = []
         for chunk in self.schedule.chunks:
-            pack = _coalesce_spans([(p.source, p.first_send, p.rows) for p in chunk.pieces if p.src == self.rank])
-            forward = _coalesce_spans([(p.first_recv, p.second_send, p.rows) for p in chunk.pieces if p.relay == self.rank])
-            unpack = _coalesce_spans([(p.second_recv, p.final, p.rows) for p in chunk.pieces if p.dst == self.rank])
+            if chunk.copy_spans is not None:
+                pack, forward, unpack = chunk.copy_spans
+            else:
+                pack = _coalesce_spans([(p.source, p.first_send, p.rows) for p in chunk.pieces if p.src == self.rank])
+                forward = _coalesce_spans([(p.first_recv, p.second_send, p.rows) for p in chunk.pieces if p.relay == self.rank])
+                unpack = _coalesce_spans([(p.second_recv, p.final, p.rows) for p in chunk.pieces if p.dst == self.rank])
             self._chunk_specs.append((chunk, list(chunk.first_counts), list(chunk.second_counts), pack, forward, unpack))
         self._bind_views()
 
@@ -347,6 +363,14 @@ class PreparedPipelinedAllToAllV:
     def _bind_views(self):
         arena = self.context._arena
         sizes = self.schedule.pool_sizes(self.rank)
+        native_bind = getattr(self.runtime, 'bind_workspace_views', None)
+        if self._native_copies and native_bind is not None:
+            self.workspace, views = native_bind(arena, sizes, [c.sizes(self.rank) for c, *_ in self._chunk_specs])
+            self.pool = [self.workspace[:4], self.workspace[4:]]
+            self.chunks = [(tuple(tensors), fc, sc, pack, forward, unpack)
+                           for tensors, (_, fc, sc, pack, forward, unpack) in zip(views, self._chunk_specs)]
+            self._bound_generation = self.context.generation
+            return
         self.pool = [[arena[slot * 4 + i].narrow(0, 0, n) for i, n in enumerate(sizes)] for slot in range(2)]
         self.workspace = [v for slot in self.pool for v in slot]
         self.chunks = []
@@ -362,6 +386,15 @@ class PreparedPipelinedAllToAllV:
             raise RuntimeError(f'PIPELINE_TRANSFER_FAILED stage={stage} rank={self.rank} '
                                f'handle={lane.handle} generation={self.context.generation} '
                                f'send_rows={len(send)} recv_rows={len(recv)}') from exc
+
+    def _copy_spans(self, dst, src, spans):
+        if not spans:
+            return
+        if self._native_copies and hasattr(self.runtime, 'copy_spans'):
+            self.runtime.copy_spans(dst, src, spans)
+        else:  # Python reference and the CPU dependency simulator.
+            for si, di, n in spans:
+                self.runtime.copy(dst, di, src, si, n)
 
     def execute(self, send, recv):
         rt = self.runtime
@@ -399,17 +432,14 @@ class PreparedPipelinedAllToAllV:
                 # unpack complete. A different slot permits the overlap.
                 if j >= 2:
                     rt.wait(first.stream, self.done[j - 2])
-                for src, dst, n in pack:
-                    rt.copy(fs, dst, send, src, n)
+                self._copy_spans(fs, send, pack)
                 self._transfer(first, fs, fr, fc, f"first_chunk_{j}")
                 rt.record(self.ready[j], first.stream)
             with rt.stream(second.stream):
                 rt.wait(second.stream, self.ready[j])
-                for src, dst, n in forward:
-                    rt.copy(ss, dst, fr, src, n)
+                self._copy_spans(ss, fr, forward)
                 self._transfer(second, ss, sr, sc, f"second_chunk_{j}")
-                for src, dst, n in unpack:
-                    rt.copy(recv, dst, sr, src, n)
+                self._copy_spans(recv, sr, unpack)
                 rt.record(self.done[j], second.stream)
         # Only the consumer joins the two legs. No device-wide synchronize and
         # no dependency from direct completion to relay first/second hop.

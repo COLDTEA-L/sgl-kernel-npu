@@ -127,8 +127,8 @@ class RelayPlanner:
         self.options['relay_capacity_bytes'] = relay_capacity_bytes
         self._native = None
         if native_module is not None:
-            if getattr(native_module, 'ep8_relay_planner_abi', None) != 1:
-                raise RuntimeError('rebuild/install DeepEP: ep8_relay_planner_abi=1 required')
+            if getattr(native_module, 'ep8_relay_planner_abi', None) != 2:
+                raise RuntimeError('rebuild/install DeepEP: ep8_relay_planner_abi=2 required')
             self._native = native_module.Ep8RelayPlanner(
                 self.relays, self.row_bytes, min_chunk_bytes, min_gain_bytes, max_actions,
                 () if relay_capacity_bytes is None else relay_capacity_bytes)
