@@ -106,6 +106,8 @@ public:
         }
     }
 
+    U RowBytes() const { return rowBytes_; }
+
     Plan Make(const Matrix& counts) const {
         CheckCounts(counts, rowBytes_);
         Plan p; p.counts = counts; p.relays.fill(-1);

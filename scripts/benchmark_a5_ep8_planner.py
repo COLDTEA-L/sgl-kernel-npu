@@ -96,6 +96,13 @@ def main():
             row['fast'] = dict(select_us=measure(lambda i: fast.select(matrices[i % 2])),
                               select_prepare_cpu_rank0_us=measure(fast_prepare),
                               selection=fast.report(decision), workspace=fast_context.workspace_stats())
+            if args.extension and getattr(native, 'ep8_pipeline_host_abi', None) == 1:
+                opaque_planner = RelayPlanner(8192, ALL, native_module=native,
+                                              relay_capacity_bytes=[1024 << 20] * 8)
+                opaque = native.ep8_pipeline_create(opaque_planner._native, 0, 8 << 20, 128, 1 << 30, True)
+                row['cpp_host'] = dict(plan_prepare_cpu_rank0_us=measure(
+                    lambda i: opaque.prepare(matrices[i % 2], inputs[i % 2])), workspace=opaque.stats())
+                opaque.close()
             results.append(row)
             print(json.dumps(row), flush=True)
     args.output.write_text(json.dumps(dict(scope='CPU only; layout_us is INCLUDED in prepare_cpu_rank0_us',

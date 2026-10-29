@@ -855,19 +855,9 @@ AllToAllVTensors CheckAllToAllVTensors(const torch::Tensor &send, const torch::T
     EP_HOST_ASSERT(layout.recvBytes / result.rowBytes == static_cast<uint64_t>(recv.size(0)));
     return result;
 }
-void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
-    int64_t rank, const std::vector<int64_t> &counts, HcclComm comm,
-    const std::vector<int64_t> *storageCounts = nullptr)
+void SubmitAllToAllVRaw(const torch::Tensor& send, const torch::Tensor& recv, int64_t handle,
+    int64_t rank, const uint64_t* counts, uint64_t rowBytes, HcclComm comm, const uint64_t* storageCounts)
 {
-    const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, storageCounts ? *storageCounts : counts);
-    std::vector<uint64_t> transferCounts;
-    if (storageCounts) {
-        EP_HOST_ASSERT(counts.size() == 64);
-        for (size_t i = 0; i < counts.size(); ++i) {
-            EP_HOST_ASSERT(counts[i] >= 0 && counts[i] <= (*storageCounts)[i]);
-            transferCounts.push_back(counts[i]);
-        }
-    }
     EP_HOST_ASSERT(torch_npu::utils::is_npu(send));
     // Zero-row views can own nonempty persistent backing (pipeline arena).
     // Reuse its BASE address/capacity: no payload will access this direction.
@@ -885,22 +875,53 @@ void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64
         using ExecuteLayout = HcclResult (*)(void *, void *, uint64_t, uint64_t, uint64_t,
             uint32_t, HcclComm, aclrtStream, uint64_t, const uint64_t *, uint32_t, const uint64_t *, uint32_t);
         static auto executeLayout = reinterpret_cast<ExecuteLayout>(PeerPlanSymbol("HcclCcuUrmaPeerPlanAllToAllVExecuteLayout"));
-        status = executeLayout(inputPtr, outputPtr, inputBytes, outputBytes, checked.rowBytes,
-            rank, comm, stream, handle, transferCounts.data(), 64, checked.counts.data(), 64);
+        status = executeLayout(inputPtr, outputPtr, inputBytes, outputBytes, rowBytes,
+            rank, comm, stream, handle, counts, 64, storageCounts, 64);
     } else {
         status = execute(inputPtr, outputPtr, inputBytes, outputBytes,
-            checked.rowBytes, rank, comm, stream, handle, checked.counts.data(), 64);
+            rowBytes, rank, comm, stream, handle, counts, 64);
     }
     if (status != HCCL_SUCCESS) {
         std::fprintf(stderr, "ALLTOALLV_EXECUTE_FAILED rank=%ld handle=%ld stream=%p status=%d "
             "send=%p recv=%p send_capacity=%lu recv_capacity=%lu row_bytes=%lu\n",
             static_cast<long>(rank), static_cast<long>(handle), stream, static_cast<int>(status),
-            inputPtr, outputPtr, inputBytes, outputBytes, checked.rowBytes);
+            inputPtr, outputPtr, inputBytes, outputBytes, rowBytes);
         std::fflush(stderr);
     }
     HCCL_CHECK(status);
 }
+void LaunchAllToAllV(const torch::Tensor &send, const torch::Tensor &recv, int64_t handle,
+    int64_t rank, const std::vector<int64_t> &counts, HcclComm comm,
+    const std::vector<int64_t> *storageCounts = nullptr)
+{
+    const auto checked = CheckAllToAllVTensors(send, recv, handle, rank, storageCounts ? *storageCounts : counts);
+    std::vector<uint64_t> transferCounts;
+    if (storageCounts) {
+        EP_HOST_ASSERT(counts.size() == 64);
+        for (size_t i = 0; i < counts.size(); ++i) {
+            EP_HOST_ASSERT(counts[i] >= 0 && counts[i] <= (*storageCounts)[i]);
+            transferCounts.push_back(counts[i]);
+        }
+    }
+    SubmitAllToAllVRaw(send, recv, handle, rank,
+        storageCounts ? transferCounts.data() : checked.counts.data(), checked.rowBytes,
+        comm, storageCounts ? checked.counts.data() : nullptr);
+}
 } // namespace
+namespace ep8 {
+// Only the validated opaque C++ pipeline calls this. Matrix/shape/alias checks
+// were done at prepare/execute entry, not reconstructed once per chunk.
+void SubmitPipelineTransfer(const torch::Tensor& send, const torch::Tensor& recv, int64_t handle,
+    int64_t rank, const uint64_t* counts, uint64_t rowBytes, HcclComm comm, const uint64_t* storageCounts)
+{
+    SubmitAllToAllVRaw(send, recv, handle, rank, counts, rowBytes, comm, storageCounts);
+}
+} // namespace ep8
+HcclComm Buffer::ep8_pipeline_comm()
+{
+    EP_HOST_ASSERT(num_ranks == 8);
+    return ResolveComm(moe_all_to_all_group_name, ep_comm);
+}
 int64_t Buffer::prepare_ccu_urma_peer_plan_alltoallv(const std::string &id, const std::string &manifest)
 {
     EP_HOST_ASSERT(num_ranks == 8 && !id.empty() && !manifest.empty());

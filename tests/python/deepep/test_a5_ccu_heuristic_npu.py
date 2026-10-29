@@ -67,6 +67,8 @@ def main():
     p.add_argument('--rounds', type=int, default=4)
     p.add_argument('--dynamic-iters', type=int, default=10)
     p.add_argument('--executor', choices=('pipeline', 'serial'), default='pipeline')
+    p.add_argument('--pipeline-host', choices=('python', 'cpp'), default='python',
+                   help='cpp keeps greedy plan/layout/views and stream/event submission inside one extension call')
     p.add_argument('--chunk-bytes', type=int, default=8 << 20,
                    help='greedy: per-flow chunk cap; fast: base chunk size, may grow to limit relay to two batches')
     p.add_argument('--thread-bridge', choices=('event', 'hcomm'), default='event',
@@ -81,6 +83,8 @@ def main():
             args.warmup < 0 or min(args.iters, args.rounds, args.dynamic_iters, args.max_scratch_mib) < 1
             or args.relay_capacity_mib < 0):
         p.error('requires EP8, positive sizes/iterations and nonnegative warmup/capacity')
+    if args.pipeline_host == 'cpp' and (args.executor != 'pipeline' or args.planner != 'native' or args.routing_policy != 'greedy'):
+        p.error('cpp host comparison requires --executor pipeline --planner native --routing-policy greedy')
     if args.routing_policy == 'fast' and (args.executor != 'pipeline' or args.planner != 'native' or args.max_chunks < 2):
         p.error('fast requires native planner, pipeline executor and max-chunks >= 2; use --routing-policy greedy for legacy controls')
     if args.routing_policy == 'fast' and (args.max_actions != 56 or args.min_chunk_bytes != 1 or args.min_gain_bytes != 0):
@@ -117,6 +121,8 @@ def main():
         raise RuntimeError('rebuild/install DeepEP wheel: planner ABI 2, span copies and workspace views required')
     if args.routing_policy == 'fast' and getattr(native_planner_module, 'ep8_fast_selector_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: fast selector ABI 1 required')
+    if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 1:
+        raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     marker = route.A5CcuBoundDirectAbiVersion
     marker.restype = ctypes.c_int
@@ -182,6 +188,14 @@ def main():
                 extra_us=args.fast_extra_us, min_saving_us=args.fast_min_saving_us,
                 relay_capacity_bytes=planner_options['relay_capacity_bytes'])
             if args.routing_policy == 'fast' else None)
+    def create_cpp_context(chunk_bytes):
+        ctx = native_planner_module.ep8_pipeline_create(planner._native, rank, chunk_bytes,
+                                                        args.max_chunks, args.max_scratch_mib << 20)
+        for li, lane in enumerate(pipeline.lanes):
+            with torch.npu.stream(lane.stream):
+                ctx.attach_lane(li, lane.buffer.runtime, lane.handle)
+        return ctx
+    cpp = create_cpp_context(args.chunk_bytes) if args.pipeline_host == 'cpp' else None
     selected = (('native', 'direct', 'multipath') if args.mode == 'all' else
                 ('direct', 'multipath') if args.mode == 'both' else (args.mode,))
     def measurement_order(round_id):
@@ -207,6 +221,7 @@ def main():
         sample = dict(phase=phase, rss_bytes=rss, npu_allocated_bytes=torch.npu.memory_allocated(),
                       npu_reserved_bytes=torch.npu.memory_reserved())
         if pipeline: sample['workspace'] = pipeline.workspace_stats()
+        if cpp is not None: sample['cpp_workspace'] = cpp.stats()
         print('PIPELINE_MEMORY ' + json.dumps(dict(rank=rank, **sample)), flush=True)
         return sample
     for case_name, counts in cases:
@@ -250,6 +265,11 @@ def main():
             def prepare(current_plan):
                 return PreparedAllToAllV(buffer, handle, rank, current_plan, send, **prepare_options)
         prepared = prepare(plan)
+        cpp_prepared = cpp.prepare(counts, send) if cpp is not None else None
+        if cpp_prepared is not None:
+            expected_plan = (plan.counts, plan.relay_rank, plan.relay_rows, plan.actions)
+            if cpp_prepared.describe() != expected_plan:
+                raise AssertionError('C++ opaque plan differs from reference')
         forced = (prepared if pipeline or args.multipath_policy == 'force' else
                   PreparedAllToAllV(buffer, handle, rank, plan, send,
                                    **dict(prepare_options, policy='force')))
@@ -264,6 +284,8 @@ def main():
         # Fast rejection uses native/native A/A. Legacy no-relay uses custom
         # direct/direct A/A. Dynamic includes selection/planning respectively.
         def selected_multi():
+            if cpp is not None:
+                return cpp.execute(cpp_prepared, send, outputs['multipath'])
             if prepared.uses_relay:
                 return prepared.execute(send, outputs['multipath'])
             if fast is not None:
@@ -298,12 +320,17 @@ def main():
             snapshots = []
             for queued_epoch in (epoch + 7, epoch + 13, epoch + 19):
                 send.copy_(source + queued_epoch)
-                forced.execute(send, outputs['multipath'])
+                if cpp is not None: cpp.execute(cpp_prepared, send, outputs['multipath'])
+                else: forced.execute(send, outputs['multipath'])
                 snapshots.append((queued_epoch, outputs['multipath'].clone()))
             torch.npu.synchronize()
             for queued_epoch, snapshot in snapshots:
                 if not torch.equal(snapshot.cpu(), expected + queued_epoch):
                     raise AssertionError(f'queued stream ordering failure rank={rank}')
+            if cpp is not None:
+                set_payload(epoch)
+                cpp.run(counts, send, outputs['multipath'])
+                torch.npu.synchronize(); check('multipath', epoch)
             dist.barrier()
         # Small correctness cases must still exercise >2 chunks and both slot
         # reuses. Default 8 MiB chunks would make them a one-round pipeline.
@@ -318,6 +345,11 @@ def main():
             probe.execute(send, outputs['multipath'])
             torch.npu.synchronize(); check('multipath', 23)
             checked_chunks.append(len(probe.schedule.chunks))
+            if cpp is not None:
+                cpp_probe = create_cpp_context(probe_rows * row_bytes)
+                cpp_probe.run(counts, send, outputs['multipath'])
+                torch.npu.synchronize(); check('multipath', 23)
+                cpp_probe.close()
             del probe
         phase('prepared_begin', case=case_name)
         timings = {name: [] for name in selected}
@@ -357,6 +389,13 @@ def main():
                 ready_at = time.perf_counter()
                 planned_at = gathered_at
                 buffer.ccu_urma_peer_plan_alltoallv_out(send, outputs[name], handle, current_counts)
+            elif cpp is not None:
+                phase_us = cpp.run(current, send, outputs[name])
+                # C++ returns host plan/layout phases; residual includes binding,
+                # submission and the device completion wait below.
+                planned_at = gathered_at + phase_us[0] * 1e-6
+                ready_at = planned_at + phase_us[1] * 1e-6
+                dynamic_backends['pipeline' if plan.uses_relay else 'custom_direct'] += 1
             elif fast is not None:
                 admission = fast.select(current)
                 if not admission.uses_relay:
@@ -426,13 +465,15 @@ def main():
     destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
     def destroy_checked(value):
         if destroy(value) != 0: raise RuntimeError('plan destroy failed')
+    if cpp is not None:
+        cpp.close()
     if pipeline:
         pipeline.close(destroy_checked)
     destroy_checked(handle)
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
-                  benchmark=dict(protocol=9, planner=args.planner, routing_policy=args.routing_policy,
+                  benchmark=dict(protocol=10, pipeline_host=args.pipeline_host, planner=args.planner, routing_policy=args.routing_policy,
                                  fast_link_gbps=args.fast_link_gbps, fast_extra_us=args.fast_extra_us,
                                  fast_min_saving_us=args.fast_min_saving_us, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
                                  copy_submission=('native_spans' if pipeline and args.planner == 'native' else 'python'),

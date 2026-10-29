@@ -10,6 +10,7 @@
 #include "event.hpp"
 #include "ep8_relay_planner_bindings.hpp"
 #include "ep8_copy_spans.hpp"
+#include "ep8_pipeline_bindings.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
@@ -50,6 +51,7 @@ TORCH_LIBRARY_IMPL(deep_ep, Meta, m)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     deep_ep::ep8::BindPlanner(m);
+    deep_ep::ep8::BindPipeline(m);
     m.def("ep8_copy_spans_out", &deep_ep::ep8::CopySpansOut,
           py::arg("src"), py::arg("dst"), py::arg("spans"), py::call_guard<py::gil_scoped_release>());
     m.def("ep8_bind_workspace_views", &deep_ep::ep8::BindWorkspaceViews,

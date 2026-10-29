@@ -5,7 +5,10 @@
 新算法仅用于八卡；relay 只能是同一通信组内、且不同于源和目的的 rank。
 2/4 卡等长多路径 API、组外 relay 规则及原执行路径保留，不使用这个规划器。
 
-本版新增并默认 `--routing-policy fast`：C++筛选单热点，预计净收益不足即调用原生HCCL。
+本版新增`--pipeline-host cpp`，把真实greedy多路径的布局、工作区和提交流程一起放进C++。
+本轮复测直接执行第2节构建和第4.10节；该节显式使用greedy，不靠native回退。
+
+保留上一版默认 `--routing-policy fast`：C++筛选单热点，预计净收益不足即调用原生HCCL。
 `--routing-policy greedy` 保留之前的贪心实验。新版本复测按第2节安装、第3节旧执行器正确性、
 第4.9节新策略验证。以下第3～4.8节命令已显式固定greedy，避免默认值变化混淆历史对照。
 
@@ -16,8 +19,8 @@ fast每批仅选最多一条流/一个relay；greedy保留逐流贪心。两者�
 默认 `--planner native`：C++筛选/选路和分块布局，静态拓扑校验一次。
 以下关于与Python相同relay决策的说明仅适用于`--routing-policy greedy`。
 各rank拷贝段的筛选/合并以及pack/forward/unpack逐段提交也在C++中完成；
-工作区及分块张量视图也由C++一次构造。Python仍负责context生命周期和stream/event编排，
-并非完整C++执行器。
+工作区及分块张量视图也由C++一次构造。`--pipeline-host python`仍由Python负责context生命周期和stream/event编排。
+新增`--pipeline-host cpp`把每批编排也放入C++；Python只做一次性建组/挂接及调用。
 `--planner python` 保留原参考实现。两者选择相同 relay、分流行数和偏移；原生扫描顺序不同，
 诊断用候选评估次数可能不同。每轮 C 都会重新处理，没有固定路由缓存；fast会明确拒绝预计不合算的relay。
 
@@ -91,10 +94,10 @@ git merge --ff-only "origin/$A5_BRANCH"
 
 ## 2. CPU 回归和构建
 
-**这次必须重新构建并安装 DeepEP wheel**：新增C++ `Ep8FastSelector`，保留规划/执行扩展属性
+**这次必须重新构建并安装 DeepEP wheel**：新增`ep8_pipeline_host_abi=1`，保留规划/执行扩展属性
 `ep8_relay_planner_abi=2`、`ep8_copy_spans_out`和`ep8_bind_workspace_views`。
 fast还要求`ep8_fast_selector_abi=1`。默认native worker会在建组前检查，
-即使已安装`d0e6e98` wheel，也须重装本版wheel以获得fast selector；不会悄悄回退到Python。
+即使已安装`19db1f8` wheel，也须重装本版wheel以获得C++执行器；指定cpp时不会悄悄回退到Python。
 已经安装 `b3a5a5b` 或更新 route 包（`A5CcuEp8DfxAbiVersion=1`）时，route 不需要重新构建；
 下方保留完整双包流程，可跳过 route 的构建命令但保留 ABI 检查。
 从 `973aafb` 或更早版本升级时，DeepEP 和 route 都按完整流程构建安装。
@@ -518,7 +521,7 @@ dynamic `prepare()` 仅重新构建 Python 布局，不销毁/重建通信域。
 `event_route_done` 以前还会重复打印 launch 的错误，本版消除这个重复阶段误导。
 
 DFX修复提交 `b3a5a5b` 的 benchmark protocol 为5；native性能baseline版本为6，
-首版C++规划为7，C++拷贝描述/提交版为8，当前fast策略版为 **9**。必须重新获取比较数据，
+首版C++规划为7，C++拷贝描述/提交版为8，fast策略版为9，当前C++提交流程版为 **10**。必须重新获取比较数据，
 比较工具拒绝跨protocol或不同planner的结果。
 DFX 注册也有 host 成本，本修复不承诺性能提升。
 
@@ -791,6 +794,96 @@ selector/context在通信组初始化时创建一次。所有rank必须使用相
 本次尚未修改vLLM Ascend模型调用点。C++核心为`ep8_fast_selector.hpp`，没有Python选路循环。
 
 
+
+### 4.10 C++完整host流水线：相同relay方案的真实对照
+
+本版针对“获准并实际执行relay”的dynamic开销，而不是通过回退消除负收益。
+`--pipeline-host cpp --routing-policy greedy`使用与上一版native greedy完全相同的选路、
+分流行数和chunk大小，不使用fast的500µs成本门控。默认仍保留python host，便于回归。
+
+一次性创建三个通信域及原有CCU plan后，将对应Buffer/handle/当前stream挂接到C++。
+动态调用`cpp.run(C, send, recv)`仅跨一次Python/C++边界，在内部完成：
+
+1. 固定数组贪心选路、direct/两跳布局和本rank拷贝段构造，不展开成Python对象。
+2. 全rank容量检查、高水位双缓冲池及持久event复用，C++内构造张量视图。
+3. 在C++中提交输入ready、direct、逐块第一跳/第二跳/pack/unpack、槽复用及最终consumer join。
+4. 缓存通信域句柄；每块直接使用已经验证的64项计数，不重复创建Python列表和前端布局校验。
+
+prepared调用为`p=cpp.prepare(C, send)`，返回不透明句柄；后续`cpp.execute(p, send, recv)`。
+变化C不缓存，dynamic每次实际重规划。容量足够时不重新分配workspace/event，不重建通信域。
+扩容前等待三条stream完成，并使旧句柄视图失效、下次执行时重新绑定；出错后context标为
+poisoned，禁止继续提交，关闭时等待全部lane。保存输入/输出allocator的跨stream生命周期。
+零行使用持久占位存储；独立self偏移、非对称长度、2/4卡旧接口不变。
+
+原始CCU调用仍通过`stream()`排空Torch host任务队列；不能改成`stream(false)`。
+原有route DFX注册、线程桥及错误码处理保留。仍为每次执行`1+2*chunks`个CCU collective，
+设备侧pack/forward/unpack拷贝数没有融合；因此并不保证小流量一定加速。
+Python仍负责一次性process group建立和最终关闭，不在逐块热路径上。
+
+第2节重装wheel后，先验证全部case（所有模式均与native及独立payload oracle核对）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --pipeline-host cpp --routing-policy greedy --planner native --executor pipeline \
+  --suite correctness --mode all --row-scale 2 --rounds 1 --warmup 1 --iters 2 --dynamic-iters 2
+```
+
+除了普通正确性，还检查C++计划与参考逐项一致、Torch producer→C++执行→Torch consumer连续排队，
+以及小块超过两个槽的复用。此处不是fast，single_hot/competing/asymmetric应实际执行relay。
+
+接着用相同C和相同分块比较Python host与C++ host，不开profiling：
+
+```bash
+for A5_HOST_IMPL in python cpp; do
+  for A5_CASE in single_hot competing asymmetric cut uniform self zero; do
+    bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+      --pipeline-host "$A5_HOST_IMPL" --routing-policy greedy --planner native \
+      --mode all --case "$A5_CASE" --chunk-bytes 8388608 --rounds 6 --dynamic-iters 100
+  done
+done
+```
+
+`benchmark.pipeline_host`明确区分两种实现，protocol=10。每个run内的native是同一原生API；
+不能跨host实现直接用旧`--compare`，它会拒绝metadata不一致。跨实现比较各自summary中的
+native/multipath与分项；若独立两次做native baseline对照，两次都指定相同pipeline-host。
+CPP的`planner_us`与`layout_workspace_us`来自内部host计时，`execute_completion_us`包含剩余
+binding/校验/提交和设备完成等待；总dynamic仍是外层wall-clock，不是CCU event时间。
+不要把旧开销直接从新机总时间中相减推导加速。
+
+为了覆盖更接近小prefill的负载，显式扫描热点流1/2/4/6/8/16/32MiB，不能只测32MiB：
+
+```bash
+for A5_SCALE in 4 8 16 24 32 64 128; do
+  bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+    --pipeline-host cpp --routing-policy greedy --mode all --case single_hot \
+    --row-scale "$A5_SCALE" --width 4096 --dtype float16 --chunk-bytes 8388608 \
+    --rounds 6 --dynamic-iters 100
+done
+```
+
+这些是单热点流的尺寸，不等于模型每rank总token数。真实模型请继续通过`--matrix-json`
+输入实际C，并匹配传输dtype/width；模型已有计数应直接复用，不额外添加微基准的gather。
+重点看小流dynamic能否胜过native。如果仍不胜，下一步应减少每次collective启动和设备搬运，
+而不是继续声称仅将代码移入C++就足以加速。
+
+模型侧接口草图（context、group与planner均在初始化阶段创建）：
+
+```python
+cpp = deep_ep_cpp.ep8_pipeline_create(planner._native, rank, chunk_bytes, max_chunks, max_scratch_bytes)
+for lane_id, lane in enumerate(context.lanes):
+    with torch.npu.stream(lane.stream):
+        cpp.attach_lane(lane_id, lane.buffer.runtime, lane.handle)
+# 每批实际C，host int[64]或8x8；send/recv已按原生AllToAllV顺序排好。
+cpp.run(C, send, recv)
+# 结果异步就绪于原caller stream；同stream的后续消费者无需额外device synchronize。
+# 退出：先cpp.close()，再销毁外层context的plan/group。
+```
+
+不能在三个lane未挂接、调用stream改变、外层通信域已销毁或多个host线程同时使用时执行。
+初版尚未接入vLLM模型调用点，也不宣称支持图捕获；目标机需完成上述NPU验证。
+
+
 ## 5. 输入真实路由矩阵
 
 外部矩阵文件格式如下，`counts` 必须是实际 dispatch 打包后的行数；也支持扁平 64 项：
@@ -1050,3 +1143,23 @@ CPU准备包括layout、池检查、rank0张量视图构造，不包括数据传
 开发机无目标NPU执行验证；新机请执行第4.9节。所有日志与数据在
 `/home/l00934901/profiling/a5-ep8-fast-dev/`，包括`cpu-tests.log`、`summary-tests.log`、
 `production-binding-tests.log`、`deepep-build.log`、`timing.json`和`timing.log`。
+
+### 本版开发验证：C++ host流水线（2026-10-29）
+
+- `cam_lyw_dev_91`实际DeepEP编译通过，C++ pipeline host ABI=1；route包未修改。
+- 136项CPU回归通过，原生拷贝/选路绑定7项检查通过。
+- 实际C++提交驱动的4项CPU异步DAG检查通过：8rank、64组变化矩阵、容量/输入校验、
+  direct与relay无完成依赖、连续排队producer/consumer、多块槽复用、扩容后旧prepared重绑定、
+  中途提交失败后禁止重试。CPU trace runtime不模拟硬件耗时，不替代目标机NPU检查。
+- 开发机CPU、500次交替C、相同greedy选路和8MiB块，选路+rank0准备耗时：
+
+| case | C++选路+Python包装/准备 µs | 不透明C++计划+准备 µs |
+|---|---:|---:|
+| single_hot | 108.3 | 21.3 |
+| competing | 129.7 | 26.9 |
+| asymmetric | 131.9 | 22.1 |
+
+数据不含gather/D2H、NPU event/CCU提交和设备执行；这些提交路径虽已编译，尚无新机实测。
+这组CPU数据保持真实relay方案，和第4.9节native回退不是同一实验。
+日志：`/home/l00934901/profiling/a5-ep8-cpp-pipeline-dev/`，包括`build-final.log`、
+`cpu-tests.log`、`bindings.log`、`cpp-driver-tests-final.log`、`timing.json`。
