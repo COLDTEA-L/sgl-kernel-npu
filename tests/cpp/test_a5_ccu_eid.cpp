@@ -6,7 +6,7 @@
 #include <iostream>
 #include <set>
 using namespace a5_ccu_urma_probe;
-struct Kernel:EidAllToAllVKernel {using EidAllToAllVKernel::EidAllToAllVKernel;using EidAllToAllVKernel::GeneArgs;};
+struct Kernel:EidAllToAllVKernel {using EidAllToAllVKernel::EidAllToAllVKernel;using EidAllToAllVKernel::GeneArgs;size_t Loads()const{return loadIndex_;}};
 static std::vector<EidChannel> Catalog(uint32_t rank) {
     std::vector<EidChannel> v;
     for(uint32_t p=0;p<8;++p) if(p!=rank) {v.push_back({p,-1});for(int k=0;k<8;++k) if(k!=int(rank)&&k!=int(p)) v.push_back({p,k});}
@@ -65,8 +65,37 @@ static void MaskDecode(Kernel& kernel) {
     }
     std::cout<<"EP8_EID_V1_MASK_PASS masks="<<masks.size()<<" highest_bit=48\n";
 }
+static void RegistrationStages() {
+    auto paths=Catalog(0);std::vector<ChannelHandle> channels;
+    for (auto p:paths) channels.push_back(p.peer*9+p.relay+2);
+    EidRegisterStage parsed;
+    assert(ParseEidRegisterStage(nullptr,&parsed) && parsed==EidRegisterStage::FULL);
+    assert(!ParseEidRegisterStage("invalid",&parsed));
+    EidAllToAllVLayout layout;
+    EidAllToAllVTaskArg task(0,0,0,0,layout);
+    for (unsigned level=0;level<9;++level) {
+        auto stage=static_cast<EidRegisterStage>(level);
+        assert(ParseEidRegisterStage(EidRegisterStageName(stage),&parsed) && parsed==stage);
+        EidAllToAllVKernelArg arg(channels,0,paths,stage);Kernel kernel(arg);
+        auto before=hcomm::CcuRep::EventAllocations();
+        assert(kernel.Init()==0);
+        assert(kernel.Loads()==(level==0?0:46));
+        assert(hcomm::CcuRep::EventAllocations()-before==(level<5?0:14));
+        size_t remote=0,local=0,waits=0,notify=0;
+        for (auto& op:kernel.instructions) {
+            remote+=op.op=="remote"; local+=op.op=="group_local";
+            waits+=op.op=="event_wait";notify+=op.op=="notify_wait";
+        }
+        assert(remote==(level<5?0:level==5?7:49));
+        assert(local==(level>=7?1:0));assert(waits==(level==8?14:0));
+        assert(notify==(level<4?0:level==8?147:98));
+        assert(EidStageAllowsPayload(stage)==(level==8));
+        if(level<8) assert(kernel.GeneArgs(task).empty());
+    }
+    std::cout<<"EP8_EID_REGISTER_STAGES_PASS stages=9 payload_disabled=8\n";
+}
 int main() {
-    Invalid();
+    Invalid(); RegistrationStages();
     std::array<std::unique_ptr<Kernel>,8> kernels;
     std::array<uint8_t,64> allowed{};
     for(int s=0;s<8;++s) for(int d=0;d<8;++d) if(s!=d) for(int k=0;k<8;++k) if(k!=s&&k!=d) allowed[s*8+d]|=1u<<k;

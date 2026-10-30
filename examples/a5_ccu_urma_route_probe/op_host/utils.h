@@ -1,3 +1,4 @@
+#include "../common/eid_register_stage.h"
 #ifndef A5_CCU_URMA_ROUTE_PROBE_UTILS_H
 #define A5_CCU_URMA_ROUTE_PROBE_UTILS_H
 
@@ -52,7 +53,8 @@ struct PeerPlanResources {
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources,
-    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE, bool allToAllV = false, bool eidAllToAllV = false);
+    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE, bool allToAllV = false, bool eidAllToAllV = false,
+    EidRegisterStage eidStage = EidRegisterStage::FULL);
 
 // Normalized two-rank control-plane request used by the production-facing
 // explicit multipath API.  The discovered route is always channel 0 and the

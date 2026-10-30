@@ -12,12 +12,19 @@ def load(root):
     create_only = results[0]['options']['suite'] == 'create'
     minimal = bool(results[0]['options'].get('minimal', False))
     if minimal and not create_only: raise ValueError('minimal requires create suite')
-    marker = 'EP8_EID_MINIMAL_RANK_PASS' if minimal else 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
-    ranks = set(map(int, re.findall(r'^'+marker+r' rank=(\d+)$', (root/'run.log').read_text(), re.M)))
-    if ranks != set(range(8)): raise ValueError('missing clean rank completion')
+    probe = results[0]['options'].get('register_stage', 'full') != 'full'
+    if probe and (not create_only or minimal): raise ValueError('invalid registration probe suite')
+    marker = 'EP8_EID_REGISTER_PROBE_RANK_PASS' if probe else 'EP8_EID_MINIMAL_RANK_PASS' if minimal else 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
+    # Old print() workers can concatenate markers or append SDK output. New
+    # workers use one atomic write; retain compatibility with existing logs.
+    ranks = set(map(int, re.findall(re.escape(marker)+r' rank=(\d+)(?=\s|EP8_|$)', (root/'run.log').read_text())))
+    if ranks != set(range(8)):
+        raise ValueError(f'missing clean rank completion: expected_marker={marker} found={sorted(ranks)} '
+                         f'minimal={minimal} probe={probe} script={Path(__file__).resolve()}')
     for r, result in enumerate(results):
         if result['options']['suite'] != results[0]['options']['suite']: raise ValueError('different rank suite')
         if bool(result['options'].get('minimal', False)) != minimal: raise ValueError('different minimal mode')
+        if result['options'].get('register_stage', 'full') != results[0]['options'].get('register_stage', 'full'): raise ValueError('different registration stages')
         if result['rank'] != r or result['backend'] != 'participant_eid_ccu_urma': raise ValueError('wrong result identity')
         for a, b in zip(result['reports'], results[0]['reports']):
             if any(a[k] != b[k] for k in ('case', 'counts', 'row_bytes', 'relay_rows', 'median_us')):
@@ -34,7 +41,9 @@ def main():
     result, topology = load(args.run)
     if result['options']['suite'] == 'create':
         if args.compare: raise ValueError('create-only cannot be used as a performance result')
-        if result['options'].get('minimal', False):
+        if result['options'].get('register_stage', 'full') != 'full':
+            print('EP8_EID_REGISTER_PROBE_ALL_RANKS_AND_EXIT_PASS stage=' + result['options']['register_stage'] + ' (registration probe only; payload disabled)')
+        elif result['options'].get('minimal', False):
             print('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS (configuration only; no EID channels or registration)')
         else:
             print('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS (registration only; no data validation)')
@@ -42,6 +51,7 @@ def main():
     other = None
     if args.compare:
         other, other_topology = load(args.compare)
+        if other['options']['suite'] == 'create': raise ValueError('create/probe cannot be a performance baseline')
         for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters'):
             if result['options'][key] != other['options'][key]: raise ValueError('different measurement option: '+key)
         for key in ('devices', 'allowed_relays', 'links', 'relay_routes'):

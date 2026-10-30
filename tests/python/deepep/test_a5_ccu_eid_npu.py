@@ -40,7 +40,11 @@ def main():
     p.add_argument('--allow-no-relay', action='store_true', help='explicit direct-only diagnostic, never a relay PASS')
     p.add_argument('--minimal', action='store_true', help='create only: stop after configuration all_gather; no Buffer or EID plan')
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
+    p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full'), default='full', help='create-only cumulative registration graph; full is production')
     args = p.parse_args()
+    if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
+        p.error('--register-stage probes require --suite create without --minimal')
+    os.environ['A5_EID_REGISTER_STAGE'] = args.register_stage
     if args.minimal and args.suite != 'create':
         p.error('--minimal requires --suite create')
     if args.config_prewarm < 0:
@@ -76,7 +80,7 @@ def main():
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
-                             ('A5CcuEidPeerResourceAbiVersion', 1),
+                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1),
                              ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
@@ -87,7 +91,7 @@ def main():
               time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
     phase('startup_resources', custom_channels_acquired=0, custom_plans=0,
           process_groups_requested=1, hccl_buffsize_mb=os.environ.get('HCCL_BUFFSIZE'),
-          minimal=args.minimal, config_prewarm=args.config_prewarm)
+          minimal=args.minimal, config_prewarm=args.config_prewarm, register_stage=args.register_stage)
     phase('device_init_begin')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     phase('device_init_complete')
@@ -118,7 +122,7 @@ def main():
         args.run_dir.mkdir(parents=True, exist_ok=True)
         (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank,
             backend='participant_eid_ccu_urma', options=vars(args), reports=[]), default=str))
-        print(f'EP8_EID_MINIMAL_RANK_PASS rank={rank}', flush=True)
+        os.write(1, f'EP8_EID_MINIMAL_RANK_PASS rank={rank}\n'.encode())
         return
     phase('buffer_init_begin')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
@@ -147,7 +151,8 @@ def main():
         phase('process_group_destroy_begin')
         dist.destroy_process_group()
         phase('process_group_destroy_complete')
-        print(f'EP8_EID_CREATE_RANK_PASS rank={rank}', flush=True)
+        marker = 'EP8_EID_CREATE_RANK_PASS' if args.register_stage == 'full' else 'EP8_EID_REGISTER_PROBE_RANK_PASS'
+        os.write(1, f'{marker} rank={rank}\n'.encode())
         return
     dtype = getattr(torch, args.dtype)
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
@@ -253,7 +258,7 @@ def main():
     (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank, backend='participant_eid_ccu_urma',
         options=vars(args), reports=reports), default=str, indent=2))
     dist.destroy_process_group()
-    print(f'EP8_EID_RANK_PASS rank={rank}', flush=True)
+    os.write(1, f'EP8_EID_RANK_PASS rank={rank}\n'.encode())
 
 
 if __name__ == '__main__':

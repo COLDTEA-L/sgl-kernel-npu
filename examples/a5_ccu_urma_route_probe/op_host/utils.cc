@@ -1228,7 +1228,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
 }
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
-    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode, bool allToAllV, bool eidAllToAllV)
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode, bool allToAllV, bool eidAllToAllV, EidRegisterStage eidStage)
 {
     if (!comm || !stream || !resources) return HCCL_E_PTR;
     PeerPlanResources result;
@@ -1364,7 +1364,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy, syncMode);
     a5ccu::KernelCreator creator = CreateRouteKernel;
     if (eidAllToAllV) {
-        EidAllToAllVKernelArg vArg(r.channels, r.rank, result.eidChannels);
+        EidAllToAllVKernelArg vArg(r.channels, r.rank, result.eidChannels, eidStage);
         a5ccu::KernelCreator vCreator = CreateEidAllToAllVKernel;
         status = trace.Call("register_transaction", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
     } else if (allToAllV) {

@@ -590,3 +590,52 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
 - 异步设备故障或SIGKILL后不保证Python清理执行；不能通过杀其他用户进程、重置设备来代替定位。当前仅能确认正常退出调用到哪一步，不能证明驱动侧残留已回收。
 
 本轮只改测试控制及启动参数，wheel/route ABI不变；已有§3更新route的环境不需重编。本次可先拉取后执行步骤1，再执行步骤2。结果仍写入 `/home/l00934901/profiling`。不要把新增诊断或缓冲区缩减表述为已修复真实9.3设备故障。
+
+### 11.11 RegisterEnd=4：逐段注册图，禁止执行诊断内核
+
+现场HCCL_BUFFSIZE=64时前置检查通过，relay上限0/1/6均在End失败。这排除了“只有relay通道才触发”的解释，但relay=0仍使用EID图（46参数、掩码解析、通知、GroupCopy等），不能推出所有内核的公共注册过程都失败。资源查询返回0仍不等于配额足够。
+
+本节使用同一个EP组、同样的建链及Start/Register/End封装，只逐步增加注册图内容。每次启动只注册一个阶段，失败后不在同一实例上重试。partial阶段不调用CCU kernel launch，因此只验证注册，绝不表示传输正确或模型可用。
+
+| --register-stage | 相对上一阶段加入的内容 |
+|---|---|
+| minimal | 一个Variable和立即数赋值；0个runtime task args，不引用通道变量 |
+| args | 正式EID的46个LoadArg；尚无通道引用/同步/读写 |
+| mask | live掩码解析、条件分支、初始化peer变量；尚无通道引用 |
+| channel_vars | 借用已建通道的output/token变量；尚无notify/wait |
+| sync | 地址/token发布、NotifyWait及peer变量拷贝 |
+| direct | 14个完成事件、源/目的地址计算、直连Write；尚无relay写/本地拷贝/最终完成握手 |
+| relay | 加入relay Write选择分支（需候选relay>0才有新增写路径） |
+| self | 加入GroupedLocalCopy |
+| full | 完成事件等待及最终通知握手，生产完整图 |
+
+以上阶段仍经过同一EID建链流程；例如max-relays=0时每rank仍建7条直连通道，minimal只是不在kernel里引用它们。mask阶段包含现有peer变量初始化，direct阶段同时加入地址/事件分配，不声称是单条指令的A/B比较。首次失败阶段确定后，再细分该阶段。
+
+先按§3重新编译安装route，必须看到 `A5CcuEidRegisterProbeAbiVersion=1`。**wheel接口未变，不用重打。** 新测试拒绝未包含该标记的旧route，防止参数被旧实现忽略后误测完整图。
+
+先单独执行最小注册图（区别于§11.10的 `--minimal`，后者完全不注册）：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+HCCL_BUFFSIZE=64 A5_CCU_RESOURCE_DIAGNOSTICS=0 \
+A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1 \
+A5_EID_MAX_RELAYS_PER_PEER=0 \
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --register-stage minimal
+```
+
+通过后每次只把stage改成下一项：`args → mask → channel_vars → sync → direct → relay → self → full`。先固定max-relays=0，relay阶段此时不会新增relay写，可直接用于验证self/full；若直连完整图可注册，再固定max-relays=1从头对照，最后才测6。第一个失败处停止并保留该阶段以及前一个成功阶段的日志。不要在循环里忽略失败继续测试。
+
+partial阶段通过输出 `EP8_EID_REGISTER_PROBE_ALL_RANKS_AND_EXIT_PASS stage=...`；full通过仍是 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`。每个rank打印 `EP8_EID_GRAPH_BUILD ... stage=...`，End失败追加raw_ccu_status、mapped_hccl_status、instance/die、kernel、task_args。所有结果留在 `/home/l00934901/profiling`。C++ plan记录创建时的stage，partial plan即使之后修改环境变量，也会在Execute入口报 `registration_probe_cannot_execute`；GeneArgs另有拒绝保护。缓存匹配包含stage，不允许复用不同阶段的plan。
+
+**End内部信息的实际能力边界。** 本机9.2头文件及公开接口签名均为 `CcuResult HcommCcuKernelRegisterEnd(CcuInsHandle)`，没有detail/sub-error输出参数；这是Hcomm接口，外层把CcuResult映射成HcclResult。我们不能直接给现场已编译的libhcomm.so内部加日志，也不调用私有Translate/实例方法重复提交。公开源码的End调用实例EndRegister，再调用kernel manager Translate；此源码版本不等于现场9.3二进制，不能仅凭4区分资源绑定、翻译和指令下发。参考：[公开注册实现](https://gitcode.com/cann/hcomm/blob/master/src/base_comm/primitives/api_c_adpt/ccu/ccu_launch.cc)。
+
+新增 `PUBLIC_CCU_SDK` 用dladdr打印Start/Register/End实际来自哪个动态库。End失败时可选读取ACL recent error，但明确标记 `recent_error_unattributed`：它可能为空、陈旧或属于其他调用，不能冒充CCU子错误。`internal_phase=unavailable`明确表示外层无法观测内部分支。若最小图也失败，保留这组最小复现交由匹配9.3 SDK源码/调试包定位EndRegister和Translate内部返回点。
+
+**minimal汇总。** 081dd25已存在minimal专用分支；本轮进一步兼容历史多进程print造成的PASS行粘连/SDK前缀，新的PASS使用单次os.write。仍要求exit.status=0、8份一致的rank结果及8个相应标记，不把诊断PASS当作正确性PASS。缺标记时打印expected_marker、实际rank集合、minimal/probe模式及汇总脚本绝对路径。无需重跑已有minimal：
+
+```bash
+python3 scripts/summarize_a5_ccu_eid.py \
+  /home/l00934901/profiling/a5-ep8-eid.ycYc6U
+```
+
+如果仍失败，请保留新的完整异常及rank0.json；不能仅凭“missing clean rank completion”认定未适配minimal。

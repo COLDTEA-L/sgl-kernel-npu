@@ -1,15 +1,22 @@
 #include "eid_alltoallv_kernel.h"
 #include "../common/path_layout.h"
+#include <cstdio>
 namespace a5_ccu_urma_probe {
 #define E_CHECK(call) do { auto status = (call); if (status != HCCL_SUCCESS) return status; } while (0)
 a5ccu::CcuKernelSignature EidAllToAllVKernelArg::GetKernelSignature() const {
     a5ccu::CcuKernelSignature s;
     std::vector<uint32_t> ids;
     for (const auto& p : paths) ids.push_back(p.peer*9+static_cast<uint32_t>(p.relay+1));
-    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V3PeerResources", ids, channels)); return s;
+    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V3PeerResources", ids, channels)); s.Append(EidRegisterStageName(stage)); return s;
 }
 HcclResult EidAllToAllVKernel::Algorithm() {
     if (channels_.size() != paths_.size() || !ValidateEidChannels(rank_, paths_)) return HCCL_E_PARA;
+    std::fprintf(stderr, "EP8_EID_GRAPH_BUILD rank=%u stage=%s channels=%zu registration_only=%u\n",
+        rank_, EidRegisterStageName(stage_), channels_.size(), !EidStageAllowsPayload(stage_));
+    if (stage_ == EidRegisterStage::MINIMAL) {
+        auto value = CreateVariable(); value = uint64_t{1};
+        return HCCL_SUCCESS;
+    }
     auto input=CreateVariable(), output=CreateVariable(), inputToken=CreateVariable(), outputToken=CreateVariable();
     auto selfSource=CreateVariable(), selfDestination=CreateVariable(), active=CreateVariable();
     Load(input); Load(output); Load(inputToken); Load(outputToken); Load(selfSource); Load(selfDestination);
@@ -21,15 +28,11 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     // Public Variable subtraction exists in headers but is unsupported by
     // the V1 instruction generator (repType 11). GeneArgs supplies direct bytes.
     for (size_t j=0;j<7;++j) {for(auto& v:peer[j]) Load(v);}
+    if (stage_ == EidRegisterStage::ARGS) return HCCL_SUCCESS;
     const size_t n=channels_.size();
     std::vector<a5ccu::CcuRep::Variable> live(n);
     std::array<a5ccu::CcuRep::Variable,7> remoteOutput, remoteToken;
     for(size_t j=0;j<7;++j) {remoteOutput[j]=uint64_t{0};remoteToken[j]=uint64_t{0};}
-    // At most two writes per peer (direct + one selected relay), regardless of
-    // the number of cached channels. reserve() does NOT construct SDK Events.
-    std::vector<a5ccu::CcuRep::CompletedEvent> events;
-    events.reserve(14);
-    for(size_t i=0;i<14;++i) events.emplace_back(CreateCompletedEvent());
     // V1 also lacks variable AND. Decode the <=49-bit mask from high to low
     // using unsigned comparison and modulo-2^64 addition, both V1 primitives.
     // A host-computed negative constant is not a CCU subtraction instruction.
@@ -41,6 +44,16 @@ HcclResult EidAllToAllVKernel::Algorithm() {
         negativeBit=uint64_t{0}-bit;
         CCU_IF(active >= bit) { live[i]=uint64_t{1}; active+=negativeBit; }
     }
+    if (stage_ == EidRegisterStage::MASK) return HCCL_SUCCESS;
+    // Borrow without allocating replacement local variables; this phase isolates
+    // channel resource references from notify/wait instructions.
+    std::vector<a5ccu::CcuRep::Variable> channelOutputs, channelTokens;
+    channelOutputs.reserve(n); channelTokens.reserve(n);
+    for (size_t i=0; i<n; ++i) {
+        channelOutputs.emplace_back(BorrowChannelVariable(channels_[i],0));
+        channelTokens.emplace_back(BorrowChannelVariable(channels_[i],1));
+    }
+    if (stage_ == EidRegisterStage::CHANNEL_VARS) return HCCL_SUCCESS;
     for(size_t i=0;i<n;++i) {
         // Both directions use the union of active paths, including receive-only ranks.
         CCU_IF(live[i] != 0) {
@@ -50,8 +63,8 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     }
     for(size_t i=0;i<n;++i) {
         auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
-        const auto channelOutput=BorrowChannelVariable(channels_[i],0);
-        const auto channelToken=BorrowChannelVariable(channels_[i],1);
+        const auto& channelOutput=channelOutputs[i];
+        const auto& channelToken=channelTokens[i];
         CCU_IF(live[i] != 0) {
             E_CHECK(NotifyWait(channels_[i],0,1)); E_CHECK(NotifyWait(channels_[i],1,1));
             // All paths to a peer publish the same final recv address/token.
@@ -60,6 +73,12 @@ HcclResult EidAllToAllVKernel::Algorithm() {
             remoteOutput[j]=channelOutput; remoteToken[j]=channelToken;
         }
     }
+    if (stage_ == EidRegisterStage::SYNC) return HCCL_SUCCESS;
+    // At most two writes per peer (direct + one selected relay), regardless of
+    // the number of cached channels. reserve() does NOT construct SDK Events.
+    std::vector<a5ccu::CcuRep::CompletedEvent> events;
+    events.reserve(14);
+    for(size_t i=0;i<14;++i) events.emplace_back(CreateCompletedEvent());
     std::array<a5ccu::CcuRep::LocalAddr,14> sources;
     std::array<a5ccu::CcuRep::RemoteAddr,14> destinations;
     for(size_t j=0;j<7;++j) for(size_t kind=0;kind<2;++kind) {
@@ -74,14 +93,16 @@ HcclResult EidAllToAllVKernel::Algorithm() {
         auto& bytes=peer[j][paths_[i].relay<0?2:3];
         if(paths_[i].relay<0) {
             CCU_IF(bytes != 0) {E_CHECK(WriteNb(channels_[i],destinations[slot],sources[slot],bytes,events[slot]));}
-        } else {CCU_IF(peer[j][4] == static_cast<uint64_t>(paths_[i].relay)) {
+        } else if (stage_ != EidRegisterStage::DIRECT) {CCU_IF(peer[j][4] == static_cast<uint64_t>(paths_[i].relay)) {
             CCU_IF(bytes != 0) {E_CHECK(WriteNb(channels_[i],destinations[slot],sources[slot],bytes,events[slot]));}
         }}
     }
+    if (stage_ == EidRegisterStage::DIRECT || stage_ == EidRegisterStage::RELAY) return HCCL_SUCCESS;
     auto src=CreateLocalAddr(), dst=CreateLocalAddr();
     src.addr=input;src.addr+=selfSource;src.token=inputToken;
     dst.addr=output;dst.addr+=selfDestination;dst.token=outputToken;
     E_CHECK(GroupedLocalCopy(dst,src,go));
+    if (stage_ == EidRegisterStage::SELF) return HCCL_SUCCESS;
     for(size_t j=0;j<7;++j) {
         CCU_IF(peer[j][2] != 0) {E_CHECK(WaitEvent(events[j*2]));}
         CCU_IF(peer[j][3] != 0) {E_CHECK(WaitEvent(events[j*2+1]));}
@@ -91,6 +112,7 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     return HCCL_SUCCESS;
 }
 std::vector<uint64_t> EidAllToAllVKernel::GeneArgs(const a5ccu::CcuTaskArg& arg) {
+    if (!EidStageAllowsPayload(stage_)) return {};
     const auto* t=dynamic_cast<const EidAllToAllVTaskArg*>(&arg);
     if(!t || t->layout.pathBytes.size()!=channels_.size() || (t->layout.activeMask>>channels_.size())) return {};
     std::array<uint64_t,4> go{};

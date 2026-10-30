@@ -27,6 +27,7 @@ struct PeerPreparedPlan {
     int32_t device = -1;
     uint32_t rankSize = 0;
     bool allToAllV = false, eidAllToAllV = false;
+    EidRegisterStage eidStage = EidRegisterStage::FULL;
     std::shared_ptr<Ep8Dfx> dfx;
     std::string id, content;
     uint32_t availableCards = 0;
@@ -127,7 +128,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         snapshot = found->second;
     }
     PeerPlanResources resources;
-    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV, snapshot.eidAllToAllV);
+    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV, snapshot.eidAllToAllV, snapshot.eidStage);
     if (status != HCCL_SUCCESS) return status;
     std::shared_ptr<ThreadEventBridge> bridge;
     if (snapshot.allToAllV) {
@@ -179,6 +180,7 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
     if (allToAllV ? (plan.rankSize != 8 || plan.syncMode != ChannelSyncMode::BASELINE) :
         (plan.rankSize != 2 && plan.rankSize != 4)) return HCCL_E_PARA;
     plan.allToAllV = allToAllV; plan.eidAllToAllV = eidAllToAllV;
+    if (eidAllToAllV && !ReadEidRegisterStage(&plan.eidStage)) return HCCL_E_PARA;
     plan.comm = comm; plan.id = planId; plan.availableCards = availableCards;
     const auto status = Load(manifest, plan.rankSize, availableCards, &plan.specs, &plan.content, eidAllToAllV);
     if (status != HCCL_SUCCESS) return status;
@@ -190,7 +192,7 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
             const auto &p = entry.second;
             if (p.comm == comm && p.id == plan.id) {
                 if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards ||
-                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV || p.eidAllToAllV != plan.eidAllToAllV)
+                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV || p.eidAllToAllV != plan.eidAllToAllV || p.eidStage != plan.eidStage)
                     return HCCL_E_PARA;
                 id = entry.first;
                 break;
@@ -322,6 +324,8 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
         const auto found = plans.find(handle);
         int32_t device = -1;
         if (found == plans.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
+        if (!EidStageAllowsPayload(found->second.eidStage))
+            return checkedStatus(HCCL_E_PARA, "registration_probe_cannot_execute");
         if (!found->second.allToAllV || found->second.eidAllToAllV != (relays != nullptr) || (comm && comm != found->second.comm) ||
             aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
@@ -427,6 +431,7 @@ extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
 // Additive capability marker: no public task/layout ABI changes.
 extern "C" int A5CcuEidV1CompatAbiVersion() { return 1; }
 extern "C" int A5CcuEidPeerResourceAbiVersion() { return 1; }
+extern "C" int A5CcuEidRegisterProbeAbiVersion() { return 1; }
 extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char* id, const char* manifest, uint64_t* handle) {
     return CreatePeerPlan(comm, stream, id, manifest, 8, handle, true, true);

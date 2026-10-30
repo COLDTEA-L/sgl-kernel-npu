@@ -8,9 +8,31 @@
 #include <mutex>
 #include <set>
 #include <unistd.h>
+#include <dlfcn.h>
 
 namespace a5ccu {
 namespace {
+void PrintSdkLocation(const char* symbol, const void* address) {
+    Dl_info info{};
+    const bool found = dladdr(address, &info) != 0;
+    std::fprintf(stderr, "PUBLIC_CCU_SDK symbol=%s library=%s address=%p\n", symbol,
+        found && info.dli_fname ? info.dli_fname : "<unknown>", address);
+}
+void ReportRegisterEndFailure(CcuResult status, CcuInsHandle instance, uint32_t die,
+                             CcuKernelHandle kernel, uint32_t taskArgs) {
+    // The API exposes no detail output. ACL's thread-local recent error may be
+    // absent or stale/unrelated; never present it as a CCU sub-error.
+    using RecentError = const char* (*)();
+    const auto recent = reinterpret_cast<RecentError>(dlsym(RTLD_DEFAULT, "aclGetRecentErrMsg"));
+    const char* message = recent ? recent() : nullptr;
+    std::string text = message ? message : "<none>";
+    for (auto& c : text) if (c == '\n' || c == '\r') c = ' ';
+    std::fprintf(stderr, "PUBLIC_CCU_REGISTER_END_FAILED raw_ccu_status=%d mapped_hccl_status=%d "
+        "instance=%llu die=%u kernel=%llu task_args=%u internal_phase=unavailable "
+        "recent_error_unattributed=%s\n", int(status), int(Status(status)),
+        static_cast<unsigned long long>(instance), die,
+        static_cast<unsigned long long>(kernel), taskArgs, text.c_str());
+}
 struct Registered {
     std::unique_ptr<CcuKernel> kernel;
     HcclComm owner = nullptr;
@@ -128,6 +150,9 @@ HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
     const std::string name = "a5_public_" + std::to_string(++sequence);
     CreateTrace trace("scope=public_register device=" + std::to_string(device) +
         " die=" + std::to_string(die) + " instance=" + std::to_string(instance));
+    PrintSdkLocation("HcommCcuKernelRegisterStart", reinterpret_cast<const void*>(HcommCcuKernelRegisterStart));
+    PrintSdkLocation("HcommCcuKernelRegister", reinterpret_cast<const void*>(HcommCcuKernelRegister));
+    PrintSdkLocation("HcommCcuKernelRegisterEnd", reinterpret_cast<const void*>(HcommCcuKernelRegisterEnd));
     auto ccuStatus = trace.Call("register_start", [&] { return HcommCcuKernelRegisterStart(instance); });
     if (ccuStatus != CcuResult::CCU_SUCCESS) return Status(ccuStatus);
     // Once a session starts, any failure poisons this communicator for this
@@ -135,7 +160,12 @@ HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
     ccuStatus = trace.Call("register_kernel", [&] { return HcommCcuKernelRegister(instance, die, name.c_str(),
         reinterpret_cast<const void*>(BuildKernel), args, 1, &registered); });
     if (ccuStatus == CcuResult::CCU_SUCCESS)
-        ccuStatus = trace.Call("register_end", [&] { return HcommCcuKernelRegisterEnd(instance); });
+        ccuStatus = trace.Call("register_end", [&] {
+            const auto result = HcommCcuKernelRegisterEnd(instance);
+            if (result != CcuResult::CCU_SUCCESS)
+                ReportRegisterEndFailure(result, instance, die, registered, entry->kernel->ArgumentCount());
+            return result;
+        });
     uint32_t actualArgs = 0;
     if (ccuStatus == CcuResult::CCU_SUCCESS)
         ccuStatus = trace.Call("get_task_args", [&] { return HcommCcuGetTaskArgsNum(registered, &actualArgs); });

@@ -86,11 +86,34 @@ class EidTests(unittest.TestCase):
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             self.assertIn('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS', result.stdout)
             self.assertNotIn('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS', result.stdout)
+            # Historical worker print calls can concatenate PASS records, or
+            # prepend another worker's SDK output on the same line.
+            (root/'run.log').write_text('[SDK] ' + ''.join(f'EP8_EID_MINIMAL_RANK_PASS rank={r}' for r in range(8)))
+            merged = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self.assertIn('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS', merged.stdout)
+
             self.assertNotEqual(subprocess.run(cmd+['--compare',str(root)], capture_output=True).returncode,0)
             p = root/'results/rank3.json'
             record = json.loads(p.read_text()); record['options']['minimal'] = False
             p.write_text(json.dumps(record))
             self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode,0)
+
+    def test_registration_probe_is_not_full_create_or_payload_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'results').mkdir(); (root/'plans').mkdir()
+            (root/'exit.status').write_text('0'); (root/'plans/topology.json').write_text('{}')
+            (root/'run.log').write_text(''.join(f'EP8_EID_REGISTER_PROBE_RANK_PASS rank={r}\n' for r in range(8)))
+            for r in range(8):
+                (root/'results'/f'rank{r}.json').write_text(json.dumps(dict(rank=r,
+                    backend='participant_eid_ccu_urma', options=dict(suite='create',register_stage='args'), reports=[])))
+            cmd=[sys.executable,str(ROOT/'scripts/summarize_a5_ccu_eid.py'),str(root)]
+            result=subprocess.run(cmd,capture_output=True,text=True,check=True)
+            self.assertIn('REGISTER_PROBE_ALL_RANKS_AND_EXIT_PASS stage=args',result.stdout)
+            self.assertNotIn('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS',result.stdout)
+            self.assertNotEqual(subprocess.run(cmd+['--compare',str(root)],capture_output=True).returncode,0)
+            data=json.loads((root/'results/rank3.json').read_text());data['options']['register_stage']='mask'
+            (root/'results/rank3.json').write_text(json.dumps(data))
+            self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
 
     def test_launcher_honors_sdk_logging_and_explicit_override(self):
         keys = ('A5_EID_LOG_LEVEL', 'A5_EID_LOG_STDOUT', 'ASCEND_GLOBAL_LOG_LEVEL',
@@ -162,6 +185,7 @@ int main() {
             result = subprocess.run([binary], capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('EP8_EID_GRAPH_PASS epochs=100 launches=800', result.stdout)
+            self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=9 payload_disabled=8', result.stdout)
             print(result.stdout.strip())
 
     @staticmethod
