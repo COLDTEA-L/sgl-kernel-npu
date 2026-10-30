@@ -302,6 +302,8 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_bidirectiona
 
 ## 11. EP8 组内显式 EID 转发（新后端）
 
+实现调用链、单 relay 贪心算法、资源生命周期和历次失败的证据说明，见 [EP8_CCU_EID_MULTIPATH_IMPLEMENTATION.md](EP8_CCU_EID_MULTIPATH_IMPLEMENTATION.md)。
+
 ### 11.1 数据路径与适用条件
 
 与原 2/4 卡一样，以源端通向 relay 的 EID、目的端通向同一个 relay die/plane/net-instance 的 EID 建立端到端 Channel；Channel 的 remote rank 和写入地址仍是最终目的卡。relay 必须是本通信组的其他成员。应用不在 relay 上接收至 HBM、不 pack/unpack、不启动第二跳 AllToAllV。直连前缀与 relay 后缀在一个 CCU kernel 中通过非阻塞 Write 下发，再统一等待完成。
