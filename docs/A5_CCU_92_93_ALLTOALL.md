@@ -537,15 +537,3 @@ device init → HCCL process group init → digest 张量创建
 优先读取已失败B/C目录的最后 `EP8_EID_PHASE`、`CCU_CREATE_STAGE` 和首个Python traceback：若没有 `catalog_register_begin`，失败在测试前置阶段，不能归因于EID注册时的诊断开关；若已进入，则按最末成功子阶段定位。End=4这一路仍需A组的SDK翻译/下发错误，不能用B/C的0x2a替代其根因。
 
 本节只补足阶段边界，不宣称修复 AICPU 或 End=4。尚未push的提交必须由开发机push后，新机才能pull；不要把本地commit号当作远端已发布版本。
-
-### 11.10 用 CPU FileStore 替代 create 的配置 all_gather
-
-当前 EID 测试默认在设备及HCCL进程组初始化前，通过 `torch.distributed.FileStore` 交换8个rank的配置SHA256。它不创建NPU张量、不调用HCCL集合通信，也不要求安装Gloo。配置不一致时全部rank报错，缺少rank时180秒超时；没有直接删除一致性检查。
-
-控制文件位于本次结果目录的 `results/cpu_control_*.store`，由torchrun rendezvous id和restart count隔离不同启动/重启。8个进程必须看到同一目录，当前单机EP8容器满足；继续使用runner的 `torchrun --standalone` 启动方式。文件由FileStore管理，运行中不要删除。结束时可能自动清理，排障依据是run.log中的阶段标记。
-
-新流程：`config_cpu_begin → config_cpu_complete → device_init → process_group → buffer_init → catalog_register`。create-only销毁handle后的HCCL barrier也替换为CPU控制同步（`create_exit_cpu_begin/complete`），不再为测试控制额外提交原生HCCL集合通信。Buffer/建链/注册仍可能触发SDK内部设备初始化；这不等于保证绕过所有AICPU任务，也不修复SDK的IndOp或RegisterEnd错误。
-
-本次只改测试Python及文档，不改wheel/route ABI。若已完成§3安装2e1f207之后的route，仅拉取即可；若仍使用1e33bca route，按§3更新以获得前述诊断改进，无需重打wheel。按§11.8的create命令执行，先确认 `config_cpu_complete backend=FileStore`（实际为JSON字段），随后查看首个失败的SDK子阶段。模型payload、benchmark动态计数交换和性能计时保持原逻辑；create通过仍不代表AllToAllV正确性通过。
-
-CPU验证增加 `test_a5_ccu_cpu_control_cpu.py`：真实8进程一致/不一致检查、缺rank超时、启动/重启隔离；纳入 `check_a5_ccu_public_api_cpu.sh`。

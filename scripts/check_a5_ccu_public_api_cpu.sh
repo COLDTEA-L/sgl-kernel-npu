@@ -8,7 +8,7 @@ mkdir -p "$A5_CHECK/tmp"
 export TMPDIR="$A5_CHECK/tmp"
 cd "$A5_REPO"
 echo "CPU_RESULTS=$A5_CHECK"
-for A5_TEST in cpu_control eid bidirectional fp8 alltoallv peer_plan local_remote channel_sync heuristic pipeline thread_bridge dfx test_runtime; do
+for A5_TEST in eid bidirectional fp8 alltoallv peer_plan local_remote channel_sync heuristic pipeline thread_bridge dfx test_runtime; do
   python3 -m unittest discover -s tests/python/deepep \
     -p "test_a5_ccu_${A5_TEST}_cpu.py" \
     > "$A5_CHECK/$A5_TEST.log" 2>&1 || {
