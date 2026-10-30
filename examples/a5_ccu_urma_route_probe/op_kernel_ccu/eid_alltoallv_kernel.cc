@@ -6,7 +6,7 @@ a5ccu::CcuKernelSignature EidAllToAllVKernelArg::GetKernelSignature() const {
     a5ccu::CcuKernelSignature s;
     std::vector<uint32_t> ids;
     for (const auto& p : paths) ids.push_back(p.peer*9+static_cast<uint32_t>(p.relay+1));
-    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V2AddCompare", ids, channels)); return s;
+    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V3PeerResources", ids, channels)); return s;
 }
 HcclResult EidAllToAllVKernel::Algorithm() {
     if (channels_.size() != paths_.size() || !ValidateEidChannels(rank_, paths_)) return HCCL_E_PARA;
@@ -18,13 +18,18 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     Load(active);
     // 11 + 7*5 = 46 task arguments, independent of up to 49 cached channels.
     std::array<std::array<a5ccu::CcuRep::Variable,5>,7> peer;
-    std::array<a5ccu::CcuRep::Variable,7> direct;
     // Public Variable subtraction exists in headers but is unsupported by
     // the V1 instruction generator (repType 11). GeneArgs supplies direct bytes.
-    for (size_t j=0;j<7;++j) {for(auto& v:peer[j]) Load(v); direct[j]=peer[j][2];}
+    for (size_t j=0;j<7;++j) {for(auto& v:peer[j]) Load(v);}
     const size_t n=channels_.size();
-    std::vector<a5ccu::CcuRep::Variable> live(n), remoteOutput(n), remoteToken(n), bytes(n);
-    std::vector<a5ccu::CcuRep::CompletedEvent> events(n);
+    std::vector<a5ccu::CcuRep::Variable> live(n);
+    std::array<a5ccu::CcuRep::Variable,7> remoteOutput, remoteToken;
+    for(size_t j=0;j<7;++j) {remoteOutput[j]=uint64_t{0};remoteToken[j]=uint64_t{0};}
+    // At most two writes per peer (direct + one selected relay), regardless of
+    // the number of cached channels. reserve() does NOT construct SDK Events.
+    std::vector<a5ccu::CcuRep::CompletedEvent> events;
+    events.reserve(14);
+    for(size_t i=0;i<14;++i) events.emplace_back(CreateCompletedEvent());
     // V1 also lacks variable AND. Decode the <=49-bit mask from high to low
     // using unsigned comparison and modulo-2^64 addition, both V1 primitives.
     // A host-computed negative constant is not a CCU subtraction instruction.
@@ -37,43 +42,49 @@ HcclResult EidAllToAllVKernel::Algorithm() {
         CCU_IF(active >= bit) { live[i]=uint64_t{1}; active+=negativeBit; }
     }
     for(size_t i=0;i<n;++i) {
-        auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
-        if(paths_[i].relay<0) bytes[i]=direct[j];
-        else bytes[i]=peer[j][3];
-        E_CHECK(CreateVariable(channels_[i],0,&remoteOutput[i]));
-        E_CHECK(CreateVariable(channels_[i],1,&remoteToken[i]));
-        events[i]=CreateCompletedEvent();
         // Both directions use the union of active paths, including receive-only ranks.
         CCU_IF(live[i] != 0) {
             E_CHECK(NotifyRecord(channels_[i],0,0,output,1));
             E_CHECK(NotifyRecord(channels_[i],1,1,outputToken,1));
         }
     }
-    for(size_t i=0;i<n;++i) {CCU_IF(live[i] != 0) {
-        E_CHECK(NotifyWait(channels_[i],0,1)); E_CHECK(NotifyWait(channels_[i],1,1));
-    }}
     for(size_t i=0;i<n;++i) {
         auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
-        auto src=CreateLocalAddr(); auto dst=CreateRemoteAddr();
-        src.addr=input; src.addr+=peer[j][0]; src.token=inputToken;
-        dst.addr=remoteOutput[i]; dst.addr+=peer[j][1]; dst.token=remoteToken[i];
-        if(paths_[i].relay>=0) {src.addr+=direct[j];dst.addr+=direct[j];}
+        const auto channelOutput=BorrowChannelVariable(channels_[i],0);
+        const auto channelToken=BorrowChannelVariable(channels_[i],1);
+        CCU_IF(live[i] != 0) {
+            E_CHECK(NotifyWait(channels_[i],0,1)); E_CHECK(NotifyWait(channels_[i],1,1));
+            // All paths to a peer publish the same final recv address/token.
+            // Named const lvalues emit a runtime copy; assigning a temporary
+            // Variable would move/rebind the handle at graph-construction time.
+            remoteOutput[j]=channelOutput; remoteToken[j]=channelToken;
+        }
+    }
+    std::array<a5ccu::CcuRep::LocalAddr,14> sources;
+    std::array<a5ccu::CcuRep::RemoteAddr,14> destinations;
+    for(size_t j=0;j<7;++j) for(size_t kind=0;kind<2;++kind) {
+        auto& src=sources[j*2+kind];auto& dst=destinations[j*2+kind];
+        src.addr=input;src.addr+=peer[j][0];src.token=inputToken;
+        dst.addr=remoteOutput[j];dst.addr+=peer[j][1];dst.token=remoteToken[j];
+        if(kind) {src.addr+=peer[j][2];dst.addr+=peer[j][2];}
+    }
+    for(size_t i=0;i<n;++i) {
+        auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
+        const size_t slot=j*2+(paths_[i].relay>=0);
+        auto& bytes=peer[j][paths_[i].relay<0?2:3];
         if(paths_[i].relay<0) {
-            CCU_IF(bytes[i] != 0) {E_CHECK(WriteNb(channels_[i],dst,src,bytes[i],events[i]));}
+            CCU_IF(bytes != 0) {E_CHECK(WriteNb(channels_[i],destinations[slot],sources[slot],bytes,events[slot]));}
         } else {CCU_IF(peer[j][4] == static_cast<uint64_t>(paths_[i].relay)) {
-            CCU_IF(bytes[i] != 0) {E_CHECK(WriteNb(channels_[i],dst,src,bytes[i],events[i]));}
+            CCU_IF(bytes != 0) {E_CHECK(WriteNb(channels_[i],destinations[slot],sources[slot],bytes,events[slot]));}
         }}
     }
     auto src=CreateLocalAddr(), dst=CreateLocalAddr();
     src.addr=input;src.addr+=selfSource;src.token=inputToken;
     dst.addr=output;dst.addr+=selfDestination;dst.token=outputToken;
     E_CHECK(GroupedLocalCopy(dst,src,go));
-    for(size_t i=0;i<n;++i) {
-        auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
-        if(paths_[i].relay<0) {CCU_IF(bytes[i] != 0) {E_CHECK(WaitEvent(events[i]));}}
-        else {CCU_IF(peer[j][4] == static_cast<uint64_t>(paths_[i].relay)) {
-            CCU_IF(bytes[i] != 0) {E_CHECK(WaitEvent(events[i]));}
-        }}
+    for(size_t j=0;j<7;++j) {
+        CCU_IF(peer[j][2] != 0) {E_CHECK(WaitEvent(events[j*2]));}
+        CCU_IF(peer[j][3] != 0) {E_CHECK(WaitEvent(events[j*2+1]));}
     }
     for(size_t i=0;i<n;++i) {CCU_IF(live[i] != 0) {E_CHECK(NotifyRecord(channels_[i],2,1));}}
     for(size_t i=0;i<n;++i) {CCU_IF(live[i] != 0) {E_CHECK(NotifyWait(channels_[i],2,1));}}

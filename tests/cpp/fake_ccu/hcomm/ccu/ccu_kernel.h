@@ -79,7 +79,11 @@ inline Variable operator>=(const Variable& a,uint64_t value) {
 }
 struct LocalAddr { Variable addr, token; };
 struct RemoteAddr { Variable addr, token; };
-struct CompletedEvent { int id = -1; };
+inline size_t& EventAllocations() {static size_t count=0;return count;}
+struct CompletedEvent {
+    int id;
+    explicit CompletedEvent(int value=-1):id(value) {++EventAllocations();}
+};
 } // namespace CcuRep
 struct CcuKernelSignature {
     std::string value;
@@ -125,6 +129,10 @@ protected:
     };
     ConditionalScope Conditional(const CcuRep::Variable &v) { return ConditionalScope(this,v); }
     CcuRep::Variable CreateVariable() { return {}; }
+    CcuRep::Variable BorrowChannelVariable(ChannelHandle ch, uint32_t slot) {
+        CcuRep::Variable v;
+        v.eval = [ch, slot](const CcuRep::Env &e) { return e.remote(ch, slot); };return v;
+    }
     HcclResult CreateVariable(ChannelHandle ch, uint32_t slot, CcuRep::Variable *v) {
         v->eval = [ch, slot](const CcuRep::Env &e) { return e.remote(ch, slot); }; return 0;
     }
@@ -134,7 +142,7 @@ protected:
     }
     CcuRep::LocalAddr CreateLocalAddr() { return {}; }
     CcuRep::RemoteAddr CreateRemoteAddr() { return {}; }
-    CcuRep::CompletedEvent CreateCompletedEvent() { return {nextEvent_++}; }
+    CcuRep::CompletedEvent CreateCompletedEvent() { return CcuRep::CompletedEvent(nextEvent_++); }
     HcclResult NotifyRecord(ChannelHandle ch, uint32_t slot, uint32_t variable,
         const CcuRep::Variable &value, uint32_t mask) {
         Instruction i; i.op="record"; i.channel=ch; i.slot=slot; i.mask=mask; i.variable=variable; i.len=value;

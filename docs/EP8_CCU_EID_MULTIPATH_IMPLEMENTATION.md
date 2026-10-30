@@ -1,6 +1,6 @@
 # EP8 CCU + URMA EID 多路径 AllToAllV：实现、调用链与失败分析
 
-更新日期：2026-10-30。代码基线：`feature/a5-ccu-92-93-alltoall`，`ce130f2`。
+更新日期：2026-10-30。代码分支：`feature/a5-ccu-92-93-alltoall`；包含 `ce130f2` 指令兼容修复及后续按 peer 复用 kernel 资源的修复。
 
 - `f1859d2`：新增 EP8 组内 EID 转发后端，消除应用层 relay HBM 中转。
 - `ce130f2`：修复 kernel 使用 CCU V1 不支持的 Sub/And 表达式导致的注册失败。
@@ -299,7 +299,15 @@ HcclCcuUrmaEidAllToAllVCreate → 4
 - 增加 `A5CcuEidV1CompatAbiVersion=1`，新测试在建链前拒绝误加载旧 route 包。
 - 增加 `CCU_CREATE_STAGE_BEGIN/OK/FAILED/EXCEPTION`，细分实例、线程、channel 和注册 Start/Register/End；原始返回码原样保留，不自动重试。
 
-### 8.3 模型未就绪、旧适配层和 close 崩溃是另一组问题
+### 8.3 后续现场 `register_kernel status=7`
+
+`ce130f2` 在目标 9.3 仍未注册成功：query instance、49 channels、channel status、register start 成功，register kernel 返回 7。此前“不支持 repType”的错误不再出现，但不能据此认定全部资源需求已满足。
+
+代码确认存在多余资源申请：49 个 SDK Event 默认构造后又赋值新 Event，实际申请 98 次；channel 变量先默认申请再重绑定；地址和长度按 49 条候选路径重复构造。后续修复按“7 peer × direct/一个 relay”分配 14 个远端写完成事件和 14 对地址描述符，并按 peer 共享目的 buffer 元数据。49 通道、46 task args、一次提交、组内 EID 转发保持不变；握手仍覆盖双方 active 路径并集。
+
+这是已确认的代码资源浪费，不是已经证明现场恰好耗尽 event 的结论。新增 `A5_CCU_RESOURCE_DIAGNOSTICS=1`，在正式注册前查询 kernel 需求、实例占用、设备最大连续剩余量；三个量语义不同，不能直接相减。详细命令和解释见 [指导文档 §11.7](A5_CCU_92_93_ALLTOALL.md#117-register_kernel-status7减少-eid-kernel-资源并查询-sdk-需求)。新 capability 为 `A5CcuEidPeerResourceAbiVersion=1`，需重编 route，已有 f1859d2 扩展 ABI 不变。
+
+### 8.4 模型未就绪、旧适配层和 close 崩溃是另一组问题
 
 此前用户提供的模型适配代码调用的是 `ep8_pipeline_create` 和三条 lane，而非 `ep8_eid_create`。因此不能把本次独立 EID 测试的注册失败，直接倒推成那次模型服务 25 分钟未就绪的唯一原因。
 
@@ -317,14 +325,16 @@ HcclCcuUrmaEidAllToAllVCreate → 4
 |---|---|
 | 现场 f1859d2 拓扑生成、49 通道申请 | 日志证据通过；随后 kernel 构图失败 |
 | ce130f2 在 cam_lyw_92 / CANN 9.2 编译、严格链接、加载 | 通过，包括新的兼容标记 |
-| CPU 回归 | 12 组 69 项通过 |
+| ce130f2 现场 CANN 9.3 注册 | 49 通道正常；register_kernel 返回 7，未通过 |
+| 按 peer 复用资源修复：cam_lyw_92 / 9.2 | 编译、严格链接、动态加载通过 |
+| CPU 回归 | 12 组 69 项通过，含新增 event 分配/单写检查 |
 | 受限指令模型 | 拒绝 Sub/And；旧代码在 Sub 失败，新代码通过 |
 | 掩码和指令图 | 202 种掩码含 bit 48；100 epochs × 8 ranks，通过 |
 | FP8/BF16 host | 5120/10240 B 行宽交替 100 次，通过 |
 | 修复后现场 CANN 9.3 八卡注册/数据/长跑 | 待复测 |
 | EID 新后端模型收益、close/double-free 修复 | 未证明 |
 
-开发验证记录：`/home/liuyuanwen/profiling/a5-ep8-eid-v1-fix/`。包含 `route-final.log`、`cpu-suite.log`、`before-v1.log`、`sdk-instruction-evidence.txt`。
+资源复用修复验证：`/home/liuyuanwen/profiling/a5-ep8-eid-peer-resources/`（`route.log`、`cpu-suite.log`）。此前 Sub/And 修复开发验证记录：`/home/liuyuanwen/profiling/a5-ep8-eid-v1-fix/`。包含 `route-final.log`、`cpu-suite.log`、`before-v1.log`、`sdk-instruction-evidence.txt`。
 
 新机先按操作文档第 3 节用目标 CANN 重建并安装 route 包；已有 `f1859d2` wheel 可保留，本修复不改变其调用 ABI。按第 11.2 节配置机器环境后执行：
 

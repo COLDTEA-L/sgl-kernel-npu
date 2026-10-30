@@ -426,6 +426,7 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)
 extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
 // Additive capability marker: no public task/layout ABI changes.
 extern "C" int A5CcuEidV1CompatAbiVersion() { return 1; }
+extern "C" int A5CcuEidPeerResourceAbiVersion() { return 1; }
 extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char* id, const char* manifest, uint64_t* handle) {
     return CreatePeerPlan(comm, stream, id, manifest, 8, handle, true, true);

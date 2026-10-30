@@ -48,6 +48,10 @@ protected:
     virtual HcclResult Algorithm() = 0;
     virtual std::vector<uint64_t> GeneArgs(const CcuTaskArg&) = 0;
     CcuRep::Variable CreateVariable() { return CcuRep::Variable(); }
+    // Return a borrowed channel variable without allocating a local XN first.
+    CcuRep::Variable BorrowChannelVariable(ChannelHandle channel, uint32_t index) {
+        return AscendC::ccu::GetResByChannel<CcuRep::Variable>(channel, index);
+    }
     HcclResult CreateVariable(ChannelHandle channel, uint32_t index, CcuRep::Variable* out) {
         if (!out) return HCCL_E_PTR;
         *out = AscendC::ccu::GetResByChannel<CcuRep::Variable>(channel, index);

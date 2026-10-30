@@ -431,3 +431,51 @@ A5_EID_LOG_LEVEL=1 A5_EID_LOG_STDOUT=1 \
 仅当阶段日志指向通道/注册资源容量时，再以 `A5_EID_MAX_RELAYS_PER_PEER=0`（7 通道）或 `1`（最多 14 通道）作定位对照；这些不是完整候选目录的等价性能配置。所有结果仍写 `/home/l00934901/profiling`，每次用新进程，不复用失败后的注册实例。
 
 本修复在 `cam_lyw_92` / CANN 9.2.0 完成 route 编译、严格链接、SDK host-test 和实际动态加载（含新能力标记）。12 组 69 项 CPU 回归通过。受限指令模型主动拒绝 Sub/And：旧 kernel 在 Sub 处失败；修复后 202 种 active mask（含第 48 位）、100 epochs × 8 ranks 指令图和 FP8/BF16 host 交替检查通过。结果位于开发机 `/home/liuyuanwen/profiling/a5-ep8-eid-v1-fix`，见 `route-final.log`、`cpu-suite.log`、`before-v1.log`、`sdk-instruction-evidence.txt`。这是编译和离线验证，目标 9.3 八卡仍需先跑上述 `--suite create`，再做数据正确性验证。
+
+### 11.7 `register_kernel status=7`：减少 EID kernel 资源并查询 SDK 需求
+
+现场 `ce130f2`：49 通道状态正常，`register_start` 成功，`register_kernel` 返回 `HCCL_E_UNAVAIL(7)`；与之前的 `repType[11]` 异常不同。当前证据把失败定位在注册阶段，但**仅凭 7 不能确定耗尽的是 event、变量、指令还是其他资源**。容器重启不排除固有配额或设备共享资源压力；`instance=2` 是不透明句柄，不表示容量。
+
+核对 9.2 公开 SDK 后，发现原图有确定的多余申请：
+
+- `vector<Event>(49)` 默认构造就申请 49 个 event，随后逐项赋值 `CreateCompletedEvent()` 又申请 49 个；move 赋值仅更换句柄，不释放第一次构图申请。因此仅远端写完成事件就申请了 **98 个**。
+- `remoteOutput/remoteToken` 默认构造先申请本地变量，随后绑定 channel 借用变量，产生不必要申请。
+- 按 49 条候选路径分别构造地址和长度，但策略限制每 peer 最多同时执行 direct 和一个 relay，两者都写到同一 peer 的最终 recv buffer。
+
+修复保持全候选目录与真实 EID 转发：远端写 event 改为 **14 个**，地址描述符改为 **14 对**，按 peer 共享最终 recv 地址/token，移除冗余 direct/每路径长度变量。以上数字只统计远端 payload 部分，不包含 channel、self-copy 和 SDK 自身资源。不同 peer 不共享完成事件；同一 peer 的所有 relay 候选互斥，才允许共用一个 relay 完成事件。incoming-only rank 的 metadata/done 握手保留。46 个 task args 不变，不增加 kernel launch，不落 relay HBM。
+
+**先按 §3 重新编译安装 route，保留 §11.2 环境变量，用新进程测试。** 已有 `f1859d2` wheel 时无须为本修复重打 wheel；构建输出新增 `PUBLIC_ROUTE_ABI A5CcuEidPeerResourceAbiVersion=1`，测试会校验，防止加载旧图。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+# 完整候选目录，先只建链、注册及退出；不传 payload。
+A5_EID_MAX_RELAYS_PER_PEER=6 \
+  bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+若仍失败，或需要查明现场资源需求，在**新进程**开启诊断：
+
+```bash
+A5_CCU_RESOURCE_DIAGNOSTICS=1 \
+A5_EID_MAX_RELAYS_PER_PEER=6 \
+A5_EID_LOG_LEVEL=1 A5_EID_LOG_STDOUT=1 \
+  bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+诊断仅发生在注册前，不进入执行/性能热路径。它用独立 kernel 对象调用 `HcommCcuKernelQueryResReq`，然后正式注册使用另一个对象，避免混用 DSL 句柄。查询失败保留原始状态；不自动换实例或重试失败注册。每类输出包含 loop、CCU buffer、variable、address、event、CCU thread、instruction：
+
+| `PUBLIC_CCU_RESOURCE kind=` | 含义 |
+| --- | --- |
+| `kernel_required` | SDK 对当前 kernel 的资源需求统计；仅 status=0 时有效 |
+| `instance_owned` | 通信域实例在该 die 上拥有/占用的资源，**不是实例内剩余量** |
+| `device_max_contiguous_remaining` | 设备各类资源的最大连续剩余块，**不是总空闲量，也不是实例内剩余量** |
+
+不能把后两行直接相减当作实例可用配额。若 query 自身返回错误，也保留 `PUBLIC_CCU_BUILD_FAILED` 和底层 plog；公开 query 不保证每个 SDK 版本都能统计这种借用 channel 的图。
+
+`HcclCommQueryCcuIns` 已返回通信域拥有的实例；本库借用它，不进行额外 `HcclCommAssignCcuIns` 或 destroy。RegisterStart 成功仅代表会话开启，不能证明后面的 kernel 资源能分配成功。若仍失败，请贴上述三类资源行、`CCU_CREATE_STAGE_FAILED` 和同时间 plog 的第一处资源申请错误，再决定是否需调整实例/SDK 配置。
+
+只有看到 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS` 后才继续 §11.2 正确性和长跑，再进行 §11.3 性能测试。资源优化本身不构成目标 9.3 注册成功或性能提升的证明。
+
+开启诊断时还输出 `PUBLIC_CCU_BUILD_STATUS status=... task_args=...`，区分 DSL callback 正常返回/非零返回与后续注册阶段；原 `PUBLIC_CCU_BUILD_FAILED` 只捕获异常，缺少该行并不能证明 callback 一定成功。
+
+开发验证：`cam_lyw_92` / CANN 9.2.0，route 完整编译、严格链接、SDK host-test 和动态加载通过；12 组 69 项 CPU 回归通过，含真实 EID 指令图 100 epochs × 8 ranks、202 种 mask、FP8/BF16 交替 100 次。新增检查强制远端写 event 只构造 14 次，并验证每次启动不会有两条 Write 共用同一完成事件。结果目录 `/home/liuyuanwen/profiling/a5-ep8-eid-peer-resources`（`route.log`、`cpu-suite.log`）。开发容器无 NPU；目标 9.3 的 create、正确性、长跑均待复测。

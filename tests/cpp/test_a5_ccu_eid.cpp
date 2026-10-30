@@ -73,7 +73,10 @@ int main() {
     for(uint32_t r=0;r<8;++r) {
         auto paths=Catalog(r);std::vector<ChannelHandle> channels;
         for(auto p:paths) channels.push_back(p.peer*9+p.relay+2);
-        EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));assert(kernels[r]->Init()==0);
+        EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));
+        const auto before=hcomm::CcuRep::EventAllocations();
+        assert(kernels[r]->Init()==0);
+        assert(hcomm::CcuRep::EventAllocations()-before==14); // no default-construct then overwrite
     }
     MaskDecode(*kernels[0]);
     uint32_t bits[8][8][9][3]{};
@@ -122,13 +125,13 @@ int main() {
                     if(i.op=="record") {
                         assert(!(bits[peer][r][path][i.slot]&i.mask));bits[peer][r][path][i.slot]|=i.mask;
                         if(i.slot<2) published[peer][r][path][i.slot]=i.len.eval(e);
-                        else for(size_t q=0;q<49;++q) if(layouts[r].pathBytes[q]) assert(completed[r].count(q));
+                        else for(size_t q=0;q<49;++q) if(layouts[r].pathBytes[q]) assert(completed[r].count((q/7)*2+(q%7!=0)));
                     } else if(i.op=="notify_wait") {
                         auto& b=bits[r][peer][path][i.slot];if((b&i.mask)!=i.mask) continue;b&=~i.mask;
                     } else if(i.op=="event_wait") assert(completed[r].count(i.event));
                     else if(i.op=="remote"||i.op=="group_local") {
                         auto len=i.len.eval(e);uint32_t dst=i.op=="remote"?peer:r;
-                        if(i.op=="remote") {assert(len);completed[r].insert(i.event);if(path) ++activeRelay;}
+                        if(i.op=="remote") {assert(len);assert(completed[r].insert(i.event).second);if(path) ++activeRelay;}
                         auto src=i.src.eval(e),target=i.dst.eval(e);
                         assert(src>=reinterpret_cast<uint64_t>(input[r].data()+guard)&&src+len<=reinterpret_cast<uint64_t>(input[r].data()+guard)+layouts[r].sendBytes);
                         assert(target>=reinterpret_cast<uint64_t>(output[dst].data()+guard)&&target+len<=reinterpret_cast<uint64_t>(output[dst].data()+guard)+layouts[dst].recvBytes);

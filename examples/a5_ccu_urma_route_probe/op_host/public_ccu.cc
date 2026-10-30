@@ -2,6 +2,8 @@
 #include "../common/create_trace.h"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -18,7 +20,14 @@ std::map<std::pair<int32_t, uint64_t>, std::shared_ptr<Registered>> kernels;
 std::set<std::pair<int32_t, HcclComm>> poisoned;
 std::atomic<uint64_t> sequence{0};
 CcuResult BuildKernel(::CcuKernelArg arg) {
-    try { return static_cast<CcuResult>(static_cast<CcuKernel*>(arg)->Build()); }
+    try {
+        auto* kernel=static_cast<CcuKernel*>(arg);
+        const auto status=static_cast<CcuResult>(kernel->Build());
+        const char* diagnostic=std::getenv("A5_CCU_RESOURCE_DIAGNOSTICS");
+        if (status!=CcuResult::CCU_SUCCESS || (diagnostic && std::strcmp(diagnostic,"1")==0))
+            std::fprintf(stderr,"PUBLIC_CCU_BUILD_STATUS status=%d task_args=%u\n",int(status),kernel->ArgumentCount());
+        return status;
+    }
     catch (const AscendC::ccu::detail::CcuException& error) {
         std::fprintf(stderr, "PUBLIC_CCU_BUILD_FAILED error=%s\n", error.what());
         return error.code();
@@ -26,6 +35,53 @@ CcuResult BuildKernel(::CcuKernelArg arg) {
         std::fprintf(stderr, "PUBLIC_CCU_BUILD_FAILED error=%s\n", error.what());
         return CcuResult::CCU_E_INTERNAL;
     }
+}
+// Diagnostic queries do not assign/destroy the communicator-owned instance.
+// The global remainder is MAX CONTIGUOUS per type, not instance-local free space.
+void ResourceDiagnostic(CcuInsHandle instance, uint32_t die, const KernelCreator& creator,
+                        const CcuKernelArg& arg) {
+    const char* enabled = std::getenv("A5_CCU_RESOURCE_DIAGNOSTICS");
+    if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    HcommCcuResDescHandle desc = 0;
+    auto status = HcommCcuInsResDescCreate(die, &desc);
+    if (status != CcuResult::CCU_SUCCESS) {
+        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE kind=create_desc die=%u status=%d\n",die,int(status));
+        return;
+    }
+    const char* names[] = {"loop","ccu_buf","variable","address","event","ccu_thread","instruction"};
+    const HcommCcuResType types[] = {HCOMM_CCU_RES_TYPE_LOOP,HCOMM_CCU_RES_TYPE_CCU_BUF,
+        HCOMM_CCU_RES_TYPE_VARIABLE,HCOMM_CCU_RES_TYPE_ADDRESS,HCOMM_CCU_RES_TYPE_EVENT,
+        HCOMM_CCU_RES_TYPE_CCU_THREAD,HCOMM_CCU_RES_TYPE_INSTRUCTION};
+    auto report = [&](const char* kind, CcuResult result) {
+        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE kind=%s instance=%llu die=%u status=%d",
+            kind,static_cast<unsigned long long>(instance),die,int(result));
+        if (result == CcuResult::CCU_SUCCESS) for (size_t i=0;i<7;++i) {
+            uint32_t value=0;
+            auto queried=HcommCcuInsResDescQueryNum(desc,types[i],&value);
+            if (queried==CcuResult::CCU_SUCCESS) std::fprintf(stderr," %s=%u",names[i],value);
+            else std::fprintf(stderr," %s_query_status=%d",names[i],int(queried));
+        }
+        std::fprintf(stderr,"\n");
+    };
+    try {
+        report("instance_owned",HcommCcuInsQueryResDesc(instance,desc));
+        report("device_max_contiguous_remaining",HcommCcuQueryRemainResDesc(desc));
+        // Query builds a separate graph. Do not reuse its DSL handles in the real
+        // registration transaction, and do not retry a failed registration.
+        auto probe=creator(arg);
+        if (probe) {
+            const void* args[]={probe.get()};
+            report("kernel_required",HcommCcuKernelQueryResReq(
+                reinterpret_cast<const void*>(BuildKernel),args,1,desc));
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE_FAILED die=%u error=%s\n",die,error.what());
+    } catch (...) {
+        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE_FAILED die=%u error=unknown\n",die);
+    }
+    status=HcommCcuInsResDescDestroy(desc);
+    if (status!=CcuResult::CCU_SUCCESS)
+        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE kind=destroy_desc die=%u status=%d\n",die,int(status));
 }
 }
 HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
@@ -54,6 +110,7 @@ HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
         return HCCL_E_INTERNAL;
     } catch (...) { return HCCL_E_INTERNAL; }
     if (!entry->kernel) return HCCL_E_PTR;
+    ResourceDiagnostic(instance,die,*creator,*arg);
     const void* args[] = {entry->kernel.get()};
     CcuKernelHandle registered = 0;
     const std::string name = "a5_public_" + std::to_string(++sequence);

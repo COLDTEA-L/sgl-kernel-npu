@@ -44,7 +44,8 @@ for name, expected in [('A5CcuPublicApiAbiVersion', 1), ('A5CcuUrmaPreparedPlanA
                        ('A5CcuPeerPlanAbiVersion', 5), ('A5CcuAllToAllVAbiVersion', 1),
                        ('A5CcuAllToAllVLayoutAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2),
                        ('A5CcuEidAllToAllVAbiVersion', 1),
-                       ('A5CcuEidV1CompatAbiVersion', 1)]:
+                       ('A5CcuEidV1CompatAbiVersion', 1),
+                       ('A5CcuEidPeerResourceAbiVersion', 1)]:
     fn = getattr(lib, name)
     fn.restype = ctypes.c_int
     actual = fn()
