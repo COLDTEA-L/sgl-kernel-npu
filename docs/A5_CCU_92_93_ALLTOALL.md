@@ -514,3 +514,26 @@ A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1 \
 这条命令在 `1e33bca` 也可执行。若已更新本节日志修复，先按 §3 重编 route；wheel ABI 未变。不要增加 barrier、重试 RegisterEnd 或换通信域来掩盖错误。若关闭查询后通过，再在**另一个新进程**把 `A5_CCU_RESOURCE_DIAGNOSTICS` 改为1作对照；若仍失败，保留完整 `run.log` 中第一处 SDK 错误及八个 device 的 End 结果，而不只保留我们打印的 `CCU_CREATE_STAGE_FAILED`。结果继续存放 `/home/l00934901/profiling`。
 
 依据：[HcommCcuKernelRegisterEnd 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/api_ref/comm_opdev/control_plane_api/ccu_kernel_launch_execution/HcommCcuKernelRegisterEnd.md)、[hcomm 公开注册实现](https://gitcode.com/cann/hcomm/blob/master/src/base_comm/primitives/api_c_adpt/ccu/ccu_launch.cc)。公开版本及本地9.2只用于核对调用语义，不等同于现场9.3二进制。本轮不改 EID 数据路径，尚未确认 End=4 的具体根因。
+
+### 11.9 create 前置 AICPU `0x2a` 与 End=4 分开定位
+
+现场 `1e33bca` 的三组报告：诊断开时八卡 End=4；诊断关的两次运行没有 End 记录，Runtime 报 AICPU `retCode=0x2a`。这不能证明同一个 EID Register 在随机失败，也不能排除查询影响：两组可能尚未走到相同调用阶段。
+
+`A5_CCU_RESOURCE_DIAGNOSTICS=0` 只跳过实例/设备资源查询和额外的 `KernelQueryResReq` 查询图；正式 Start/Register/End 均在开关判断外。开关=1会多构一次查询图，所以不是纯打印开关。不开诊断时成功的 `PUBLIC_CCU_BUILD_STATUS` 也会被抑制，不能用缺少该行判断没构图。
+
+create 测试的真实前置流程如下（无 EID payload，但并非没有设备任务）：
+
+```text
+device init → HCCL process group init → digest 张量创建
+→ 原生 HCCL all_gather（检查8个rank配置一致）→ CPU比对
+→ DeepEP Buffer初始化 → EID实例/线程/建链 → 可选资源查询
+→ RegisterStart → Register → RegisterEnd → 释放及退出
+```
+
+`0x2a` 是 Runtime 报告的 AICPU 执行异常，不是 `HcclResult=42`，也不直接表示 CCU 配额不足。还需任务名、底层 `errcode` 和对应调用栈；`sqe_type=5(aicpu_d)`只是本条Runtime日志标出的任务类别。官方故障处理示例同样要求结合 `fault op_name` / kernel name / 内层 errcode 定位：[AI CPU算子执行报错](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/developmentguide/maintenref/troubleshooting/troubleshooting_0151.html)。
+
+新增启动阶段日志：`device_init_*`、`process_group_*`、`config_digest_*`、`config_allgather_*`、`config_check_*`、`buffer_init_*`。digest创建、原生all_gather、Buffer初始化后分别同步，防止其异步错误拖到后续 EID 阶段才暴露。配置一致性检查保留，不更换通信后端、不增加跨rank barrier、不改变性能计时路径。
+
+优先读取已失败B/C目录的最后 `EP8_EID_PHASE`、`CCU_CREATE_STAGE` 和首个Python traceback：若没有 `catalog_register_begin`，失败在测试前置阶段，不能归因于EID注册时的诊断开关；若已进入，则按最末成功子阶段定位。End=4这一路仍需A组的SDK翻译/下发错误，不能用B/C的0x2a替代其根因。
+
+本节只补足阶段边界，不宣称修复 AICPU 或 End=4。尚未push的提交必须由开发机push后，新机才能pull；不要把本地commit号当作远端已发布版本。

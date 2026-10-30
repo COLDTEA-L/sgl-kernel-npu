@@ -79,16 +79,34 @@ def main():
     def phase(name, **fields):
         print('EP8_EID_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
               time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
-    phase('process_group_begin')
+    phase('device_init_begin')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
+    phase('device_init_complete')
+    phase('process_group_begin')
     dist.init_process_group('hccl', timeout=timedelta(seconds=180), **ccu_pg_kwargs(torch_npu))
+    phase('process_group_complete')
     identity = json.dumps(dict(options=vars(args), cases=cases, topology=topology,
                                manifest=args.manifest.read_text()), default=str, sort_keys=True)
+    phase('config_digest_begin')
     digest = torch.tensor(list(hashlib.sha256(identity.encode()).digest()), dtype=torch.int32, device='npu')
     hashes = [torch.empty_like(digest) for _ in range(8)]
+    torch.npu.synchronize()
+    phase('config_digest_complete')
+    phase('config_allgather_begin')
     dist.all_gather(hashes, digest)
-    if any(not torch.equal(h.cpu(), digest.cpu()) for h in hashes): raise ValueError('rank configuration mismatch')
+    phase('config_allgather_submitted')
+    # Startup-only fence: report asynchronous native collective errors here,
+    # before entering EID resources/registration. No fence in measured payloads.
+    torch.npu.synchronize()
+    phase('config_allgather_complete')
+    phase('config_check_begin')
+    expected_digest=digest.cpu()
+    if any(not torch.equal(h.cpu(), expected_digest) for h in hashes): raise ValueError('rank configuration mismatch')
+    phase('config_check_complete')
+    phase('buffer_init_begin')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
+    torch.npu.synchronize()
+    phase('buffer_init_complete')
     phase('catalog_register_begin', manifest=str(args.manifest.resolve()),
           manifest_sha256=hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
           channels=topology.get('channels_per_rank'), executor=topology['executor'])
