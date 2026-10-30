@@ -19,7 +19,7 @@ export TMPDIR="$A5_HEURISTIC_RUN/tmp"
 echo "结果目录：$A5_HEURISTIC_RUN"
 printf '%s\n' "$@" > "$A5_HEURISTIC_RUN/arguments.txt"
 git rev-parse HEAD > "$A5_HEURISTIC_RUN/commit.txt"
-python3 scripts/prepare_a5_ccu_ep8_topology.py \
+python3 scripts/prepare_a5_ccu_ep8_topology.py --executor hbm \
   --devices "$ASCEND_RT_VISIBLE_DEVICES" \
   --root-info "${A5_ROOT_INFO:-/etc/hccl_rootinfo.json}" \
   --topology-json "${A5_ATLAS_JSON:-/usr/local/Ascend/driver/topo/950/atlas_950_1.json}" \

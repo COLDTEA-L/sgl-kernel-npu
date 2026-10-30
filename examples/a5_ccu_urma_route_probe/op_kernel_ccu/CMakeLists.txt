@@ -1,4 +1,5 @@
 set(op_kernel_ccu_src_list
+    ${CMAKE_CURRENT_SOURCE_DIR}/eid_alltoallv_kernel.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/alltoallv_kernel.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/route_kernel.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/grouped_local_copy_kernel.cc

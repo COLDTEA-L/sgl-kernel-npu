@@ -40,6 +40,7 @@ torch::Tensor ccu_urma_prepared_multipath_alltoall_policy_meta(
     const c10::List<int64_t> &path_weights);
 
 struct Buffer {
+    int64_t prepare_ccu_urma_eid_alltoallv(const std::string &, const std::string &);
     HcclComm ep8_pipeline_comm();  // C++ executor only; resolved once at lane attachment.
     int64_t prepare_ccu_urma_peer_plan_alltoallv(const std::string &, const std::string &);
     void bind_ccu_urma_peer_plan_alltoallv(int64_t handle);

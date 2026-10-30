@@ -14,6 +14,7 @@ namespace CcuRep {
 struct Env { std::vector<uint64_t> args; std::function<uint64_t(ChannelHandle, uint32_t)> remote; };
 struct Variable {
     std::function<uint64_t(const Env &)> eval = [](const Env &) { return 0ULL; };
+    Variable &operator=(uint64_t value) { eval=[value](const Env&) {return value;}; return *this; }
     Variable &operator+=(const Variable &other) {
         const auto left = eval, right = other.eval;
         eval = [left, right](const Env &e) { return left(e) + right(e); }; return *this;
@@ -22,6 +23,15 @@ struct Variable {
 inline Variable operator!=(const Variable &v, uint64_t value) {
     Variable result; const auto expr = v.eval;
     result.eval = [expr, value](const Env &e) { return uint64_t(expr(e) != value); }; return result;
+}
+inline Variable operator==(const Variable& v,uint64_t value) {
+    Variable out;auto a=v.eval;out.eval=[a,value](const Env& e){return uint64_t(a(e)==value);};return out;
+}
+inline Variable operator-(const Variable& a,const Variable& b) {
+    Variable out;auto x=a.eval,y=b.eval;out.eval=[x,y](const Env& e){return x(e)-y(e);};return out;
+}
+inline Variable operator&(const Variable& a,const Variable& b) {
+    Variable out;auto x=a.eval,y=b.eval;out.eval=[x,y](const Env& e){return x(e)&y(e);};return out;
 }
 struct LocalAddr { Variable addr, token; };
 struct RemoteAddr { Variable addr, token; };

@@ -17,7 +17,7 @@ struct PeerPathSpec {
 };
 
 inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
-    const std::vector<PeerPathSpec> &specs, std::string *error)
+    const std::vector<PeerPathSpec> &specs, std::string *error, bool participantRelays = false)
 {
     auto fail = [error](const char *text) {
         if (error != nullptr) *error = text;
@@ -25,13 +25,15 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
     };
     if ((rankSize != 2 && rankSize != 4 && rankSize != 8) || availableCards < rankSize || specs.empty())
         return fail("peer-plan supports rankSize 2/4 or direct-only 8 and N >= k");
+    if (participantRelays && (rankSize != 8 || availableCards != 8))
+        return fail("participant relay mode requires exactly EP8");
     std::map<uint32_t, uint32_t> mapping;
     std::map<std::pair<uint32_t, uint32_t>, std::vector<const PeerPathSpec *>> pairs;
     for (const auto &p : specs) {
         if (p.srcRank >= p.dstRank || p.dstRank >= rankSize || p.srcPhy == p.dstPhy ||
             p.weight == 0 || p.srcDie > 1 || p.dstDie > 1)
             return fail("invalid canonical rank pair, weight, physical IDs or endpoint die");
-        if (rankSize == 8 && p.relay) return fail("8-rank plans are direct-only");
+        if (rankSize == 8 && p.relay && !participantRelays) return fail("8-rank plans are direct-only");
         for (auto endpoint : {std::make_pair(p.srcRank, p.srcPhy),
                               std::make_pair(p.dstRank, p.dstPhy)}) {
             const auto inserted = mapping.emplace(endpoint);
@@ -44,7 +46,7 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
     for (auto entry : mapping) members.insert(entry.second);
     if (mapping.size() != rankSize || members.size() != rankSize)
         return fail("rank-to-physical-device mapping must be complete and unique");
-    const size_t relayLimit = (availableCards - rankSize) / (rankSize - 1);
+    const size_t relayLimit = participantRelays ? 6 : (availableCards - rankSize) / (rankSize - 1);
     std::map<uint32_t, std::set<uint32_t>> usedByRank;
     std::set<uint32_t> allRelays;
     for (uint32_t a = 0; a < rankSize; ++a) {
@@ -59,11 +61,12 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
                 if (!path->relay) {
                     ++directs;
                 } else {
-                    if (members.count(path->relayPhy) || path->relayPhy == UINT32_MAX ||
+                    if ((participantRelays ? (!members.count(path->relayPhy) || path->relayPhy == path->srcPhy || path->relayPhy == path->dstPhy)
+                                          : members.count(path->relayPhy)) || path->relayPhy == UINT32_MAX ||
                         !relays.insert(path->relayPhy).second || path->srcEid.empty() ||
-                        path->dstEid.empty()) return fail("relay must be explicit, unique and outside communicator");
-                    if (!usedByRank[a].insert(path->relayPhy).second ||
-                        !usedByRank[b].insert(path->relayPhy).second)
+                        path->dstEid.empty()) return fail("relay must be explicit, unique and in the allowed physical membership");
+                    if (!participantRelays && (!usedByRank[a].insert(path->relayPhy).second ||
+                        !usedByRank[b].insert(path->relayPhy).second))
                         return fail("one rank cannot reuse the same relay for different peers");
                     allRelays.insert(path->relayPhy);
                 }
@@ -72,7 +75,7 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
                 return fail("one direct per peer; relay count exceeds (N-k)/(k-1)");
         }
     }
-    if (allRelays.size() > availableCards - rankSize)
+    if (!participantRelays && allRelays.size() > availableCards - rankSize)
         return fail("relay device union exceeds available external cards");
     return true;
 }

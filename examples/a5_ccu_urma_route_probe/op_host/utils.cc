@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "alltoallv_kernel.h"
+#include "eid_alltoallv_kernel.h"
 #include "route_kernel.h"
 #include "all_to_all_multiroute_kernel.h"
 #include "command_block_worker_kernel.h"
@@ -1226,7 +1227,7 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
 }
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
-    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode, bool allToAllV)
+    const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources, ChannelSyncMode syncMode, bool allToAllV, bool eidAllToAllV)
 {
     if (!comm || !stream || !resources) return HCCL_E_PTR;
     PeerPlanResources result;
@@ -1238,6 +1239,17 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     if (status != HCCL_SUCCESS) return status;
     status = HcclGetRankSize(comm, &r.rankSize);
     if (status != HCCL_SUCCESS) return status;
+    std::map<uint32_t,uint32_t> physicalRanks;
+    if (eidAllToAllV) {
+        if (!allToAllV || r.rankSize != 8) return HCCL_E_PARA;
+        for (const auto& p : specs) {physicalRanks[p.srcPhy]=p.srcRank;physicalRanks[p.dstPhy]=p.dstRank;}
+        for (const auto& p : specs) if (p.relay) {
+            if (!physicalRanks.count(p.relayPhy)) return HCCL_E_PARA;
+            const auto k=physicalRanks.at(p.relayPhy);
+            result.eidAllowed[p.srcRank*8+p.dstRank] |= 1u<<k;
+            result.eidAllowed[p.dstRank*8+p.srcRank] |= 1u<<k;
+        }
+    }
     std::vector<HcclChannelDesc> descs;
     bool haveDie = false;
     for (uint32_t peer = 0; peer < r.rankSize; ++peer) {
@@ -1302,6 +1314,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             }
             haveDie = true; r.dieId = die;
             descs.push_back(desc); result.peers.push_back(peer);
+            if (eidAllToAllV) result.eidChannels.push_back({peer, p.relay ? static_cast<int32_t>(physicalRanks.at(p.relayPhy)) : -1});
             r.weights.push_back(p.weight); r.routeIndices.push_back(static_cast<uint32_t>(i));
             r.pathUids.push_back(uid);
             std::printf("PEER_PATH_DESC rank=%u peer=%u kind=%s relay_phy=%u weight=%u die=%u local=%s remote=%s\n",
@@ -1310,7 +1323,10 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                 CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
         }
     }
-    if ((allToAllV && (r.rankSize != 8 || descs.size() != 7 || syncMode != ChannelSyncMode::BASELINE)) ||
+    if (eidAllToAllV) {
+        if (!ValidateEidChannels(r.rank, result.eidChannels) || syncMode != ChannelSyncMode::BASELINE) return HCCL_E_PARA;
+        std::printf("EP8_EID_CATALOG rank=%u channels=%zu task_args=46 participant_relays=1 hbm_relay=0\n", r.rank, descs.size());
+    } else if ((allToAllV && (r.rankSize != 8 || descs.size() != 7 || syncMode != ChannelSyncMode::BASELINE)) ||
         descs.empty() || (allToAllV ? 10 : r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);
     // Thread resources must exist before ChannelAcquire on every rank.
@@ -1343,7 +1359,11 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     }
     RouteKernelArg arg(r.channels, r.routeIndices, r.ccuSelfCopy,r.ccuGroupCopy, syncMode);
     a5ccu::KernelCreator creator = CreateRouteKernel;
-    if (allToAllV) {
+    if (eidAllToAllV) {
+        EidAllToAllVKernelArg vArg(r.channels, r.rank, result.eidChannels);
+        a5ccu::KernelCreator vCreator = CreateEidAllToAllVKernel;
+        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg);
+    } else if (allToAllV) {
         AllToAllVKernelArg vArg(r.channels);
         a5ccu::KernelCreator vCreator = CreateAllToAllVKernel;
         status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg);

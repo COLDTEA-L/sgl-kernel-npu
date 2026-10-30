@@ -11,6 +11,7 @@
 #include "ep8_relay_planner_bindings.hpp"
 #include "ep8_copy_spans.hpp"
 #include "ep8_pipeline_bindings.hpp"
+#include "ep8_eid_bindings.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
@@ -52,6 +53,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     deep_ep::ep8::BindPlanner(m);
     deep_ep::ep8::BindPipeline(m);
+    deep_ep::ep8::BindEid(m);
     m.def("ep8_copy_spans_out", &deep_ep::ep8::CopySpansOut,
           py::arg("src"), py::arg("dst"), py::arg("spans"), py::call_guard<py::gil_scoped_release>());
     m.def("ep8_bind_workspace_views", &deep_ep::ep8::BindWorkspaceViews,
@@ -70,6 +72,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, std::string>())
+        .def("prepare_ccu_urma_eid_alltoallv", &deep_ep::Buffer::prepare_ccu_urma_eid_alltoallv, py::arg("plan_id"), py::arg("manifest"))
         .def("prepare_ccu_urma_peer_plan_alltoallv", &deep_ep::Buffer::prepare_ccu_urma_peer_plan_alltoallv,
              py::arg("plan_id"), py::arg("manifest"))
         .def("bind_ccu_urma_peer_plan_alltoallv", &deep_ep::Buffer::bind_ccu_urma_peer_plan_alltoallv, py::arg("handle"))

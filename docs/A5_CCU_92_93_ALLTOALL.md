@@ -9,14 +9,14 @@
 | 2 卡 | 等长多路径 AllToAll、prepared plan、动态权重、显式组外物理 relay、serial/concurrent、self-copy 模式 |
 | 4 卡 | 原 peer-plan、组外物理 relay、baseline/packed/packed-ready 通知协议 |
 | 8 卡 | EP8 AllToAllV，非对称 C[8][8]、零长度、独立 self 偏移、storage-count 偏移接口 |
-| EP8 多路径 | 原 greedy/fast 规划、组内 HBM relay、direct 与双缓冲 relay 流水线、C++ 布局和提交路径 |
+| EP8 多路径 | §11 新增组内显式 EID + CCU/URMA 端到端转发；原 HBM pipeline 保留作对照 |
 | 计时 | 原 native HCCL / custom direct / multipath，prepared 和 dynamic 两种口径 |
 
-2/4 卡不套用 EP8 贪心算法；8 卡 AllToAllV 继续专供 EP8，relay 仅在通信组成员中选择。模型输入接口、规划算法和 C++ pipeline host 未在本次迁移中重写。
+2/4 卡不套用 EP8 贪心算法；8 卡 AllToAllV 继续专供 EP8，relay 仅在通信组成员中选择。**当前验证新的 EP8 EID 后端请执行 §3、§4 重编译，然后从 §11 开始；§6/§7/§10 的 HBM pipeline 命令保留用于历史对照，不会自动切换到 EID。**
 
 服务器已在独立 `cam_lyw_92` 中编译、严格链接、加载整个 route 库及 local-copy 诊断程序；新 host mock 检查固定注册、100 次复用、设备/通信域归属、注册失败不重试；EP8 CPU 图模型执行 100 轮、800 次调度；2/4 卡布局、通知、自拷贝和规划器 CPU 回归通过。
 
-首次迁移时该容器没有 Torch/torch_npu。后续在独立 venv 中安装了 CPU Torch，完成了 §9/§10 的真实 ATen C++ 编译及 CPU 回归；容器仍没有 torch_npu、未挂载 NPU，因此未编译完整 DeepEP wheel 或上卡测试。9.3 接口名称/参数形式来自用户提供的检查结果，仍需在 9.3 本机重编译和上卡。CPU 模型不验证固件、实际 MS/loop 资源或性能；9.2 二进制也不能作为 9.3 的已验证产物。
+首次迁移时该容器没有 Torch/torch_npu；后续独立 venv 的 CPU Torch 用于 §9/§10 的真实 ATen C++ 编译。§11 又在任务 profiling 目录解包了 torch_npu 2.10.0 的真实头文件/库，完成整个 DeepEP C++ 扩展的编译、严格链接和导入。未挂载 NPU，尚未打包验证完整 device-op wheel 或上卡。9.3 接口名称/参数形式来自用户提供的检查结果，仍需在 9.3 本机重编译和上卡。CPU 模型不验证固件、实际 MS/loop 资源或性能；9.2 二进制也不能作为 9.3 的已验证产物。
 
 ## 2. 实现与 ABI
 
@@ -299,3 +299,101 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_bidirectiona
 该测试编译并链接真实 ATen + 生产 C++ planner/pipeline host，使用八 rank 延迟执行的 CPU transport 检查依赖：宽 5120，FP8/BF16 交替 100 对，覆盖 staged/免拷贝、非对称与转置矩阵、零行、self、原始字节和保护区、旧 prepared 复用、同字节数不同签名、总工作区上限、错误传播。预热后不新增 workspace 分配或同步；不能代替 NPU 验证。
 
 本轮 `cam_lyw_92` 中 11 组 CPU 套件 **63 项全部通过**，包含上述真实 C++ 编译/链接；CANN 9.2 route 全量构建、严格链接、host ctest 与加载通过。结果：`/home/liuyuanwen/profiling/a5-bidirectional-validation/`（CPU 日志子目录 `a5-public-cpu.figBa1`）。完整 DeepEP wheel 和真实 NPU 双向执行仍须在目标环境按 §4、§10.2 验证。
+
+## 11. EP8 组内显式 EID 转发（新后端）
+
+### 11.1 数据路径与适用条件
+
+与原 2/4 卡一样，以源端通向 relay 的 EID、目的端通向同一个 relay die/plane/net-instance 的 EID 建立端到端 Channel；Channel 的 remote rank 和写入地址仍是最终目的卡。relay 必须是本通信组的其他成员。应用不在 relay 上接收至 HBM、不 pack/unpack、不启动第二跳 AllToAllV。直连前缀与 relay 后缀在一个 CCU kernel 中通过非阻塞 Write 下发，再统一等待完成。
+
+启动时注册一个 communicator/stream 的候选 Channel 和 kernel，每 peer 最多一条 direct 加六条 relay，每 rank 最多 49 条 Channel。动态参数压缩为 46 个 task args：每次只更新 C、relay 选择、偏移和长度；零流、receive-only、两个方向选不同 relay 使用双向 active mask 协议。FP8 dispatch 与 BF16 combine 可复用同一个 host/handle，分别按真实 tensor 的 row_bytes 规划。
+
+候选目录由 rootinfo、Atlas 和实时 hccn EID/端口联合生成；保持每 rank 单 IO die 的约束。缺失、歧义、不同 plane/net-instance/die 的 relay 不纳入候选。不接受手写 TXT，也不以 8 卡 full mesh 推断某条 EID 一定可转发。脚本默认 `--executor eid`；旧 HBM 启动脚本明确使用 `--executor hbm`。
+
+新增 route ABI `A5CcuEidAllToAllVAbiVersion=1` 和扩展 `ep8_eid_host_abi=1`。**本次必须同时重建 route 和 DeepEP wheel（§3、§4），不能仅更新 Python。** 旧 2/4 卡接口和旧 direct-only EP8 接口保留；旧 9.1 分支不修改。
+
+### 11.2 新机正确性和长跑
+
+在目标容器中执行；所有八张卡需要可用。先按 §3/§4 编译安装当前环境产物，再设置：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_CCU_ROUTE_PROBE_LIB="$A5_CANN_PATH/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+export A5_DEVICES=0,1,2,3,4,5,6,7
+export A5_ROOT_INFO=/etc/hccl_rootinfo.json
+export A5_ATLAS_JSON=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+export A5_HCCN_TOOL=/usr/local/Ascend/driver/tools/hccn_tool
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite correctness --mode all --dtype float8_e4m3fn --width 5120 \
+  --row-scale 1 --rounds 1 --iters 10 --dynamic-iters 100 \
+  --bidirectional-iters 100
+```
+
+每次生成独立 `a5-ep8-eid.XXXXXX` 目录，含 `plans/topology.json`、`plans/peer_plan.tsv`、`topology.log`、`run.log`、八份 `results/rank*.json` 和 `exit.status`。预期：每 rank 出现 `EP8_EID_CATALOG ... participant_relays=1 hbm_relay=0`；7 case 的数据、输入/输出 guard、异步 producer/consumer 检查通过；FP8/BF16 双向交替 100 次通过；最终 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`。
+
+`single_hot` 默认必须真正选中 relay；无候选则直接报错，防止把 direct-only 当成多路径正确性 PASS。只有专门诊断时使用 `--allow-no-relay`。`topology.json` 的 `relay_routes`/`excluded_relays` 给出纳入和排除证据。八卡参与者同时充当 EID 转发节点、49 条候选 Channel 的实际 SDK/固件资源容量，都需新机验证；编译和 CPU 模型不代表已验证这两项。
+
+如果 Channel/kernel 资源不足，可显式 `export A5_EID_MAX_RELAYS_PER_PEER=1` 缩小候选目录后定位建链问题（默认 6，范围 0–6）；这会限制选路，不是等价性能配置，不自动重试或回退 HBM。每次重新启动进程，以免复用失败注册后的通信域。
+
+### 11.3 对照性能
+
+先比较同进程交替测量，六轮覆盖 native/direct/multipath 顺序排列：
+
+```bash
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --mode all --case single_hot --dtype bfloat16 --width 4096 \
+  --row-scale 128 --rounds 6 --iters 100 --dynamic-iters 100
+```
+
+此例每行 8192 B，热点流 4096 行 = **32 MiB 单向跨卡**，不是“每卡 8 MiB”；另外还有 self 行。EID 路径不分 HBM chunk，因此没有 `--chunk-bytes`。随后用相同参数分别测 `competing`、`asymmetric`、`cut`、`uniform`、`self`、`zero`。不能沿用旧流水线的时间或假定收益比例。
+
+需要独立两次运行时：
+
+```bash
+bash scripts/run_a5_ccu_eid_alltoallv.sh --mode native \
+  --case single_hot --dtype bfloat16 --width 4096 --row-scale 128 \
+  --rounds 6 --iters 100 --dynamic-iters 100
+bash scripts/run_a5_ccu_eid_alltoallv.sh --mode multipath \
+  --case single_hot --dtype bfloat16 --width 4096 --row-scale 128 \
+  --rounds 6 --iters 100 --dynamic-iters 100
+# 用上面输出的实际目录替换两处路径：
+python3 scripts/summarize_a5_ccu_eid.py \
+  /home/l00934901/profiling/a5-ep8-eid.MULTIPATH \
+  --compare /home/l00934901/profiling/a5-ep8-eid.NATIVE
+```
+
+每轮取八 rank 最大耗时，再跨轮取中位数。`native/multipath > 1` 才表示多路径更快。prepared 复用已规划结果；dynamic 三种模式都包含相同计数 gather/D2H，随后 C++ 规划/布局/提交（native 无 relay 规划）。两种口径均为 host wall-clock 至完成，不是 CCU event 时间。三种模式都预分配输出，启动建链/注册和正确性预检不进入计时。无 relay case 是 custom direct 的 A/A 对照；新后端不会因预测开销静默改成 native/HBM。
+
+### 11.4 模型输入接口
+
+C 为当前批次实际 packed 行计数，行列顺序与 communicator 的 rank 一致。所有 rank 必须拿到一致的 C 和候选目录。模型已经持有完整 CPU C 时可直接传入，测试脚本的 gather 不属于 host 的强制步骤。启动一次：
+
+```python
+# buffer 是既有 EP8 DeepEP Buffer；allowed 来自 topology.json。
+planner = RelayPlanner(row_bytes, allowed, native_module=deep_ep_cpp)
+handle = buffer.prepare_ccu_urma_eid_alltoallv("moe-eid", manifest)
+host = deep_ep_cpp.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
+# 每次更新真实矩阵；同一个 host 支持不同方向 dtype/row_bytes。
+host.run(dispatch_counts, fp8_send, fp8_recv)
+host.run(combine_counts, bf16_send, bf16_recv)
+# 全部提交结束后，在销毁 handle/通信域前：
+host.close()
+```
+
+模型自身 dispatch/combine 的 packing 顺序和 counts 应由接入处提供，不在算子内猜测转置关系。不进行 dtype 数值转换，FP8 原始比特保持。核心 `EidHost::Run`、规划和布局均在 C++；Python 入口仅包装。`run` 必须在创建时的原始设备/stream 上调用，调用方保持 Buffer/handle/comm 生命周期；handle 销毁前先 close host。固定 payload signature 预热后只保留两块一行零长度 backing，不再分配 relay workspace；失败后该 host 不继续提交。
+
+### 11.5 开发机验证记录
+
+2026-10-30，独立 `cam_lyw_92`、CANN 9.2.0、Torch 2.10.0 CPU/aarch64，结果目录 `/home/liuyuanwen/profiling/a5-ep8-eid-validation`：
+
+- 整个 route 库编译、严格链接、SDK host-test、实际加载及 EID ABI 1 检查通过，见 `route.log` / `route-build/`。
+- 实际生产 EID CCU 指令图 CPU 模型：100 epochs × 8 ranks、49 channels/rank、46 task args；非对称方向、零长度、自拷贝独立偏移、通知清除、guard 和不同 relay 选择通过。
+- 实际 ATen C++ `EidHost`：FP8 5120 B/row 与 BF16 10240 B/row 交替 100 次；每次单提交、无 relay HBM、固定 sentinel 分配；错误后停止提交通过。
+- 12 组 67 项 CPU 回归全部通过，涵盖原 2/4 卡、direct AllToAllV、HBM pipeline、DFX、thread bridge；见 `cpu-suite.log`。
+- 使用官方 torch_npu 2.10.0 cp312/aarch64 wheel 的真实头文件和库，编译全部 DeepEP C++ 翻译单元，`--no-undefined` 严格链接；导入成功且 `ep8_eid_host_abi=1`。见 `extension-build/commands.json`、`extension-build/link.log`、`extension-import.log`。仅解包为构建依赖，不更改其他容器；构建脚本保留在该 profiling 目录的 `a5-build-extension.py`。9.2 严格链接显式加入 `hccl_fwk`、`nnopbase`；profiling timestamp 特性按实际头文件关闭，与仓库 CMake 特性检测一致。
+
+这些结果证明编译和离线协议/布局检查通过，**未证明组内 EID 物理转发、实际 CCU 资源容量、八卡长期稳定性或性能收益**。新机按 §11.2/§11.3 继续验证，不能引用旧 HBM pipeline 的 PASS 作为新后端硬件结论。
+
+还直接构建了仓库 `csrc/deepep/CMakeLists.txt` 的完整扩展目标，严格链接并导入通过，见 `host-cmake.log` / `host-cmake-import.log`。生产 CMake 现会在指定 CANN 中发现并显式链接 `hccl_fwk`、`nnopbase`，减少对其他模块预先全局加载库的依赖。测试用 torch_npu 2.10.0 发布包携带的 HCCL 枚举头与 9.2 SDK 存在 LTO 定义差异警告；不据此宣称目标模型的软件栈兼容，目标环境仍按 §4 使用配套 Torch/torch_npu/CANN 重建。

@@ -174,6 +174,18 @@ HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
 HcclResult HcclCcuUrmaCommandBlockWorkerStop(
     uint64_t workerHandle, aclrtStream controlStream);
 
+// EP8 participant EID channels: no intermediate HBM payload, one route launch.
+int A5CcuEidAllToAllVAbiVersion(void);
+HcclResult HcclCcuUrmaPeerPlanSynchronize(uint64_t handle);
+HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char* planId, const char* manifest, uint64_t* handle);
+// counts/relayRanks/relayRows are global row-major [8,8] host arrays, count=64.
+// relayRanks are communicator ranks, -1 when relayRows=0; each flow uses at most one.
+HcclResult HcclCcuUrmaEidAllToAllVExecute(void* send, void* recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t* counts,
+    const int32_t* relayRanks, const uint64_t* relayRows, uint32_t count);
+
 #ifdef __cplusplus
 }
 #endif

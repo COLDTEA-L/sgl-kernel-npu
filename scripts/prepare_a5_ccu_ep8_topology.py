@@ -11,7 +11,7 @@ import csv
 import json
 from pathlib import Path
 
-from a5_ccu_machine_topology import add_machine_arguments, load_machine, directed_links, connected_pair
+from a5_ccu_machine_topology import add_machine_arguments, load_machine, directed_links, connected_pair, relay_candidates
 from prepare_a5_ccu_peer_plan import FIELDS, parse_phys_ids
 
 
@@ -58,10 +58,45 @@ def build_topology(devices, entries, edges, net_layer=0, direct_route=0):
     return rows, topology
 
 
+def build_eid_topology(devices, entries, edges, net_layer=0, direct_route=0, max_relays=6):
+    """Bind a deterministic catalog once; the per-call planner selects only these paths."""
+    if not 0 <= max_relays <= 6:
+        raise ValueError('max-relays-per-peer must be in [0,6]')
+    direct_rows, topology = build_topology(devices, entries, edges, net_layer, direct_route)
+    rows, allowed, evidence, excluded = [], [[] for _ in range(64)], {}, []
+    for direct in direct_rows:
+        rows.append(direct)
+        s, d = direct['src_rank'], direct['dst_rank']
+        candidates = []
+        for k in range(8):
+            if k in (s, d): continue
+            matches = relay_candidates(entries, edges, devices[s], devices[d], devices[k], 'all', net_layer)
+            matches = [m for m in matches if m['src_die'] == topology['rank_dies'][s]
+                       and m['dst_die'] == topology['rank_dies'][d]]
+            if len(matches) != 1:
+                excluded.append(dict(src=s, dst=d, relay=k, reason='missing_or_ambiguous_same_die_path', matches=len(matches)))
+                continue
+            candidates.append((k, matches[0]))
+        for k, path in candidates[:max_relays]:
+            row = dict(direct, kind='relay', relay_phy=devices[k], weight=1,
+                       src_die=path['src_die'], dst_die=path['dst_die'],
+                       src_eid=path['src_eid'], dst_eid=path['dst_eid'])
+            rows.append(row)
+            allowed[s*8+d].append(k); allowed[d*8+s].append(k)
+            evidence[f'{s},{d},{k}'] = path
+    topology.update(version=2, executor='participant_eid_ccu_urma', allowed_relays=allowed,
+                    relay_routes=evidence, excluded_relays=excluded,
+                    max_relays_per_peer=max_relays,
+                    channels_per_rank=[sum(1 for row in rows if r in (row['src_rank'], row['dst_rank'])) for r in range(8)])
+    return rows, topology
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--devices', default='0,1,2,3,4,5,6,7')
     p.add_argument('--direct-route', type=int, default=0)
+    p.add_argument('--executor', choices=('eid', 'hbm'), default='eid')
+    p.add_argument('--max-relays-per-peer', type=int, default=6)
     p.add_argument('--output-dir', type=Path, required=True)
     add_machine_arguments(p)
     args = p.parse_args()
@@ -70,7 +105,10 @@ def main():
             raise ValueError('direct-route must be nonnegative')
         devices = parse_phys_ids(args.devices, '--devices')
         entries, edges, provenance = load_machine(args, devices)
-        rows, topology = build_topology(devices, entries, edges, args.net_layer, args.direct_route)
+        if args.executor == 'eid':
+            rows, topology = build_eid_topology(devices, entries, edges, args.net_layer, args.direct_route, args.max_relays_per_peer)
+        else:
+            rows, topology = build_topology(devices, entries, edges, args.net_layer, args.direct_route)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         p.error(str(exc))
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -80,7 +118,7 @@ def main():
         writer.writerows(rows)
     topology['provenance'] = provenance
     (args.output_dir / 'topology.json').write_text(json.dumps(topology, indent=2) + '\n')
-    print('EP8_TOPOLOGY_PASS ' + str(args.output_dir))
+    print('EP8_TOPOLOGY_PASS ' + str(args.output_dir) + ' executor=' + topology['executor'])
 
 
 if __name__ == '__main__':

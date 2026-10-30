@@ -315,7 +315,7 @@ def relay_candidates(entries, edges, src, dst, relay, plane, net_layer):
                 continue
             for se, ri in connected_pair(entries, src, a['endpoint_port'], relay, a['relay_port'], net_layer):
                 for de, ro in connected_pair(entries, dst, b['endpoint_port'], relay, b['relay_port'], net_layer):
-                    if ri['plane_id'] != ro['plane_id']:
+                    if ri['plane_id'] != ro['plane_id'] or ri['net_instance_id'] != ro['net_instance_id']:
                         continue
                     rows.append(dict(relay_phy=relay, plane=rd, src_die=sd, dst_die=dd,
                         relay_die=rd, src_port=sp, relay_port_from_src=rp,

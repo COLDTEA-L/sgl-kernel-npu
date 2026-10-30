@@ -549,6 +549,10 @@ class Buffer:
             send_data, recv_data, relay_manifest, direct_route, path_weights
         )
 
+    def prepare_ccu_urma_eid_alltoallv(self, plan_id: str, manifest: str):
+        """EP8 end-to-end EID channels; relay cards must be group members."""
+        return self.runtime.prepare_ccu_urma_eid_alltoallv(plan_id, manifest)
+
     def prepare_ccu_urma_peer_plan_alltoallv(self, plan_id, manifest):
         """Prepare an EP8 direct-only plan outside execution (baseline, one IO die)."""
         return self.runtime.prepare_ccu_urma_peer_plan_alltoallv(plan_id, manifest)

@@ -7,6 +7,7 @@
 #include <cstring>
 #include "route_kernel.h"
 #include "alltoallv_kernel.h"
+#include "eid_alltoallv_kernel.h"
 #include "../common/public_ccu.h"
 #include <hcomm/hcomm_res.h>
 #include <atomic>
@@ -25,7 +26,7 @@ struct PeerPreparedPlan {
     HcclComm comm = nullptr;
     int32_t device = -1;
     uint32_t rankSize = 0;
-    bool allToAllV = false;
+    bool allToAllV = false, eidAllToAllV = false;
     std::shared_ptr<Ep8Dfx> dfx;
     std::string id, content;
     uint32_t availableCards = 0;
@@ -57,7 +58,7 @@ std::vector<std::string> Fields(const std::string &line)
     return fields;
 }
 HcclResult Load(const char *path, uint32_t rankSize, uint32_t availableCards,
-    std::vector<PeerPathSpec> *specs, std::string *content)
+    std::vector<PeerPathSpec> *specs, std::string *content, bool eidAllToAllV)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file || file.tellg() <= 0 || file.tellg() > 1024 * 1024) return HCCL_E_PARA;
@@ -99,7 +100,7 @@ HcclResult Load(const char *path, uint32_t rankSize, uint32_t availableCards,
         specs->push_back(p);
     }
     std::string error;
-    if (!ValidatePeerPlan(rankSize, availableCards, *specs, &error)) {
+    if (!ValidatePeerPlan(rankSize, availableCards, *specs, &error, eidAllToAllV)) {
         std::fprintf(stderr, "PEER_PLAN_INVALID %s\n", error.c_str());
         return HCCL_E_PARA;
     }
@@ -126,7 +127,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         snapshot = found->second;
     }
     PeerPlanResources resources;
-    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV);
+    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV, snapshot.eidAllToAllV);
     if (status != HCCL_SUCCESS) return status;
     std::shared_ptr<ThreadEventBridge> bridge;
     if (snapshot.allToAllV) {
@@ -167,7 +168,7 @@ extern "C" __attribute__((visibility("default"))) int A5CcuPeerPlanAbiVersion() 
 extern "C" __attribute__((visibility("default"))) int A5CcuChannelSyncAbiVersion() { return 1; }
 
 static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
-    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle, bool allToAllV)
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle, bool allToAllV, bool eidAllToAllV = false)
 {
     if (!comm || !stream || !planId || !manifest || !handle) return HCCL_E_PTR;
     *handle = 0;
@@ -177,9 +178,9 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
         aclrtGetDevice(&plan.device) != ACL_SUCCESS) return HCCL_E_PARA;
     if (allToAllV ? (plan.rankSize != 8 || plan.syncMode != ChannelSyncMode::BASELINE) :
         (plan.rankSize != 2 && plan.rankSize != 4)) return HCCL_E_PARA;
-    plan.allToAllV = allToAllV;
+    plan.allToAllV = allToAllV; plan.eidAllToAllV = eidAllToAllV;
     plan.comm = comm; plan.id = planId; plan.availableCards = availableCards;
-    const auto status = Load(manifest, plan.rankSize, availableCards, &plan.specs, &plan.content);
+    const auto status = Load(manifest, plan.rankSize, availableCards, &plan.specs, &plan.content, eidAllToAllV);
     if (status != HCCL_SUCCESS) return status;
     uint64_t id = 0;
     bool inserted = false;
@@ -189,7 +190,7 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
             const auto &p = entry.second;
             if (p.comm == comm && p.id == plan.id) {
                 if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards ||
-                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV)
+                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV || p.eidAllToAllV != plan.eidAllToAllV)
                     return HCCL_E_PARA;
                 id = entry.first;
                 break;
@@ -297,7 +298,8 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv,
 static HcclResult ExecuteAllToAllV(void *send, void *recv,
     uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
     HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count,
-    const uint64_t *storageCounts, uint32_t storageCount)
+    const uint64_t *storageCounts, uint32_t storageCount,
+    const int32_t *relays = nullptr, const uint64_t *moved = nullptr)
 {
     std::lock_guard<std::mutex> submit(submitMutex);
     auto checkedStatus = [&](HcclResult status, const char *stage) {
@@ -320,7 +322,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
         const auto found = plans.find(handle);
         int32_t device = -1;
         if (found == plans.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
-        if (!found->second.allToAllV || (comm && comm != found->second.comm) ||
+        if (!found->second.allToAllV || found->second.eidAllToAllV != (relays != nullptr) || (comm && comm != found->second.comm) ||
             aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
         if (bound == found->second.streams.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
@@ -331,16 +333,25 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
     }
     const auto &r = resources.route;
     AllToAllVLayout layout;
-    if (rank != r.rank || r.rankSize != 8 ||
-        !BuildAllToAllVLayoutWithStorage(rank, counts, count, rowBytes, resources.peers,
-            storageCounts, storageCount, &layout) ||
+    EidAllToAllVLayout eidLayout;
+    bool validLayout = false;
+    if (relays) {
+        validLayout = !storageCounts && BuildEidAllToAllVLayout(rank, counts, count, rowBytes, relays, moved,
+                          resources.eidAllowed, resources.eidChannels, &eidLayout);
+        if (validLayout) layout = eidLayout;
+    } else validLayout = BuildAllToAllVLayoutWithStorage(rank, counts, count, rowBytes, resources.peers,
+                                                        storageCounts, storageCount, &layout);
+    if (rank != r.rank || r.rankSize != 8 || !validLayout ||
         !DisjointAllToAllVBuffers(reinterpret_cast<uint64_t>(send), sendCapacity,
             reinterpret_cast<uint64_t>(recv), recvCapacity, layout) || layout.selfBytes > GROUP_MAX_BYTES)
         return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
     const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(send), sendCapacity);
     const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(recv), recvCapacity);
-    AllToAllVTaskArg task(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
+    AllToAllVTaskArg directTask(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
         inputToken, outputToken, layout);
+    EidAllToAllVTaskArg eidTask(reinterpret_cast<uint64_t>(send), reinterpret_cast<uint64_t>(recv),
+        inputToken, outputToken, eidLayout);
+    const a5ccu::CcuTaskArg* task = relays ? static_cast<const a5ccu::CcuTaskArg*>(&eidTask) : &directTask;
     if (!dfx) return checkedStatus(HCCL_E_PTR, "dfx_context");
     uint64_t payloadBytes = layout.selfBytes;
     for (auto bytes : layout.pathBytes) payloadBytes += bytes; // bounded by validated storage layout
@@ -356,7 +367,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
             status = checkedStatus(static_cast<HcclResult>(HcommThreadNotifyWaitOnThread(r.routeThread, 0, 1800)), "wait_route_start");
             if (status != HCCL_SUCCESS) return status;
         }
-        status = checkedStatus(a5ccu::LaunchKernel(owner, r.routeThread, r.kernel, &task), "kernel_launch");
+        status = checkedStatus(a5ccu::LaunchKernel(owner, r.routeThread, r.kernel, task), "kernel_launch");
         if (bridge) {
             const auto finishStatus = bridge->Finish(status);
             // Finish preserves a failed launch and poisons the bridge; do not log
@@ -410,4 +421,38 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanDestroy(uint64_t handle)
     }
     plans.erase(found);
     return HCCL_SUCCESS;
+}
+
+extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
+extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char* id, const char* manifest, uint64_t* handle) {
+    return CreatePeerPlan(comm, stream, id, manifest, 8, handle, true, true);
+}
+extern "C" HcclResult HcclCcuUrmaEidAllToAllVExecute(void* send, void* recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t* counts,
+    const int32_t* relays, const uint64_t* moved, uint32_t count) {
+    if (!relays || !moved) return HCCL_E_PTR;
+    return ExecuteAllToAllV(send, recv, sendCapacity, recvCapacity, rowBytes, rank,
+                           comm, stream, handle, counts, count, nullptr, 0, relays, moved);
+}
+
+// Drain both caller and IO-die route streams before freeing payload sentinels.
+extern "C" HcclResult HcclCcuUrmaPeerPlanSynchronize(uint64_t handle) {
+    std::lock_guard<std::mutex> build(buildMutex);
+    std::lock_guard<std::mutex> submit(submitMutex);
+    std::vector<aclrtStream> streams;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        auto found=plans.find(handle);if(found==plans.end()) return HCCL_E_NOT_FOUND;
+        int32_t device=-1;
+        if(aclrtGetDevice(&device)!=ACL_SUCCESS || device!=found->second.device) return HCCL_E_PARA;
+        for(const auto& entry:found->second.streams) {
+            streams.push_back(reinterpret_cast<aclrtStream>(entry.first));
+            if(entry.second.route.slaveStream) streams.push_back(entry.second.route.slaveStream);
+        }
+    }
+    HcclResult status=HCCL_SUCCESS;
+    for(auto stream:streams) if(aclrtSynchronizeStream(stream)!=ACL_SUCCESS) status=HCCL_E_RUNTIME;
+    return status;
 }

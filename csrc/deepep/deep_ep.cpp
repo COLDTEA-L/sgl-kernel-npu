@@ -1,4 +1,5 @@
 #include "ccu_payload.hpp"
+#include "ep8_relay_planner.hpp"
 #include "../../examples/a5_ccu_urma_route_probe/common/alltoallv_layout.h"
 #include <memory>
 #include <cstdint>
@@ -921,6 +922,39 @@ void SubmitPipelineTransfer(const torch::Tensor& send, const torch::Tensor& recv
     SubmitAllToAllVRaw(send, recv, handle, rank, counts, rowBytes, comm, storageCounts);
 }
 } // namespace ep8
+namespace ep8 {
+void SubmitEidTransfer(const at::Tensor& send,const at::Tensor& recv,int64_t handle,int64_t rank,
+                       HcclComm comm,const Plan& plan,U rowBytes) {
+    static_assert(sizeof(int)==sizeof(int32_t), "relay ABI needs int32");
+    using Execute = HcclResult(*)(void*,void*,uint64_t,uint64_t,uint64_t,uint32_t,HcclComm,aclrtStream,uint64_t,
+                                  const uint64_t*,const int32_t*,const uint64_t*,uint32_t);
+    static auto execute=reinterpret_cast<Execute>(PeerPlanSymbol("HcclCcuUrmaEidAllToAllVExecute"));
+    auto stream=OrderedCcuTensorStream(send,recv);
+    void* src=send.numel()?send.data_ptr():send.storage().data_ptr().get();
+    void* dst=recv.numel()?recv.data_ptr():recv.storage().data_ptr().get();
+    auto status=execute(src,dst,send.numel()?send.nbytes():send.storage().nbytes(),
+                        recv.numel()?recv.nbytes():recv.storage().nbytes(),rowBytes,rank,comm,stream,handle,
+                        plan.counts.data(),plan.relays.data(),plan.moved.data(),64);
+    if(status!=HCCL_SUCCESS) std::fprintf(stderr,"EP8_EID_EXECUTE_FAILED rank=%ld handle=%ld status=%d row_bytes=%lu\n",rank,handle,int(status),rowBytes);
+    HCCL_CHECK(status); // evaluate once; never retry a partially submitted operation
+}
+void SynchronizeEidPlan(int64_t handle) {
+    using Sync=HcclResult(*)(uint64_t);
+    static auto sync=reinterpret_cast<Sync>(PeerPlanSymbol("HcclCcuUrmaPeerPlanSynchronize"));
+    auto status=sync(handle);HCCL_CHECK(status);
+}
+}
+int64_t Buffer::prepare_ccu_urma_eid_alltoallv(const std::string& id,const std::string& manifest) {
+    EP_HOST_ASSERT(num_ranks==8 && !id.empty() && !manifest.empty());
+    static auto abi=reinterpret_cast<int(*)()>(PeerPlanSymbol("A5CcuEidAllToAllVAbiVersion"));
+    EP_HOST_ASSERT(abi()==1);
+    using Create=HcclResult(*)(HcclComm,aclrtStream,const char*,const char*,uint64_t*);
+    static auto create=reinterpret_cast<Create>(PeerPlanSymbol("HcclCcuUrmaEidAllToAllVCreate"));
+    uint64_t handle=0;
+    auto status=create(ResolveComm(moe_all_to_all_group_name,ep_comm),c10_npu::getCurrentNPUStream().stream(),
+                       id.c_str(),manifest.c_str(),&handle);
+    HCCL_CHECK(status);EP_HOST_ASSERT(handle>0);return handle;
+}
 HcclComm Buffer::ep8_pipeline_comm()
 {
     EP_HOST_ASSERT(num_ranks == 8);
