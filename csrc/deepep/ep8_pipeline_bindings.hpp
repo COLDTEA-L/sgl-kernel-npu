@@ -45,8 +45,9 @@ public:
 };
 inline void BindPipeline(pybind11::module_& m) {
     namespace py = pybind11;
-    m.attr("ep8_pipeline_host_abi") = 2;
+    m.attr("ep8_pipeline_host_abi") = 3;
     py::class_<PipelinePrepared, std::shared_ptr<PipelinePrepared>>(m, "Ep8PipelinePrepared")
+        .def_readonly("row_bytes", &PipelinePrepared::rowBytes)
         .def_property_readonly("uses_relay", &PipelinePrepared::UsesRelay)
         .def_property_readonly("chunks", [](const PipelinePrepared& p) { return p.layout.chunks.size(); })
         .def("copy_report", [](const PipelinePrepared& p) {
@@ -81,6 +82,16 @@ inline void BindPipeline(pybind11::module_& m) {
             d["reserved_bytes"] = v[3]; d["poisoned"] = bool(v[4]);
             d["zero_backing_bytes"] = v[5]; d["closed"] = bool(v[6]); return d;
         })
+        .def("payload_stats", [](const PipelineHost& h) {
+            py::list result;
+            for (const auto& p : h.PayloadStats()) {
+                py::dict d;
+                d["device"] = p.device.str(); d["dtype"] = c10::toString(p.dtype); d["row_shape"] = p.shape;
+                d["row_bytes"] = p.rowBytes; d["reserved_bytes"] = p.stats[3];
+                d["tensor_allocations"] = p.stats[1]; d["generation"] = p.stats[0]; result.append(d);
+            }
+            return result;
+        })
         .def("take_trace", [](PipelineHost& h) {
             auto rt = dynamic_cast<TracePipelineRuntime*>(h.Runtime().get()); TORCH_CHECK(rt, "CPU trace only");
             py::list out;
@@ -96,12 +107,12 @@ inline void BindPipeline(pybind11::module_& m) {
             auto rt = dynamic_cast<TracePipelineRuntime*>(h.Runtime().get()); TORCH_CHECK(rt, "CPU trace only");
             rt->failAfter = transfers;
         });
-    m.def("ep8_pipeline_create", [](const Planner& planner, int rank, U chunk, U maxChunks, U limit, bool cpuTrace, bool bypassCopies) {
+    m.def("ep8_pipeline_create", [](const Planner& planner, int rank, U chunk, U maxChunks, U limit, bool cpuTrace, bool bypassCopies, U maxPayloads) {
         std::shared_ptr<PipelineRuntime> rt;
         if (cpuTrace) rt = std::make_shared<TracePipelineRuntime>();
         else rt = std::make_shared<NpuPipelineRuntime>(rank);
-        return std::make_shared<PipelineHost>(planner, rank, chunk, maxChunks, limit, std::move(rt), bypassCopies);
+        return std::make_shared<PipelineHost>(planner, rank, chunk, maxChunks, limit, std::move(rt), bypassCopies, maxPayloads);
     }, py::arg("planner"), py::arg("rank"), py::arg("chunk_bytes") = 8 << 20,
-       py::arg("max_chunks") = 128, py::arg("max_scratch_bytes") = 1 << 30, py::arg("cpu_trace") = false, py::arg("bypass_copies") = true);
+       py::arg("max_chunks") = 128, py::arg("max_scratch_bytes") = 1 << 30, py::arg("cpu_trace") = false, py::arg("bypass_copies") = true, py::arg("max_payloads") = 4);
 }
 } // namespace deep_ep::ep8

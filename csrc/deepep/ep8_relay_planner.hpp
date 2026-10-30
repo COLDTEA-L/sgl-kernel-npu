@@ -85,7 +85,8 @@ class Planner {
 public:
     Planner(const std::vector<std::vector<U>>& allowed, U rowBytes, U minChunk,
             U minGain, U maxActions, const std::vector<U>& capacity)
-        : rowBytes_(rowBytes), minGain_(minGain), maxActions_(maxActions) {
+        : rowBytes_(rowBytes), minGain_(minGain), maxActions_(maxActions),
+          minChunkBytes_(minChunk), capacityBytes_(capacity) {
         if (!rowBytes || rowBytes > Max || !minChunk || minChunk > Max ||
             minGain > Max || maxActions > 56 || allowed.size() != 64 ||
             (!capacity.empty() && capacity.size() != 8))
@@ -107,6 +108,16 @@ public:
     }
 
     U RowBytes() const { return rowBytes_; }
+    // Preserve byte thresholds rather than scaling already rounded row counts.
+    Planner WithRowBytes(U bytes) const {
+        if (!bytes || bytes > Max) throw std::invalid_argument("invalid EP8 row bytes");
+        Planner out = *this;
+        out.rowBytes_ = bytes;
+        out.chunkRows_ = minChunkBytes_ / bytes + (minChunkBytes_ % bytes != 0);
+        out.capacity_.fill(Max);
+        for (size_t k = 0; k < capacityBytes_.size(); ++k) out.capacity_[k] = capacityBytes_[k] / bytes;
+        return out;
+    }
 
     Plan Make(const Matrix& counts) const {
         Plan p; MakeInto(counts, p); return p;
@@ -220,7 +231,8 @@ public:
         }
     }
 private:
-    U rowBytes_, chunkRows_, minGain_, maxActions_;
+    U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;
+    std::vector<U> capacityBytes_;
     std::array<unsigned, 64> masks_{};
     std::array<U, 8> capacity_{};
 };

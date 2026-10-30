@@ -30,22 +30,23 @@ struct PipelinePrepared {
     std::vector<ChunkViews> views;
     std::vector<PipelineCopyBinding> copyBindings;
     std::array<U, 3> bypassSpans{}, bypassBytes{};
-    U sendRows = 0, recvRows = 0, generation = 0;
+    U sendRows = 0, recvRows = 0, generation = 0, rowBytes = 0;
     const void* owner = nullptr;
     bool tracked = false;
     bool UsesRelay() const { return !layout.chunks.empty(); }
 };
 
-class PipelineHost {
+class PipelinePayloadHost {
 public:
-    PipelineHost(const Planner& planner, int rank, U chunkBytes, U maxChunks, U maxScratch,
+    PipelinePayloadHost(const Planner& planner, int rank, U chunkBytes, U maxChunks, U maxScratch,
                  std::shared_ptr<PipelineRuntime> runtime, bool bypassCopies = true)
         : planner_(planner), rank_(rank), rowBytes_(planner.RowBytes()), chunkBytes_(chunkBytes),
-          maxChunks_(maxChunks), limit_(maxScratch), rt_(std::move(runtime)), bypassCopies_(bypassCopies) {
+          maxChunks_(maxChunks), rt_(std::move(runtime)), bypassCopies_(bypassCopies) {
         TORCH_CHECK(rank >= 0 && rank < 8 && chunkBytes && chunkBytes <= Max && maxChunks && maxChunks <= Max && maxScratch,
                     "invalid native pipeline configuration");
+        limits_.fill(maxScratch);
     }
-    ~PipelineHost() {
+    ~PipelinePayloadHost() {
         try { Close(); } catch (const std::exception& e) {
             std::fprintf(stderr, "EP8_CPP_CLOSE_FAILED: %s\n", e.what());
         }
@@ -82,7 +83,12 @@ public:
         return {generation_, allocations_, events_, reservedBytes_, poisoned_ ? 1u : 0u,
                 zero_.defined() ? static_cast<U>(zero_.nbytes() + zeroRecv_.nbytes()) : 0u, closed_ ? 1u : 0u};
     }
-    const std::shared_ptr<PipelineRuntime>& Runtime() const { return rt_; }
+    void SetLimits(const std::array<U, 8>& limits) { limits_ = limits; }
+    std::array<U, 8> ReservedPerRank() const {
+        std::array<U, 8> result{};
+        if (!closed_) for (int r = 0; r < 8; ++r) for (U n : capacities_[r]) result[r] += n * rowBytes_ * 2;
+        return result;
+    }
 private:
     using Clock = std::chrono::steady_clock;
     static double Micros(Clock::time_point start) {
@@ -136,6 +142,7 @@ private:
                 live_.push_back(p); p->tracked = true;
             }
         }
+        p->rowBytes = rowBytes_;
         p->owner = this;
         lastLayoutUs_ = Micros(begin);
         return p;
@@ -153,10 +160,10 @@ private:
             rounded[r][i] = n < exact[r][i] ? exact[r][i] : n;
         }
         auto fits = [&](const Sizes& caps) {
-            for (auto& row : caps) {
+            for (int r = 0; r < 8; ++r) {
                 U total = 0;
-                for (U n : row) { if (n > Max - total) return false; total += n; }
-                if (total > limit_ / rowBytes_ / 2) return false;
+                for (U n : caps[r]) { if (n > Max - total) return false; total += n; }
+                if (total > limits_[r] / rowBytes_ / 2) return false;
             }
             return true;
         };
@@ -272,7 +279,8 @@ private:
     }
     Planner planner_;
     int rank_;
-    U rowBytes_, chunkBytes_, maxChunks_, limit_;
+    U rowBytes_, chunkBytes_, maxChunks_;
+    std::array<U, 8> limits_{};
     std::shared_ptr<PipelineRuntime> rt_;
     mutable std::mutex mutex_;
     at::Tensor zero_, zeroView_, zeroRecv_, zeroRecvView_;
@@ -283,5 +291,121 @@ private:
     U generation_ = 0, allocations_ = 0, events_ = 0, reservedBytes_ = 0;
     double lastPlanUs_ = 0, lastLayoutUs_ = 0;
     bool closed_ = false, poisoned_ = false, bypassCopies_ = true;
+};
+// One communication context, multiple typed payload workspaces. The lane-0 join
+// in Submit orders consecutive directions, including shared event and CCU handle
+// reuse. Profile selection never creates a communicator/channel/kernel or syncs.
+class PipelineHost {
+public:
+    struct PayloadInfo {
+        c10::Device device;
+        at::ScalarType dtype;
+        std::vector<int64_t> shape;
+        U rowBytes;
+        std::array<U, 7> stats;
+    };
+    PipelineHost(const Planner& planner, int rank, U chunkBytes, U maxChunks, U maxScratch,
+                 std::shared_ptr<PipelineRuntime> runtime, bool bypassCopies = true, U maxPayloads = 4)
+        : planner_(planner), rank_(rank), chunkBytes_(chunkBytes), maxChunks_(maxChunks),
+          limit_(maxScratch), rt_(std::move(runtime)), bypassCopies_(bypassCopies), maxPayloads_(maxPayloads) {
+        TORCH_CHECK(rank >= 0 && rank < 8 && chunkBytes && chunkBytes <= Max &&
+                    maxChunks && maxChunks <= Max && maxScratch && maxScratch <= Max && maxPayloads && rt_,
+                    "invalid native pipeline configuration");
+    }
+    ~PipelineHost() {
+        try { Close(); } catch (const std::exception& e) {
+            std::fprintf(stderr, "EP8_CPP_CLOSE_FAILED: %s\n", e.what());
+        }
+    }
+    std::shared_ptr<PipelinePrepared> Prepare(const Matrix& counts, const at::Tensor& example) {
+        auto lock = Lock(); Check(); auto& p = Select(example); Budget(p);
+        return p.host->Prepare(counts, example);
+    }
+    void Execute(const std::shared_ptr<PipelinePrepared>& prepared, const at::Tensor& send, const at::Tensor& recv) {
+        auto lock = Lock(); Check();
+        TORCH_CHECK(prepared, "null prepared pipeline");
+        for (auto& p : payloads_) if (prepared->owner == p.host.get()) {
+            Budget(p); p.host->Execute(prepared, send, recv); return;
+        }
+        TORCH_CHECK(false, "prepared pipeline belongs to another context");
+    }
+    std::array<double, 3> Run(const Matrix& counts, const at::Tensor& send, const at::Tensor& recv) {
+        auto lock = Lock(); Check(); auto& p = Select(send); Budget(p);
+        return p.host->Run(counts, send, recv);
+    }
+    void Close() {
+        auto lock = Lock();
+        if (closed_) return;
+        for (auto& p : payloads_) p.host->Close();
+        closed_ = true;
+    }
+    std::array<U, 7> Stats() const {
+        auto lock = Lock(); std::array<U, 7> result{};
+        for (const auto& p : payloads_) {
+            auto s = p.host->Stats();
+            for (int i : {0, 1, 3, 5}) result[i] += s[i];
+            // Events belong to the shared runtime, not to individual profiles.
+            result[2] = std::max(result[2], s[2]); result[4] |= s[4];
+        }
+        result[6] = closed_; return result;
+    }
+    std::vector<PayloadInfo> PayloadStats() const {
+        auto lock = Lock(); std::vector<PayloadInfo> result;
+        for (const auto& p : payloads_) result.push_back({p.device, p.dtype, p.shape, p.rowBytes, p.host->Stats()});
+        return result;
+    }
+    const std::shared_ptr<PipelineRuntime>& Runtime() const { return rt_; }
+private:
+    struct Payload {
+        c10::Device device;
+        at::ScalarType dtype;
+        std::vector<int64_t> shape;
+        U rowBytes;
+        std::unique_ptr<PipelinePayloadHost> host;
+    };
+    std::unique_lock<std::mutex> Lock() const {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        TORCH_CHECK(lock.owns_lock(), "native pipeline does not allow concurrent host submissions");
+        return lock;
+    }
+    void Check() const {
+        TORCH_CHECK(!closed_, "native pipeline is closed; recreate context");
+        for (const auto& p : payloads_) TORCH_CHECK(!p.host->Stats()[4], "native pipeline failed; recreate context");
+    }
+    Payload& Select(const at::Tensor& t) {
+        rt_->Check(t);
+        TORCH_CHECK(t.dim() >= 1 && t.is_contiguous() && IsCcuPayload(t.scalar_type()), "invalid pipeline payload");
+        for (auto& p : payloads_) if (p.device == t.device() && p.dtype == t.scalar_type() &&
+                                       t.sizes().slice(1) == at::IntArrayRef(p.shape)) return p;
+        U bytes = t.element_size();
+        for (int i = 1; i < t.dim(); ++i) {
+            TORCH_CHECK(t.size(i) > 0 && static_cast<U>(t.size(i)) <= Max / bytes, "invalid row shape");
+            bytes *= t.size(i);
+        }
+        TORCH_CHECK(payloads_.size() < maxPayloads_, "pipeline max_payloads exceeded; reuse existing payload signatures or increase max_payloads");
+        payloads_.push_back({t.device(), t.scalar_type(), t.sizes().slice(1).vec(), bytes,
+            std::make_unique<PipelinePayloadHost>(planner_.WithRowBytes(bytes), rank_, chunkBytes_, maxChunks_,
+                                                  limit_, rt_, bypassCopies_)});
+        return payloads_.back();
+    }
+    void Budget(Payload& selected) {
+        std::array<U, 8> remaining; remaining.fill(limit_);
+        for (const auto& p : payloads_) if (&p != &selected) {
+            auto reserved = p.host->ReservedPerRank();
+            for (int r = 0; r < 8; ++r) {
+                TORCH_CHECK(reserved[r] <= remaining[r], "pipeline aggregate workspace budget exceeded");
+                remaining[r] -= reserved[r];
+            }
+        }
+        selected.host->SetLimits(remaining);
+    }
+    Planner planner_;
+    int rank_;
+    U chunkBytes_, maxChunks_, limit_;
+    std::shared_ptr<PipelineRuntime> rt_;
+    bool bypassCopies_, closed_ = false;
+    U maxPayloads_;
+    mutable std::mutex mutex_;
+    std::vector<Payload> payloads_;
 };
 } // namespace deep_ep::ep8

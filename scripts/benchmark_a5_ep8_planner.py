@@ -96,7 +96,7 @@ def main():
             row['fast'] = dict(select_us=measure(lambda i: fast.select(matrices[i % 2])),
                               select_prepare_cpu_rank0_us=measure(fast_prepare),
                               selection=fast.report(decision), workspace=fast_context.workspace_stats())
-            if args.extension and getattr(native, 'ep8_pipeline_host_abi', None) == 2:
+            if args.extension and getattr(native, 'ep8_pipeline_host_abi', None) in (2, 3):
                 opaque_planner = RelayPlanner(8192, ALL, native_module=native,
                                               relay_capacity_bytes=[1024 << 20] * 8)
                 opaque = native.ep8_pipeline_create(opaque_planner._native, 0, 8 << 20, 128, 1 << 30, True)

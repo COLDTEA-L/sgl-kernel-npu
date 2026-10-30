@@ -23,7 +23,7 @@ def main():
     from heuristic_alltoallv import RelayPlanner
     spec = importlib.util.spec_from_file_location('deep_ep_cpp', args.extension.resolve(strict=True))
     ext = importlib.util.module_from_spec(spec); spec.loader.exec_module(ext)
-    assert ext.ep8_pipeline_host_abi == 2
+    assert ext.ep8_pipeline_host_abi == 3
     planner = RelayPlanner(8, ref.ALL, native_module=ext)
 
     def context(rank, chunk=24, limit=1 << 20, bypass=True):

@@ -16,7 +16,7 @@
 
 服务器已在独立 `cam_lyw_92` 中编译、严格链接、加载整个 route 库及 local-copy 诊断程序；新 host mock 检查固定注册、100 次复用、设备/通信域归属、注册失败不重试；EP8 CPU 图模型执行 100 轮、800 次调度；2/4 卡布局、通知、自拷贝和规划器 CPU 回归通过。
 
-该容器没有 Torch/torch_npu，也未挂载 NPU，因此未在这里编译完整 DeepEP wheel、运行全部 Torch CPU 用例或上卡测试。9.3 接口名称/参数形式来自用户提供的检查结果，仍需在 9.3 本机重编译和上卡。CPU 模型不验证固件、实际 MS/loop 资源或性能；9.2 二进制也不能作为 9.3 的已验证产物。
+首次迁移时该容器没有 Torch/torch_npu。后续在独立 venv 中安装了 CPU Torch，完成了 §9/§10 的真实 ATen C++ 编译及 CPU 回归；容器仍没有 torch_npu、未挂载 NPU，因此未编译完整 DeepEP wheel 或上卡测试。9.3 接口名称/参数形式来自用户提供的检查结果，仍需在 9.3 本机重编译和上卡。CPU 模型不验证固件、实际 MS/loop 资源或性能；9.2 二进制也不能作为 9.3 的已验证产物。
 
 ## 2. 实现与 ABI
 
@@ -212,3 +212,90 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_fp8_cpu.py'
 需要支持上述 FP8 类型的 Torch 和 g++；其中一个用例直接编译真实 ATen + 生产 C++ copy/pipeline host，检查原始字节、保护区、错误 span 不提前写入，以及 400 次 host 动态调用时 workspace 不新增分配。另一个用例用八 rank 异步 CPU DAG 检查四种格式、变动矩阵和 relay 双缓冲复用。它们不证明 NPU/驱动上的 dtype view 或通信正确性；仍需上述目标机测试。
 
 本次 FP8 开发验证在 `cam_lyw_92` 的独立 CPU Torch 2.10 venv 中完成，未修改其他容器或 9.1 安装。10 组核心 CPU 套件共 **62 项全部通过**，包含 FP8 的真实 ATen C++ 编译/链接和四格式异步 DAG 测试；源文件语法检查通过。日志：`/home/liuyuanwen/profiling/a5-fp8-validation/a5-public-cpu.i4NJm7`。完整 DeepEP wheel 仍须在带 torch_npu 的目标 9.3 环境按 §4 编译；尚无 FP8 NPU 实测结果。
+
+## 10. 同一个 C++ host 支持 FP8 dispatch / BF16 combine
+
+本节对应 `ep8_pipeline_host_abi=3`。**已有本分支 route 安装不必重建；更新代码后从 §4 重建并安装 DeepEP wheel，再执行本节。** 原 9.1 分支和 2/4 卡接口不变。
+
+对照开发服务器 `/home/liuyuanwen/vllm-ascend-dsv41` 的 `56debc194`：
+`vllm_ascend/ops/fused_moe/token_dispatcher.py` 中 `TokenDispatcherWithAll2AllV.token_dispatch`
+对量化 payload 调用 `async_all_to_all(..., output_splits, input_splits, ...)`，
+`token_combine` 对专家输出调用 `async_all_to_all(..., input_splits, output_splits, ...)`。
+开启量化时，dynamic scale 还有一次独立通信。`moe_utils.py` 的 wrapper 按实际 input dtype 分配 output。
+因此 dispatch/combine 要分别采用实际张量的 dtype 和行形状，不能假设两个方向的 row_bytes 相同。
+
+### 10.1 输入与复用约定
+
+| 方向 | 输入/输出 dtype | 行形状 | 每行字节 |
+| --- | --- | --- | --- |
+| dispatch | FP8 | `[5120]` | 5120 |
+| combine | BF16 | `[5120]` | 10240 |
+
+9072 行对应 46,448,640 B / 92,897,280 B；这是这 9072 行的 payload 总量，不包含 scale、self 排除或 relay 增量。
+
+`ep8_pipeline_create` 仍只创建一次，`attach_lane` 仍只调用三次。第一次见到 `(device, dtype, row_shape)` 时创建一份内部 payload 配置，后续同签名复用。行数、counts 不属于签名，可逐次变化；同一 row_bytes 但 dtype 或行形状不同也不能混用。
+
+- 每份配置分别保存 planner、chunk 行数、布局、copy span、零行占位和双缓冲 workspace；按张量重新计算实际 row_bytes。
+- relay 门槛和容量保留原始**字节**值，再换算为各 dtype 的行数，避免整数舍入后反推字节。
+- 三条 lane 的通信域、stream、channel、CCU kernel handle、event pool 共享；切换 dtype 不重新建链或注册。首次分配或容量增长仍可能同步；预热后切换不增加 host/device 同步。
+- 前一个调用在 caller stream 上的完成依赖继续约束下一个方向；接口仍是异步提交，保持原 caller stream，不允许多个 CPU 线程同时提交。
+- `prepare(C, example)` 返回的对象固定属于该签名，新增 `prepared.row_bytes`；FP8 prepared 不能拿来执行 BF16。两个方向各 prepare 一份即可，二者长期并存。
+- `run(C, send, recv)` 自动选择签名并重规划实际 counts。单次调用 send/recv 仍必须 dtype、device、行形状相同；不会做量化、反量化或自动转换。
+- 新增可选 `max_payloads=4`，覆盖 FP8、BF16、scale 等签名。`max_scratch_bytes` 是所有签名**合计**的每 rank workspace 上限，不是每个签名都分一份上限。零行占位单独报告。超过签名/容量上限明确报错，不回收仍可能在途的 workspace。
+- `payload_stats()` 返回各签名的 dtype、row_shape、row_bytes、reserved_bytes、tensor_allocations、generation。`stats()` 是合计；event 数量按共享池计一次。任何签名提交失败会阻止整个 host 继续执行。
+
+接入示意（沿用已创建的三条 `pipeline.lanes` 和原 `RelayPlanner`，counts 是实际 packed 行数矩阵）：
+
+```python
+# 创建一次：planner._native 的初始 row_bytes 不再限制后续 payload。
+cpp = deep_ep_cpp.ep8_pipeline_create(
+    planner._native, rank, chunk_bytes=8388608,
+    max_scratch_bytes=1 << 30, max_payloads=4,
+)
+for li, lane in enumerate(pipeline.lanes):
+    with torch.npu.stream(lane.stream):
+        cpp.attach_lane(li, lane.buffer.runtime, lane.handle)
+
+# 每层/每批的实际输入；同一个 cpp，同一套通信资源。
+cpp.run(C_dispatch, dispatch_fp8, dispatched_fp8)   # [..., 5120], 5120 B/行
+# 专家计算、对应的模型 permute/unpermute ...
+cpp.run(C_combine, expert_bf16, combined_bf16)       # [..., 5120], 10240 B/行
+print(cpp.payload_stats())
+```
+
+在上述标准往返路由中 `C_combine = transpose(C_dispatch)`；仍由调用方传入真实矩阵，不在算子内部隐式转置。若模型 padding、去重或额外过滤改变 packed 行数，应以实际 splits 为准。scale 也必须独立传递正确 counts；本改动不融合 scale，不改动模型本身。此多签名能力针对 C++ `Ep8PipelineHost`；Python 参考 `PipelineContext` 仍使用其原有固定签名约束。
+
+### 10.2 新机双向正确性和复用长跑
+
+先按 §4 安装新 wheel，并沿用 §6 的环境变量。用较小 chunk 专门覆盖两个 dtype 的不同分块数、真实 relay、双缓冲复用；**40960 B 是正确性压力参数，不是性能推荐值**：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export A5_ROOT_INFO=/etc/hccl_rootinfo.json
+export A5_ATLAS_JSON=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+bash scripts/run_a5_ccu_heuristic_alltoallv.sh \
+  --routing-policy greedy --executor pipeline --pipeline-host cpp \
+  --suite correctness --mode all --dtype float8_e4m3fn \
+  --width 5120 --row-scale 1 --chunk-bytes 40960 \
+  --bidirectional-iters 100 \
+  --warmup 1 --iters 2 --rounds 1 --dynamic-iters 1
+```
+
+应看到 8 个 rank 各自的 `EP8_BIDIRECTIONAL_PASS`，以及正常退出后的 `EP8_HEURISTIC_ALL_RANKS_AND_EXIT_PASS`。
+每个 case 先各执行一次 prepared dispatch/combine，再用同一 host 交替动态执行 100 对 FP8/BF16 调用。
+两方向之间不插入 device synchronize；每对完成后校验数据、保护区和原生基线（基线在初次 prepared 校验），确认预热后 workspace/event 分配计数不再增长。每轮更新测试数据，避免把旧结果误认为本轮成功。
+`results/rank*.json` 新增 `bidirectional` 字段，记录两个 row_bytes、chunk 数、每签名与合计 workspace；测试不属于性能计时。
+
+性能仍按 §7，使用 8MiB chunk 和真实矩阵分别测 dispatch/combine；本改动解决双 dtype 兼容和资源复用，不代表已经获得模型端加速。
+
+### 10.3 开发验证
+
+```bash
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_bidirectional_cpu.py'
+```
+
+该测试编译并链接真实 ATen + 生产 C++ planner/pipeline host，使用八 rank 延迟执行的 CPU transport 检查依赖：宽 5120，FP8/BF16 交替 100 对，覆盖 staged/免拷贝、非对称与转置矩阵、零行、self、原始字节和保护区、旧 prepared 复用、同字节数不同签名、总工作区上限、错误传播。预热后不新增 workspace 分配或同步；不能代替 NPU 验证。
+
+本轮 `cam_lyw_92` 中 11 组 CPU 套件 **63 项全部通过**，包含上述真实 C++ 编译/链接；CANN 9.2 route 全量构建、严格链接、host ctest 与加载通过。结果：`/home/liuyuanwen/profiling/a5-bidirectional-validation/`（CPU 日志子目录 `a5-public-cpu.figBa1`）。完整 DeepEP wheel 和真实 NPU 双向执行仍须在目标环境按 §4、§10.2 验证。

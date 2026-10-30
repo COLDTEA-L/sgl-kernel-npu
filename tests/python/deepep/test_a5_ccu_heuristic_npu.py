@@ -51,6 +51,8 @@ def main():
     p.add_argument('--mode', choices=('all', 'native', 'both', 'direct', 'multipath'), default='both')
     p.add_argument('--dtype', choices=PAYLOAD_DTYPE_NAMES, default='float16')
     p.add_argument('--width', type=int, default=4096)
+    p.add_argument('--bidirectional-iters', type=int, default=0,
+                   help='additional same-host FP8 dispatch/BF16 combine correctness iterations per case')
     p.add_argument('--row-scale', type=int, default=128)
     p.add_argument('--min-chunk-bytes', type=int, default=1)
     p.add_argument('--min-gain-bytes', type=int, default=0)
@@ -88,6 +90,10 @@ def main():
             args.warmup < 0 or min(args.iters, args.rounds, args.dynamic_iters, args.max_scratch_mib) < 1
             or args.relay_capacity_mib < 0):
         p.error('requires EP8, positive sizes/iterations and nonnegative warmup/capacity')
+    if args.bidirectional_iters < 0 or (args.bidirectional_iters and args.pipeline_host != 'cpp'):
+        p.error('--bidirectional-iters requires C++ pipeline host and a nonnegative count')
+    if args.bidirectional_iters and not args.dtype.startswith('float8_'):
+        p.error('--bidirectional-iters requires an FP8 dispatch --dtype')
     if args.pipeline_host == 'cpp' and (args.executor != 'pipeline' or args.planner != 'native' or args.routing_policy != 'greedy'):
         p.error('cpp host comparison requires --executor pipeline --planner native --routing-policy greedy')
     if args.routing_policy == 'fast' and (args.executor != 'pipeline' or args.planner != 'native' or args.max_chunks < 2):
@@ -126,8 +132,8 @@ def main():
         raise RuntimeError('rebuild/install DeepEP wheel: planner ABI 2, span copies and workspace views required')
     if args.routing_policy == 'fast' and getattr(native_planner_module, 'ep8_fast_selector_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: fast selector ABI 1 required')
-    if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 2:
-        raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=2 required')
+    if args.pipeline_host == 'cpp' and getattr(native_planner_module, 'ep8_pipeline_host_abi', None) != 3:
+        raise RuntimeError('rebuild/install DeepEP: ep8_pipeline_host_abi=3 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     public_api = route.A5CcuPublicApiAbiVersion
     public_api.restype = ctypes.c_int
@@ -237,6 +243,13 @@ def main():
         if cpp is not None: sample['cpp_workspace'] = cpp.stats()
         print('PIPELINE_MEMORY ' + json.dumps(dict(rank=rank, **sample)), flush=True)
         return sample
+    bidirectional = []
+    if args.bidirectional_iters:
+        from a5_ccu_bidirectional_test import check_bidirectional
+        phase('bidirectional_begin')
+        bidirectional = check_bidirectional(cpp, cases, rank, dtype, args.width,
+                                            args.bidirectional_iters, native_alltoallv)
+        print('EP8_BIDIRECTIONAL_PASS ' + json.dumps(dict(rank=rank, cases=bidirectional)), flush=True)
     for case_name, counts in cases:
         phase('correctness_begin', case=case_name)
         begin = time.perf_counter()
@@ -490,8 +503,9 @@ def main():
     dist.barrier(); dist.destroy_process_group()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     result = dict(rank=rank, ranks=8, correctness='PASS', dtype=args.dtype, width=args.width,
+                  bidirectional=bidirectional,
                   payload_transport=('uint8_bitwise' if dtype in fp8_dtypes() else 'typed'),
-                  benchmark=dict(protocol=11, pipeline_host=args.pipeline_host,
+                  benchmark=dict(protocol=11, pipeline_host=args.pipeline_host, bidirectional_iters=args.bidirectional_iters,
                                  cpp_copy_mode=(args.cpp_copy_mode if cpp is not None else 'unused'), planner=args.planner, routing_policy=args.routing_policy,
                                  fast_link_gbps=args.fast_link_gbps, fast_extra_us=args.fast_extra_us,
                                  fast_min_saving_us=args.fast_min_saving_us, warmup=args.warmup, iters=args.iters, rounds=args.rounds,
