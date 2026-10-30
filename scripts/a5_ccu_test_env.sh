@@ -12,6 +12,21 @@ a5_ccu_prepare_eid_log_env() {
     export ASCEND_SLOG_PRINT_TO_STDOUT=${A5_EID_LOG_STDOUT:-${ASCEND_SLOG_PRINT_TO_STDOUT:-0}}
 }
 
+# Only EID create tests opt into a smaller default; preserve explicit settings.
+a5_ccu_prepare_eid_buffer_env() {
+    local a5_eid_suite=benchmark
+    while (($#)); do
+        case "$1" in
+            --suite) if (($# > 1)); then a5_eid_suite=$2; shift; fi ;;
+            --suite=*) a5_eid_suite=${1#--suite=} ;;
+        esac
+        shift
+    done
+    if [[ $a5_eid_suite == create && -z ${HCCL_BUFFSIZE:-} ]]; then
+        export HCCL_BUFFSIZE=64
+    fi
+}
+
 a5_ccu_prepare_test_env() {
     local a5_test_cann=$1 a5_test_repo=$2 a5_test_nounset=0
     [[ $- != *u* ]] || a5_test_nounset=1

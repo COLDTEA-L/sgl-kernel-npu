@@ -10,11 +10,14 @@ def load(root):
     if (root / 'exit.status').read_text().strip() != '0': raise ValueError('run did not exit successfully')
     results = [json.loads((root/'results'/f'rank{r}.json').read_text()) for r in range(8)]
     create_only = results[0]['options']['suite'] == 'create'
-    marker = 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
+    minimal = bool(results[0]['options'].get('minimal', False))
+    if minimal and not create_only: raise ValueError('minimal requires create suite')
+    marker = 'EP8_EID_MINIMAL_RANK_PASS' if minimal else 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
     ranks = set(map(int, re.findall(r'^'+marker+r' rank=(\d+)$', (root/'run.log').read_text(), re.M)))
     if ranks != set(range(8)): raise ValueError('missing clean rank completion')
     for r, result in enumerate(results):
         if result['options']['suite'] != results[0]['options']['suite']: raise ValueError('different rank suite')
+        if bool(result['options'].get('minimal', False)) != minimal: raise ValueError('different minimal mode')
         if result['rank'] != r or result['backend'] != 'participant_eid_ccu_urma': raise ValueError('wrong result identity')
         for a, b in zip(result['reports'], results[0]['reports']):
             if any(a[k] != b[k] for k in ('case', 'counts', 'row_bytes', 'relay_rows', 'median_us')):
@@ -31,7 +34,10 @@ def main():
     result, topology = load(args.run)
     if result['options']['suite'] == 'create':
         if args.compare: raise ValueError('create-only cannot be used as a performance result')
-        print('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS (registration only; no data validation)')
+        if result['options'].get('minimal', False):
+            print('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS (configuration only; no EID channels or registration)')
+        else:
+            print('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS (registration only; no data validation)')
         return
     other = None
     if args.compare:

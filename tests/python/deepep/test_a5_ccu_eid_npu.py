@@ -38,7 +38,13 @@ def main():
     p.add_argument('--dynamic-iters', type=int, default=100)
     p.add_argument('--bidirectional-iters', type=int, default=0)
     p.add_argument('--allow-no-relay', action='store_true', help='explicit direct-only diagnostic, never a relay PASS')
+    p.add_argument('--minimal', action='store_true', help='create only: stop after configuration all_gather; no Buffer or EID plan')
+    p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
     args = p.parse_args()
+    if args.minimal and args.suite != 'create':
+        p.error('--minimal requires --suite create')
+    if args.config_prewarm < 0:
+        p.error('--config-prewarm must be nonnegative')
     if (int(os.environ.get('WORLD_SIZE', 0)) != 8 or min(args.width, args.row_scale, args.iters,
             args.rounds, args.dynamic_iters) < 1 or min(args.warmup, args.bidirectional_iters) < 0):
         p.error('requires EP8, positive sizes/iterations and nonnegative warmup')
@@ -79,6 +85,9 @@ def main():
     def phase(name, **fields):
         print('EP8_EID_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
               time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
+    phase('startup_resources', custom_channels_acquired=0, custom_plans=0,
+          process_groups_requested=1, hccl_buffsize_mb=os.environ.get('HCCL_BUFFSIZE'),
+          minimal=args.minimal, config_prewarm=args.config_prewarm)
     phase('device_init_begin')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     phase('device_init_complete')
@@ -92,17 +101,25 @@ def main():
     hashes = [torch.empty_like(digest) for _ in range(8)]
     torch.npu.synchronize()
     phase('config_digest_complete')
-    phase('config_allgather_begin')
-    dist.all_gather(hashes, digest)
-    phase('config_allgather_submitted')
-    # Startup-only fence: report asynchronous native collective errors here,
-    # before entering EID resources/registration. No fence in measured payloads.
-    torch.npu.synchronize()
-    phase('config_allgather_complete')
+    from a5_ccu_startup_probe import traced_all_gather
+    for warmup in range(args.config_prewarm):
+        traced_all_gather(torch, dist, hashes, digest, phase, f'config_prewarm_{warmup}')
+    traced_all_gather(torch, dist, hashes, digest, phase)
     phase('config_check_begin')
     expected_digest=digest.cpu()
     if any(not torch.equal(h.cpu(), expected_digest) for h in hashes): raise ValueError('rank configuration mismatch')
     phase('config_check_complete')
+    if args.minimal:
+        # Same imports, process group and config check as full create, but no
+        # Buffer, EID channel acquisition or kernel registration.
+        phase('process_group_destroy_begin')
+        dist.destroy_process_group()
+        phase('process_group_destroy_complete')
+        args.run_dir.mkdir(parents=True, exist_ok=True)
+        (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank,
+            backend='participant_eid_ccu_urma', options=vars(args), reports=[]), default=str))
+        print(f'EP8_EID_MINIMAL_RANK_PASS rank={rank}', flush=True)
+        return
     phase('buffer_init_begin')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     torch.npu.synchronize()
@@ -116,13 +133,20 @@ def main():
         # No payload host, FP8 allocation, AllToAllV execution or timed loop.
         destroy = route.HcclCcuUrmaPeerPlanDestroy
         destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
+        phase('plan_destroy_begin', handle=handle)
         status = destroy(handle)
         if status != 0: raise RuntimeError(f'EID create-only destroy failed status={status}')
+        phase('plan_destroy_complete', handle=handle, channels_released_by_plan=False)
+        phase('create_exit_barrier_begin')
         dist.barrier()
+        torch.npu.synchronize()
+        phase('create_exit_barrier_complete')
         args.run_dir.mkdir(parents=True, exist_ok=True)
         (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank,
             backend='participant_eid_ccu_urma', options=vars(args), reports=[]), default=str))
+        phase('process_group_destroy_begin')
         dist.destroy_process_group()
+        phase('process_group_destroy_complete')
         print(f'EP8_EID_CREATE_RANK_PASS rank={rank}', flush=True)
         return
     dtype = getattr(torch, args.dtype)
@@ -233,4 +257,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except BaseException as error:
+        print('EP8_EID_FAILURE ' + json.dumps(dict(rank=os.environ.get('RANK'), pid=os.getpid(),
+            error_type=type(error).__name__, error=str(error))), file=sys.stderr, flush=True)
+        raise

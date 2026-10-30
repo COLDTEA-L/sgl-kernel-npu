@@ -537,3 +537,56 @@ device init → HCCL process group init → digest 张量创建
 优先读取已失败B/C目录的最后 `EP8_EID_PHASE`、`CCU_CREATE_STAGE` 和首个Python traceback：若没有 `catalog_register_begin`，失败在测试前置阶段，不能归因于EID注册时的诊断开关；若已进入，则按最末成功子阶段定位。End=4这一路仍需A组的SDK翻译/下发错误，不能用B/C的0x2a替代其根因。
 
 本节只补足阶段边界，不宣称修复 AICPU 或 End=4。尚未push的提交必须由开发机push后，新机才能pull；不要把本地commit号当作远端已发布版本。
+
+### 11.10 all_gather 等待诊断、最小 create 与缓冲区缩减
+
+本节保留HCCL配置all_gather，不使用FileStore/Gloo。当前顺序是配置检查→Buffer→EID建链注册，所以停在config_allgather时**本次还没有申请49条EID通道**。完整测试复用一个EP进程组（8个rank各持本地句柄），不能把它解释成额外创建8个独立通信组。之前运行的资源残留尚需现场确认；资源查询status=0仅表示查询成功，不表示资源需求一定满足。
+
+**降低初始化缓冲区。** 仅 `--suite create` 在调用者未设置HCCL_BUFFSIZE时，默认从旧脚本2300改为64（MB）。显式设置优先，correctness/benchmark仍保持原默认2300。这是减少HCCL共享缓冲占用，不是增加CCU实例配额，也不保证修复IndOp或RegisterEnd。官方说明：[HCCL_BUFFSIZE](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/user_guide/hccl_env/HCCL_BUFFSIZE.md)。实际值写入environment.log和startup_resources阶段；对照实验必须显式使用相同值。
+
+**等待定位。** 配置检查改用 `async_op=True` 加显式Work.wait（180秒）及原有设备同步。日志依次为：
+
+```text
+config_allgather_begin       dtype/shape/output_shapes/async_op/input_bytes/output_bytes/caller_stream
+config_allgather_submitted   submit_us
+config_allgather_wait_begin
+config_allgather_wait_complete wait_us
+config_allgather_sync_begin
+config_allgather_sync_complete sync_us
+config_allgather_complete    total_us
+```
+
+Work.wait返回不一定等同host已等到设备完成，所以保留后续同步。caller_stream是调用者流，不冒充HCCL内部流。异常会打印 `config_allgather_failed stage=submit|wait|device_sync`（JSON字段）和 `EP8_EID_FAILURE`，继续抛原始异常，不重试、不吞错。配置输入int32[32]共128B，8个输出共1024B。
+
+**步骤1：相同启动条件的最小变体。** 仍保留完整测试相同的导入、route ABI校验和通信组初始化，配置检查后直接销毁进程组；不创建Buffer、不申请EID channels、不注册kernel、不额外做退出barrier。
+
+```bash
+HCCL_BUFFSIZE=64 A5_CCU_RESOURCE_DIAGNOSTICS=0 \
+A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1 \
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --minimal
+```
+
+只有8rank干净退出才显示 `EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS`。它不等同EID注册/数据正确性通过，也不能用于性能比较。最小与完整模式在配置检查前没有EID通道规模差异，因此不能用它们一次通过/失败认定49通道导致前置检查失败。
+
+**步骤2：同一缓冲配置执行完整create。**
+
+```bash
+HCCL_BUFFSIZE=64 A5_CCU_RESOURCE_DIAGNOSTICS=0 \
+A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1 \
+A5_EID_MAX_RELAYS_PER_PEER=0 \
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+仅当走过config_check_complete/buffer_init_complete/catalog_register_begin后，0/1/6个relay候选的注册结果才可用于分析通道规模。完整create PASS仍为 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`。
+
+**步骤3：可选预热对照。** 在上述任一命令末尾加 `--config-prewarm 1`，会先用同一组digest/输出张量执行并完成一次小all_gather，然后再做正式配置检查；日志前缀 `config_prewarm_0`。默认0，预热失败立即退出，不自动重试，不另建通信域或stream。它可能使延迟初始化提前发生，也会增加一次通信，不应当作清理资源或修复问题的保证。减少测试buffer是否改变现象，可用显式HCCL_BUFFSIZE=2300与64作对照，其他条件保持相同。
+
+**资源回收审计。**
+
+- 本测试正常路径使用Buffer获取的已有EP组名；C++ Buffer只在组名为空的fallback分支新建通信域，本次config检查前尚未构造Buffer。
+- 当前HcclCcuUrmaPeerPlanDestroy关闭bridge/self-copy并删除plan登记，**不逐条调用HcclChannelDestroy，不释放HcclThreadAcquire借用的线程，也不销毁通信域或实例**。不能把plan_destroy_complete解释为所有SDK资源已释放。
+- create新增plan_destroy、create_exit_barrier、process_group_destroy的begin/complete日志。正常路径由测试拥有者调用dist.destroy_process_group。最小模式不创建plan，直接销毁组。
+- SDK公开了HcclChannelDestroy，但通道可能被通信域缓存/其他plan复用；不能未经所有权确认直接在通用Destroy里批量释放。当前公开kernel wrapper还保留注册对象至进程结束，route slave stream也未在plan destroy中显式销毁，因此同一进程反复create/destroy不能视为零资源累积。此轮不改这些共享资源生命周期，避免模型侧已有handle悬空。
+- 异步设备故障或SIGKILL后不保证Python清理执行；不能通过杀其他用户进程、重置设备来代替定位。当前仅能确认正常退出调用到哪一步，不能证明驱动侧残留已回收。
+
+本轮只改测试控制及启动参数，wheel/route ABI不变；已有§3更新route的环境不需重编。本次可先拉取后执行步骤1，再执行步骤2。结果仍写入 `/home/l00934901/profiling`。不要把新增诊断或缓冲区缩减表述为已修复真实9.3设备故障。

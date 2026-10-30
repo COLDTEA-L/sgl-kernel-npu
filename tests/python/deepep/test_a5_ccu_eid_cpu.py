@@ -8,11 +8,90 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
+from a5_ccu_startup_probe import traced_all_gather
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from prepare_a5_ccu_ep8_topology import build_eid_topology
 
 class EidTests(unittest.TestCase):
+    def test_create_buffer_default_and_explicit_override(self):
+        clean = {k: v for k, v in os.environ.items() if k != 'HCCL_BUFFSIZE'}
+        script = 'source "$1"; shift; a5_ccu_prepare_eid_buffer_env "$@"; printf "%s" "${HCCL_BUFFSIZE:-unset}"'
+        for args, override, expected in (
+            (['--suite', 'create'], None, '64'),
+            (['--suite=create', '--minimal'], None, '64'),
+            (['--suite', 'create'], '2300', '2300'),
+            (['--suite', 'benchmark'], None, 'unset'),
+            (['--suite', 'correctness'], None, 'unset'),
+            ([], None, 'unset'),
+        ):
+            env = dict(clean)
+            if override is not None: env['HCCL_BUFFSIZE'] = override
+            result = subprocess.run(['bash', '-c', script, 'buffer-test',
+                str(ROOT/'scripts/a5_ccu_test_env.sh')] + args, env=env,
+                capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, expected)
+
+    def run_collective_probe(self, failure=None):
+        events = []
+        tensor = SimpleNamespace(dtype='torch.int32', shape=(32,), numel=lambda:32, element_size=lambda:4)
+        wait = Mock(return_value=True)
+        sync = Mock()
+        if failure == 'wait': wait.side_effect = RuntimeError('wait rejected')
+        if failure == 'device_sync': sync.side_effect = RuntimeError('stream failed')
+        if failure == 'false_wait': wait.return_value = False
+        npu = SimpleNamespace(current_stream=lambda:SimpleNamespace(npu_stream=123), synchronize=sync)
+        dist = SimpleNamespace(all_gather=Mock(return_value=SimpleNamespace(wait=wait)))
+        phase = lambda name, **fields: events.append((name, fields))
+        def call(): traced_all_gather(SimpleNamespace(npu=npu), dist, [tensor]*8, tensor, phase)
+        if failure:
+            with self.assertRaises(RuntimeError): call()
+        else: call()
+        self.assertEqual(dist.all_gather.call_count, 1)
+        self.assertEqual(dist.all_gather.call_args.kwargs, {'async_op': True})
+        self.assertEqual(wait.call_count, 1)
+        return events, sync
+
+    def test_probe_distinguishes_wait_and_device_completion(self):
+        events, sync = self.run_collective_probe()
+        names = [name for name, fields in events]
+        self.assertLess(names.index('config_allgather_wait_complete'), names.index('config_allgather_sync_begin'))
+        self.assertEqual(names[-1], 'config_allgather_complete')
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(events[0][1]['input_bytes'], 128)
+        self.assertEqual(events[0][1]['output_bytes'], 1024)
+        self.assertEqual(events[0][1]['caller_stream'], '123')
+
+    def test_probe_failure_is_not_retried_or_reported_complete(self):
+        for failure, stage in [('wait', 'wait'), ('false_wait', 'wait'), ('device_sync', 'device_sync')]:
+            events, sync = self.run_collective_probe(failure)
+            self.assertEqual(events[-1][0], 'config_allgather_failed')
+            self.assertEqual(events[-1][1]['stage'], stage)
+            self.assertNotIn('config_allgather_complete', [name for name, fields in events])
+            self.assertEqual(sync.call_count, int(stage == 'device_sync'))
+
+    def test_minimal_pass_is_not_registration_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'results').mkdir(); (root/'plans').mkdir()
+            (root/'exit.status').write_text('0')
+            (root/'plans/topology.json').write_text('{}')
+            (root/'run.log').write_text(''.join(f'EP8_EID_MINIMAL_RANK_PASS rank={r}\n' for r in range(8)))
+            for r in range(8):
+                (root/'results'/f'rank{r}.json').write_text(json.dumps(dict(rank=r,
+                    backend='participant_eid_ccu_urma', options=dict(suite='create', minimal=True), reports=[])))
+            cmd = [sys.executable, str(ROOT/'scripts/summarize_a5_ccu_eid.py'), str(root)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self.assertIn('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS', result.stdout)
+            self.assertNotIn('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS', result.stdout)
+            self.assertNotEqual(subprocess.run(cmd+['--compare',str(root)], capture_output=True).returncode,0)
+            p = root/'results/rank3.json'
+            record = json.loads(p.read_text()); record['options']['minimal'] = False
+            p.write_text(json.dumps(record))
+            self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode,0)
+
     def test_launcher_honors_sdk_logging_and_explicit_override(self):
         keys = ('A5_EID_LOG_LEVEL', 'A5_EID_LOG_STDOUT', 'ASCEND_GLOBAL_LOG_LEVEL',
                 'ASCEND_MODULE_LOG_LEVEL', 'ASCEND_SLOG_PRINT_TO_STDOUT')
