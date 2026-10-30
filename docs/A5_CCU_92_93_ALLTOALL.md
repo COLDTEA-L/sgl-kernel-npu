@@ -639,3 +639,10 @@ python3 scripts/summarize_a5_ccu_eid.py \
 ```
 
 如果仍失败，请保留新的完整异常及rank0.json；不能仅凭“missing clean rank completion”认定未适配minimal。
+
+
+#### 11.11.1 minimal 已有日志的粘连确认
+
+现场rank0.json确认 `suite=create, minimal=true, reports=[]`，这符合minimal设计，汇总器并不要求reports非空。实际漏判来自 `EP8_EID_MINIMAL_RANK_PASS rank=7[INFO] ASCENDCL(...)`：严格行尾匹配漏掉rank7，acc34ec允许空白/下一条EP8标记的版本也尚未覆盖紧邻的`[`。现已补上SDK方括号前缀边界，并验证缺rank及rank=70不会被误认成rank7。
+
+本补丁只修改汇总Python、测试与文档。无需重编route/wheel，不用重新跑卡；用更新后的 `scripts/summarize_a5_ccu_eid.py` 重新汇总上述ycYc6U目录即可。新的worker已使用单次os.write输出PASS，不改回多次写入的print/sys.stdout.write。

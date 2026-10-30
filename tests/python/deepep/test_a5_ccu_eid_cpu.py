@@ -92,6 +92,20 @@ class EidTests(unittest.TestCase):
             merged = subprocess.run(cmd, capture_output=True, text=True, check=True)
             self.assertIn('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS', merged.stdout)
 
+            # Exact field report: rank 7 is immediately followed by SDK INFO.
+            clean = ''.join(f'EP8_EID_MINIMAL_RANK_PASS rank={r}\n' for r in range(7))
+            for suffix in ('[INFO] ASCENDCL(27712,python3): device cleanup\n',
+                           '[WARNING] SDK cleanup\n'):
+                (root/'run.log').write_text(clean + 'EP8_EID_MINIMAL_RANK_PASS rank=7' + suffix)
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                self.assertIn('EP8_EID_MINIMAL_ALL_RANKS_AND_EXIT_PASS', result.stdout)
+            # A missing rank or a two-digit rank must not be accepted as rank 7.
+            for last in ('', 'EP8_EID_MINIMAL_RANK_PASS rank=70[INFO] SDK\n'):
+                (root/'run.log').write_text(clean + last)
+                rejected = subprocess.run(cmd, capture_output=True, text=True)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn('missing clean rank completion', rejected.stderr)
+            (root/'run.log').write_text(clean + 'EP8_EID_MINIMAL_RANK_PASS rank=7[INFO] SDK\n')
             self.assertNotEqual(subprocess.run(cmd+['--compare',str(root)], capture_output=True).returncode,0)
             p = root/'results/rank3.json'
             record = json.loads(p.read_text()); record['options']['minimal'] = False

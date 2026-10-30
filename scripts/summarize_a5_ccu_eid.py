@@ -16,8 +16,9 @@ def load(root):
     if probe and (not create_only or minimal): raise ValueError('invalid registration probe suite')
     marker = 'EP8_EID_REGISTER_PROBE_RANK_PASS' if probe else 'EP8_EID_MINIMAL_RANK_PASS' if minimal else 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
     # Old print() workers can concatenate markers or append SDK output. New
-    # workers use one atomic write; retain compatibility with existing logs.
-    ranks = set(map(int, re.findall(re.escape(marker)+r' rank=(\d+)(?=\s|EP8_|$)', (root/'run.log').read_text())))
+    # workers use one atomic write; retain compatibility with existing logs,
+    # including rank=7[INFO] with no separator. Consume the full rank number.
+    ranks = set(map(int, re.findall(re.escape(marker)+r' rank=(\d+)(?=\s|\[|EP8_|$)', (root/'run.log').read_text())))
     if ranks != set(range(8)):
         raise ValueError(f'missing clean rank completion: expected_marker={marker} found={sorted(ranks)} '
                          f'minimal={minimal} probe={probe} script={Path(__file__).resolve()}')
