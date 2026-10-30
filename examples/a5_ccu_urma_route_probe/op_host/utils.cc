@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "../common/create_trace.h"
 #include "alltoallv_kernel.h"
 #include "eid_alltoallv_kernel.h"
 #include "route_kernel.h"
@@ -1329,27 +1330,30 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     } else if ((allToAllV && (r.rankSize != 8 || descs.size() != 7 || syncMode != ChannelSyncMode::BASELINE)) ||
         descs.empty() || (allToAllV ? 10 : r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);
+    a5ccu::CreateTrace trace("scope=peer_resources rank=" + std::to_string(r.rank) +
+        " eid=" + std::to_string(eidAllToAllV) + " die=" + std::to_string(r.dieId) +
+        " channels=" + std::to_string(descs.size()));
     // Thread resources must exist before ChannelAcquire on every rank.
     CcuInsHandle publicInstance = 0;
     uint32_t publicInstanceCount = 1;
-    status = HcclCommQueryCcuIns(comm, &publicInstance, &publicInstanceCount);
+    status = trace.Call("query_instance", [&] { return HcclCommQueryCcuIns(comm, &publicInstance, &publicInstanceCount); });
     if (status != HCCL_SUCCESS) return status;
     if (!publicInstance || publicInstanceCount != 1) return HCCL_E_UNAVAIL;
-    status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread);
+    status = trace.Call("acquire_main_thread", [&] { return HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, stream, THREAD_NOTIFY_NUM, &r.mainThread); });
     if (status != HCCL_SUCCESS) return status;
     r.routeThread = r.mainThread;
     if (r.dieId == 1) {
-        if (aclrtCreateStream(&r.slaveStream) != ACL_SUCCESS) return HCCL_E_RUNTIME;
-        status = HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, r.slaveStream, THREAD_NOTIFY_NUM, &r.routeThread);
+        if (trace.Call("create_slave_stream", [&] { return aclrtCreateStream(&r.slaveStream); }) != ACL_SUCCESS) return HCCL_E_RUNTIME;
+        status = trace.Call("acquire_route_thread", [&] { return HcclThreadAcquireWithStream(comm, COMM_ENGINE_CCU, r.slaveStream, THREAD_NOTIFY_NUM, &r.routeThread); });
         if (status != HCCL_SUCCESS) return status;
     }
     r.channels.resize(descs.size());
-    status = HcclChannelAcquire(comm, COMM_ENGINE_CCU, descs.data(), static_cast<uint32_t>(descs.size()), r.channels.data());
+    status = trace.Call("acquire_channels", [&] { return HcclChannelAcquire(comm, COMM_ENGINE_CCU, descs.data(), static_cast<uint32_t>(descs.size()), r.channels.data()); });
     std::printf("PEER_PLAN_ACQUIRE rank=%u channels=%zu status=%d\n", r.rank, descs.size(), status);
     std::fflush(stdout);
     if (status != HCCL_SUCCESS) return status;
     std::vector<int32_t> states(descs.size(), -1);
-    if (HcommChannelGetStatus(r.channels.data(), static_cast<uint32_t>(states.size()), states.data()) != 0)
+    if (trace.Call("channel_status", [&] { return HcommChannelGetStatus(r.channels.data(), static_cast<uint32_t>(states.size()), states.data()); }) != 0)
         return HCCL_E_RUNTIME;
     std::set<ChannelHandle> handles;
     for (size_t i = 0; i < states.size(); ++i) {
@@ -1362,13 +1366,13 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     if (eidAllToAllV) {
         EidAllToAllVKernelArg vArg(r.channels, r.rank, result.eidChannels);
         a5ccu::KernelCreator vCreator = CreateEidAllToAllVKernel;
-        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg);
+        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
     } else if (allToAllV) {
         AllToAllVKernelArg vArg(r.channels);
         a5ccu::KernelCreator vCreator = CreateAllToAllVKernel;
-        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg);
+        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
     } else {
-        status = a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &creator, &arg);
+        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &creator, &arg); });
     }
     if (status != HCCL_SUCCESS) return status;
     std::printf("CHANNEL_SYNC_PLAN rank=%u mode=%s channels=%zu\n",

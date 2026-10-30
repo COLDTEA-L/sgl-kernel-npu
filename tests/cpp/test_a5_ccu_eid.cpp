@@ -36,6 +36,35 @@ static void Invalid() {
     m[1]=5;assert(!BuildEidAllToAllVLayout(0,c.data(),64,5120,k.data(),m.data(),allowed,Catalog(0),&out));
     m[1]=2;c[1]=UINT64_MAX;assert(!BuildEidAllToAllVLayout(0,c.data(),64,5120,k.data(),m.data(),allowed,Catalog(0),&out));
 }
+static void MaskDecode(Kernel& kernel) {
+    const uint64_t all=(uint64_t{1}<<49)-1;
+    std::vector<uint64_t> masks{0,all,all^1,all^(uint64_t{1}<<48)};
+    for(unsigned bit=0;bit<49;++bit) {
+        masks.push_back(uint64_t{1}<<bit);
+        masks.push_back(all^(uint64_t{1}<<bit));
+    }
+    uint64_t random=17;
+    for(unsigned i=0;i<100;++i) {random=random*6364136223846793005ULL+1;masks.push_back(random&all);}
+    for(auto mask:masks) {
+        hcomm::CcuRep::Env env;env.args.assign(46,0);env.args[10]=mask;
+        env.remote=[](ChannelHandle,uint32_t){return uint64_t{0};};
+        std::vector<bool> conditions;
+        std::set<ChannelHandle> published;
+        for(const auto& i:kernel.instructions) {
+            if(i.op=="notify_wait") break; // Only the metadata-publish phase.
+            const bool active=conditions.empty()||conditions.back();
+            if(i.op=="if_begin") conditions.push_back(active&&i.len.eval(env));
+            else if(i.op=="if_end") {assert(!conditions.empty());conditions.pop_back();}
+            else if(active&&i.op=="record") published.insert(i.channel);
+        }
+        const auto paths=Catalog(0);
+        for(size_t i=0;i<paths.size();++i) {
+            const auto ch=paths[i].peer*9+paths[i].relay+2;
+            assert(bool(published.count(ch))==bool(mask&(uint64_t{1}<<i)));
+        }
+    }
+    std::cout<<"EP8_EID_V1_MASK_PASS masks="<<masks.size()<<" highest_bit=48\n";
+}
 int main() {
     Invalid();
     std::array<std::unique_ptr<Kernel>,8> kernels;
@@ -46,6 +75,7 @@ int main() {
         for(auto p:paths) channels.push_back(p.peer*9+p.relay+2);
         EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));assert(kernels[r]->Init()==0);
     }
+    MaskDecode(*kernels[0]);
     uint32_t bits[8][8][9][3]{};
     constexpr size_t guard=37;
     size_t activeRelay=0, skipped=0;

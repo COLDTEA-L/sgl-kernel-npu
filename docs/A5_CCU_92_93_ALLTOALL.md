@@ -314,7 +314,7 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_bidirectiona
 
 ### 11.2 新机正确性和长跑
 
-在目标容器中执行；所有八张卡需要可用。先按 §3/§4 编译安装当前环境产物，再设置：
+在目标容器中执行；所有八张卡需要可用。先按 §3/§4 编译安装当前环境产物，再设置。若此前在 `f1859d2` 遇到 `Unsupported repType[11]`，先执行 §11.6 的修复和只注册检查：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
@@ -397,3 +397,35 @@ host.close()
 这些结果证明编译和离线协议/布局检查通过，**未证明组内 EID 物理转发、实际 CCU 资源容量、八卡长期稳定性或性能收益**。新机按 §11.2/§11.3 继续验证，不能引用旧 HBM pipeline 的 PASS 作为新后端硬件结论。
 
 还直接构建了仓库 `csrc/deepep/CMakeLists.txt` 的完整扩展目标，严格链接并导入通过，见 `host-cmake.log` / `host-cmake-import.log`。生产 CMake 现会在指定 CANN 中发现并显式链接 `hccl_fwk`、`nnopbase`，减少对其他模块预先全局加载库的依赖。测试用 torch_npu 2.10.0 发布包携带的 HCCL 枚举头与 9.2 SDK 存在 LTO 定义差异警告；不据此宣称目标模型的软件栈兼容，目标环境仍按 §4 使用配套 Torch/torch_npu/CANN 重建。
+
+### 11.6 修复 `PUBLIC_CCU_BUILD_FAILED: [GetInstrCount] Unsupported repType[11]`
+
+现场证据为 `PEER_PLAN_ACQUIRE channels=49 status=0`、49 条 `PEER_PATH_CHANNEL state=0` 后出现构图异常。此次失败在 kernel 注册，不在 manifest 解析或 ChannelAcquire，也发生在 payload/FP8 运算前。
+
+开发容器 CANN 9.2 `libhcomm.so` 的 `CcuRepSub::SetCommonInfo` 将表示类型设为 11；V1 生成器的 Sub 和 And 翻译返回不支持。`f1859d2` 的 EID kernel 新增了 `direct = total - relay` 和 `live = active & bit`，公开头文件声明这些操作不代表实际选用的 CCU 生成器支持它们。现场 9.3 的错误与前者匹配；不应推广为“整个 CANN 9.3 不支持 CCU/EID”。
+
+修复将 `total - relay` 放在 CPU `GeneArgs` 中，复用原有参数槽；active mask 从高位到低位，用无符号比较和加上预计算的负常量解码，不产生设备 Sub/And。仍为 46 个 task args、最多 49 channels、每次一条 kernel 提交、无 relay HBM，外部布局/handle ABI 不变，2/4 卡 kernel 不变。新的 `A5CcuEidV1CompatAbiVersion=1` 用于阻止测试误加载旧 route 库。
+
+**更新代码后，必须按 §3 用目标 CANN 重新编译并安装 route 包，重启测试进程。** 若已安装 `f1859d2` 对应的 DeepEP wheel，本修复不改扩展 ABI，无须仅为此重新打 wheel；若 wheel 更旧，仍按 §4 更新。构建输出必须包含 `PUBLIC_ROUTE_ABI A5CcuEidV1CompatAbiVersion=1`。
+
+保留 §11.2 的机器环境变量，先跑：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+它仍使用八卡进行通信组初始化、配置一致性检查、EID 建链和 kernel 注册，但不创建 payload host、不执行 AllToAllV、不跑性能循环。八个 rank 正常释放并退出后输出 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`，**这不是数据正确性 PASS**。通过后继续 §11.2 原有 FP8/BF16 正确性和长跑命令，再测 §11.3 性能。
+
+新日志会在每次启动的 `run.log` 中输出 `CCU_CREATE_STAGE_BEGIN/OK/FAILED/EXCEPTION`，区分实例查询、线程申请、ChannelAcquire、注册 Start/Register/End 和 task args 查询；保存 SDK 原始状态且不自动重试。`catalog_register_begin` 同时记录 manifest 绝对路径及 SHA256，不能只靠没看到旧路径来判断使用了哪个文件。
+
+如仍失败，先贴本次 `run.log` 的 `PUBLIC_CCU_BUILD_FAILED` 和 `CCU_CREATE_STAGE_FAILED/EXCEPTION` 附近日志。需要 HCCL/HCCP INFO 日志时，在独立诊断进程中运行：
+
+```bash
+A5_EID_LOG_LEVEL=1 A5_EID_LOG_STDOUT=1 \
+  bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+仅当阶段日志指向通道/注册资源容量时，再以 `A5_EID_MAX_RELAYS_PER_PEER=0`（7 通道）或 `1`（最多 14 通道）作定位对照；这些不是完整候选目录的等价性能配置。所有结果仍写 `/home/l00934901/profiling`，每次用新进程，不复用失败后的注册实例。
+
+本修复在 `cam_lyw_92` / CANN 9.2.0 完成 route 编译、严格链接、SDK host-test 和实际动态加载（含新能力标记）。12 组 69 项 CPU 回归通过。受限指令模型主动拒绝 Sub/And：旧 kernel 在 Sub 处失败；修复后 202 种 active mask（含第 48 位）、100 epochs × 8 ranks 指令图和 FP8/BF16 host 交替检查通过。结果位于开发机 `/home/liuyuanwen/profiling/a5-ep8-eid-v1-fix`，见 `route-final.log`、`cpu-suite.log`、`before-v1.log`、`sdk-instruction-evidence.txt`。这是编译和离线验证，目标 9.3 八卡仍需先跑上述 `--suite create`，再做数据正确性验证。

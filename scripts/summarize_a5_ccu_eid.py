@@ -8,10 +8,13 @@ import re
 
 def load(root):
     if (root / 'exit.status').read_text().strip() != '0': raise ValueError('run did not exit successfully')
-    ranks = set(map(int, re.findall(r'^EP8_EID_RANK_PASS rank=(\d+)$', (root/'run.log').read_text(), re.M)))
-    if ranks != set(range(8)): raise ValueError('missing clean rank completion')
     results = [json.loads((root/'results'/f'rank{r}.json').read_text()) for r in range(8)]
+    create_only = results[0]['options']['suite'] == 'create'
+    marker = 'EP8_EID_CREATE_RANK_PASS' if create_only else 'EP8_EID_RANK_PASS'
+    ranks = set(map(int, re.findall(r'^'+marker+r' rank=(\d+)$', (root/'run.log').read_text(), re.M)))
+    if ranks != set(range(8)): raise ValueError('missing clean rank completion')
     for r, result in enumerate(results):
+        if result['options']['suite'] != results[0]['options']['suite']: raise ValueError('different rank suite')
         if result['rank'] != r or result['backend'] != 'participant_eid_ccu_urma': raise ValueError('wrong result identity')
         for a, b in zip(result['reports'], results[0]['reports']):
             if any(a[k] != b[k] for k in ('case', 'counts', 'row_bytes', 'relay_rows', 'median_us')):
@@ -26,6 +29,10 @@ def main():
     p.add_argument('--compare', type=Path, help='native baseline result directory')
     args = p.parse_args()
     result, topology = load(args.run)
+    if result['options']['suite'] == 'create':
+        if args.compare: raise ValueError('create-only cannot be used as a performance result')
+        print('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS (registration only; no data validation)')
+        return
     other = None
     if args.compare:
         other, other_topology = load(args.compare)

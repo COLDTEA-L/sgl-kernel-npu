@@ -1,4 +1,5 @@
 #include "../common/public_ccu.h"
+#include "../common/create_trace.h"
 #include <atomic>
 #include <cstdio>
 #include <map>
@@ -48,20 +49,27 @@ HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
     auto entry = std::make_shared<Registered>();
     entry->owner = comm; entry->device = device;
     try { entry->kernel = (*creator)(*arg); }
-    catch (...) { return HCCL_E_INTERNAL; }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "PUBLIC_CCU_CONSTRUCT_FAILED die=%u error=%s\n", die, error.what());
+        return HCCL_E_INTERNAL;
+    } catch (...) { return HCCL_E_INTERNAL; }
     if (!entry->kernel) return HCCL_E_PTR;
     const void* args[] = {entry->kernel.get()};
     CcuKernelHandle registered = 0;
     const std::string name = "a5_public_" + std::to_string(++sequence);
-    auto ccuStatus = HcommCcuKernelRegisterStart(instance);
+    CreateTrace trace("scope=public_register device=" + std::to_string(device) +
+        " die=" + std::to_string(die) + " instance=" + std::to_string(instance));
+    auto ccuStatus = trace.Call("register_start", [&] { return HcommCcuKernelRegisterStart(instance); });
     if (ccuStatus != CcuResult::CCU_SUCCESS) return Status(ccuStatus);
     // Once a session starts, any failure poisons this communicator for this
     // library. Never retry a partially built instruction/resource session.
-    ccuStatus = HcommCcuKernelRegister(instance, die, name.c_str(),
-        reinterpret_cast<const void*>(BuildKernel), args, 1, &registered);
-    if (ccuStatus == CcuResult::CCU_SUCCESS) ccuStatus = HcommCcuKernelRegisterEnd(instance);
+    ccuStatus = trace.Call("register_kernel", [&] { return HcommCcuKernelRegister(instance, die, name.c_str(),
+        reinterpret_cast<const void*>(BuildKernel), args, 1, &registered); });
+    if (ccuStatus == CcuResult::CCU_SUCCESS)
+        ccuStatus = trace.Call("register_end", [&] { return HcommCcuKernelRegisterEnd(instance); });
     uint32_t actualArgs = 0;
-    if (ccuStatus == CcuResult::CCU_SUCCESS) ccuStatus = HcommCcuGetTaskArgsNum(registered, &actualArgs);
+    if (ccuStatus == CcuResult::CCU_SUCCESS)
+        ccuStatus = trace.Call("get_task_args", [&] { return HcommCcuGetTaskArgsNum(registered, &actualArgs); });
     if (ccuStatus != CcuResult::CCU_SUCCESS || actualArgs != entry->kernel->ArgumentCount()) {
         poisoned.insert(ownerKey);
         return ccuStatus != CcuResult::CCU_SUCCESS ? Status(ccuStatus) : HCCL_E_PARA;

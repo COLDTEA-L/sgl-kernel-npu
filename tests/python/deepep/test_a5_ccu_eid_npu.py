@@ -26,7 +26,7 @@ def main():
     p.add_argument('--topology-json', type=Path, required=True)
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--matrix-json', type=Path)
-    p.add_argument('--suite', choices=('correctness', 'benchmark'), default='benchmark')
+    p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
     p.add_argument('--dtype', choices=PAYLOAD_DTYPE_NAMES, default='bfloat16')
@@ -69,7 +69,9 @@ def main():
     if getattr(native, 'ep8_eid_host_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
-    for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
+    for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
+                             ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
+        if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
         if fn() != expected: raise RuntimeError('rebuild route: ' + symbol)
     rank = int(os.environ['RANK'])
@@ -86,9 +88,24 @@ def main():
     dist.all_gather(hashes, digest)
     if any(not torch.equal(h.cpu(), digest.cpu()) for h in hashes): raise ValueError('rank configuration mismatch')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
-    phase('catalog_register_begin')
+    phase('catalog_register_begin', manifest=str(args.manifest.resolve()),
+          manifest_sha256=hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
+          channels=topology.get('channels_per_rank'), executor=topology['executor'])
     handle = buffer.prepare_ccu_urma_eid_alltoallv('ep8-eid', str(args.manifest.resolve()))
     phase('catalog_register_complete', handle=handle)
+    if args.suite == 'create':
+        # No payload host, FP8 allocation, AllToAllV execution or timed loop.
+        destroy = route.HcclCcuUrmaPeerPlanDestroy
+        destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
+        status = destroy(handle)
+        if status != 0: raise RuntimeError(f'EID create-only destroy failed status={status}')
+        dist.barrier()
+        args.run_dir.mkdir(parents=True, exist_ok=True)
+        (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank,
+            backend='participant_eid_ccu_urma', options=vars(args), reports=[]), default=str))
+        dist.destroy_process_group()
+        print(f'EP8_EID_CREATE_RANK_PASS rank={rank}', flush=True)
+        return
     dtype = getattr(torch, args.dtype)
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
     # Same registered channels/kernel for direct and multipath; only policy differs.
