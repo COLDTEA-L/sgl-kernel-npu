@@ -79,30 +79,19 @@ def main():
     def phase(name, **fields):
         print('EP8_EID_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
               time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
+    from a5_ccu_cpu_control import CpuControl, launch_store_path
+    phase('config_cpu_begin')
+    control = CpuControl(launch_store_path(args.run_dir, os.environ), rank, 8)
+    identity = json.dumps(dict(options=vars(args), cases=cases, topology=topology,
+                               manifest=args.manifest.read_text()), default=str, sort_keys=True)
+    digest = control.check_config(identity)
+    phase('config_cpu_complete', sha256=digest, backend='FileStore')
     phase('device_init_begin')
     torch.npu.set_device(int(os.environ['LOCAL_RANK']))
     phase('device_init_complete')
     phase('process_group_begin')
     dist.init_process_group('hccl', timeout=timedelta(seconds=180), **ccu_pg_kwargs(torch_npu))
     phase('process_group_complete')
-    identity = json.dumps(dict(options=vars(args), cases=cases, topology=topology,
-                               manifest=args.manifest.read_text()), default=str, sort_keys=True)
-    phase('config_digest_begin')
-    digest = torch.tensor(list(hashlib.sha256(identity.encode()).digest()), dtype=torch.int32, device='npu')
-    hashes = [torch.empty_like(digest) for _ in range(8)]
-    torch.npu.synchronize()
-    phase('config_digest_complete')
-    phase('config_allgather_begin')
-    dist.all_gather(hashes, digest)
-    phase('config_allgather_submitted')
-    # Startup-only fence: report asynchronous native collective errors here,
-    # before entering EID resources/registration. No fence in measured payloads.
-    torch.npu.synchronize()
-    phase('config_allgather_complete')
-    phase('config_check_begin')
-    expected_digest=digest.cpu()
-    if any(not torch.equal(h.cpu(), expected_digest) for h in hashes): raise ValueError('rank configuration mismatch')
-    phase('config_check_complete')
     phase('buffer_init_begin')
     buffer = deep_ep.Buffer(dist.group.WORLD, num_nvl_bytes=0, num_rdma_bytes=0)
     torch.npu.synchronize()
@@ -118,7 +107,9 @@ def main():
         destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int
         status = destroy(handle)
         if status != 0: raise RuntimeError(f'EID create-only destroy failed status={status}')
-        dist.barrier()
+        phase('create_exit_cpu_begin')
+        control.barrier('create_handles_destroyed')
+        phase('create_exit_cpu_complete')
         args.run_dir.mkdir(parents=True, exist_ok=True)
         (args.run_dir / f'rank{rank}.json').write_text(json.dumps(dict(rank=rank,
             backend='participant_eid_ccu_urma', options=vars(args), reports=[]), default=str))
