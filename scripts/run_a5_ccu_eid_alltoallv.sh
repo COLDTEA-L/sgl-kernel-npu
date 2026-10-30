@@ -10,9 +10,7 @@ export A5_CCU_ROUTE_PROBE_LIB=${A5_CCU_ROUTE_PROBE_LIB:-$A5_EID_CANN/opp/vendors
 export ASCEND_RT_VISIBLE_DEVICES=${A5_DEVICES:-0,1,2,3,4,5,6,7}
 export A5_CCU_CHANNEL_SYNC_MODE=baseline A5_CCU_PG_MODE=env
 export PYTHONUNBUFFERED=1
-export ASCEND_GLOBAL_LOG_LEVEL=${A5_EID_LOG_LEVEL:-3}
-export ASCEND_MODULE_LOG_LEVEL="HCCL=${A5_EID_LOG_LEVEL:-3}:HCCP=${A5_EID_LOG_LEVEL:-3}"
-export ASCEND_SLOG_PRINT_TO_STDOUT=${A5_EID_LOG_STDOUT:-0}
+a5_ccu_prepare_eid_log_env
 unset HCCL_ALGO
 A5_RESULTS_ROOT=${A5_OUTPUT_ROOT:-/home/l00934901/profiling}
 mkdir -p "$A5_RESULTS_ROOT"
@@ -20,6 +18,9 @@ A5_EID_RUN=$(mktemp -d "$A5_RESULTS_ROOT/a5-ep8-eid.XXXXXX")
 mkdir -p "$A5_EID_RUN/tmp"
 export TMPDIR="$A5_EID_RUN/tmp"
 echo "结果目录：$A5_EID_RUN"
+printf 'EID_LOG_ENV global=%s modules=%s stdout=%s resource_diagnostics=%s\n' \
+  "$ASCEND_GLOBAL_LOG_LEVEL" "$ASCEND_MODULE_LOG_LEVEL" "$ASCEND_SLOG_PRINT_TO_STDOUT" \
+  "${A5_CCU_RESOURCE_DIAGNOSTICS:-0}" | tee "$A5_EID_RUN/environment.log"
 printf '%s\n' "$@" > "$A5_EID_RUN/arguments.txt"
 git rev-parse HEAD > "$A5_EID_RUN/commit.txt"
 python3 scripts/prepare_a5_ccu_ep8_topology.py --executor eid \

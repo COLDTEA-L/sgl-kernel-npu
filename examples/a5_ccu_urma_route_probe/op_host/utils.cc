@@ -1366,13 +1366,13 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     if (eidAllToAllV) {
         EidAllToAllVKernelArg vArg(r.channels, r.rank, result.eidChannels);
         a5ccu::KernelCreator vCreator = CreateEidAllToAllVKernel;
-        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
+        status = trace.Call("register_transaction", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
     } else if (allToAllV) {
         AllToAllVKernelArg vArg(r.channels);
         a5ccu::KernelCreator vCreator = CreateAllToAllVKernel;
-        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
+        status = trace.Call("register_transaction", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &vCreator, &vArg); });
     } else {
-        status = trace.Call("register_kernel", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &creator, &arg); });
+        status = trace.Call("register_transaction", [&] { return a5ccu::RegisterKernel(comm, r.dieId, &r.kernel, &creator, &arg); });
     }
     if (status != HCCL_SUCCESS) return status;
     std::printf("CHANNEL_SYNC_PLAN rank=%u mode=%s channels=%zu\n",

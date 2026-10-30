@@ -479,3 +479,38 @@ A5_EID_LOG_LEVEL=1 A5_EID_LOG_STDOUT=1 \
 开启诊断时还输出 `PUBLIC_CCU_BUILD_STATUS status=... task_args=...`，区分 DSL callback 正常返回/非零返回与后续注册阶段；原 `PUBLIC_CCU_BUILD_FAILED` 只捕获异常，缺少该行并不能证明 callback 一定成功。
 
 开发验证：`cam_lyw_92` / CANN 9.2.0，route 完整编译、严格链接、SDK host-test 和动态加载通过；12 组 69 项 CPU 回归通过，含真实 EID 指令图 100 epochs × 8 ranks、202 种 mask、FP8/BF16 交替 100 次。新增检查强制远端写 event 只构造 14 次，并验证每次启动不会有两条 Write 共用同一完成事件。结果目录 `/home/liuyuanwen/profiling/a5-ep8-eid-peer-resources`（`route.log`、`cpu-suite.log`）。开发容器无 NPU；目标 9.3 的 create、正确性、长跑均待复测。
+
+### 11.8 `1e33bca` 注册通过、`register_end status=4`
+
+现场 `a5-ep8-eid.IyV5jk` 已从 `register_kernel=7` 推进到 `register_kernel=0`、`register_end=4`。目前贴出的 device 4–7 / die=1 均失败；device 0–3 的完整结果仍需核对。**本阶段没有证明 EID 已可执行，勿开始 payload 或模型测试。**
+
+`PUBLIC_CCU_RESOURCE ... status=0` 表示查询成功，不等于所有资源足够。`device_max_contiguous_remaining event=352` 是设备该 die 的最大连续空闲块，不是当前 instance 的 event 可用配额。新图注册成功说明它通过了本次 Register 的检查，但既不能倒推旧图的 status=7 与资源无关，也不能说明 End 一定成功。`PUBLIC_CCU_BUILD_STATUS status=0 task_args=46` 说明 callback 完成并记录了 46 个参数槽，不是硬件执行或微码翻译已通过。
+
+公开源码及开发容器的 CANN 9.2 `libhcomm.so` 调用链：
+
+```text
+本 rank：RegisterStart → Register(callback 构图) → RegisterEnd
+                                                    ├─ instance.EndRegister()
+                                                    └─ kernelMgr.Translate(untranslatedKernels)
+                                                         └─ 翻译及设备指令下发
+```
+
+这是本进程实例的注册事务；该调用链没有其他 rank 的 barrier。各 rank 必须在执行通信前完成自身注册，但无需为了 RegisterEnd 加一轮跨 rank 同步，也不能跳过 End。公开文档将 End 的内部错误列为翻译、设备内存拷贝或调用顺序问题；具体是哪条分支，仍需目标 9.3 的内部错误。
+
+旧 `scope=peer_resources stage=register_kernel` 实际包裹了 `a5ccu::RegisterKernel` 的整个查询及 Start/Register/End 流程，其 213–235 ms 包含资源诊断及 90–105 ms 的 Register。它不是只测 End 的 1 ms，也不证明等待其他 rank 超时。现已将外层名改为 `register_transaction`，另输出 `resource_diagnostics` 耗时；SDK Register 的内层阶段名不变。
+
+还修复了日志配置：旧 launcher 默认用 `A5_EID_LOG_LEVEL=3` 覆盖已设置的 `ASCEND_GLOBAL_LOG_LEVEL=1`，所以仅设后者未必得到 INFO。现在 A5 专用设置优先，否则保留用户已有 SDK 设置；最终值写入结果目录 `environment.log`。资源行增加 device/PID，并一次写出所有字段，避免八进程交错而把数值误归到其他 rank。
+
+下一次先**关闭资源查询**，保持相同的49通道，单独检查正式注册流程。使用新进程，不复用失败实例：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+A5_CCU_RESOURCE_DIAGNOSTICS=0 \
+A5_EID_MAX_RELAYS_PER_PEER=6 \
+A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1 \
+  bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
+```
+
+这条命令在 `1e33bca` 也可执行。若已更新本节日志修复，先按 §3 重编 route；wheel ABI 未变。不要增加 barrier、重试 RegisterEnd 或换通信域来掩盖错误。若关闭查询后通过，再在**另一个新进程**把 `A5_CCU_RESOURCE_DIAGNOSTICS` 改为1作对照；若仍失败，保留完整 `run.log` 中第一处 SDK 错误及八个 device 的 End 结果，而不只保留我们打印的 `CCU_CREATE_STAGE_FAILED`。结果继续存放 `/home/l00934901/profiling`。
+
+依据：[HcommCcuKernelRegisterEnd 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/api_ref/comm_opdev/control_plane_api/ccu_kernel_launch_execution/HcommCcuKernelRegisterEnd.md)、[hcomm 公开注册实现](https://gitcode.com/cann/hcomm/blob/master/src/base_comm/primitives/api_c_adpt/ccu/ccu_launch.cc)。公开版本及本地9.2只用于核对调用语义，不等同于现场9.3二进制。本轮不改 EID 数据路径，尚未确认 End=4 的具体根因。

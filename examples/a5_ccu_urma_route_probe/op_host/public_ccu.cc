@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <unistd.h>
 
 namespace a5ccu {
 namespace {
@@ -38,7 +39,7 @@ CcuResult BuildKernel(::CcuKernelArg arg) {
 }
 // Diagnostic queries do not assign/destroy the communicator-owned instance.
 // The global remainder is MAX CONTIGUOUS per type, not instance-local free space.
-void ResourceDiagnostic(CcuInsHandle instance, uint32_t die, const KernelCreator& creator,
+void ResourceDiagnostic(CcuInsHandle instance, int32_t device, uint32_t die, const KernelCreator& creator,
                         const CcuKernelArg& arg) {
     const char* enabled = std::getenv("A5_CCU_RESOURCE_DIAGNOSTICS");
     if (!enabled || std::strcmp(enabled, "1") != 0) return;
@@ -53,15 +54,20 @@ void ResourceDiagnostic(CcuInsHandle instance, uint32_t die, const KernelCreator
         HCOMM_CCU_RES_TYPE_VARIABLE,HCOMM_CCU_RES_TYPE_ADDRESS,HCOMM_CCU_RES_TYPE_EVENT,
         HCOMM_CCU_RES_TYPE_CCU_THREAD,HCOMM_CCU_RES_TYPE_INSTRUCTION};
     auto report = [&](const char* kind, CcuResult result) {
-        std::fprintf(stderr,"PUBLIC_CCU_RESOURCE kind=%s instance=%llu die=%u status=%d",
-            kind,static_cast<unsigned long long>(instance),die,int(result));
+        std::ostringstream line;
+        line << "PUBLIC_CCU_RESOURCE kind=" << kind << " device=" << device << " pid=" << getpid()
+             << " instance=" << instance << " die=" << die << " status=" << int(result);
         if (result == CcuResult::CCU_SUCCESS) for (size_t i=0;i<7;++i) {
             uint32_t value=0;
             auto queried=HcommCcuInsResDescQueryNum(desc,types[i],&value);
-            if (queried==CcuResult::CCU_SUCCESS) std::fprintf(stderr," %s=%u",names[i],value);
-            else std::fprintf(stderr," %s_query_status=%d",names[i],int(queried));
+            if (queried==CcuResult::CCU_SUCCESS) line << " " << names[i] << "=" << value;
+            else line << " " << names[i] << "_query_status=" << int(queried);
         }
-        std::fprintf(stderr,"\n");
+        line << "\n";
+        const auto record=line.str();
+        // One short write prevents eight workers interleaving fields on a pipe.
+        const auto written=::write(STDERR_FILENO,record.data(),record.size());
+        (void)written;
     };
     try {
         report("instance_owned",HcommCcuInsQueryResDesc(instance,desc));
@@ -110,7 +116,13 @@ HcclResult RegisterKernel(HcclComm comm, uint32_t die, uint64_t* handle,
         return HCCL_E_INTERNAL;
     } catch (...) { return HCCL_E_INTERNAL; }
     if (!entry->kernel) return HCCL_E_PTR;
-    ResourceDiagnostic(instance,die,*creator,*arg);
+    CreateTrace diagnosticTrace("scope=public_register device=" + std::to_string(device) +
+        " die=" + std::to_string(die) + " instance=" + std::to_string(instance));
+    const char* diagnostic=std::getenv("A5_CCU_RESOURCE_DIAGNOSTICS");
+    if (diagnostic && std::strcmp(diagnostic,"1")==0)
+        diagnosticTrace.Call("resource_diagnostics", [&] {
+            ResourceDiagnostic(instance,device,die,*creator,*arg); return HCCL_SUCCESS;
+        });
     const void* args[] = {entry->kernel.get()};
     CcuKernelHandle registered = 0;
     const std::string name = "a5_public_" + std::to_string(++sequence);

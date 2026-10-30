@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # Shared launcher environment; this file defines a function only.
+a5_ccu_prepare_eid_log_env() {
+    # An explicit launcher option wins; otherwise honor the caller's SDK settings.
+    if [[ -n ${A5_EID_LOG_LEVEL:-} ]]; then
+        export ASCEND_GLOBAL_LOG_LEVEL=$A5_EID_LOG_LEVEL
+        export ASCEND_MODULE_LOG_LEVEL="HCCL=$A5_EID_LOG_LEVEL:HCCP=$A5_EID_LOG_LEVEL"
+    else
+        export ASCEND_GLOBAL_LOG_LEVEL=${ASCEND_GLOBAL_LOG_LEVEL:-3}
+        export ASCEND_MODULE_LOG_LEVEL=${ASCEND_MODULE_LOG_LEVEL:-HCCL=$ASCEND_GLOBAL_LOG_LEVEL:HCCP=$ASCEND_GLOBAL_LOG_LEVEL}
+    fi
+    export ASCEND_SLOG_PRINT_TO_STDOUT=${A5_EID_LOG_STDOUT:-${ASCEND_SLOG_PRINT_TO_STDOUT:-0}}
+}
+
 a5_ccu_prepare_test_env() {
     local a5_test_cann=$1 a5_test_repo=$2 a5_test_nounset=0
     [[ $- != *u* ]] || a5_test_nounset=1

@@ -1,6 +1,7 @@
 """EP8 participant-EID catalog, production CCU graph and C++ host checks."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +13,21 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from prepare_a5_ccu_ep8_topology import build_eid_topology
 
 class EidTests(unittest.TestCase):
+    def test_launcher_honors_sdk_logging_and_explicit_override(self):
+        keys = ('A5_EID_LOG_LEVEL', 'A5_EID_LOG_STDOUT', 'ASCEND_GLOBAL_LOG_LEVEL',
+                'ASCEND_MODULE_LOG_LEVEL', 'ASCEND_SLOG_PRINT_TO_STDOUT')
+        clean = {k: v for k, v in os.environ.items() if k not in keys}
+        script = 'source "$1"; a5_ccu_prepare_eid_log_env; printf "%s|%s|%s" "$ASCEND_GLOBAL_LOG_LEVEL" "$ASCEND_MODULE_LOG_LEVEL" "$ASCEND_SLOG_PRINT_TO_STDOUT"'
+        for settings, expected in (
+            ({}, '3|HCCL=3:HCCP=3|0'),
+            ({'ASCEND_GLOBAL_LOG_LEVEL': '1'}, '1|HCCL=1:HCCP=1|0'),
+            ({'ASCEND_GLOBAL_LOG_LEVEL': '1', 'ASCEND_MODULE_LOG_LEVEL': 'HCCL=0', 'ASCEND_SLOG_PRINT_TO_STDOUT': '1'}, '1|HCCL=0|1'),
+            ({'ASCEND_GLOBAL_LOG_LEVEL': '3', 'ASCEND_MODULE_LOG_LEVEL': 'HCCL=3', 'A5_EID_LOG_LEVEL': '0', 'A5_EID_LOG_STDOUT': '1'}, '0|HCCL=0:HCCP=0|1'),
+        ):
+            result = subprocess.run(['bash', '-c', script, 'eid-log-test', str(ROOT/'scripts/a5_ccu_test_env.sh')],
+                                    env=dict(clean, **settings), capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, expected)
+
     @unittest.skipUnless(shutil.which('g++'), 'g++ required')
     def test_create_trace_preserves_failure_and_does_not_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
