@@ -58,44 +58,77 @@ class NativePlannerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def test_dense_observed_cut_and_smaller_split(self):
+    def test_dense_observed_volume_split_and_diagnostics(self):
         from a5_ccu_dense_cases import dense_counts
-        for divisor in (2,4,8,16):
+        for divisor, expected in ((2,31),(4,15),(8,7),(16,3)):
             planner=RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=divisor)
             observed=planner.plan(dense_counts('observed_dense'))
             self.assertEqual(sum(observed.counts),196608)
-            self.assertFalse(observed.uses_relay)  # identical columns saturate receiver cut
-            self.assertEqual(observed.candidate_evaluations,0)
-            near=planner.plan(dense_counts('dense_near'))
-            self.assertEqual(len(near.actions),1)
-            self.assertEqual(near.actions[0][:2],(0,1))
-            self.assertEqual(sum(near.relay_rows),(3165-3017)//divisor)
-            self.assertLess(max(near.link_rows),max(near.counts))
-            self.assertLessEqual(near.candidate_evaluations,6)
+            self.assertEqual(observed.actions[0][:3],(0,7,2))
+            self.assertEqual(sum(observed.relay_rows),expected)
+            self.assertEqual(max(observed.link_rows),3165)
+            diag=observed.volume_diagnostics()
+            self.assertEqual((diag['base_rows'],diag['excess_rows']),(3072,62))
+            self.assertEqual((diag['edge_peak_rows_before'],diag['edge_peak_rows_after'],diag['edge_peak_rows_delta']),(3165,3165,0))
+            self.assertEqual(diag['edge_peak_bytes_after'],3165*5120)
+            self.assertLessEqual(observed.candidate_evaluations,336)
+            # Helper is NOT a lighter card: it also sends 3165 rows to rank 1.
+            self.assertEqual(observed.counts[2*8+1],3165)
+            for case in ('dense_near','dense_hot'):
+                c=dense_counts(case);p=planner.plan(c)
+                self.assertEqual(len(p.actions),1)
+                self.assertEqual(p.actions[0][:2],(0,1))
+                self.assertEqual(sum(p.relay_rows),(c[1]-sum(c[:8])//8)//divisor)
+                self.assertLess(max(p.link_rows),max(c))
         for bad in (1,1025):
             with self.assertRaises(ValueError): RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=bad)
         with self.assertRaises(RuntimeError): RelayPlanner(5120,ALL,dense_split_divisor=8)
 
+    def test_dense_rejects_new_bottleneck_and_honors_direct(self):
+        from a5_ccu_dense_cases import dense_counts
+        c=dense_counts('observed_dense')
+        # Only flows to the hottest receiver are eligible: every second hop
+        # already carries the global maximum, so any positive split is unsafe.
+        allowed=[ks if f%8==1 else () for f,ks in enumerate(ALL)]
+        for opts in (dict(),dict(max_actions=0)):
+            p=RelayPlanner(5120,allowed,native_module=self.native,dense_split_divisor=2,**opts).plan(c)
+            self.assertFalse(p.uses_relay)
+            self.assertEqual(p.volume_diagnostics()['excess_rows'],0)
+        p=RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=2,min_gain_bytes=1).plan(c)
+        self.assertFalse(p.uses_relay)  # strict improvement remains an optional threshold
+        for c in ([3000]*64,[0]*64,[r+1 if f//8==f%8 else 0 for f in range(64) for r in [f//8]]):
+            self.assertFalse(RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=8).plan(c).uses_relay)
+
     def test_dense_randomized_bounds_and_capacity(self):
         rng=random.Random(412)
         for trial in range(150):
-            c=[rng.randrange(1,5) for _ in range(64)]
-            f=rng.choice([i for i in range(64) if i//8!=i%8]);c[f]=rng.randrange(10,80)
+            c=[rng.randrange(1,80) for _ in range(64)]
             divisor=rng.choice((2,4,8,16));cap=[rng.randrange(10)*5120 for _ in range(8)]
             allowed=[tuple(k for k in ks if rng.randrange(2)) for ks in ALL]
             p=RelayPlanner(5120,allowed,native_module=self.native,dense_split_divisor=divisor,
                            relay_capacity_bytes=cap).plan(c)
+            original=[c[f] if f//8!=f%8 else 0 for f in range(64)]
+            peak=max(original)
+            feasible=[]
+            # Independent brute-force oracle constructs all changed edges.
+            for f in range(64):
+                excess=max(0,c[f]-sum(c[f//8*8:f//8*8+8])//8)
+                for k in allowed[f]:
+                    x=min(excess//divisor,cap[k]//5120)
+                    if not x: continue
+                    loads=list(original);loads[f]-=x;loads[f//8*8+k]+=x;loads[k*8+f%8]+=x
+                    if max(loads)<=peak: feasible.append(((-excess,max(loads),f,k),x,loads))
+            self.assertEqual(bool(p.actions),bool(feasible))
             self.assertLessEqual(len(p.actions),1)
             if p.actions:
-                s,d,k,x,gain=p.actions[0]
-                burden=max(max(c[k*8+j] if j!=k else 0,c[j*8+k] if j!=k else 0) for j in range(8))
-                self.assertIn(k,allowed[s*8+d])
-                self.assertLessEqual(x,(c[s*8+d]-burden)//divisor)
-                self.assertLessEqual(x*5120,cap[k])
-                self.assertTrue(gain>0)
+                key,x,loads=min(feasible)
+                s,d,k,moved,gain=p.actions[0]
+                self.assertEqual((s*8+d,k,moved),(key[2],key[3],x))
+                self.assertEqual(list(p.link_rows),loads)
+                self.assertEqual(gain,peak-max(loads))
                 self.assertTrue(all(not p.relay_rows[k*8+j] and not p.relay_rows[j*8+k] for j in range(8)))
-                self.assertEqual(sum(p.link_rows),sum(c[i] for i in range(64) if i//8!=i%8)+x)
-                self.assertLess(max(p.link_rows),max(c[i] for i in range(64) if i//8!=i%8))
+                self.assertEqual(sum(p.link_rows),sum(original)+x)
+                self.assertLessEqual(max(p.link_rows),peak)
 
     def test_fast_admission_defaults_and_large_hotspot(self):
         from test_a5_ccu_heuristic_npu import synthetic

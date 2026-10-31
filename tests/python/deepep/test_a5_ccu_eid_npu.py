@@ -32,7 +32,7 @@ def main():
     p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut') + DENSE_CASES, default='single_hot')
     p.add_argument('--planner', choices=('greedy', 'dense_ready'), default='greedy')
-    p.add_argument('--dense-split-divisor', type=int, default=8, help='dense-ready: moved_rows=floor((hot-burden)/divisor), 2..1024')
+    p.add_argument('--dense-split-divisor', type=int, default=8, help='dense-ready: moved_rows=floor((flow-source_row_mean)/divisor), 2..1024')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
     p.add_argument('--dtype', choices=PAYLOAD_DTYPE_NAMES, default='bfloat16')
     p.add_argument('--width', type=int, default=4096)
@@ -99,8 +99,8 @@ def main():
         required_abis.append(('A5CcuEidCompareProbeAbiVersion', 1))
     if args.planner == 'dense_ready':
         required_abis.append(('A5CcuEidReadyRelayAbiVersion', 1))
-        if getattr(native, 'ep8_dense_ready_planner_abi', None) != 1:
-            raise RuntimeError('rebuild/install DeepEP: ep8_dense_ready_planner_abi=1 required')
+        if getattr(native, 'ep8_dense_ready_planner_abi', None) != 2:
+            raise RuntimeError('rebuild/install DeepEP: ep8_dense_ready_planner_abi=2 required')
     for symbol, expected in required_abis:
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
@@ -273,6 +273,7 @@ def main():
                       ready_relay=plan.actions[0][2] if plan.actions and args.planner == 'dense_ready' else None, samples_us=samples,
                       median_us={metric: {mode: statistics.median(values) for mode, values in modes.items()} for metric, modes in samples.items()},
                       workspace={mode: host.stats() for mode, host in hosts.items()})
+        report.update(plan.volume_diagnostics())
         reports.append(report)
         print('EP8_EID_CASE_PASS ' + json.dumps(dict(rank=rank, **report)), flush=True)
     for host in hosts.values(): host.close()

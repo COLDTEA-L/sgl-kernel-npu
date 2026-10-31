@@ -237,35 +237,47 @@ public:
         }
     }
 private:
-    // One delayed relay action. Byte-free arithmetic on token rows; no clock,
-    // bandwidth fitting, search iterations or routing-history assumptions.
+    // One delayed relay action, triggered by excess over the source row mean.
+    // Include self in the /8 mean; physical edge loads exclude self. No time
+    // estimate or helper-card burden predicate. At most 56*6 candidates.
     void MakeDense(Plan& p) const {
         p.exhausted=true;
         if (!maxActions_) return;
-        U peak=0, second=0;size_t hot=0;
-        std::array<U,8> burden{};
+        U peak=0, second=0;
+        std::array<U,8> base{};
         for(size_t f=0;f<64;++f) {
+            base[f/8]+=p.counts[f];
             const U n=p.loads[f];
-            if(n>peak) {second=peak;peak=n;hot=f;} else second=std::max(second,n);
-            burden[f/8]=std::max(burden[f/8],n);burden[f%8]=std::max(burden[f%8],n);
+            if(n>peak) {second=peak;peak=n;} else second=std::max(second,n);
         }
-        // With at most one action, a tied peak cannot lower global peak load.
-        if(peak==second) return;
-        U bestGain=0,bestX=0;size_t bestK=0;
-        for(size_t k=0;k<8;++k) {
-            if(!(masks_[hot]&(1u<<k))) continue;
-            ++p.evaluations;
-            if(peak<=burden[k]) continue;
-            U x=std::min((peak-burden[k])/denseDivisor_,capacity_[k]);
-            U after=std::max({second,peak-x,burden[k]+x});
-            U gain=peak-after;
-            if(x<chunkRows_ || !gain || gain*rowBytes_<minGain_) continue;
-            if(gain>bestGain || (gain==bestGain && x<bestX)) {bestGain=gain;bestX=x;bestK=k;}
+        for(auto& n:base) n/=8;
+        U bestExcess=0,bestAfter=peak,bestX=0;size_t bestF=0,bestK=0;
+        for(size_t f=0;f<64;++f) {
+            if(f/8==f%8 || p.counts[f]<=base[f/8]) continue;
+            const U excess=p.counts[f]-base[f/8];
+            if(bestX && excess<bestExcess) continue;
+            const U requested=excess/denseDivisor_;
+            if(requested<chunkRows_) continue;
+            for(size_t k=0;k<8;++k) {
+                if(!(masks_[f]&(1u<<k))) continue;
+                ++p.evaluations;
+                const U x=std::min(requested,capacity_[k]);
+                const size_t first=f/8*8+k, last=k*8+f%8;
+                // Reject, do not force a split that grows the global peak.
+                // Subtraction before addition also prevents integer overflow.
+                if(x<chunkRows_ || x>peak-p.loads[first] || x>peak-p.loads[last]) continue;
+                const U other=p.loads[f]==peak ? second : peak;
+                const U after=std::max({other,p.loads[f]-x,p.loads[first]+x,p.loads[last]+x});
+                if((peak-after)*rowBytes_<minGain_) continue;
+                if(!bestX || excess>bestExcess || (excess==bestExcess && after<bestAfter)) {
+                    bestExcess=excess;bestAfter=after;bestX=x;bestF=f;bestK=k;
+                }
+            }
         }
         if(!bestX) return;
-        p.relays[hot]=static_cast<int>(bestK);p.moved[hot]=bestX;
-        p.loads[hot]-=bestX;p.loads[hot/8*8+bestK]+=bestX;p.loads[bestK*8+hot%8]+=bestX;
-        p.actions.push_back({hot/8,hot%8,bestK,bestX,bestGain});p.exhausted=false;
+        p.relays[bestF]=static_cast<int>(bestK);p.moved[bestF]=bestX;
+        p.loads[bestF]-=bestX;p.loads[bestF/8*8+bestK]+=bestX;p.loads[bestK*8+bestF%8]+=bestX;
+        p.actions.push_back({bestF/8,bestF%8,bestK,bestX,peak-bestAfter});p.exhausted=false;
     }
     U denseDivisor_=0;
     U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;

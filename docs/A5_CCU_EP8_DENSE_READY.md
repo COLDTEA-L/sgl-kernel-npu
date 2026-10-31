@@ -2,37 +2,68 @@
 
 分支：`feature/a5-ccu-ep8-dense-ready-alltoallv`，基于 `feature/a5-ccu-92-93-alltoall` 的 `121e8f4`。原 2/4 卡接口和 EP8 默认 greedy 策略保留，原分支不修改。
 
-## 1. 算法和边界
+## 1. 按超均值数据量触发（更新版）
 
-新策略 `dense_ready` 的规划、布局和执行入口均在 C++。不估计微秒、不拟合带宽、不做迭代搜索：扫描 64 个 counts，最多检查 6 个组内合法 relay。本版每次通信**全局至多选一条流、一个 relay**，先验证小比例分流和通知开销；不是多热点最优算法。
+本版修改 `71d71e7` 的触发条件，`dense_ready` 名称及 `/2、/4、/8、/16` 参数保持。规划、布局和执行入口均在 C++，不估计时间，不需要轻载卡。每次仍全局最多一条流、一个组内relay，走原CCU READY、不落relay HBM。
 
-排除 self 后，H 为唯一最大流 C[i,j]，S 为其他流的最大值，B[k] 为卡 k 所有跨卡发送和接收流的最大值：
+基准固定采用源rank的行均值（含self，整数向下取整），避免多种基准造成对照歧义：
 
 ```
-x = floor((H - B[k]) / divisor)
-after = max(S, H-x, B[k]+x)
+base[i]   = sum(C[i,0:8]) // 8
+excess    = max(C[i,j] - base[i], 0)       # 仅考虑 i != j
+requested = excess // divisor
+x         = min(requested, relay_capacity_rows[k])
 ```
 
-只考虑拓扑允许且 k!=i,j、B[k]<H 的 relay。x 受容量和最小行数约束；after<H 才接受。选择降幅最大者，平局优先更小 x，再按 rank 固定打破平局。最大流并列时保持直连：本版仅拆一条流，无法降低剩余并列峰值。默认 divisor=8，即原 /2 分流的四分之一，可扫 2/4/8/16，允许范围 2–1024。按行计算再乘 row_bytes，等价于字节公式按整行向下取整。
+对每个合法组内k（k!=i,j），仅改变三条有向物理边：
 
-B[k]+x 是等带宽、独立链路下的流量代理，**不是实际完成时间保证**。端口争用和 READY 开销仍需实测。无 relay 时走自定义 EID direct，不自动回退 native；端到端仍可能比 native 慢。
+```
+L[i,j] -= x
+L[i,k] += x
+L[k,j] += x
+```
 
-### 真实采样与合成用例
+L从C去掉对角线得到。只有 `max(L_after) <= max(L_before)` 才接受；也保留最小分流行数及可选min_gain_bytes约束（默认0，允许峰值持平）。危险候选直接拒绝，不强行分流。没有“helper最大收发必须更小”或“峰值并列立即退出”的条件；最热流不安全时继续考虑其他超均值流。
 
-`observed_dense` 精确使用以下行重复 8 次：
+优先选excess最大的可行流，再选分流后全局峰值更小的候选，再按流索引和relay rank固定打破平局。只做一次候选扫描，最多56×6=336个候选，无反复优化。/8仍是默认值，允许范围2–1024。
+
+这是**物理边累计字节负载**的兜底，不是延迟不变的保证。READY仍等待helper自己的跨卡收发完成：helper不轻时，转发可能启动得很晚。两跳字节增量和通知成本仍可能导致劣化，这正是本次对照实验要验证的。无relay仍走自定义EID direct，不自动回退native。
+
+### observed_dense 的预期结果
+
+以下行重复8次，counts不随 `--row-scale` 改变：
 
 ```
 [3048,3165,3067,3017,3071,3028,3046,3134]
 ```
 
-共 196608 行，FP8 width=5120 时含 self 为 960 MiB，跨卡 840 MiB，单流平均 15 MiB。rank1 的 7 条入链路均为 3165 行，入方向割下界也是 3165，等于直连峰值；所有候选卡 B[k] 也不小于 3165。**预期 executed_relay=false**，不能强行把它当多路径收益用例。该下界解释以等容量独立有向链路为前提。
+共196608行，FP8 width5120时含self为960 MiB，跨卡840 MiB；单流平均15 MiB，而不是3.75 MiB。列和各不相同，rank0为24384，rank1为25320。
 
-| case | 定义 | divisor=8 的预期 |
-|---|---|---|
-| dense_near（合成） | 所有元素3017，仅0→1为3165 | 拓扑允许时分18行：FP8为90 KiB，BF16为180 KiB |
-| dense_hot（合成） | 所有元素3017，仅0→1为4096 | 拓扑允许时分134行 |
+**最热目的rank1不能借道**：它的7条入边均为3165行，任何额外relay写入都会把某条边推到3165以上。要保留峰值不增加的条件，就不可能对它分46行或11行。新策略改选次热目的rank7，base=3072、excess=3134−3072=62。在全部合法候选可用时，固定选择 `0→7 via 2`：
 
-这三个用例的 counts **不随 --row-scale 缩放**。继续保留 `--matrix-json` 真实64元素 counts 输入（packed 行数），不从历史热度推断。
+| divisor | relay_rows | FP8分流量 | excess_rows | 全局峰值前→后（行） |
+|---|---:|---:|---:|---|
+| 2 | 31 | 155 KiB | 62 | 3165→3165 |
+| 4 | 15 | 75 KiB | 62 | 3165→3165 |
+| 8 | 7 | 35 KiB | 62 | 3165→3165 |
+| 16 | 3 | 15 KiB | 62 | 3165→3165 |
+
+例如/2：0→7从3134降至3103；0→2从3067升至3098；2→7从3134升至3165，其他边不变。全局峰值持平。实际EID拓扑可能选中另一个合法helper；若所有安全候选均不可用则回直连，不绕过拓扑。
+
+另外两个合成用例也继续分流（默认/8、拓扑允许）：
+
+| case | 定义 | 新行均值 | excess | relay_rows |
+|---|---|---:|---:|---:|
+| dense_near | 所有元素3017，仅0→1为3165 | 3035 | 130 | 16 |
+| dense_hot | 所有元素3017，仅0→1为4096 | 3151 | 945 | 118 |
+
+这三个用例的counts均不随row-scale缩放。继续保留 `--matrix-json` 真实64元素packed行数输入。
+
+### 可观测字段
+
+每个rank的JSON、CASE_PASS和汇总终端输出保留：`executed_relay`、`relay_rows`、`candidate_evaluations`，新增 `selected_flow`、`base_rows`、`excess_rows`、`edge_peak_rows_before/after/delta`；JSON同时有 `edge_peak_bytes_before/after`。无分流时selected_flow为空、base/excess为0，峰值前后相同；excess指最终选中流，不是被拒绝的最热流。字段在计时区间之外生成，不加入dynamic热路径。
+
+这些描述该用例的multipath计划；native/direct计时不使用其relay。无relay的direct/multipath仍是A/A，native才是目标通信baseline。
 
 ## 2. READY 协议：仍然不落 relay HBM
 
@@ -46,19 +77,20 @@ helper 的“自身完成”指跨卡收发，self-copy 不作为 READY 条件�
 
 复用 direct channel notify slot2：mask1最终完成、mask2发往helper的直连完成、mask4 READY。仍使用14个写完成event，已消费event不重复wait。task args仍46个，slot10在READY模式传helper rank，8代表无relay。只用生产已有EQ/NE，不用历史失败的GE动态mask解码。无relay时跳过READY握手。
 
-## 3. 拉取并重编 route 和 wheel
+## 3. 拉取并重编 wheel（READY route不变）
 
 首次拉取：
 
 ```bash
 cd /home/l00934901/sgl-kernel-npu
 git fetch origin feature/a5-ccu-ep8-dense-ready-alltoallv
-git switch --track origin/feature/a5-ccu-ep8-dense-ready-alltoallv
+git switch feature/a5-ccu-ep8-dense-ready-alltoallv
+git pull --ff-only origin feature/a5-ccu-ep8-dense-ready-alltoallv
 ```
 
-这次**必须重编 route 和 DeepEP wheel**，不能复用 f1859d2 wheel。执行 [9.2/9.3指导文档](A5_CCU_92_93_ALLTOALL.md) §3构建命令和§4 wheel命令；**跳过§3开头切回旧分支的 fetch/switch**，始终留在本新分支。
+已安装71d71e7的READY route时，本次**只需按 [9.2/9.3指导文档](A5_CCU_92_93_ALLTOALL.md) §4重建并安装DeepEP wheel**，route没有改动。仍使用613abc9等更旧route时，先执行该文档§3构建命令，再执行§4；跳过§3切回旧分支的fetch/switch，留在本分支。不能只拉Python脚本而复用旧planner wheel。
 
-新增能力标记：route `A5CcuEidReadyRelayAbiVersion=1`，DeepEP `ep8_dense_ready_planner_abi=1`。测试及host构造检查能力与handle模式，避免新planner误配旧immediate kernel。
+新增能力标记：route `A5CcuEidReadyRelayAbiVersion=1`，DeepEP `ep8_dense_ready_planner_abi=2`（1是71d71e7的轻载策略，测试会拒绝旧wheel）。测试及host构造检查能力与handle模式，避免新planner误配旧immediate kernel。
 
 在目标容器设置（Atlas路径按实际文件调整）：
 
@@ -91,7 +123,7 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh \
   --rounds 1 --iters 10 --dynamic-iters 100 --bidirectional-iters 100
 ```
 
-应有 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`，原7用例加3稠密用例共10个case×8rank。双向验证同host交替FP8/BF16。核对dense_near/dense_hot实际发生relay，observed_dense无relay；拓扑无候选时先处理拓扑，不绕过校验。
+应有 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`，原7用例加3稠密用例共10个case×8rank。双向验证同host交替FP8/BF16。核对observed_dense、dense_near、dense_hot实际发生relay，并核对上述分流行数和峰值；拓扑无候选时先处理拓扑，不绕过校验。
 
 ## 5. 同参数性能对照与分流扫描
 
@@ -138,6 +170,10 @@ counts为本轮全局8×8 packed行数。同host可交替FP8/BF16，WithRowBytes
 关闭契约不变：stream/设备/通信域存活时先host.close，再由handle唯一所有者销毁plan，最后销毁通信域。不要重复销毁共享handle。
 
 ## 7. 开发验证边界
+
+按量触发更新的验证：cam_lyw_92/CANN9.2中12项planner和13项EID回归通过，包含150组随机矩阵与独立穷举oracle对照、热点目的所有入边已满时拒绝分流、observed_dense选次热目的、零/self、容量约束和原greedy行为。真实C++ ATen host对observed矩阵FP8/BF16分流检查通过。完整DeepEP C++扩展编译、`--no-undefined`链接及SDK devlib环境的导入检查通过；新planner ABI=2，四个divisor分别31/15/7/3行、全局峰值均3165。日志在 `/home/liuyuanwen/profiling/a5-ep8-volume-ready/{planner.log,eid.log,extension.log,extension-import.log}`。未跑新机NPU性能，没有硬件收益结论。
+
+以下71d71e7验证为原READY协议记录；按量触发修改的新增检查和编译日志保存在开发机 `/home/liuyuanwen/profiling/a5-ep8-volume-ready`，不把旧规则测试当作新规则验证。
 
 日志在开发机 `/home/liuyuanwen/profiling/a5-ep8-dense-ready`。CANN9.2 route编译、SDK host-test和动态加载通过。生产图离线解释器覆盖immediate/READY的7/14/49通道、重复通知、零流、延迟完成event；实际ATen host检查FP8/BF16交替、字节正确性、保护区；C++ planner检查真实和随机稠密矩阵的拓扑、容量、分流边界。
 

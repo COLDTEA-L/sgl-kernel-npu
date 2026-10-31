@@ -98,4 +98,25 @@ static void Run(bool dense) {
     std::cout<<"EP8_EID_HOST_PASS ranks=8 alternating=100 row_bytes=5120,10240 submissions_per_call=1 relay_hbm_bytes=0 dense="<<dense<<"\n";
 }
 
-int main() { Run(false); Run(true); }
+static void RunObserved() {
+    Batch batch;std::vector<std::vector<U>> allowed(64);
+    for(int s=0;s<8;++s)for(int d=0;d<8;++d)if(s!=d)for(int k=0;k<8;++k)if(k!=s&&k!=d){allowed[s*8+d].push_back(k);batch.allowed[s*8+d]|=1u<<k;}
+    Planner planner=Planner(allowed,17,1,0,56,{}).WithDenseReady(8);
+    const std::array<U,8> row{{3048,3165,3067,3017,3071,3028,3046,3134}};
+    Matrix c{};for(int f=0;f<64;++f)c[f]=row[f%8];
+    std::array<std::shared_ptr<Runtime>,8> runtimes;std::array<std::unique_ptr<EidHost>,8> hosts;
+    for(int r=0;r<8;++r){runtimes[r]=std::make_shared<Runtime>(batch,r);hosts[r]=std::make_unique<EidHost>(planner,r,runtimes[r]);}
+    for(auto type:{at::kFloat8_e4m3fn,at::kBFloat16}) {
+        auto payload=Make(c,type,17,3);
+        for(int r=0;r<8;++r) {
+            auto prepared=hosts[r]->Prepare(c,payload.sends[r]);
+            Require(prepared->plan.actions.size()==1 && prepared->plan.moved[7]==7);
+            Require(prepared->plan.actions[0][4]==0); // equal global peak is allowed
+            hosts[r]->Execute(prepared,payload.sends[r],payload.outputs[r]);
+        }
+        batch.Run();Verify(payload);
+    }
+    for(auto& host:hosts) host->Close();
+    std::cout<<"EP8_EID_OBSERVED_VOLUME_PASS moved_rows=7 peak_rows=3165 fp8_bf16=1\n";
+}
+int main() { Run(false); Run(true); RunObserved(); }

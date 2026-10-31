@@ -198,6 +198,27 @@ int main() {
             (root/'run.log').write_text('EP8_EID_CREATE_RANK_PASS rank=0\n')
             self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode,0)
 
+    def test_volume_diagnostics_summary_and_rank_agreement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'results').mkdir();(root/'plans').mkdir()
+            (root/'exit.status').write_text('0');(root/'plans/topology.json').write_text('{}')
+            (root/'run.log').write_text(''.join(f'EP8_EID_RANK_PASS rank={r}\n' for r in range(8)))
+            report=dict(case='observed_dense',counts=[1]*64,row_bytes=5120,
+                        relay_rows=7,excess_rows=62,base_rows=3072,selected_flow=[0,7],
+                        executed_relay=True,candidate_evaluations=84,
+                        edge_peak_rows_before=3165,edge_peak_rows_after=3165,edge_peak_rows_delta=0,
+                        median_us={'prepared':{'multipath':10.,'native':12.}})
+            for r in range(8):
+                (root/'results'/f'rank{r}.json').write_text(json.dumps(dict(rank=r,
+                    backend='participant_eid_ccu_urma',options={'suite':'benchmark'},reports=[report])))
+            cmd=[sys.executable,str(ROOT/'scripts/summarize_a5_ccu_eid.py'),str(root)]
+            result=subprocess.run(cmd,capture_output=True,text=True,check=True)
+            self.assertIn('excess_rows=62 relay_rows=7 candidate_evaluations=84',result.stdout)
+            self.assertIn('edge_peak_rows=3165->3165 delta=0',result.stdout)
+            path=root/'results/rank7.json';data=json.loads(path.read_text())
+            data['reports'][0]['edge_peak_rows_after']=3166;path.write_text(json.dumps(data))
+            self.assertNotEqual(subprocess.run(cmd,capture_output=True,text=True).returncode,0)
+
     @unittest.skipUnless(shutil.which('g++'), 'g++ required')
     def test_production_ccu_graph(self):
         with tempfile.TemporaryDirectory() as tmp:

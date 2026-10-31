@@ -761,6 +761,6 @@ mask_init未到注册与mask_negative End成功但rc=1，仍不能据缺少PASS�
 
 ## 12. 稠密矩阵与轻载卡 READY 分流（独立新分支）
 
-`feature/a5-ccu-ep8-dense-ready-alltoallv` 新增 C++ `dense_ready` 策略、可调更小分流量与 CCU READY 依赖，仍使用组内 EID/URMA 转发、不落 relay HBM。需要重新构建 route **和** DeepEP wheel。旧默认策略和2/4卡接口保留。
+`feature/a5-ccu-ep8-dense-ready-alltoallv` 新增 C++ `dense_ready` 策略、可调更小分流量与 CCU READY 依赖，仍使用组内 EID/URMA 转发、不落 relay HBM。首次从旧分支升级需构建route和DeepEP wheel；已经安装71d71e7 READY route时，按量触发更新只需重建wheel。旧默认策略和2/4卡接口保留。
 
-完整拉取、构建、注册、10用例正确性和2/4/8/16比例性能扫描见 [EP8稠密READY指导](A5_CCU_EP8_DENSE_READY.md)。真实8行相同的采样预期不分流；不能把该A/A结果当成多路径加速。
+完整拉取、构建、注册、10用例正确性和2/4/8/16比例性能扫描见 [EP8稠密READY指导](A5_CCU_EP8_DENSE_READY.md)。更新版按源rank行均值的超出量分流，允许全局边峰值持平；真实8行相同的采样可借道次热目的卡，小比例分流不代表一定有性能收益。已有71d71e7 READY route不需重编，本次重编wheel并检查dense planner ABI=2。

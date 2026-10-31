@@ -88,6 +88,23 @@ class RoutePlan:
     def uses_relay(self):
         return any(self.relay_rows)
 
+    def volume_diagnostics(self):
+        """Reporting only; never part of the C++ host execution hot path."""
+        before = max((n for f, n in enumerate(self.counts) if f // N != f % N), default=0)
+        after = max(self.link_rows, default=0)
+        base = excess = 0
+        flow = None
+        if self.actions:
+            src, dst = self.actions[0][:2]
+            flow = (src, dst)
+            base = sum(self.counts[src*N:(src+1)*N]) // N
+            excess = max(0, self.counts[src*N+dst] - base)
+        return dict(selected_flow=flow, base_rows=base, excess_rows=excess,
+                    edge_peak_rows_before=before, edge_peak_rows_after=after,
+                    edge_peak_rows_delta=after-before,
+                    edge_peak_bytes_before=before*self.row_bytes,
+                    edge_peak_bytes_after=after*self.row_bytes)
+
     @property
     def fingerprint(self):
         return hashlib.sha256(json.dumps((self.counts, self.row_bytes, self.relay_rank,
@@ -141,8 +158,8 @@ class RelayPlanner:
         if self.dense_split_divisor:
             if not 2 <= self.dense_split_divisor <= 1024:
                 raise ValueError('dense_split_divisor must be 2..1024')
-            if native_module is None or getattr(native_module, 'ep8_dense_ready_planner_abi', None) != 1:
-                raise RuntimeError('dense-ready requires rebuilt C++ planner ep8_dense_ready_planner_abi=1')
+            if native_module is None or getattr(native_module, 'ep8_dense_ready_planner_abi', None) != 2:
+                raise RuntimeError('dense-ready requires rebuilt C++ planner ep8_dense_ready_planner_abi=2')
             self._native = self._native.with_dense_ready(self.dense_split_divisor)
         self.backend = 'native' if self._native is not None else 'python'
 

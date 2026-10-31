@@ -28,6 +28,9 @@ def load(root):
         if result['options'].get('register_stage', 'full') != results[0]['options'].get('register_stage', 'full'): raise ValueError('different registration stages')
         if result['rank'] != r or result['backend'] != 'participant_eid_ccu_urma': raise ValueError('wrong result identity')
         for a, b in zip(result['reports'], results[0]['reports']):
+            for key in ('excess_rows', 'base_rows', 'selected_flow', 'executed_relay', 'candidate_evaluations',
+                        'edge_peak_rows_before', 'edge_peak_rows_after', 'edge_peak_rows_delta'):
+                if a.get(key) != b.get(key): raise ValueError('rank volume diagnostics disagree: '+key)
             if any(a[k] != b[k] for k in ('case', 'counts', 'row_bytes', 'relay_rows', 'median_us')):
                 raise ValueError('rank reports disagree')
         if len(result['reports']) != len(results[0]['reports']): raise ValueError('case count differs')
@@ -68,6 +71,11 @@ def main():
         if 'planner_policy' in report:
             print('planner=' + report['planner_policy'] + ' split_divisor=' + str(report['dense_split_divisor']) +
                   ' relay=' + str(report['ready_relay']) + ' reason=' + report['plan_reason'])
+        if 'excess_rows' in report:
+            print(f"  flow={report['selected_flow']} base_rows={report['base_rows']} excess_rows={report['excess_rows']} "
+                  f"relay_rows={report['relay_rows']} candidate_evaluations={report['candidate_evaluations']} "
+                  f"edge_peak_rows={report['edge_peak_rows_before']}->{report['edge_peak_rows_after']} "
+                  f"delta={report['edge_peak_rows_delta']}")
         for metric, values in report['median_us'].items():
             comparison = baseline['median_us'][metric]
             print(metric + ': ' + ' '.join(f'{mode}={us:.1f}us' for mode, us in values.items()))
