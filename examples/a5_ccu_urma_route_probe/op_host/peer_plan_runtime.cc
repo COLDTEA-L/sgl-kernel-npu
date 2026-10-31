@@ -432,6 +432,7 @@ extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
 extern "C" int A5CcuEidV1CompatAbiVersion() { return 1; }
 extern "C" int A5CcuEidPeerResourceAbiVersion() { return 1; }
 extern "C" int A5CcuEidRegisterProbeAbiVersion() { return 1; }
+extern "C" int A5CcuEidCompareProbeAbiVersion() { return 1; }
 extern "C" uint32_t A5CcuEidDirectControlAbiVersion() { return 1; }
 
 extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,

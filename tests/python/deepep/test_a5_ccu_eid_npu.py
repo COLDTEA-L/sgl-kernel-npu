@@ -11,6 +11,8 @@ import statistics
 import sys
 import time
 
+_last_phase = {}
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, gather_routing_counts
@@ -40,7 +42,7 @@ def main():
     p.add_argument('--allow-no-relay', action='store_true', help='explicit direct-only diagnostic, never a relay PASS')
     p.add_argument('--minimal', action='store_true', help='create only: stop after configuration all_gather; no Buffer or EID plan')
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
-    p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static'), default='full', help='create-only registration graph; mask probes are isolated from production')
+    p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static', 'mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'), default='full', help='create-only registration graph; mask probes are isolated from production')
     args = p.parse_args()
     if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
         p.error('--register-stage probes require --suite create without --minimal')
@@ -80,13 +82,16 @@ def main():
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
-                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1), ('A5CcuEidDirectControlAbiVersion', 1),
+                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1), ('A5CcuEidDirectControlAbiVersion', 1), ('A5CcuEidCompareProbeAbiVersion', 1),
                              ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
         if fn() != expected: raise RuntimeError('rebuild route: ' + symbol)
     rank = int(os.environ['RANK'])
     def phase(name, **fields):
+        _last_phase.clear()
+        _last_phase.update(phase=name, register_stage=args.register_stage)
+        _last_phase.update(fields)
         print('EP8_EID_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
               time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
     phase('startup_resources', custom_channels_acquired=0, custom_plans=0,
@@ -266,5 +271,5 @@ if __name__ == '__main__':
         main()
     except BaseException as error:
         print('EP8_EID_FAILURE ' + json.dumps(dict(rank=os.environ.get('RANK'), pid=os.getpid(),
-            error_type=type(error).__name__, error=str(error))), file=sys.stderr, flush=True)
+            error_type=type(error).__name__, error=str(error), last_phase=_last_phase)), file=sys.stderr, flush=True)
         raise

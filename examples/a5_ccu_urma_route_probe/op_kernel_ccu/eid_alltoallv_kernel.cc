@@ -11,8 +11,9 @@ a5ccu::CcuKernelSignature EidAllToAllVKernelArg::GetKernelSignature() const {
 }
 HcclResult EidAllToAllVKernel::Algorithm() {
     if (channels_.size() != paths_.size() || !ValidateEidChannels(rank_, paths_)) return HCCL_E_PARA;
-    std::fprintf(stderr, "EP8_EID_GRAPH_BUILD rank=%u stage=%s channels=%zu registration_only=%u\n",
-        rank_, EidRegisterStageName(stage_), channels_.size(), !EidStageAllowsPayload(stage_));
+    std::fprintf(stderr, "EP8_EID_GRAPH_BUILD rank=%u stage=%s channels=%zu registration_only=%u graph=%s\n",
+        rank_, EidRegisterStageName(stage_), channels_.size(), !EidStageAllowsPayload(stage_),
+        (stage_ == EidRegisterStage::MASK || stage_ >= EidRegisterStage::MASK_INIT) ? "legacy_mask_probe" : "direct_peer_control");
     if (stage_ == EidRegisterStage::MINIMAL) {
         auto value = CreateVariable(); value = uint64_t{1};
         return HCCL_SUCCESS;
@@ -28,7 +29,7 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     // Public Variable subtraction exists in headers but is unsupported by
     // the V1 instruction generator (repType 11). GeneArgs supplies direct bytes.
     for (size_t j=0;j<7;++j) {for(auto& v:peer[j]) Load(v);}
-    std::fprintf(stderr, "EP8_EID_TASK_LAYOUT rank=%u task_args=46 slots=0:input,1:output,2:input_token,3:output_token,4:self_src,5:self_dst,6-9:self_copy,10:reserved_mask,11-45:seven_peers_x_send_offset_recv_offset_direct_bytes_relay_bytes_relay_rank control=direct_peer\n", rank_);
+    std::fprintf(stderr, "EP8_EID_TASK_LAYOUT rank=%u task_args=46 slots=0:input,1:output,2:input_token,3:output_token,4:self_src,5:self_dst,6-9:self_copy,10:reserved_mask,11-45:seven_peers_x_send_offset_recv_offset_direct_bytes_relay_bytes_relay_rank mask_slot=probe_input_or_production_reserved\n", rank_);
     if (stage_ == EidRegisterStage::ARGS) return HCCL_SUCCESS;
     const size_t n=channels_.size();
     // Legacy mask operations are registration-only probes. Production never
@@ -46,6 +47,12 @@ HcclResult EidAllToAllVKernel::Algorithm() {
             if (stage_ == EidRegisterStage::MASK_NEGATIVE || stage_ == EidRegisterStage::MASK_ADD || stage_ == EidRegisterStage::MASK)
                 negativeBit=uint64_t{0}-bit;
             if (stage_ == EidRegisterStage::MASK_COMPARE) {CCU_IF(active >= bit) {live[i]=uint64_t{1};}}
+            // EQ/NE use the same bit constants and graph size as MASK_COMPARE.
+            // ZERO changes only the GE immediate; SINGLE isolates one GE block.
+            if (stage_ == EidRegisterStage::MASK_EQUAL) {CCU_IF(active == bit) {live[i]=uint64_t{1};}}
+            if (stage_ == EidRegisterStage::MASK_NOT_EQUAL) {CCU_IF(active != bit) {live[i]=uint64_t{1};}}
+            if (stage_ == EidRegisterStage::MASK_COMPARE_ZERO) {CCU_IF(active >= uint64_t{0}) {live[i]=uint64_t{1};}}
+            if (stage_ == EidRegisterStage::MASK_COMPARE_SINGLE && i==0) {CCU_IF(active >= uint64_t{1}) {live[i]=uint64_t{1};}}
             if (stage_ == EidRegisterStage::MASK_ADD) active+=negativeBit;
             if (stage_ == EidRegisterStage::MASK) {CCU_IF(active >= bit) {live[i]=uint64_t{1};active+=negativeBit;}}
         }

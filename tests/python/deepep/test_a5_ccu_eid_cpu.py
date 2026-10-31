@@ -125,6 +125,18 @@ class EidTests(unittest.TestCase):
             self.assertIn('REGISTER_PROBE_ALL_RANKS_AND_EXIT_PASS stage=args',result.stdout)
             self.assertNotIn('EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS',result.stdout)
             self.assertNotEqual(subprocess.run(cmd+['--compare',str(root)],capture_output=True).returncode,0)
+            for stage in ('mask_init', 'mask_negative', 'mask_equal', 'mask_not_equal',
+                          'mask_compare_zero', 'mask_compare_single'):
+                for r in range(8):
+                    path=root/'results'/f'rank{r}.json'
+                    data=json.loads(path.read_text());data['options']['register_stage']=stage
+                    path.write_text(json.dumps(data))
+                checked=subprocess.run(cmd,capture_output=True,text=True,check=True)
+                self.assertIn('REGISTER_PROBE_ALL_RANKS_AND_EXIT_PASS stage='+stage,checked.stdout)
+            # SDK End success cannot override a worker/cleanup failure.
+            (root/'exit.status').write_text('1')
+            self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
+            (root/'exit.status').write_text('0')
             data=json.loads((root/'results/rank3.json').read_text());data['options']['register_stage']='mask'
             (root/'results/rank3.json').write_text(json.dumps(data))
             self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
@@ -199,7 +211,7 @@ int main() {
             result = subprocess.run([binary], capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('EP8_EID_GRAPH_PASS epochs=100 launches=800', result.stdout)
-            self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=14 payload_disabled=13', result.stdout)
+            self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17', result.stdout)
             self.assertIn('EP8_EID_FIXED_CONTROL_PASS masks=202', result.stdout)
             self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 3)
             print(result.stdout.strip())

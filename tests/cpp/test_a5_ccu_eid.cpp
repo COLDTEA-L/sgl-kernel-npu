@@ -73,7 +73,7 @@ static void RegistrationStages() {
     assert(!ParseEidRegisterStage("invalid",&parsed));
     EidAllToAllVLayout layout;
     EidAllToAllVTaskArg task(0,0,0,0,layout);
-    for (unsigned level=0;level<14;++level) {
+    for (unsigned level=0;level<18;++level) {
         auto stage=static_cast<EidRegisterStage>(level);
         assert(ParseEidRegisterStage(EidRegisterStageName(stage),&parsed) && parsed==stage);
         EidAllToAllVKernelArg arg(channels,0,paths,stage);Kernel kernel(arg);
@@ -89,10 +89,15 @@ static void RegistrationStages() {
         assert(remote==(level<5||level>8?0:level==5?7:49));
         assert(local==(level==7||level==8?1:0));assert(waits==(level==8?14:0));
         assert(notify==(level<4||level>8?0:level==8?21:14));
+        if(level>=9) {
+            size_t conditions=0;
+            for(auto& op:kernel.instructions) conditions+=op.op=="if_begin";
+            assert(conditions==(level==11||level==14||level==15||level==16?49:level==17?1:0));
+        }
         assert(EidStageAllowsPayload(stage)==(level==8));
         if(level!=8) assert(kernel.GeneArgs(task).empty());
     }
-    std::cout<<"EP8_EID_REGISTER_STAGES_PASS stages=14 payload_disabled=13\n";
+    std::cout<<"EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17\n";
 }
 static void RunGraph(unsigned relayLimit) {
     std::array<std::unique_ptr<Kernel>,8> kernels;

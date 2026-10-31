@@ -704,3 +704,34 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
 RegisterEnd的公开签名没有detail输出参数。外层可打印任务槽与失败阶段，但无法直接给现场libhcomm.so内部增加阶段日志，也没有证据确认本次失败来自“申报指令数与生成数不一致”的检查。
 
 开发侧验证：`cam_lyw_92` / CANN 9.2.0 的route编译、SDK host test、动态加载及新能力标记检查通过。实际生产C++图的离线解释测试覆盖relay上限0/1/6各100轮×8rank，含零行、非对称收发、每行1/2/257/5120/10240字节及连续更换relay；另校验202种旧mask值不再改变控制通道集合、14个注册阶段的payload隔离及FP8/BF16 host交替。构建及CPU回归日志在开发机 `/home/liuyuanwen/profiling/a5-ep8-direct-control/`。这不是CANN 9.3真机注册或性能结果。
+
+### 11.13 比较探针的解释：mask 不等于 full
+
+613abc9现场：args/static/add注册及退出通过；negative八卡End通过但进程失败；compare与mask八卡End=4；init未到注册。**`--register-stage mask`是故意保留的旧故障探针，生产路径是`full`**。生产仍使用`bytes != 0`、`relay_id == k`的条件块和self-copy条件，不使用mask中的`active >= bit`。不能从mask失败推出613abc9生产路径仍执行旧decoder，也不能从GE失败推出所有EQ/NE都不可用。
+
+首先用现有613abc9按§11.12执行`--suite create --register-stage full`。若已运行，先读该次结果，不必重新跑旧mask。新版本的 `EP8_EID_GRAPH_BUILD` 明确打印 `graph=legacy_mask_probe` 或 `graph=direct_peer_control`。
+
+如果需要继续区分比较类型、常量范围和重复条件块，新增四个仅注册探针。需按§3重编route，出现 `A5CcuEidCompareProbeAbiVersion=1`；wheel不变。其他环境保持§11.12一致。
+
+| stage | 相对mask_compare的改动 | 用途 |
+|---|---|---|
+| mask_equal | 同样的bit常量和块数，仅GE改EQ | 检查相等条件块 |
+| mask_not_equal | 同样的bit常量和块数，仅GE改NE | 检查不等条件块 |
+| mask_compare_zero | 同样块数，GE右侧改为0 | 区分立即数范围因素 |
+| mask_compare_single | 同样变量规模，只生成一个`active >= 1`块 | 区分单块与重复块/规模因素 |
+
+例如：
+
+```bash
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --register-stage mask_equal
+```
+
+按需要单独运行其余探针，保留各自结果。EQ/NE通过不等于真实Write、嵌套条件、完成通知已通过，仍须full create和正确性测试。若单个GE也失败，可进一步提交最小复现给SDK维护者；不要直接替换成V1此前不支持的AND/Sub/shift。
+
+`CCU_IF`不只是数值比较，它还生成跳转、标签和条件块收尾。开发机9.2头文件声明EQ/NE/GE，但声明并不证明现场9.3特定图能翻译；公开参考实现与安装SDK存在差异，不能套用旧源码中仅EQ/NE的限制作为9.3结论。当前未证实SDK内部拒绝的是谓词、标签还是翻译资源。
+
+**两个rc=1需独立处理。** `mask_init`应该走完整注册过程，不是`--minimal`；没有注册记录表示尚不能评价初始化图，需查看最末startup阶段/traceback。`mask_negative`的End=0不表示整个Create或退出已成功：后续还有get_task_args、plan绑定/登记、destroy、退出barrier、通信域销毁和结果汇总。汇总器对所有partial stage使用同一规则，允许reports=[]；不能仅凭rc=1修改成PASS。已扩展离线汇总测试验证init/negative和新增比较探针均可正常汇总，同时非零exit仍必须失败。新的`EP8_EID_FAILURE`包含`last_phase`及register_stage，辅助区分注册前和退出期异常。
+
+无需重跑即可先读取两次异常目录的run.log末尾60行、终端traceback和exit.status。若缺少这些日志，不能认定是summarizer，也不能把End=0抹成注册失败。
+
+本次开发验证：cam_lyw_92的CANN9.2 route编译、SDK host-test和动态加载通过；12项EID CPU测试通过，包含18个注册阶段的payload隔离、各新增条件块数量、7/14/49通道三种图共2400次离线rank执行及init/negative的汇总判定。日志：开发机 `/home/liuyuanwen/profiling/a5-ep8-compare-probes/route.log`、`eid-cpu.log`。没有9.3真机验证结果，本次不改变full生产算法。
