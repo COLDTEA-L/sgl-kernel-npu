@@ -7,7 +7,7 @@ a5ccu::CcuKernelSignature EidAllToAllVKernelArg::GetKernelSignature() const {
     a5ccu::CcuKernelSignature s;
     std::vector<uint32_t> ids;
     for (const auto& p : paths) ids.push_back(p.peer*9+static_cast<uint32_t>(p.relay+1));
-    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V3PeerResources", ids, channels)); s.Append(EidRegisterStageName(stage)); return s;
+    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V4DirectControl", ids, channels)); s.Append(EidRegisterStageName(stage)); return s;
 }
 HcclResult EidAllToAllVKernel::Algorithm() {
     if (channels_.size() != paths_.size() || !ValidateEidChannels(rank_, paths_)) return HCCL_E_PARA;
@@ -28,50 +28,54 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     // Public Variable subtraction exists in headers but is unsupported by
     // the V1 instruction generator (repType 11). GeneArgs supplies direct bytes.
     for (size_t j=0;j<7;++j) {for(auto& v:peer[j]) Load(v);}
+    std::fprintf(stderr, "EP8_EID_TASK_LAYOUT rank=%u task_args=46 slots=0:input,1:output,2:input_token,3:output_token,4:self_src,5:self_dst,6-9:self_copy,10:reserved_mask,11-45:seven_peers_x_send_offset_recv_offset_direct_bytes_relay_bytes_relay_rank control=direct_peer\n", rank_);
     if (stage_ == EidRegisterStage::ARGS) return HCCL_SUCCESS;
     const size_t n=channels_.size();
-    std::vector<a5ccu::CcuRep::Variable> live(n);
-    std::array<a5ccu::CcuRep::Variable,7> remoteOutput, remoteToken;
-    for(size_t j=0;j<7;++j) {remoteOutput[j]=uint64_t{0};remoteToken[j]=uint64_t{0};}
-    // V1 also lacks variable AND. Decode the <=49-bit mask from high to low
-    // using unsigned comparison and modulo-2^64 addition, both V1 primitives.
-    // A host-computed negative constant is not a CCU subtraction instruction.
-    auto negativeBit=CreateVariable();
-    for(size_t end=n;end>0;--end) {
-        const size_t i=end-1;
-        const uint64_t bit=uint64_t{1}<<i;
-        live[i]=uint64_t{0};
-        negativeBit=uint64_t{0}-bit;
-        CCU_IF(active >= bit) { live[i]=uint64_t{1}; active+=negativeBit; }
+    // Legacy mask operations are registration-only probes. Production never
+    // constructs this decoder: CANN 9.3 End rejects the old MASK graph.
+    if (stage_ == EidRegisterStage::MASK || stage_ >= EidRegisterStage::MASK_INIT) {
+        std::vector<a5ccu::CcuRep::Variable> live(n);
+        std::array<a5ccu::CcuRep::Variable,7> probeOutput, probeToken;
+        for(size_t j=0;j<7;++j) {probeOutput[j]=uint64_t{0};probeToken[j]=uint64_t{0};}
+        auto negativeBit=CreateVariable();
+        for(size_t end=n;end>0;--end) {
+            const size_t i=end-1;
+            const uint64_t bit=uint64_t{1}<<i;
+            live[i]=uint64_t{0};
+            if (stage_ == EidRegisterStage::MASK_STATIC) live[i]=uint64_t{1};
+            if (stage_ == EidRegisterStage::MASK_NEGATIVE || stage_ == EidRegisterStage::MASK_ADD || stage_ == EidRegisterStage::MASK)
+                negativeBit=uint64_t{0}-bit;
+            if (stage_ == EidRegisterStage::MASK_COMPARE) {CCU_IF(active >= bit) {live[i]=uint64_t{1};}}
+            if (stage_ == EidRegisterStage::MASK_ADD) active+=negativeBit;
+            if (stage_ == EidRegisterStage::MASK) {CCU_IF(active >= bit) {live[i]=uint64_t{1};active+=negativeBit;}}
+        }
+        return HCCL_SUCCESS;
     }
-    if (stage_ == EidRegisterStage::MASK) return HCCL_SUCCESS;
-    // Borrow without allocating replacement local variables; this phase isolates
-    // channel resource references from notify/wait instructions.
+    // Fixed, reciprocal control plane: one direct channel per peer. Metadata
+    // and completion are independent of the selected data path, including
+    // receive-only/zero-row peers. Slot 10 remains reserved for ABI compatibility.
+    std::array<a5ccu::CcuRep::Variable,7> remoteOutput, remoteToken;
+    std::vector<size_t> control;
     std::vector<a5ccu::CcuRep::Variable> channelOutputs, channelTokens;
-    channelOutputs.reserve(n); channelTokens.reserve(n);
-    for (size_t i=0; i<n; ++i) {
+    control.reserve(7);channelOutputs.reserve(7);channelTokens.reserve(7);
+    for (size_t i=0;i<n;++i) if(paths_[i].relay<0) {
+        control.push_back(i);
         channelOutputs.emplace_back(BorrowChannelVariable(channels_[i],0));
         channelTokens.emplace_back(BorrowChannelVariable(channels_[i],1));
     }
     if (stage_ == EidRegisterStage::CHANNEL_VARS) return HCCL_SUCCESS;
-    for(size_t i=0;i<n;++i) {
-        // Both directions use the union of active paths, including receive-only ranks.
-        CCU_IF(live[i] != 0) {
-            E_CHECK(NotifyRecord(channels_[i],0,0,output,1));
-            E_CHECK(NotifyRecord(channels_[i],1,1,outputToken,1));
-        }
+    for(auto i:control) {
+        E_CHECK(NotifyRecord(channels_[i],0,0,output,1));
+        E_CHECK(NotifyRecord(channels_[i],1,1,outputToken,1));
     }
-    for(size_t i=0;i<n;++i) {
+    for(size_t q=0;q<control.size();++q) {
+        auto i=control[q];
         auto j=paths_[i].peer<rank_?paths_[i].peer:paths_[i].peer-1;
-        const auto& channelOutput=channelOutputs[i];
-        const auto& channelToken=channelTokens[i];
-        CCU_IF(live[i] != 0) {
-            E_CHECK(NotifyWait(channels_[i],0,1)); E_CHECK(NotifyWait(channels_[i],1,1));
-            // All paths to a peer publish the same final recv address/token.
-            // Named const lvalues emit a runtime copy; assigning a temporary
-            // Variable would move/rebind the handle at graph-construction time.
-            remoteOutput[j]=channelOutput; remoteToken[j]=channelToken;
-        }
+        E_CHECK(NotifyWait(channels_[i],0,1));E_CHECK(NotifyWait(channels_[i],1,1));
+        // const lvalue assignments emit runtime copies, not handle rebinding.
+        const auto& channelOutput=channelOutputs[q];
+        const auto& channelToken=channelTokens[q];
+        remoteOutput[j]=channelOutput;remoteToken[j]=channelToken;
     }
     if (stage_ == EidRegisterStage::SYNC) return HCCL_SUCCESS;
     // At most two writes per peer (direct + one selected relay), regardless of
@@ -107,8 +111,8 @@ HcclResult EidAllToAllVKernel::Algorithm() {
         CCU_IF(peer[j][2] != 0) {E_CHECK(WaitEvent(events[j*2]));}
         CCU_IF(peer[j][3] != 0) {E_CHECK(WaitEvent(events[j*2+1]));}
     }
-    for(size_t i=0;i<n;++i) {CCU_IF(live[i] != 0) {E_CHECK(NotifyRecord(channels_[i],2,1));}}
-    for(size_t i=0;i<n;++i) {CCU_IF(live[i] != 0) {E_CHECK(NotifyWait(channels_[i],2,1));}}
+    for(auto i:control) {E_CHECK(NotifyRecord(channels_[i],2,1));}
+    for(auto i:control) {E_CHECK(NotifyWait(channels_[i],2,1));}
     return HCCL_SUCCESS;
 }
 std::vector<uint64_t> EidAllToAllVKernel::GeneArgs(const a5ccu::CcuTaskArg& arg) {

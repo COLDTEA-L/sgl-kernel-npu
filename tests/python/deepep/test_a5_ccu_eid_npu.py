@@ -40,7 +40,7 @@ def main():
     p.add_argument('--allow-no-relay', action='store_true', help='explicit direct-only diagnostic, never a relay PASS')
     p.add_argument('--minimal', action='store_true', help='create only: stop after configuration all_gather; no Buffer or EID plan')
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
-    p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full'), default='full', help='create-only cumulative registration graph; full is production')
+    p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static'), default='full', help='create-only registration graph; mask probes are isolated from production')
     args = p.parse_args()
     if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
         p.error('--register-stage probes require --suite create without --minimal')
@@ -80,7 +80,7 @@ def main():
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
-                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1),
+                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1), ('A5CcuEidDirectControlAbiVersion', 1),
                              ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int

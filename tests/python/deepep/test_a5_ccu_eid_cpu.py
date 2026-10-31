@@ -199,7 +199,9 @@ int main() {
             result = subprocess.run([binary], capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('EP8_EID_GRAPH_PASS epochs=100 launches=800', result.stdout)
-            self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=9 payload_disabled=8', result.stdout)
+            self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=14 payload_disabled=13', result.stdout)
+            self.assertIn('EP8_EID_FIXED_CONTROL_PASS masks=202', result.stdout)
+            self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 3)
             print(result.stdout.strip())
 
     @staticmethod

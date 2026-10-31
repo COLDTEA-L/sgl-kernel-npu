@@ -432,6 +432,8 @@ extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
 extern "C" int A5CcuEidV1CompatAbiVersion() { return 1; }
 extern "C" int A5CcuEidPeerResourceAbiVersion() { return 1; }
 extern "C" int A5CcuEidRegisterProbeAbiVersion() { return 1; }
+extern "C" uint32_t A5CcuEidDirectControlAbiVersion() { return 1; }
+
 extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char* id, const char* manifest, uint64_t* handle) {
     return CreatePeerPlan(comm, stream, id, manifest, 8, handle, true, true);

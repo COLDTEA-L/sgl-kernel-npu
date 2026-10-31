@@ -308,7 +308,7 @@ python3 -m unittest discover -s tests/python/deepep -p 'test_a5_ccu_bidirectiona
 
 与原 2/4 卡一样，以源端通向 relay 的 EID、目的端通向同一个 relay die/plane/net-instance 的 EID 建立端到端 Channel；Channel 的 remote rank 和写入地址仍是最终目的卡。relay 必须是本通信组的其他成员。应用不在 relay 上接收至 HBM、不 pack/unpack、不启动第二跳 AllToAllV。直连前缀与 relay 后缀在一个 CCU kernel 中通过非阻塞 Write 下发，再统一等待完成。
 
-启动时注册一个 communicator/stream 的候选 Channel 和 kernel，每 peer 最多一条 direct 加六条 relay，每 rank 最多 49 条 Channel。动态参数压缩为 46 个 task args：每次只更新 C、relay 选择、偏移和长度；零流、receive-only、两个方向选不同 relay 使用双向 active mask 协议。FP8 dispatch 与 BF16 combine 可复用同一个 host/handle，分别按真实 tensor 的 row_bytes 规划。
+启动时注册一个 communicator/stream 的候选 Channel 和 kernel，每 peer 最多一条 direct 加六条 relay，每 rank 最多 49 条 Channel。动态参数压缩为 46 个 task args：每次只更新 C、relay 选择、偏移和长度；零流、receive-only、两个方向选不同 relay 使用固定直连peer控制握手（§11.12）；数据可走不同relay，生产图不再解码active mask。FP8 dispatch 与 BF16 combine 可复用同一个 host/handle，分别按真实 tensor 的 row_bytes 规划。
 
 候选目录由 rootinfo、Atlas 和实时 hccn EID/端口联合生成；保持每 rank 单 IO die 的约束。缺失、歧义、不同 plane/net-instance/die 的 relay 不纳入候选。不接受手写 TXT，也不以 8 卡 full mesh 推断某条 EID 一定可转发。脚本默认 `--executor eid`；旧 HBM 启动脚本明确使用 `--executor hbm`。
 
@@ -593,6 +593,8 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create
 
 ### 11.11 RegisterEnd=4：逐段注册图，禁止执行诊断内核
 
+> 本节记录截至d6c1caa的旧累积分段。最新实现已移除生产mask解码，执行顺序与新增探针见§11.12。
+
 现场HCCL_BUFFSIZE=64时前置检查通过，relay上限0/1/6均在End失败。这排除了“只有relay通道才触发”的解释，但relay=0仍使用EID图（46参数、掩码解析、通知、GroupCopy等），不能推出所有内核的公共注册过程都失败。资源查询返回0仍不等于配额足够。
 
 本节使用同一个EP组、同样的建链及Start/Register/End封装，只逐步增加注册图内容。每次启动只注册一个阶段，失败后不在同一实例上重试。partial阶段不调用CCU kernel launch，因此只验证注册，绝不表示传输正确或模型可用。
@@ -646,3 +648,59 @@ python3 scripts/summarize_a5_ccu_eid.py \
 现场rank0.json确认 `suite=create, minimal=true, reports=[]`，这符合minimal设计，汇总器并不要求reports非空。实际漏判来自 `EP8_EID_MINIMAL_RANK_PASS rank=7[INFO] ASCENDCL(...)`：严格行尾匹配漏掉rank7，acc34ec允许空白/下一条EP8标记的版本也尚未覆盖紧邻的`[`。现已补上SDK方括号前缀边界，并验证缺rank及rank=70不会被误认成rank7。
 
 本补丁只修改汇总Python、测试与文档。无需重编route/wheel，不用重新跑卡；用更新后的 `scripts/summarize_a5_ccu_eid.py` 重新汇总上述ycYc6U目录即可。新的worker已使用单次os.write输出PASS，不改回多次写入的print/sys.stdout.write。
+
+### 11.12 d6c1caa 现场结果：移除生产图中的动态 mask 解码
+
+现场已确认 `minimal` 和 `args` 的 RegisterEnd 均8/8通过，`mask` 首次8/8返回4。失败范围已缩到该阶段新增的变量初始化、立即数、比较及加法组合；尚未定位SDK内部的具体拒绝条件。后续阶段继承mask，不能据此证明它们单独兼容。资源查询status=0也仅表示查询成功。
+
+两项报告口径修正：create不调用运行期GeneArgs，所以CPU上的 `totalBytes-relayBytes` 不参与本次注册失败。AICPU初始化日志的 `argsSize=8` 是另一个任务的参数大小，与本图46个uint64参数槽无关。HCCL_BUFFSIZE=64在现场恢复了前置通信，仍不据此断言具体驱动分配冲突机制。
+
+**生产路径变更。** 每个peer固定使用一条直连通道交换接收地址/token，并在所有本rank数据写完成后，用这些直连通道完成对端握手。数据仍按每次规划走直连前缀和一个可选EID relay后缀，relay必须是EP8成员，不在relay HBM中转。不解码active mask、不为mask产生负常量/GE/加法，不按49条路径逐一交换控制信息。控制通道固定7条；数据通道仍最多49条。零行和仅接收rank也参加固定握手，保证双方通知匹配。
+
+kernel与通道仍只初始化一次；每次传入新的偏移、长度和relay编号。46参数槽保持不变，第10槽仍加载但生产图忽略，旧wheel无需重打。新增日志 `EP8_EID_TASK_LAYOUT` 列出全部槽位。新route能力标记为 `A5CcuEidDirectControlAbiVersion=1`，测试与构建脚本必须检查到它。2/4卡实现不涉及本次修改。
+
+这是移除已知失败构图的实现调整，不是已经证明9.3设备修复。固定7peer握手可能增加全零/稀疏负载控制成本；CPU图测试无法验证真实EID链路、硬件顺序、SDK翻译或性能。
+
+**新机执行顺序：**
+
+1. 拉取后按§3重新编译、安装route，确认BUILD/LOAD PASS和上述新标记；不用重打原wheel。不要只更新Python而仍加载旧route。
+2. 沿用§11.2已配置的rootinfo、Atlas和CANN路径，再设置：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+export HCCL_BUFFSIZE=64 A5_CCU_RESOURCE_DIAGNOSTICS=0
+export A5_EID_LOG_LEVEL=0 A5_EID_LOG_STDOUT=1
+export A5_EID_MAX_RELAYS_PER_PEER=0
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --register-stage full
+```
+
+若失败，保持relay=0，分别跑 `channel_vars → sync → direct → self → full`，在首个失败处停止并保留前后日志。**当前生产阶段不再包含mask**，不沿用§11.11旧版 `args → mask → channel_vars` 的累积含义。成功后再把relay上限改为1、6，各执行一次full create。
+
+3. relay=6的full create通过后，执行正确性及连续调用；本段命令显式保留64MB，避免correctness默认值改变前置条件：
+
+```bash
+export A5_EID_MAX_RELAYS_PER_PEER=6
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
+  --dtype float8_e4m3fn --width 5120
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
+  --dtype bfloat16 --width 5120
+```
+
+需看到 `EP8_EID_ALL_RANKS_AND_EXIT_PASS` 才继续§11的双向、长跑及性能测试；create PASS不表示传输正确。结果统一位于 `/home/l00934901/profiling`。
+
+**可选：继续定位旧mask拒绝条件。** 以下阶段只注册、不允许payload执行。它们各自从相同46参数加载开始，互为独立对照；不是必须全部通过才能用新生产路径。
+
+| stage | 注册图内容 |
+|---|---|
+| mask_init | 原mask变量规模，peer变量与live置0；不比较、不赋负常量、不相加 |
+| mask_static | 与init相同，额外把live赋为常量1 |
+| mask_negative | 与init相同，增加逐位 `0-bit` 负常量赋值；常量在host计算 |
+| mask_compare | 与init相同，仅 `active >= bit` 条件下把live置1，不修改active |
+| mask_add | 与init相同，负常量赋值后无条件相加，不做比较 |
+| mask | 原完整decoder：负常量、比较、条件加法组合；预期可复现旧故障 |
+
+例如保持其他环境相同，单独执行 `bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --register-stage mask_compare`。不能把这些probe当作可执行数据内核；不引入V1已不支持的减法/位移表达式。若单项都通过而组合失败，仍需SDK侧查看组合翻译、资源需求及生成指令，不能仅从外层4认定申报数不一致。
+
+RegisterEnd的公开签名没有detail输出参数。外层可打印任务槽与失败阶段，但无法直接给现场libhcomm.so内部增加阶段日志，也没有证据确认本次失败来自“申报指令数与生成数不一致”的检查。
+
+开发侧验证：`cam_lyw_92` / CANN 9.2.0 的route编译、SDK host test、动态加载及新能力标记检查通过。实际生产C++图的离线解释测试覆盖relay上限0/1/6各100轮×8rank，含零行、非对称收发、每行1/2/257/5120/10240字节及连续更换relay；另校验202种旧mask值不再改变控制通道集合、14个注册阶段的payload隔离及FP8/BF16 host交替。构建及CPU回归日志在开发机 `/home/liuyuanwen/profiling/a5-ep8-direct-control/`。这不是CANN 9.3真机注册或性能结果。
