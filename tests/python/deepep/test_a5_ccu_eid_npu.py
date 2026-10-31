@@ -81,9 +81,17 @@ def main():
     if getattr(native, 'ep8_eid_host_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
-    for symbol, expected in (('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
-                             ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1), ('A5CcuEidDirectControlAbiVersion', 1), ('A5CcuEidCompareProbeAbiVersion', 1),
-                             ('A5CcuPublicApiAbiVersion', 1), ('A5CcuEp8DfxAbiVersion', 2)):
+    required_abis = [
+        ('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
+        ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1),
+        ('A5CcuEidDirectControlAbiVersion', 1), ('A5CcuPublicApiAbiVersion', 1),
+        ('A5CcuEp8DfxAbiVersion', 2),
+    ]
+    # Existing direct-control routes can run full/correctness unchanged. Only
+    # the new comparison probes require their additional capability marker.
+    if args.register_stage in ('mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'):
+        required_abis.append(('A5CcuEidCompareProbeAbiVersion', 1))
+    for symbol, expected in required_abis:
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
         if fn() != expected: raise RuntimeError('rebuild route: ' + symbol)
@@ -243,8 +251,9 @@ def main():
                     torch.npu.synchronize()
                     elapsed = (time.perf_counter()-start)*1e6/iterations
                     check(mode, round_id)
-                    # Slowest participant, outside measured interval.
-                    value = torch.tensor([elapsed], dtype=torch.float64, device='npu')
+                    # Slowest participant, outside measured interval. HCCL rejects
+                    # FP64; FP32 is sufficient for microsecond timing samples.
+                    value = torch.tensor([elapsed], dtype=torch.float32, device='npu')
                     dist.all_reduce(value, op=dist.ReduceOp.MAX)
                     samples[metric][mode].append(value.item())
                     phase('measure_complete', case=case, metric=metric, mode=mode, round=round_id)

@@ -735,3 +735,26 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --register-stage mask_eq
 无需重跑即可先读取两次异常目录的run.log末尾60行、终端traceback和exit.status。若缺少这些日志，不能认定是summarizer，也不能把End=0抹成注册失败。
 
 本次开发验证：cam_lyw_92的CANN9.2 route编译、SDK host-test和动态加载通过；12项EID CPU测试通过，包含18个注册阶段的payload隔离、各新增条件块数量、7/14/49通道三种图共2400次离线rank执行及init/negative的汇总判定。日志：开发机 `/home/liuyuanwen/profiling/a5-ep8-compare-probes/route.log`、`eid-cpu.log`。没有9.3真机验证结果，本次不改变full生产算法。
+
+### 11.14 full注册已通过；修复测量阶段FP64归约
+
+现场613abc9的full复测已出现 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`：八卡Register/End及退出通过。这确认生产路径移除mask decoder的改动生效，不等于“生产不再有比较”：数据长度NE和relay编号EQ条件仍存在。旧mask/GE探针失败不能替代full结果。
+
+正确性测试随后报 `HCCL allreduce: Unsupported data type at::kDouble`。已定位到EID测试的最慢rank耗时归约：把host测得的微秒值创建成NPU FP64张量，再执行all_reduce(MAX)。现改为FP32；计时、校验、归约先后顺序及MAX口径不变，归约仍在测量区间之外。FP8/BF16 payload与算子C++代码均不变。同目录A5测试扫描未发现其他FP64统计归约；multidtype meta中的FP64是拒绝非法输入的负向测试，保留。
+
+**本修复只需更新Python，不需重编route或wheel。** 测试仍要求613abc9已有的 `A5CcuEidDirectControlAbiVersion=1`；c015f22新增的 `A5CcuEidCompareProbeAbiVersion=1` 现在只在四个新增比较探针运行时检查，full/create/correctness可继续用已装的613abc9 route。若要跑新比较探针，再按§3重编。
+
+更新后沿用§11.2的CANN、rootinfo、Atlas配置，从本次失败的正确性命令重跑即可，不必重复旧mask扫描：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+export HCCL_BUFFSIZE=64
+export A5_EID_MAX_RELAYS_PER_PEER=6
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
+  --dtype float8_e4m3fn --width 5120 --row-scale 1 --rounds 1 \
+  --iters 10 --dynamic-iters 100 --bidirectional-iters 100
+```
+
+结果仍写入 `/home/l00934901/profiling`。部分rank的 `EP8_EID_BIDIRECTIONAL_PASS` 与 `measure_begin` 是阶段进展；需最终 `EP8_EID_ALL_RANKS_AND_EXIT_PASS` 才能宣告本轮完整验证通过。若再失败，保留首个 `EP8_EID_FAILURE`（含last_phase）及traceback。
+
+mask_init未到注册与mask_negative End成功但rc=1，仍不能据缺少PASS判定为汇总器假阴性：mask_init应注册kernel，只有`--minimal`才不注册。现有partial专用PASS允许reports为空，但必须等正常清理完成才能写出；不新增跳过失败的PASS出口。它们的退出原因仍待失败目录的原始日志。
