@@ -55,6 +55,8 @@ def main():
         if other['options']['suite'] == 'create': raise ValueError('create/probe cannot be a performance baseline')
         for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters'):
             if result['options'][key] != other['options'][key]: raise ValueError('different measurement option: '+key)
+        for key, default in (('planner', 'greedy'), ('dense_split_divisor', 8)):
+            if result['options'].get(key, default) != other['options'].get(key, default): raise ValueError('different planning option: '+key)
         for key in ('devices', 'allowed_relays', 'links', 'relay_routes'):
             if topology[key] != other_topology[key]: raise ValueError('different topology: '+key)
         if len(result['reports']) != len(other['reports']): raise ValueError('different case lists')
@@ -63,6 +65,9 @@ def main():
         for key in ('case', 'counts', 'row_bytes'):
             if report[key] != baseline[key]: raise ValueError('different payload: '+key)
         print(f"case={report['case']} row_bytes={report['row_bytes']} executed_relay={report['executed_relay']}")
+        if 'planner_policy' in report:
+            print('planner=' + report['planner_policy'] + ' split_divisor=' + str(report['dense_split_divisor']) +
+                  ' relay=' + str(report['ready_relay']) + ' reason=' + report['plan_reason'])
         for metric, values in report['median_us'].items():
             comparison = baseline['median_us'][metric]
             print(metric + ': ' + ' '.join(f'{mode}={us:.1f}us' for mode, us in values.items()))

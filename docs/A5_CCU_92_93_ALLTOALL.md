@@ -758,3 +758,9 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
 结果仍写入 `/home/l00934901/profiling`。部分rank的 `EP8_EID_BIDIRECTIONAL_PASS` 与 `measure_begin` 是阶段进展；需最终 `EP8_EID_ALL_RANKS_AND_EXIT_PASS` 才能宣告本轮完整验证通过。若再失败，保留首个 `EP8_EID_FAILURE`（含last_phase）及traceback。
 
 mask_init未到注册与mask_negative End成功但rc=1，仍不能据缺少PASS判定为汇总器假阴性：mask_init应注册kernel，只有`--minimal`才不注册。现有partial专用PASS允许reports为空，但必须等正常清理完成才能写出；不新增跳过失败的PASS出口。它们的退出原因仍待失败目录的原始日志。
+
+## 12. 稠密矩阵与轻载卡 READY 分流（独立新分支）
+
+`feature/a5-ccu-ep8-dense-ready-alltoallv` 新增 C++ `dense_ready` 策略、可调更小分流量与 CCU READY 依赖，仍使用组内 EID/URMA 转发、不落 relay HBM。需要重新构建 route **和** DeepEP wheel。旧默认策略和2/4卡接口保留。
+
+完整拉取、构建、注册、10用例正确性和2/4/8/16比例性能扫描见 [EP8稠密READY指导](A5_CCU_EP8_DENSE_READY.md)。真实8行相同的采样预期不分流；不能把该A/A结果当成多路径加速。

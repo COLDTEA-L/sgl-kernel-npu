@@ -58,6 +58,45 @@ class NativePlannerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
+    def test_dense_observed_cut_and_smaller_split(self):
+        from a5_ccu_dense_cases import dense_counts
+        for divisor in (2,4,8,16):
+            planner=RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=divisor)
+            observed=planner.plan(dense_counts('observed_dense'))
+            self.assertEqual(sum(observed.counts),196608)
+            self.assertFalse(observed.uses_relay)  # identical columns saturate receiver cut
+            self.assertEqual(observed.candidate_evaluations,0)
+            near=planner.plan(dense_counts('dense_near'))
+            self.assertEqual(len(near.actions),1)
+            self.assertEqual(near.actions[0][:2],(0,1))
+            self.assertEqual(sum(near.relay_rows),(3165-3017)//divisor)
+            self.assertLess(max(near.link_rows),max(near.counts))
+            self.assertLessEqual(near.candidate_evaluations,6)
+        for bad in (1,1025):
+            with self.assertRaises(ValueError): RelayPlanner(5120,ALL,native_module=self.native,dense_split_divisor=bad)
+        with self.assertRaises(RuntimeError): RelayPlanner(5120,ALL,dense_split_divisor=8)
+
+    def test_dense_randomized_bounds_and_capacity(self):
+        rng=random.Random(412)
+        for trial in range(150):
+            c=[rng.randrange(1,5) for _ in range(64)]
+            f=rng.choice([i for i in range(64) if i//8!=i%8]);c[f]=rng.randrange(10,80)
+            divisor=rng.choice((2,4,8,16));cap=[rng.randrange(10)*5120 for _ in range(8)]
+            allowed=[tuple(k for k in ks if rng.randrange(2)) for ks in ALL]
+            p=RelayPlanner(5120,allowed,native_module=self.native,dense_split_divisor=divisor,
+                           relay_capacity_bytes=cap).plan(c)
+            self.assertLessEqual(len(p.actions),1)
+            if p.actions:
+                s,d,k,x,gain=p.actions[0]
+                burden=max(max(c[k*8+j] if j!=k else 0,c[j*8+k] if j!=k else 0) for j in range(8))
+                self.assertIn(k,allowed[s*8+d])
+                self.assertLessEqual(x,(c[s*8+d]-burden)//divisor)
+                self.assertLessEqual(x*5120,cap[k])
+                self.assertTrue(gain>0)
+                self.assertTrue(all(not p.relay_rows[k*8+j] and not p.relay_rows[j*8+k] for j in range(8)))
+                self.assertEqual(sum(p.link_rows),sum(c[i] for i in range(64) if i//8!=i%8)+x)
+                self.assertLess(max(p.link_rows),max(c[i] for i in range(64) if i//8!=i%8))
+
     def test_fast_admission_defaults_and_large_hotspot(self):
         from test_a5_ccu_heuristic_npu import synthetic
         planner = FastRelayPlanner(8192, ALL, native_module=self.native)

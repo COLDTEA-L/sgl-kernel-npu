@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, gather_routing_counts
 from test_a5_ccu_heuristic_npu import synthetic
+from a5_ccu_dense_cases import DENSE_CASES, dense_counts
 from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, full_payload,
     cat_payload, byte_payload_view, copy_payload_, fill_payload_, equal_payload,
     guards_intact, shifted_payload, clone_payload)
@@ -29,7 +30,9 @@ def main():
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--matrix-json', type=Path)
     p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
-    p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
+    p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut') + DENSE_CASES, default='single_hot')
+    p.add_argument('--planner', choices=('greedy', 'dense_ready'), default='greedy')
+    p.add_argument('--dense-split-divisor', type=int, default=8, help='dense-ready: moved_rows=floor((hot-burden)/divisor), 2..1024')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
     p.add_argument('--dtype', choices=PAYLOAD_DTYPE_NAMES, default='bfloat16')
     p.add_argument('--width', type=int, default=4096)
@@ -44,6 +47,9 @@ def main():
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
     p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static', 'mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'), default='full', help='create-only registration graph; mask probes are isolated from production')
     args = p.parse_args()
+    if not 2 <= args.dense_split_divisor <= 1024:
+        p.error('--dense-split-divisor must be 2..1024')
+    os.environ['A5_EID_RELAY_SCHEDULE'] = 'ready' if args.planner == 'dense_ready' else 'immediate'
     if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
         p.error('--register-stage probes require --suite create without --minimal')
     os.environ['A5_EID_REGISTER_STAGE'] = args.register_stage
@@ -68,8 +74,8 @@ def main():
             raise ValueError('matrix physical-device order mismatch')
         cases = [('external', normalize_counts(data['counts']))]
     else:
-        names = ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut') if args.suite == 'correctness' else (args.case,)
-        cases = [(name, synthetic(name, args.row_scale)) for name in names]
+        names = ('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut') + (DENSE_CASES if args.planner == 'dense_ready' else ()) if args.suite == 'correctness' else (args.case,)
+        cases = [(name, dense_counts(name) if name in DENSE_CASES else synthetic(name, args.row_scale)) for name in names]
     os.environ['A5_CCU_EP8_THREAD_BRIDGE'] = 'event'
     from a5_ccu_test_runtime import prepare_runtime, import_deep_ep, ccu_pg_kwargs
     extension, route_path = prepare_runtime(__file__)
@@ -91,6 +97,10 @@ def main():
     # the new comparison probes require their additional capability marker.
     if args.register_stage in ('mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'):
         required_abis.append(('A5CcuEidCompareProbeAbiVersion', 1))
+    if args.planner == 'dense_ready':
+        required_abis.append(('A5CcuEidReadyRelayAbiVersion', 1))
+        if getattr(native, 'ep8_dense_ready_planner_abi', None) != 1:
+            raise RuntimeError('rebuild/install DeepEP: ep8_dense_ready_planner_abi=1 required')
     for symbol, expected in required_abis:
         if not hasattr(route, symbol): raise RuntimeError('rebuild/install route: missing ' + symbol)
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
@@ -171,7 +181,7 @@ def main():
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
     # Same registered channels/kernel for direct and multipath; only policy differs.
     planners = {mode: RelayPlanner(row_bytes, allowed, max_actions=0 if mode == 'direct' else 56,
-                                   native_module=native) for mode in ('direct', 'multipath')}
+                                   native_module=native, dense_split_divisor=args.dense_split_divisor if args.planner == 'dense_ready' else 0) for mode in ('direct', 'multipath')}
     hosts = {mode: native.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
              for mode, planner in planners.items()}
     def native_transfer(send, recv, sends, recvs):
@@ -258,7 +268,9 @@ def main():
                     samples[metric][mode].append(value.item())
                     phase('measure_complete', case=case, metric=metric, mode=mode, round=round_id)
         report = dict(case=case, row_bytes=row_bytes, counts=counts, relay_rows=sum(plan.relay_rows),
-                      executed_relay=plan.uses_relay, samples_us=samples,
+                      executed_relay=plan.uses_relay, planner_policy=args.planner, dense_split_divisor=args.dense_split_divisor,
+                      plan_reason=plan.stop_reason, candidate_evaluations=plan.candidate_evaluations,
+                      ready_relay=plan.actions[0][2] if plan.actions and args.planner == 'dense_ready' else None, samples_us=samples,
                       median_us={metric: {mode: statistics.median(values) for mode, values in modes.items()} for metric, modes in samples.items()},
                       workspace={mode: host.stats() for mode, host in hosts.items()})
         reports.append(report)

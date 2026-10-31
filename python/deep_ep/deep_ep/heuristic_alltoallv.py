@@ -117,7 +117,7 @@ class RelayPlanner:
     This object owns only static topology/options, no counts or plan cache.
     """
     def __init__(self, row_bytes, allowed_relays, *, min_chunk_bytes=1, min_gain_bytes=0,
-                 max_actions=56, relay_capacity_bytes=None, native_module=None):
+                 max_actions=56, relay_capacity_bytes=None, native_module=None, dense_split_divisor=0):
         self.row_bytes = _uint(row_bytes, 'row_bytes', 1)
         self.relays = normalize_relays(allowed_relays)
         self.options = dict(min_chunk_bytes=_uint(min_chunk_bytes, 'min_chunk_bytes', 1),
@@ -137,6 +137,13 @@ class RelayPlanner:
             self._native = native_module.Ep8RelayPlanner(
                 self.relays, self.row_bytes, min_chunk_bytes, min_gain_bytes, max_actions,
                 () if relay_capacity_bytes is None else relay_capacity_bytes)
+        self.dense_split_divisor = _uint(dense_split_divisor, 'dense_split_divisor')
+        if self.dense_split_divisor:
+            if not 2 <= self.dense_split_divisor <= 1024:
+                raise ValueError('dense_split_divisor must be 2..1024')
+            if native_module is None or getattr(native_module, 'ep8_dense_ready_planner_abi', None) != 1:
+                raise RuntimeError('dense-ready requires rebuilt C++ planner ep8_dense_ready_planner_abi=1')
+            self._native = self._native.with_dense_ready(self.dense_split_divisor)
         self.backend = 'native' if self._native is not None else 'python'
 
     def plan(self, counts):

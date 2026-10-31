@@ -938,6 +938,12 @@ void SubmitEidTransfer(const at::Tensor& send,const at::Tensor& recv,int64_t han
     if(status!=HCCL_SUCCESS) std::fprintf(stderr,"EP8_EID_EXECUTE_FAILED rank=%ld handle=%ld status=%d row_bytes=%lu\n",rank,handle,int(status),rowBytes);
     HCCL_CHECK(status); // evaluate once; never retry a partially submitted operation
 }
+void RequireReadyEidPlan(int64_t handle) {
+    using Check=HcclResult(*)(uint64_t);
+    static auto check=reinterpret_cast<Check>(PeerPlanSymbol("HcclCcuUrmaEidReadyPlanCheck"));
+    auto status=check(handle);
+    TORCH_CHECK(status==HCCL_SUCCESS,"dense-ready planner requires a full EID plan created with A5_EID_RELAY_SCHEDULE=ready; status=",int(status));
+}
 void SynchronizeEidPlan(int64_t handle) {
     using Sync=HcclResult(*)(uint64_t);
     static auto sync=reinterpret_cast<Sync>(PeerPlanSymbol("HcclCcuUrmaPeerPlanSynchronize"));

@@ -26,7 +26,7 @@ struct PeerPreparedPlan {
     HcclComm comm = nullptr;
     int32_t device = -1;
     uint32_t rankSize = 0;
-    bool allToAllV = false, eidAllToAllV = false;
+    bool allToAllV = false, eidAllToAllV = false, eidReady = false;
     EidRegisterStage eidStage = EidRegisterStage::FULL;
     std::shared_ptr<Ep8Dfx> dfx;
     std::string id, content;
@@ -128,7 +128,7 @@ HcclResult Bind(uint64_t handle, HcclComm comm, aclrtStream stream)
         snapshot = found->second;
     }
     PeerPlanResources resources;
-    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV, snapshot.eidAllToAllV, snapshot.eidStage);
+    const auto status = GetPeerPlanResources(snapshot.comm, stream, snapshot.specs, &resources, snapshot.syncMode, snapshot.allToAllV, snapshot.eidAllToAllV, snapshot.eidStage, snapshot.eidReady);
     if (status != HCCL_SUCCESS) return status;
     std::shared_ptr<ThreadEventBridge> bridge;
     if (snapshot.allToAllV) {
@@ -181,6 +181,11 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
         (plan.rankSize != 2 && plan.rankSize != 4)) return HCCL_E_PARA;
     plan.allToAllV = allToAllV; plan.eidAllToAllV = eidAllToAllV;
     if (eidAllToAllV && !ReadEidRegisterStage(&plan.eidStage)) return HCCL_E_PARA;
+    if (eidAllToAllV) {
+        const char* schedule=std::getenv("A5_EID_RELAY_SCHEDULE");
+        if(schedule && *schedule && std::strcmp(schedule,"immediate") && std::strcmp(schedule,"ready")) return HCCL_E_PARA;
+        plan.eidReady=schedule && std::strcmp(schedule,"ready")==0;
+    }
     plan.comm = comm; plan.id = planId; plan.availableCards = availableCards;
     const auto status = Load(manifest, plan.rankSize, availableCards, &plan.specs, &plan.content, eidAllToAllV);
     if (status != HCCL_SUCCESS) return status;
@@ -192,7 +197,7 @@ static HcclResult CreatePeerPlan(HcclComm comm, aclrtStream stream,
             const auto &p = entry.second;
             if (p.comm == comm && p.id == plan.id) {
                 if (p.content != plan.content || p.device != plan.device || p.availableCards != availableCards ||
-                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV || p.eidAllToAllV != plan.eidAllToAllV || p.eidStage != plan.eidStage)
+                    p.syncMode != plan.syncMode || p.allToAllV != plan.allToAllV || p.eidAllToAllV != plan.eidAllToAllV || p.eidStage != plan.eidStage || p.eidReady != plan.eidReady)
                     return HCCL_E_PARA;
                 id = entry.first;
                 break;
@@ -319,6 +324,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
     std::shared_ptr<ThreadEventBridge> bridge;
     std::shared_ptr<Ep8Dfx> dfx;
     HcclComm owner;
+    bool eidReady=false;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         const auto found = plans.find(handle);
@@ -330,7 +336,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
             aclrtGetDevice(&device) != ACL_SUCCESS || device != found->second.device) return checkedStatus(HCCL_E_PARA, "validate_plan_device_layout");
         const auto bound = found->second.streams.find(reinterpret_cast<uintptr_t>(stream));
         if (bound == found->second.streams.end()) return checkedStatus(HCCL_E_NOT_FOUND, "lookup_plan_or_stream");
-        resources = bound->second; owner = found->second.comm;
+        resources = bound->second; owner = found->second.comm; eidReady=found->second.eidReady;
         dfx = found->second.dfx;
         const auto bridgeFound = found->second.bridges.find(reinterpret_cast<uintptr_t>(stream));
         if (bridgeFound != found->second.bridges.end()) bridge = bridgeFound->second;
@@ -342,6 +348,7 @@ static HcclResult ExecuteAllToAllV(void *send, void *recv,
     if (relays) {
         validLayout = !storageCounts && BuildEidAllToAllVLayout(rank, counts, count, rowBytes, relays, moved,
                           resources.eidAllowed, resources.eidChannels, &eidLayout);
+        if (validLayout && eidReady && eidLayout.readyRelay>8) return checkedStatus(HCCL_E_PARA, "ready_requires_at_most_one_relay_flow");
         if (validLayout) layout = eidLayout;
     } else validLayout = BuildAllToAllVLayoutWithStorage(rank, counts, count, rowBytes, resources.peers,
                                                         storageCounts, storageCount, &layout);
@@ -432,9 +439,18 @@ extern "C" int A5CcuEidAllToAllVAbiVersion() { return 1; }
 extern "C" int A5CcuEidV1CompatAbiVersion() { return 1; }
 extern "C" int A5CcuEidPeerResourceAbiVersion() { return 1; }
 extern "C" int A5CcuEidRegisterProbeAbiVersion() { return 1; }
+extern "C" int A5CcuEidReadyRelayAbiVersion() { return 1; }
 extern "C" int A5CcuEidCompareProbeAbiVersion() { return 1; }
 extern "C" uint32_t A5CcuEidDirectControlAbiVersion() { return 1; }
 
+extern "C" HcclResult HcclCcuUrmaEidReadyPlanCheck(uint64_t handle) {
+    std::lock_guard<std::mutex> lock(registryMutex);
+    auto found=plans.find(handle);if(found==plans.end()) return HCCL_E_NOT_FOUND;
+    int32_t device=-1;
+    if(aclrtGetDevice(&device)!=ACL_SUCCESS || device!=found->second.device ||
+       !found->second.eidAllToAllV || !found->second.eidReady || !EidStageAllowsPayload(found->second.eidStage)) return HCCL_E_PARA;
+    return HCCL_SUCCESS;
+}
 extern "C" HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
     const char* id, const char* manifest, uint64_t* handle) {
     return CreatePeerPlan(comm, stream, id, manifest, 8, handle, true, true);

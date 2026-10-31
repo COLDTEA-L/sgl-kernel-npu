@@ -54,7 +54,7 @@ struct PeerPlanResources {
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources,
     ChannelSyncMode syncMode = ChannelSyncMode::BASELINE, bool allToAllV = false, bool eidAllToAllV = false,
-    EidRegisterStage eidStage = EidRegisterStage::FULL);
+    EidRegisterStage eidStage = EidRegisterStage::FULL, bool eidReady = false);
 
 // Normalized two-rank control-plane request used by the production-facing
 // explicit multipath API.  The discovered route is always channel 0 and the

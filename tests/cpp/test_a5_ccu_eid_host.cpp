@@ -68,10 +68,12 @@ static Payload Make(const Matrix& c, at::ScalarType type, int width, int epoch) 
 static Matrix Transpose(const Matrix& c) { Matrix t{}; for (int s=0;s<8;++s) for(int d=0;d<8;++d) t[d*8+s]=c[s*8+d]; return t; }
 static void Verify(const Payload& p) { for (int r=0;r<8;++r) Require(at::equal(p.stores[r],p.expected[r])); }
 
-int main() {
+static void Run(bool dense) {
     Batch batch;std::vector<std::vector<U>> allowed(64);
     for(int s=0;s<8;++s)for(int d=0;d<8;++d)if(s!=d)for(int k=0;k<8;++k)if(k!=s&&k!=d){allowed[s*8+d].push_back(k);batch.allowed[s*8+d]|=1u<<k;}
     Planner planner(allowed,5120,1,0,56,{});
+    if(dense) planner=planner.WithDenseReady(8);
+    Require(planner.WithRowBytes(10240).DenseDivisor()==(dense?8:0));
     std::array<std::shared_ptr<Runtime>,8> runtimes;std::array<std::unique_ptr<EidHost>,8> hosts;
     Matrix c{};c[4]=65;c[0]=3;
     auto warm=Make(c,at::kFloat8_e4m3fn,5120,0),rev=Make(Transpose(c),at::kBFloat16,5120,0);
@@ -93,5 +95,7 @@ int main() {
     runtimes[0]->fail=true;Reject([&]{hosts[0]->Run(c,warm.sends[0],warm.outputs[0]);});Require(hosts[0]->Stats()[4]);
     Reject([&]{hosts[0]->Run(Transpose(c),rev.sends[0],rev.outputs[0]);});
     for(auto& h:hosts){h->Close();Require(h->Stats()[6]);}
-    std::cout<<"EP8_EID_HOST_PASS ranks=8 alternating=100 row_bytes=5120,10240 submissions_per_call=1 relay_hbm_bytes=0\n";
+    std::cout<<"EP8_EID_HOST_PASS ranks=8 alternating=100 row_bytes=5120,10240 submissions_per_call=1 relay_hbm_bytes=0 dense="<<dense<<"\n";
 }
+
+int main() { Run(false); Run(true); }

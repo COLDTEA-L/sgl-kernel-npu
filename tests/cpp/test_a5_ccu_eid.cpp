@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <set>
+#include <map>
 using namespace a5_ccu_urma_probe;
 struct Kernel:EidAllToAllVKernel {using EidAllToAllVKernel::EidAllToAllVKernel;using EidAllToAllVKernel::GeneArgs;size_t Loads()const{return loadIndex_;}};
 static std::vector<EidChannel> Catalog(uint32_t rank, unsigned relayLimit=6) {
@@ -99,22 +100,22 @@ static void RegistrationStages() {
     }
     std::cout<<"EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17\n";
 }
-static void RunGraph(unsigned relayLimit) {
+static void RunGraph(unsigned relayLimit, bool ready=false) {
     std::array<std::unique_ptr<Kernel>,8> kernels;
     std::array<uint8_t,64> allowed{};
     for(int s=0;s<8;++s) for(auto path:Catalog(s,relayLimit)) if(path.relay>=0) allowed[s*8+path.peer]|=1u<<path.relay;
     for(uint32_t r=0;r<8;++r) {
         auto paths=Catalog(r,relayLimit);std::vector<ChannelHandle> channels;
         for(auto p:paths) channels.push_back(p.peer*9+p.relay+2);
-        EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));
+        EidAllToAllVKernelArg arg(channels,r,paths,EidRegisterStage::FULL,ready);kernels[r].reset(new Kernel(arg));
         const auto before=hcomm::CcuRep::EventAllocations();
         assert(kernels[r]->Init()==0);
         assert(hcomm::CcuRep::EventAllocations()-before==14); // no default-construct then overwrite
     }
-    if(relayLimit==6) FixedDirectControl(*kernels[0]);
+    if(relayLimit==6 && !ready) FixedDirectControl(*kernels[0]);
     uint32_t bits[8][8][9][3]{};
     constexpr size_t guard=37;
-    size_t activeRelay=0, skipped=0;
+    size_t activeRelay=0, skipped=0, overlapped=0;
     for(unsigned epoch=0;epoch<100;++epoch) {
         std::array<uint64_t,64> c{},m{};std::array<int32_t,64> k;k.fill(-1);
         if(epoch%10==1) for(unsigned r=0;r<8;++r) c[r*8+r]=r+1;
@@ -124,6 +125,15 @@ static void RunGraph(unsigned relayLimit) {
             if(c[f]&&s!=d&&(s+d+epoch)%3&&allowed[f]) {
                 int relay=(s+3*d+epoch)%8;while(!(allowed[f]&(1u<<relay))) relay=(relay+1)%8;
                 m[f]=epoch%4?c[f]/2:c[f];if(m[f]) k[f]=relay;
+            }
+        }
+        if(ready && epoch%10>=2) {
+            for(size_t f=0;f<64;++f) c[f]=1+(f%3);
+            m.fill(0);k.fill(-1);
+            size_t src=epoch%8,dst=(epoch+3)%8,f=src*8+dst;c[f]=32;
+            if(allowed[f]) {
+                int relay=(epoch+5)%8;while(!(allowed[f]&(1u<<relay))) relay=(relay+1)%8;
+                k[f]=relay;m[f]=4;
             }
         }
         const uint64_t rb=std::array<uint64_t,5>{{1,2,257,5120,10240}}[epoch%5];
@@ -139,13 +149,21 @@ static void RunGraph(unsigned relayLimit) {
             original[r]=input[r];
             EidAllToAllVTaskArg task(reinterpret_cast<uint64_t>(input[r].data()+guard),reinterpret_cast<uint64_t>(output[r].data()+guard),11,22,l);
             envs[r].args=kernels[r]->GeneArgs(task);assert(envs[r].args.size()==46);
+            if(ready && epoch==0) {
+                auto invalid=task;invalid.layout.readyRelay=9;
+                assert(kernels[r]->GeneArgs(invalid).empty());
+            }
             envs[r].remote=[&,r](ChannelHandle ch,uint32_t slot){return published[r][(ch-1)/9][(ch-1)%9][slot];};
             for(size_t i=0;i<l.pathBytes.size();++i) if(!(l.activeMask&(uint64_t{1}<<i))) ++skipped;
         }
-        std::array<size_t,8> pc{};std::array<std::vector<bool>,8> conditions;std::array<std::set<int>,8> completed;
+        std::array<size_t,8> pc{};std::array<std::vector<bool>,8> conditions;std::array<std::set<int>,8> completed,waited;
+        std::array<std::map<int,size_t>,8> pending;std::array<bool,8> readySeen{};
         size_t ticks=0;
         for(;;) {
             bool progress=false,done=true;
+            for(size_t r=0;r<8;++r) for(auto it=pending[r].begin();it!=pending[r].end();) {
+                if(it->second<=ticks) {completed[r].insert(it->first);it=pending[r].erase(it);progress=true;} else ++it;
+            }
             for(uint32_t n=0;n<8;++n) {
                 auto r=(n+epoch)%8;const auto& code=kernels[r]->instructions;
                 if(pc[r]==code.size()) continue;
@@ -158,7 +176,20 @@ static void RunGraph(unsigned relayLimit) {
                     if(i.op=="record") {
                         assert(!(bits[peer][r][path][i.slot]&i.mask));bits[peer][r][path][i.slot]|=i.mask;
                         if(i.slot<2) published[peer][r][path][i.slot]=i.len.eval(e);
-                        else {
+                        else if(i.mask==2) {
+                            assert(ready && layouts[r].readyRelay==peer);
+                            auto j=peer<r?peer:peer-1;
+                            if(layouts[r].peerArgs[j][2]) assert(waited[r].count(j*2));
+                        } else if(i.mask==4) {
+                            assert(ready && layouts[r].readyRelay==r);
+                            for(uint32_t other=0;other<8;++other) if(other!=r) {
+                                auto j=other<r?other:other-1;
+                                if(layouts[r].peerArgs[j][2]) assert(waited[r].count(j*2));
+                                auto reverse=r<other?r:r-1;
+                                if(layouts[other].peerArgs[reverse][2]) assert(waited[other].count(reverse*2));
+                            }
+                        } else {
+                            assert(i.mask==1);
                             auto paths=Catalog(r,relayLimit);
                             for(size_t q=0;q<paths.size();++q) if(layouts[r].pathBytes[q]) {
                                 auto j=paths[q].peer<r?paths[q].peer:paths[q].peer-1;
@@ -167,10 +198,21 @@ static void RunGraph(unsigned relayLimit) {
                         }
                     } else if(i.op=="notify_wait") {
                         auto& b=bits[r][peer][path][i.slot];if((b&i.mask)!=i.mask) continue;b&=~i.mask;
-                    } else if(i.op=="event_wait") assert(completed[r].count(i.event));
+                        if(i.slot==2 && i.mask==4) readySeen[r]=true;
+                    } else if(i.op=="event_wait") {
+                        if(!completed[r].count(i.event)) {assert(ready && pending[r].count(i.event));continue;}
+                        assert(waited[r].insert(i.event).second);
+                    }
                     else if(i.op=="remote"||i.op=="group_local") {
                         auto len=i.len.eval(e);uint32_t dst=i.op=="remote"?peer:r;
-                        if(i.op=="remote") {assert(len);assert(completed[r].insert(i.event).second);if(path) ++activeRelay;}
+                        if(i.op=="remote") {
+                            assert(len && !completed[r].count(i.event) && !pending[r].count(i.event));
+                            if(ready) pending[r][i.event]=ticks+(len/rb>10?2000:4);else completed[r].insert(i.event);
+                            if(path) {
+                                ++activeRelay;
+                                if(ready) {assert(readySeen[r]);if(!completed[r].count(i.event-1)) ++overlapped;}
+                            }
+                        }
                         auto src=i.src.eval(e),target=i.dst.eval(e);
                         assert(src>=reinterpret_cast<uint64_t>(input[r].data()+guard)&&src+len<=reinterpret_cast<uint64_t>(input[r].data()+guard)+layouts[r].sendBytes);
                         assert(target>=reinterpret_cast<uint64_t>(output[dst].data()+guard)&&target+len<=reinterpret_cast<uint64_t>(output[dst].data()+guard)+layouts[dst].recvBytes);
@@ -180,7 +222,8 @@ static void RunGraph(unsigned relayLimit) {
                 ++pc[r];progress=true;
             }
             if(done) break;
-            assert(progress && ++ticks<10000);
+            assert(++ticks<10000);
+            if(!progress) {bool inFlight=false;for(auto& jobs:pending) inFlight|=!jobs.empty();assert(inFlight);}
         }
         for(uint32_t d=0;d<8;++d) {
             size_t ro=0;
@@ -194,7 +237,8 @@ static void RunGraph(unsigned relayLimit) {
         }
     }
     assert(bool(activeRelay)==bool(relayLimit) && skipped);
-    std::cout<<"EP8_EID_GRAPH_PASS epochs=100 launches=800 task_args=46 relay_limit="<<relayLimit<<" relay_writes="<<activeRelay<<" skipped="<<skipped<<"\n";
+    if(ready && relayLimit) assert(overlapped>0);
+    std::cout<<(ready?"EP8_EID_READY_GRAPH_PASS":"EP8_EID_GRAPH_PASS")<<" epochs=100 launches=800 task_args=46 relay_limit="<<relayLimit<<" relay_writes="<<activeRelay<<" overlapped="<<overlapped<<" skipped="<<skipped<<"\n";
 }
 
-int main() { Invalid(); RegistrationStages(); for(unsigned limit:{0u,1u,6u}) RunGraph(limit); }
+int main() { Invalid(); RegistrationStages(); for(unsigned limit:{0u,1u,6u}) {RunGraph(limit);RunGraph(limit,true);} }

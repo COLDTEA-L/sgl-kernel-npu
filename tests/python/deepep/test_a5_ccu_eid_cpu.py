@@ -214,6 +214,7 @@ int main() {
             self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17', result.stdout)
             self.assertIn('EP8_EID_FIXED_CONTROL_PASS masks=202', result.stdout)
             self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 3)
+            self.assertEqual(result.stdout.count('EP8_EID_READY_GRAPH_PASS epochs=100 launches=800'), 3)
             print(result.stdout.strip())
 
     @staticmethod

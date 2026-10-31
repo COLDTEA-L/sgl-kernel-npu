@@ -108,6 +108,11 @@ public:
     }
 
     U RowBytes() const { return rowBytes_; }
+    Planner WithDenseReady(U divisor) const {
+        if (divisor < 2 || divisor > 1024) throw std::invalid_argument("dense split divisor must be 2..1024");
+        Planner out=*this; out.denseDivisor_=divisor; return out;
+    }
+    U DenseDivisor() const { return denseDivisor_; }
     // Preserve byte thresholds rather than scaling already rounded row counts.
     Planner WithRowBytes(U bytes) const {
         if (!bytes || bytes > Max) throw std::invalid_argument("invalid EP8 row bytes");
@@ -129,6 +134,7 @@ public:
         p.counts = counts; p.relays.fill(-1); p.moved.fill(0);
         p.actions.clear(); p.evaluations = 0; p.exhausted = false;
         for (size_t f = 0; f < 64; ++f) p.loads[f] = f / 8 == f % 8 ? 0 : counts[f];
+        if (denseDivisor_) { MakeDense(p); return; }
         std::array<U, 8> used{};
         p.actions.reserve(56);
         for (U iteration = 0; iteration < maxActions_; ++iteration) {
@@ -231,6 +237,37 @@ public:
         }
     }
 private:
+    // One delayed relay action. Byte-free arithmetic on token rows; no clock,
+    // bandwidth fitting, search iterations or routing-history assumptions.
+    void MakeDense(Plan& p) const {
+        p.exhausted=true;
+        if (!maxActions_) return;
+        U peak=0, second=0;size_t hot=0;
+        std::array<U,8> burden{};
+        for(size_t f=0;f<64;++f) {
+            const U n=p.loads[f];
+            if(n>peak) {second=peak;peak=n;hot=f;} else second=std::max(second,n);
+            burden[f/8]=std::max(burden[f/8],n);burden[f%8]=std::max(burden[f%8],n);
+        }
+        // With at most one action, a tied peak cannot lower global peak load.
+        if(peak==second) return;
+        U bestGain=0,bestX=0;size_t bestK=0;
+        for(size_t k=0;k<8;++k) {
+            if(!(masks_[hot]&(1u<<k))) continue;
+            ++p.evaluations;
+            if(peak<=burden[k]) continue;
+            U x=std::min((peak-burden[k])/denseDivisor_,capacity_[k]);
+            U after=std::max({second,peak-x,burden[k]+x});
+            U gain=peak-after;
+            if(x<chunkRows_ || !gain || gain*rowBytes_<minGain_) continue;
+            if(gain>bestGain || (gain==bestGain && x<bestX)) {bestGain=gain;bestX=x;bestK=k;}
+        }
+        if(!bestX) return;
+        p.relays[hot]=static_cast<int>(bestK);p.moved[hot]=bestX;
+        p.loads[hot]-=bestX;p.loads[hot/8*8+bestK]+=bestX;p.loads[bestK*8+hot%8]+=bestX;
+        p.actions.push_back({hot/8,hot%8,bestK,bestX,bestGain});p.exhausted=false;
+    }
+    U denseDivisor_=0;
     U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;
     std::vector<U> capacityBytes_;
     std::array<unsigned, 64> masks_{};

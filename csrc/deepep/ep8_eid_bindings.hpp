@@ -6,6 +6,7 @@
 namespace deep_ep::ep8 {
 void SubmitEidTransfer(const at::Tensor&,const at::Tensor&,int64_t,int64_t,HcclComm,const Plan&,U);
 void SynchronizeEidPlan(int64_t);
+void RequireReadyEidPlan(int64_t);
 class NpuEidRuntime : public EidRuntime {
 public:
     NpuEidRuntime(int rank,Buffer& buffer,int64_t handle)
@@ -41,6 +42,7 @@ inline void BindEid(pybind11::module_& m) {
         .def("payload_stats",[](const EidHost& h){py::list out;for(const auto& p:h.PayloadStats()){py::dict d;
             d["device"]=p.device;d["dtype"]=p.dtype;d["row_shape"]=p.shape;d["row_bytes"]=p.rowBytes;d["reserved_bytes"]=0;out.append(d);}return out;});
     m.def("ep8_eid_create",[](const Planner& planner,int rank,Buffer& buffer,int64_t handle,U maxPayloads){
+        if(planner.DenseDivisor()) RequireReadyEidPlan(handle);
         return std::make_shared<EidHost>(planner,rank,std::make_shared<NpuEidRuntime>(rank,buffer,handle),maxPayloads);
     },py::arg("planner"),py::arg("rank"),py::arg("buffer"),py::arg("handle"),py::arg("max_payloads")=4,py::keep_alive<0,3>());
 }

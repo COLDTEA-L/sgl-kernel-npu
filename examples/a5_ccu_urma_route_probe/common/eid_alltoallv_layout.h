@@ -11,6 +11,7 @@ struct EidAllToAllVLayout : AllToAllVLayout {
     // src offset, destination offset, original bytes, suffix bytes, relay rank.
     std::array<std::array<uint64_t, 5>, 7> peerArgs{};
     uint64_t activeMask = 0;
+    uint64_t readyRelay = 8; // 8=no relay, 9=multiple actions (invalid for ready schedule)
 };
 inline bool ValidateEidChannels(uint32_t rank, const std::vector<EidChannel>& channels) {
     if (rank >= 8 || channels.size() < 7 || channels.size() > EP8_EID_MAX_CHANNELS) return false;
@@ -46,6 +47,8 @@ inline bool BuildEidAllToAllVLayout(uint32_t rank, const uint64_t* counts, uint3
     if (!BuildAllToAllVLayout(rank, counts, count, rowBytes, peers, &base)) return false;
     EidAllToAllVLayout result;
     static_cast<AllToAllVLayout&>(result) = base;
+    size_t actions=0;
+    for(size_t f=0;f<64;++f) if(moved[f]) result.readyRelay=++actions==1 ? static_cast<uint64_t>(relays[f]) : 9;
     result.sourceOffsets.clear(); result.remoteOffsets.clear(); result.pathBytes.clear();
     for (size_t j = 0; j < 7; ++j) {
         auto f = rank*8+peers[j];
