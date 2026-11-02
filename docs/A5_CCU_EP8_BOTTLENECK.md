@@ -110,7 +110,7 @@ echo "扫描摘要：$A5_SWEEP"
 
 同一C换BF16这里只测试字节宽度，**不代表真实combine矩阵**。随后把matrix路径换为模型profile结束后采集的真实dispatch和combine文件，各按FP8/BF16再测。格式同样为64个packed行数，按源rank行、目的rank列展开，并保持物理卡顺序一致。不要将旧profile矩阵混入结果。
 
-新测试输出三种时间口径，全部含提交至完成的host wall-clock，不是纯CCU device event时间：
+以下是三种核心时间口径，全部含提交至完成的host wall-clock，不是纯CCU device event时间；第9节版本另外保留host_counts_serial和counts_only两个诊断口径：
 
 | 指标 | 输入计数 | 每次是否规划 | 用途 |
 |---|---|---|---|
@@ -404,3 +404,143 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh \
 **步骤4：短验证成功后，原样执行8.3，再按8.5回报。** FP8/BF16各3次独立启动，共6份成功记录；不重新启动DeepSeek模型，不额外开profiler。目录 `ep8-dynamic-audit.153535`中的旧失败记录保留，不覆盖、也不算性能样本。新命令使用mktemp建立新目录。
 
 8.3已有失败即停止的逻辑，按整个命令块运行；若第一份失败，不要继续手工补跑其余5份。回报实际结果目录、最后阶段及首个异常；若是设备同步错误，要与本次Python dtype重复参数错误区分。
+
+## 9. Dynamic 计数路径优化：复用缓冲区与显式 begin/finish
+
+### 9.1 新证据与本次改动的边界
+
+新审计的 `host_counts_serial` 中 native/multipath 基本持平，而 dynamic 仍有差距。这不支持“仅逐次同步就能解释 custom/native 差距”；应继续检查计数获取与后续提交的组合路径。它**尚未证明**特定 stream、event 或 HCCL 内部资源是根因。`counts_only` 约300µs不能直接与其他口径相加减；`host_counts` 包含完整传输，绝不是“只测计数”。
+
+本次保持当前层真实C、原all_gather协议、EP通信组、CCU+URMA EID转发和一调用一launch不变。增加：
+
+- `RoutingCountsExchange`：复用一个device int64[8,8]、8个行view、一个pinned CPU int64[8,8]及其flat view。省去调用侧每次的8个张量分配、`stack`和CPU张量分配；HCCL内部是否仍分配临时空间不在保证范围内。
+- `finish()` 在HCCL Work等待之后提交非阻塞D2H，以完成event同步后才把CPU计数交给规划器；没有跳过数据依赖。
+- `host.run_counts_tensor(cpu_counts, send, recv)`：直接检查并复制64个CPU int64，避免`.tolist()`、Python normalize和逐个PyLong转换。原 `run(list_or_tuple, ...)` 接口保留，原host ABI不变，新增能力 `ep8_eid_host_counts_tensor_abi=1`。
+- 可选独立计数流：`begin()`捕获真实producer流的完成依赖；`finish()`在A2A前取回当前层C。模型可在二者间提交不依赖全局C的当前层permute工作。**不是预测下一层C，不复用上一次计划，不增加进程组。** HCCL自身的流实现及模型依赖仍可能限制重叠。
+
+提供三种 `--counts-path`，默认保留 `legacy`，不未经目标NPU验证就替换模型：
+
+| 选项 | count交换/内存 | custom入口 |
+|---|---|---|
+| legacy | 原gather + stack + cpu + normalize | run(tuple) |
+| reuse | 复用缓冲区，原caller流 | run_counts_tensor |
+| stream | 复用缓冲区，专用计数流，保留producer依赖 | run_counts_tensor |
+
+三种模式的native使用同样的计数交换路径，之后转换为HCCL split接口所需的列表；不能只优化multipath的计数路径、却拿legacy native比较得出加速结论。`--compare`拒绝不同counts_path的独立结果配对；跨path应逐格对照，并报告同path native/multipath。
+
+### 9.2 更新、构建和不占卡的检查
+
+1. 按第8.6步骤1更新本分支。现场自改过五口径脚本时先保留diff并合并；新版本已包含 `host_counts_serial` 和 `counts_only`，不要覆盖回旧文件。
+2. **按 `docs/A5_CCU_92_93_ALLTOALL.md` 第4节重编安装DeepEP wheel**，本次新增C++接口，不能沿用edb42f5测试时的旧wheel。已通过的EID route无需重编。本次没有改SDK注册、CCU构图或转发协议。
+3. 沿用第2节环境，执行CPU计数调度/错误处理回归：
+
+```bash
+PYTHONPATH="tests/python/deepep:python/deep_ep/deep_ep${PYTHONPATH:+:$PYTHONPATH}" \
+python3 -m unittest test_a5_routing_counts -v
+```
+
+要求5项通过。它们模拟通信调度和数据，检查100次变化C、缓冲区复用、等待顺序、失败保留引用和关闭路径；不能代替NPU测试。NPU脚本在reuse/stream时会明确检查新wheel能力，缺少时在建组前报错。
+
+### 9.3 先跑短验证，再测三条路径
+
+八卡空闲时在目标容器执行。保持原有拓扑环境，结果全部写到个人profiling目录；失败立即停止，不用连续重试挑成功样本。
+
+```bash
+(
+set -Ee -o pipefail
+cd /home/l00934901/sgl-kernel-npu
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64
+export A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+A5_COUNTS_SMOKE=$(mktemp -d "$A5_OUTPUT_ROOT/ep8-counts-smoke.XXXXXX")
+for A5_COUNTS_PATH in reuse stream; do
+  for A5_COUNTS_DTYPE in float8_e4m3fn bfloat16; do
+    bash scripts/run_a5_ccu_eid_alltoallv.sh \
+      --suite correctness --mode all --planner bottleneck \
+      --counts-path "$A5_COUNTS_PATH" --dtype "$A5_COUNTS_DTYPE" \
+      --width 5120 --row-scale 1 --warmup 1 --iters 2 --rounds 1 --dynamic-iters 2 \
+      > "$A5_COUNTS_SMOKE/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log" 2>&1 || {
+        tail -100 "$A5_COUNTS_SMOKE/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log"; exit 1;
+      }
+    tail -20 "$A5_COUNTS_SMOKE/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log"
+  done
+done
+echo "$A5_COUNTS_SMOKE"
+)
+```
+
+要求4次均 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`。每个case计时前还有3个不同C的 `counts_exchange_validate_complete`，用于检查计数缓冲区未缓存旧值、rank顺序和跨流依赖。原输入/输出guard及queued通信验证保留。
+
+短验证完成后，先各做一次六轮正式测试，比较同一新wheel的legacy/reuse/stream：
+
+```bash
+(
+set -Ee -o pipefail
+cd /home/l00934901/sgl-kernel-npu
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64 A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+A5_COUNTS_AUDIT=$(mktemp -d "$A5_OUTPUT_ROOT/ep8-counts-audit.XXXXXX")
+for A5_COUNTS_DTYPE in float8_e4m3fn bfloat16; do
+  for A5_COUNTS_PATH in legacy reuse stream; do
+    bash scripts/run_a5_ccu_eid_alltoallv.sh \
+      --suite benchmark --mode all --planner bottleneck \
+      --counts-path "$A5_COUNTS_PATH" \
+      --matrix-json tests/data/ep8_prefill_673.json \
+      --dtype "$A5_COUNTS_DTYPE" --width 5120 \
+      --warmup 3 --iters 10 --rounds 6 --dynamic-iters 100 \
+      > "$A5_COUNTS_AUDIT/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log" 2>&1 || {
+        tail -100 "$A5_COUNTS_AUDIT/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log"; exit 1;
+      }
+    tail -35 "$A5_COUNTS_AUDIT/${A5_COUNTS_PATH}_${A5_COUNTS_DTYPE}.log"
+  done
+done
+echo "$A5_COUNTS_AUDIT"
+)
+```
+
+保留全部5口径×3实现的 `samples_us` 和 `median_us`、新wheel版本、counts_path及每次结果目录。`counts_only`的mode标签只表示轮换位置，不调用该模式的A2A，不应宣称“counts_only多路径加速”。它计时外校验C，不检查未写入的payload。
+
+先看reuse/stream能否降低**同path下multipath−native的dynamic差距**，以及各自相对legacy的绝对耗时。若某路径有可重复改善，再把该路径和legacy以交替顺序各补2次独立启动；没有改善时回报全部结果，不直接接模型。此次微基准begin后立即finish，没有permute可重叠；它测复用和流路径，不代表模型重叠收益。
+
+### 9.4 模型接入契约（NPU短验证通过后）
+
+```python
+from deep_ep.routing_counts import RoutingCountsExchange
+
+# 每个模型通信组创建一次；两种payload dtype不影响int64计数。
+exchange = RoutingCountsExchange(local_counts_example, group=ep_group,
+                                 dedicated_stream=True)
+
+# 当前层router完成，已知真实packed token行数 local_counts[8]。
+# begin必须在生成local_counts的stream上下文中调用。
+exchange.begin(local_counts)
+# 仅可在此执行不需要完整C的当前层工作，例如满足自身依赖的pack/permute。
+# 不在同一进程组中插入乱序collective；所有rank必须维持相同collective顺序。
+cpu_counts = exchange.finish()  # 已完成D2H；返回借用的CPU int64[64]
+host.run_counts_tensor(cpu_counts, packed_send, output)
+
+# 停止提交后、通信组和NPU runtime销毁前：
+exchange.close()
+host.close()
+# 再按原契约销毁plan/Buffer/通信组。
+```
+
+`cpu_counts`只在下次begin前有效，若保存历史应clone；C++入口当场复制64个值，不保留tensor指针。begin至finish之间不得修改input计数，且一个exchange只允许一个未完成任务。出错后不继续复用。不要依赖Python析构在NPU runtime销毁后清理。
+
+不使用独立stream时选择 `dedicated_stream=False`，begin要求原caller流。两个方向必须顺序使用exchange；若应用确实并发调用，分别建计数对象并明确集合通信排序。host的原caller流要求仍然有效，不能把EID执行搬到计数流上。若模型已经持有同一调用的完整CPU C，可直接使用 `run_counts_tensor`，不重复交换；若仅有本地splits则仍需要获取全局C。
+
+说明：保持跨流tensor引用直到完成，且D2H完成前不读取CPU缓冲区，遵循[PyTorch跨流内存生命周期说明](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html)；NPU具体Event接口已对照开发容器的torch_npu SDK。性能和HCCL流行为仍需9.3.0目标机实测。
+
+### 9.5 开发侧验证记录
+
+在专用 `cam_lyw_92`（CANN9.2）完成：
+
+- 19项CPU回归通过，包括5项计数交换调度/生命周期模拟测试、生产CCU图解释测试及实际ATen C++ host测试。后者覆盖变化C、FP8/BF16各100次交替、CPU tensor计数复制与非法输入拒绝。
+- 完整8个C++编译单元编译通过，`--no-undefined`严格链接通过。完整扩展导入通过，新增counts tensor ABI和原接口同时存在。
+- 文档命令通过bash语法检查。
+
+开发日志：`/home/liuyuanwen/profiling/a5-ep8-bottleneck/counts-cpu.log`、`counts-extension.log`、`counts-import.log`。这不是9.3.0八卡NPU性能结果；独立流的HCCL依赖、pinned D2H和实际收益仍按9.3节验收。目标机须重打自己的cp311 wheel，不能使用开发侧cp312编译产物。

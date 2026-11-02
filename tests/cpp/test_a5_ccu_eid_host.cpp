@@ -1,4 +1,5 @@
 #include "../../csrc/deepep/ep8_eid_host.hpp"
+#include "../../csrc/deepep/ep8_host_counts.hpp"
 #include "../../examples/a5_ccu_urma_route_probe/common/eid_alltoallv_layout.h"
 #include <cstring>
 #include <iostream>
@@ -68,7 +69,20 @@ static Payload Make(const Matrix& c, at::ScalarType type, int width, int epoch) 
 static Matrix Transpose(const Matrix& c) { Matrix t{}; for (int s=0;s<8;++s) for(int d=0;d<8;++d) t[d*8+s]=c[s*8+d]; return t; }
 static void Verify(const Payload& p) { for (int r=0;r<8;++r) Require(at::equal(p.stores[r],p.expected[r])); }
 
+static void HostTensorValidation() {
+    auto c=at::arange(64,at::TensorOptions().dtype(at::kLong));
+    auto a=HostCountTensor(c), b=HostCountTensor(c.view({8,8}));
+    Require(a==b && a[63]==63);
+    c.fill_(7);Require(a[63]==63 && HostCountTensor(c)[63]==7);
+    c[0]=-1;Reject([&]{HostCountTensor(c);});c[0]=0;
+    Reject([&]{HostCountTensor(c.to(at::kFloat));});
+    Reject([&]{HostCountTensor(c.narrow(0,0,63));});
+    Reject([&]{HostCountTensor(c.view({4,16}));});
+    Reject([&]{HostCountTensor(c.view({8,8}).transpose(0,1));});
+    std::cout<<"EP8_HOST_COUNTS_TENSOR_PASS\n";
+}
 static void RunSuite(bool bottleneck) {
+    HostTensorValidation();
     Batch batch;std::vector<std::vector<U>> allowed(64);
     for(int s=0;s<8;++s)for(int d=0;d<8;++d)if(s!=d)for(int k=0;k<8;++k)if(k!=s&&k!=d){allowed[s*8+d].push_back(k);batch.allowed[s*8+d]|=1u<<k;}
     Planner planner(allowed,5120,1,0,56,{});
@@ -83,7 +97,9 @@ static void RunSuite(bool bottleneck) {
         auto counts=c;if(epoch%10==0) counts={};else if(epoch%10==1) {counts={};for(int r=0;r<8;++r) counts[r*8+r]=r+1;}
         else if(epoch%10>=5) for(int s=0;s<8;++s)for(int d=0;d<8;++d) counts[s*8+d]=(s*7+d*3+epoch)%9;
         auto a=Make(counts,at::kFloat8_e4m3fn,5120,epoch),b=Make(Transpose(counts),at::kBFloat16,5120,epoch+1);
-        for(int r=0;r<8;++r)hosts[r]->Run(counts,a.sends[r],a.outputs[r]);batch.Run();Verify(a);
+        auto hostCounts=at::empty({8,8},at::TensorOptions().dtype(at::kLong));
+        for(int i=0;i<64;++i)hostCounts.data_ptr<int64_t>()[i]=counts[i];
+        for(int r=0;r<8;++r)hosts[r]->Run(HostCountTensor(hostCounts),a.sends[r],a.outputs[r]);batch.Run();Verify(a);
         for(int r=0;r<8;++r)hosts[r]->Run(Transpose(counts),b.sends[r],b.outputs[r]);batch.Run();Verify(b);
     }
     for(int r=0;r<8;++r){Require(runtimes[r]->submits==200&&runtimes[r]->syncs==0);

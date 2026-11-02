@@ -39,6 +39,8 @@ def main():
     p.add_argument('--iters', type=int, default=10)
     p.add_argument('--rounds', type=int, default=6)
     p.add_argument('--dynamic-iters', type=int, default=100)
+    p.add_argument('--counts-path', choices=('legacy', 'reuse', 'stream'), default='legacy',
+                   help='dynamic/counts_only: old adapter, reusable buffers, or reusable dedicated count stream')
     p.add_argument('--bidirectional-iters', type=int, default=0)
     p.add_argument('--allow-no-relay', action='store_true', help='explicit direct-only diagnostic, never a relay PASS')
     p.add_argument('--minimal', action='store_true', help='create only: stop after configuration all_gather; no Buffer or EID plan')
@@ -81,6 +83,8 @@ def main():
     native = sys.modules['deep_ep_cpp']
     if getattr(native, 'ep8_eid_host_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_abi=1 required')
+    if args.counts_path != 'legacy' and getattr(native, 'ep8_eid_host_counts_tensor_abi', None) != 1:
+        raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_counts_tensor_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     required_abis = [
         ('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
@@ -258,16 +262,55 @@ def main():
             if not equal_payload(snapshot, shifted_payload(expected, epoch)): raise AssertionError('queued ordering mismatch')
         phase('queued_validation_complete', case=case)
         local_counts = torch.tensor(sends, dtype=torch.int64, device='npu')
+        exchange = None
+        if args.counts_path != 'legacy':
+            from routing_counts import RoutingCountsExchange
+            exchange = RoutingCountsExchange(local_counts, dedicated_stream=args.counts_path == 'stream')
+            phase('counts_exchange_validate_begin', case=case, counts_path=args.counts_path)
+            # Changing producer values prove that buffer reuse does not cache C.
+            # begin/finish bracket an unrelated current-stream operation, without
+            # moving a collective across any other collective on the EP group.
+            for epoch in range(3):
+                probe = torch.arange(8, dtype=torch.int64, device='npu') + rank*100 + epoch*1000
+                exchange.begin(probe)
+                independent = probe + 1
+                actual = exchange.finish().tolist()
+                if actual != [r*100 + epoch*1000 + j for r in range(8) for j in range(8)]:
+                    raise AssertionError('reusable counts are stale or rank order is wrong')
+                if independent.cpu().tolist() != [rank*100 + epoch*1000 + j+1 for j in range(8)]:
+                    raise AssertionError('producer stream ordering failed')
+            phase('counts_exchange_validate_complete', case=case, counts_path=args.counts_path)
+        last_counts = None
+        def read_counts():
+            return exchange.gather(local_counts) if exchange is not None else gather_routing_counts(local_counts)
         def dynamic(mode):
-            current = gather_routing_counts(local_counts)
-            if mode == 'native': native_transfer(send, outputs[mode], list(current[rank*8:(rank+1)*8]), list(current[rank::8]))
-            else: hosts[mode].run(current, send, outputs[mode])
+            current = read_counts()
+            if mode == 'native':
+                # HCCL's public split API still requires host integer lists.
+                if exchange is not None: current = current.tolist()
+                native_transfer(send, outputs[mode], list(current[rank*8:(rank+1)*8]), list(current[rank::8]))
+            elif exchange is not None:
+                hosts[mode].run_counts_tensor(current, send, outputs[mode])
+            else:
+                hosts[mode].run(current, send, outputs[mode])
         def host_counts(mode):
             if mode == 'native': native_transfer(send, outputs[mode], sends, recvs)
             else: hosts[mode].run(counts, send, outputs[mode])
-        samples = {metric: {mode: [] for mode in selected} for metric in ('prepared', 'host_counts', 'dynamic')}
-        for metric, iterations in (('prepared', args.iters), ('host_counts', args.dynamic_iters), ('dynamic', args.dynamic_iters)):
-            call = {'prepared': op, 'host_counts': host_counts, 'dynamic': dynamic}[metric]
+        def host_counts_serial(mode):
+            host_counts(mode)
+            torch.npu.synchronize()
+        def counts_only(mode):
+            nonlocal last_counts
+            last_counts = read_counts()
+        def check_counts():
+            actual = last_counts.tolist() if exchange is not None else last_counts
+            if tuple(actual) != counts: raise AssertionError('count exchange mismatch')
+        metrics = ('prepared', 'host_counts', 'host_counts_serial', 'counts_only', 'dynamic')
+        samples = {metric: {mode: [] for mode in selected} for metric in metrics}
+        for metric in metrics:
+            iterations = args.iters if metric == 'prepared' else args.dynamic_iters
+            call = dict(prepared=op, host_counts=host_counts, host_counts_serial=host_counts_serial,
+                        counts_only=counts_only, dynamic=dynamic)[metric]
             for round_id in range(args.rounds):
                 order = selected[round_id % len(selected):] + selected[:round_id % len(selected)]
                 if round_id % 2: order = tuple(reversed(order))
@@ -285,7 +328,8 @@ def main():
                     torch.npu.synchronize()
                     elapsed = (time.perf_counter()-start)*1e6/iterations
                     phase('measure_execution_complete', case=case, metric=metric, mode=mode, round=round_id)
-                    check(mode, round_id)
+                    if metric == 'counts_only': check_counts()
+                    else: check(mode, round_id)
                     phase('measure_check_complete', case=case, metric=metric, mode=mode, round=round_id)
                     # Slowest participant, outside measured interval. HCCL rejects
                     # FP64; FP32 is sufficient for microsecond timing samples.
@@ -294,7 +338,8 @@ def main():
                     dist.all_reduce(value, op=dist.ReduceOp.MAX)
                     samples[metric][mode].append(value.item())
                     phase('measure_complete', case=case, metric=metric, mode=mode, round=round_id)
-        report = dict(case=case, row_bytes=row_bytes, counts=counts, relay_rows=sum(plan.relay_rows),
+        if exchange is not None: exchange.close()
+        report = dict(case=case, counts_path=args.counts_path, row_bytes=row_bytes, counts=counts, relay_rows=sum(plan.relay_rows),
                       executed_relay=plan.uses_relay, planner=args.planner, plan=plan.report(), samples_us=samples,
                       median_us={metric: {mode: statistics.median(values) for mode, values in modes.items()} for metric, modes in samples.items()},
                       workspace={mode: host.stats() for mode, host in hosts.items()})

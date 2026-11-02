@@ -53,8 +53,8 @@ def main():
     if args.compare:
         other, other_topology = load(args.compare)
         if other['options']['suite'] == 'create': raise ValueError('create/probe cannot be a performance baseline')
-        for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters', 'planner'):
-            if result['options'].get(key, 'greedy' if key == 'planner' else None) != other['options'].get(key, 'greedy' if key == 'planner' else None): raise ValueError('different measurement option: '+key)
+        for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters', 'planner', 'counts_path'):
+            if result['options'].get(key, 'greedy' if key == 'planner' else 'legacy' if key == 'counts_path' else None) != other['options'].get(key, 'greedy' if key == 'planner' else 'legacy' if key == 'counts_path' else None): raise ValueError('different measurement option: '+key)
         for key in ('devices', 'allowed_relays', 'links', 'relay_routes'):
             if topology[key] != other_topology[key]: raise ValueError('different topology: '+key)
         if len(result['reports']) != len(other['reports']): raise ValueError('different case lists')
@@ -63,6 +63,7 @@ def main():
         for key in ('case', 'counts', 'row_bytes'):
             if report[key] != baseline[key]: raise ValueError('different payload: '+key)
         print(f"case={report['case']} row_bytes={report['row_bytes']} executed_relay={report['executed_relay']}")
+        print('counts_path=' + result['options'].get('counts_path', 'legacy'))
         if 'plan' in report:
             plan = report['plan']
             print(f"planner={report.get('planner')} actions={len(plan['actions'])} "

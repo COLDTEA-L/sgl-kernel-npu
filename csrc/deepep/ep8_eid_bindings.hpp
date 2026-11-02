@@ -1,5 +1,6 @@
 #pragma once
 #include "ep8_eid_host.hpp"
+#include "ep8_host_counts.hpp"
 #include "ep8_relay_planner_bindings.hpp"
 #include "deep_ep.hpp"
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -25,6 +26,7 @@ private:
 inline void BindEid(pybind11::module_& m) {
     namespace py=pybind11;
     m.attr("ep8_eid_host_abi")=1;
+    m.attr("ep8_eid_host_counts_tensor_abi")=1;
     py::class_<EidPrepared,std::shared_ptr<EidPrepared>>(m,"Ep8EidPrepared")
         .def_readonly("row_bytes",&EidPrepared::rowBytes)
         .def_property_readonly("uses_relay",&EidPrepared::UsesRelay)
@@ -34,6 +36,8 @@ inline void BindEid(pybind11::module_& m) {
         .def("prepare",[](EidHost& h,const py::object& c,const at::Tensor& send){auto matrix=HostCounts(c);py::gil_scoped_release release;return h.Prepare(matrix,send);},py::keep_alive<0,1>())
         .def("execute",&EidHost::Execute,py::call_guard<py::gil_scoped_release>())
         .def("run",[](EidHost& h,const py::object& c,const at::Tensor& send,const at::Tensor& recv){auto matrix=HostCounts(c);py::gil_scoped_release release;return h.Run(matrix,send,recv);})
+        .def("run_counts_tensor",[](EidHost& h,const at::Tensor& c,const at::Tensor& send,const at::Tensor& recv){auto matrix=HostCountTensor(c);py::gil_scoped_release release;return h.Run(matrix,send,recv);})
+        .def("prepare_counts_tensor",[](EidHost& h,const at::Tensor& c,const at::Tensor& send){auto matrix=HostCountTensor(c);py::gil_scoped_release release;return h.Prepare(matrix,send);},py::keep_alive<0,1>())
         .def("close",&EidHost::Close,py::call_guard<py::gil_scoped_release>())
         .def("stats",[](const EidHost& h){auto s=h.Stats();py::dict d;
             d["generation"]=s[0];d["tensor_allocations"]=s[1];d["event_allocations"]=s[2];d["reserved_bytes"]=s[3];
