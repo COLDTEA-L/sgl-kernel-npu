@@ -69,5 +69,66 @@ inline bool BuildEidAllToAllVLayout(uint32_t rank, const uint64_t* counts, uint3
     }
     *out = std::move(result); return true;
 }
+// Validated immutable topology and reusable per-stream output. The old builder
+// above remains an independent reference and compatibility entry point.
+class EidLayoutTopology {
+public:
+    bool Init(uint32_t rank, const std::vector<EidChannel>& channels) {
+        valid_=false;
+        if (!ValidateEidChannels(rank,channels)) return false;
+        rank_=rank;size_=channels.size();relayMasks_.fill(0);
+        for(size_t i=0;i<size_;++i) {
+            channels_[i]=channels[i];
+            if(channels[i].relay>=0) relayMasks_[channels[i].peer]|=1u<<channels[i].relay;
+        }
+        valid_=true;return true;
+    }
+    bool Build(const uint64_t* counts,uint32_t count,uint64_t rowBytes,
+               const int32_t* relays,const uint64_t* moved,
+               const std::array<uint8_t,64>& allowed,EidAllToAllVLayout* out) const {
+        if(!valid_ || !out || !rowBytes || !ValidateEidPolicy(counts,relays,moved,count,allowed)) return false;
+        // Preserve all original overflow/capacity checks, including other ranks.
+        std::array<uint64_t,8> sends{},recvs{};
+        std::array<uint64_t,64> source{},destination{},bytes{};
+        for(uint32_t src=0;src<8;++src) for(uint32_t dst=0;dst<8;++dst) {
+            const size_t f=src*8+dst;
+            if(counts[f]>UINT64_MAX/rowBytes) return false;
+            bytes[f]=counts[f]*rowBytes;source[f]=sends[src];destination[f]=recvs[dst];
+            if(bytes[f]>UINT64_MAX-sends[src] || bytes[f]>UINT64_MAX-recvs[dst]) return false;
+            sends[src]+=bytes[f];recvs[dst]+=bytes[f];
+        }
+        for(uint32_t peer=0;peer<8;++peer) if(peer!=rank_)
+            for(size_t f:{size_t(rank_*8+peer),size_t(peer*8+rank_)})
+                if(moved[f] && !(relayMasks_[peer]&(1u<<relays[f]))) return false;
+        // In-place scratch is exclusively owned by the submit mutex. No caller
+        // may consume it after a failed Build or retain it beyond this launch.
+        out->sendBytes=sends[rank_];out->recvBytes=recvs[rank_];
+        const size_t self=rank_*8+rank_;
+        out->selfSourceOffset=source[self];out->selfDestinationOffset=destination[self];out->selfBytes=bytes[self];
+        size_t j=0;
+        for(uint32_t peer=0;peer<8;++peer) if(peer!=rank_) {
+            const size_t f=rank_*8+peer;
+            out->peerArgs[j++]={source[f],destination[f],bytes[f],moved[f]*rowBytes,static_cast<uint64_t>(relays[f])};
+        }
+        out->activeMask=0;
+        out->sourceOffsets.resize(size_);out->remoteOffsets.resize(size_);out->pathBytes.resize(size_);
+        for(size_t i=0;i<size_;++i) {
+            const auto& c=channels_[i];const size_t f=rank_*8+c.peer,reverse=c.peer*8+rank_;
+            const auto& a=out->peerArgs[c.peer<rank_?c.peer:c.peer-1];
+            const uint64_t direct=a[2]-a[3],offset=c.relay<0?0:direct;
+            const uint64_t n=c.relay<0?direct:(relays[f]==c.relay?a[3]:0);
+            const uint64_t incoming=c.relay<0?counts[reverse]-moved[reverse]:(relays[reverse]==c.relay?moved[reverse]:0);
+            if(n || incoming) out->activeMask|=uint64_t{1}<<i;
+            out->sourceOffsets[i]=a[0]+offset;out->remoteOffsets[i]=a[1]+offset;out->pathBytes[i]=n;
+        }
+        return true;
+    }
+private:
+    bool valid_=false;
+    uint32_t rank_=0;
+    size_t size_=0;
+    std::array<EidChannel,EP8_EID_MAX_CHANNELS> channels_{};
+    std::array<uint8_t,8> relayMasks_{};
+};
 } // namespace a5_ccu_urma_probe
 #endif

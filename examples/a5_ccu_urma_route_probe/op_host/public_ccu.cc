@@ -1,6 +1,7 @@
 #include "../common/public_ccu.h"
 #include "../common/create_trace.h"
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -192,6 +193,14 @@ HcclResult LaunchKernel(HcclComm comm, ThreadHandle thread, uint64_t handle, con
         entry = found->second;
     }
     if (entry->owner != comm) return HCCL_E_PARA;
+    const auto inlineCount=entry->kernel->InlineArgumentCount();
+    if(inlineCount) {
+        // Per-call stack storage avoids heap allocation and shared mutable args.
+        std::array<uint64_t,46> args;
+        if(inlineCount>args.size() || inlineCount!=entry->kernel->ArgumentCount() ||
+           !entry->kernel->FillInlineArgs(*task,args.data(),inlineCount)) return HCCL_E_PARA;
+        return Status(HcommCcuKernelLaunch(thread,handle,args.data(),inlineCount));
+    }
     const auto args = entry->kernel->Args(*task);
     if (args.empty() || args.size() != entry->kernel->ArgumentCount()) return HCCL_E_PARA;
     // No instance query, registration, channel creation or host synchronization.

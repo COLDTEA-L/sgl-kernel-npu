@@ -2,7 +2,9 @@
 // vendor entry points. It does not initialize ACL or model NPU execution.
 #include "../../examples/a5_ccu_urma_route_probe/common/public_ccu.h"
 #include <cassert>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 namespace {
 int device = 0, queries = 0, starts = 0, registrations = 0, ends = 0, launches = 0;
@@ -11,6 +13,8 @@ uint64_t nextHandle = 20, lastValue = 0;
 CcuResult registrationStatus = CcuResult::CCU_SUCCESS;
 CcuResult launchStatus = CcuResult::CCU_SUCCESS;
 bool badArgCount = false;
+uint32_t expectedArgs=1,inlineArgs=46;
+std::array<uint64_t,46> lastArgs{};
 std::vector<int> order;
 struct Arg : a5ccu::CcuKernelArg {
     a5ccu::CcuKernelSignature GetKernelSignature() const override { return {}; }
@@ -26,6 +30,23 @@ protected:
         return task ? std::vector<uint64_t>{task->value} : std::vector<uint64_t>{};
     }
 };
+class InlineKernel: public Kernel {
+public:
+    using Kernel::Kernel;
+    uint32_t InlineArgumentCount() const override {return inlineArgs;}
+    bool FillInlineArgs(const a5ccu::CcuTaskArg& arg,uint64_t* out,size_t n) override {
+        const auto* task=dynamic_cast<const Task*>(&arg);
+        if(!task || n!=46)return false;
+        for(size_t i=0;i<n;++i)out[i]=task->value+i;
+        return true;
+    }
+protected:
+    HcclResult Algorithm() override {for(unsigned i=0;i<46;++i){auto v=CreateVariable();Load(v);}return HCCL_SUCCESS;}
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg&) override {std::abort();}
+};
+std::unique_ptr<a5ccu::CcuKernel> InlineCreator(const a5ccu::CcuKernelArg& arg) {
+    return std::unique_ptr<a5ccu::CcuKernel>(new InlineKernel(arg));
+}
 std::unique_ptr<a5ccu::CcuKernel> Creator(const a5ccu::CcuKernelArg& arg) {
     return std::unique_ptr<a5ccu::CcuKernel>(new Kernel(arg));
 }
@@ -35,7 +56,7 @@ extern "C" HcclResult HcclCommQueryCcuIns(HcclComm, CcuInsHandle* out, uint32_t*
     ++queries; *out = 77; *count = 1; return HCCL_SUCCESS;
 }
 extern "C" CcuResult CcuVariableAlloc(CcuVariableHandle* out) { *out = 100; return CcuResult::CCU_SUCCESS; }
-extern "C" CcuResult CcuLoadArg(CcuVariableHandle, uint32_t index) { assert(index == 0); return CcuResult::CCU_SUCCESS; }
+extern "C" CcuResult CcuLoadArg(CcuVariableHandle, uint32_t index) { assert(index < 46); return CcuResult::CCU_SUCCESS; }
 extern "C" CcuResult HcommCcuKernelRegisterStart(CcuInsHandle instance) {
     assert(instance == 77); ++starts; order.push_back(1); return CcuResult::CCU_SUCCESS;
 }
@@ -53,11 +74,13 @@ extern "C" CcuResult HcommCcuKernelRegisterEnd(CcuInsHandle instance) {
     assert(instance == 77); ++ends; order.push_back(3); return CcuResult::CCU_SUCCESS;
 }
 extern "C" CcuResult HcommCcuGetTaskArgsNum(CcuKernelHandle, uint32_t* out) {
-    *out = badArgCount ? 2 : 1; return CcuResult::CCU_SUCCESS;
+    *out = badArgCount ? expectedArgs+1 : expectedArgs; return CcuResult::CCU_SUCCESS;
 }
 extern "C" CcuResult HcommCcuKernelLaunch(ThreadHandle thread, CcuKernelHandle, const void* args, uint32_t count) {
-    assert(thread == 8 && count == 1); ++launches;
-    lastValue = static_cast<const uint64_t*>(args)[0]; return launchStatus;
+    assert(thread == 8 && count == expectedArgs); ++launches;
+    lastValue = static_cast<const uint64_t*>(args)[0];
+    if(count==46)for(size_t i=0;i<count;++i)lastArgs[i]=static_cast<const uint64_t*>(args)[i];
+    return launchStatus;
 }
 int main() {
     auto comm = reinterpret_cast<HcclComm>(0x10), other = reinterpret_cast<HcclComm>(0x20);
@@ -96,5 +119,23 @@ int main() {
     const auto oldEnds = ends;
     assert(a5ccu::RegisterKernel(failed, 0, &second, &creator, &arg) == HCCL_E_PTR);
     assert(ends == oldEnds && second == 0);
+    registrationStatus=CcuResult::CCU_SUCCESS;expectedArgs=46;
+    auto inlineComm=reinterpret_cast<HcclComm>(0x40);
+    a5ccu::KernelCreator inlineCreator=InlineCreator;uint64_t inlineHandle=0;
+    assert(a5ccu::RegisterKernel(inlineComm,0,&inlineHandle,&inlineCreator,&arg)==HCCL_SUCCESS);
+    for(uint64_t i=0;i<100;++i) {
+        Task t;t.value=i*100;
+        assert(a5ccu::LaunchKernel(inlineComm,8,inlineHandle,&t)==HCCL_SUCCESS);
+        for(size_t j=0;j<46;++j)assert(lastArgs[j]==i*100+j);
+    }
+    a5ccu::CcuTaskArg wrong;
+    const auto beforeInvalid=launches;
+    assert(a5ccu::LaunchKernel(inlineComm,8,inlineHandle,&wrong)==HCCL_E_PARA);
+    inlineArgs=47;assert(a5ccu::LaunchKernel(inlineComm,8,inlineHandle,&task)==HCCL_E_PARA);
+    assert(launches==beforeInvalid);inlineArgs=46;
+    launchStatus=CcuResult::CCU_E_PTR;
+    assert(a5ccu::LaunchKernel(inlineComm,8,inlineHandle,&task)==HCCL_E_PTR);
+    assert(launches==beforeInvalid+1);
+    std::puts("PUBLIC_CCU_INLINE_ARGS_PASS count=46 launches=100 invalid_args_rejected=1 no_retry=1");
     std::puts("PUBLIC_CCU_HOST_TEST_PASS launches=102 single_registration_reuse=100 failures_preserved=1");
 }

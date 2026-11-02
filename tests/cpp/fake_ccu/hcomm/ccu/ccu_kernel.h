@@ -107,6 +107,8 @@ class CcuKernel {
 public:
     explicit CcuKernel(const CcuKernelArg &arg) : channels_(arg.channels) {}
     virtual ~CcuKernel() = default;
+    virtual uint32_t InlineArgumentCount() const { return 0; }
+    virtual bool FillInlineArgs(const CcuTaskArg&,uint64_t*,size_t) { return false; }
     HcclResult Init() { return Algorithm(); }
     std::vector<Instruction> instructions;
 protected:

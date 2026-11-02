@@ -44,6 +44,9 @@ public:
     HcclResult Build() { argumentCount_ = 0; return Algorithm(); }
     uint32_t ArgumentCount() const { return argumentCount_; }
     std::vector<uint64_t> Args(const CcuTaskArg& task) { return GeneArgs(task); }
+    // Additive internal fast path; existing 2/4-rank kernels keep GeneArgs.
+    virtual uint32_t InlineArgumentCount() const { return 0; }
+    virtual bool FillInlineArgs(const CcuTaskArg&,uint64_t*,size_t) { return false; }
 protected:
     virtual HcclResult Algorithm() = 0;
     virtual std::vector<uint64_t> GeneArgs(const CcuTaskArg&) = 0;

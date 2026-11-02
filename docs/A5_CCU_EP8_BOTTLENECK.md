@@ -657,3 +657,99 @@ echo "$A5_COMBO_RUN"
 当前不删除必要的event、不更换配置all_gather、不增加额外通信组。先把剩余差距定位到可修改的具体等待边界，再针对该边界优化。
 
 开发侧验证：专用cam_lyw_92中15项CPU测试通过，包含5项新组合诊断回归、5项计数交换回归及5项日志/结果判定回归；Python编译检查与文档bash语法检查通过。没有新增C++或route代码，因此无需重新编译二进制。目标9.3.0八卡诊断尚需按10.3执行，不能把CPU模拟通过当作NPU性能结论。
+
+
+## 11. EID 主机提交路径：四项低风险优化
+
+本节在 `196fe73` 的组合诊断之后实施。只修改 route 的主机实现，继续使用原生产 EID CCU 图、46 个 task 参数和 READY/DONE 协议；FP8/BF16、2/4 卡接口保留。**需要重编 route；已安装 de5b412 counts ABI=1 的 wheel 无需重打。** 本轮保持原 `-O0` 编译选项，避免混入编译优化级别的收益。
+
+### 11.1 改了什么，以及没有测出什么
+
+| 改动 | 原先每次执行的工作 | 新实现 |
+|---|---|---|
+| 静态资源复用 | 复制 PeerPlanResources 及其多个 vector | shared owner 固定生命周期，读取 const 资源；Destroy 与提交仍受同一锁保护 |
+| 布局原地更新 | 重验静态通道、构造多个临时 vector、复制基类布局 | Bind 时验证拓扑并分配 scratch；每次按当前 C/row_bytes 重算前缀和，原地覆盖；不缓存旧计数 |
+| task 按需构造 | 同时创建 direct/EID task，并复制布局 | 仅构造本次使用的 task；EID task 在同步主机参数打包期间借用 scratch |
+| 固定参数打包 | GeneArgs 构造/扩容 vector | 在栈上填充 std::array<uint64_t,46>，校验后调用 SDK；2/4 卡保留旧 GeneArgs 路径 |
+
+动态 policy、缺失 relay 通道、整数溢出、容量、别名、设备/通信域归属检查仍执行。每次发送/接收 token 仍查询，event/stream/thread 仍复用；没有删除依赖、缓存可能失效的 token 或绕过错误。scratch 由现有 submitMutex 保护，参数数组在 SDK 调用返回前保持有效，与旧临时 vector 的生存期一致。未来若改异步主机队列，必须重新设计这段所有权，不能直接捕获这些引用。
+
+新增能力标记 `A5CcuEidSubmitFastAbiVersion=1`。它标识这四项 route 改动，不表示已测得目标 NPU 性能收益。原 C ABI、46 项参数布局及 wheel 接口不变，仍须整个 route 库重编，不能混用旧目标文件。
+
+本轮开发侧结果：cam_lyw_92 / CANN 9.2 编译、严格链接、动态加载通过；真实 SDK 头文件的 host mock 验证 vector 与固定46项两条提交路径、100次复用及错误不重试；15项 EID CPU 回归、27项旧接口/同步等回归通过。布局测试在9600组变化计数/通道/FP8/BF16样本上与旧实现一致，绑定后构建布局零动态分配；生产图CPU模型验证数据及guard。这些不能代替9.3八卡正确性或性能结果。
+
+### 11.2 DeepSeek执行：先更新route，再验证
+
+在目标容器执行，保留现场本地修改，继续当前 bottleneck 分支；不要切回旧92/93分支。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git fetch origin feature/a5-ccu-ep8-bottleneck-alltoallv
+git switch feature/a5-ccu-ep8-bottleneck-alltoallv
+git merge --ff-only origin/feature/a5-ccu-ep8-bottleneck-alltoallv
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+mkdir -p "$A5_OUTPUT_ROOT/ep8-submit-fast/tmp"
+export TMPDIR="$A5_OUTPUT_ROOT/ep8-submit-fast/tmp"
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --cann-path "$A5_CANN_PATH" \
+  --build-dir "$A5_OUTPUT_ROOT/ep8-submit-fast/route-build" \
+  --install --install-path "$A5_CANN_PATH"
+export A5_CCU_ROUTE_PROBE_LIB="$A5_CANN_PATH/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+```
+
+要求 `PUBLIC_ROUTE_BUILD_PASS`、`PUBLIC_ROUTE_LOAD_PASS`，以及新增 `PUBLIC_ROUTE_ABI A5CcuEidSubmitFastAbiVersion=1`。用新的测试进程加载，不在已运行的模型中热替换库。rootinfo、Atlas、设备等沿用第2节现场有效配置。
+
+不占NPU的回归：
+
+```bash
+PYTHONPATH=tests/python/deepep python3 -m unittest test_a5_ccu_eid_cpu -v
+```
+
+要求15项OK；其中应有 `EP8_EID_SUBMIT_LAYOUT_PASS cases=9600` 和 `allocations_after_bind=0`。然后八卡可用时执行完整正确性，交替行宽验证必须保留：
+
+```bash
+(
+set -Ee -o pipefail
+export HCCL_BUFFSIZE=64 HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export A5_EID_MAX_RELAYS_PER_PEER=6 A5_CCU_RESOURCE_DIAGNOSTICS=0
+export A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+unset A5_EID_RELAY_SCHEDULE
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite create --register-stage full --planner bottleneck
+for A5_SUBMIT_DTYPE in float8_e4m3fn bfloat16; do
+  bash scripts/run_a5_ccu_eid_alltoallv.sh \
+    --suite correctness --mode all --planner bottleneck --counts-path legacy \
+    --dtype "$A5_SUBMIT_DTYPE" --width 5120 --row-scale 1 \
+    --warmup 3 --iters 10 --rounds 1 --dynamic-iters 100 \
+    --bidirectional-iters 100
+done
+)
+```
+
+create必须有 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`，后两次必须各有 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`；不能只检查某个rank或注册成功。
+
+### 11.3 性能复测与回报
+
+正确性通过后，**原样执行10.3的两dtype正式诊断命令**，保留 `--combination-audit --counts-path legacy`、真实673样本和原轮数。不换计数路径、不改 event 桥、不改 HCCL_BUFFSIZE，不额外开profiler；脚本使用 `/home/l00934901/profiling/ep8-combination-audit.*` 保存结果。
+
+回传两份普通摘要、两份 `boundaries.log`、新route的ABI标记、git提交、wheel与torch_npu版本，并列出：
+
+- audit_dynamic_prepared：native/direct/multipath的action_host_us及总时间，检查不重规划时能否改善。
+- audit_dynamic：同样的action、counts、fence及总时间，同时对照未插桩dynamic。
+- audit_counts_prepare_only：本轮没有修改host.prepare，预期不因route优化直接改变；不能把它当作“空CCU提交”。
+- prepared、host_counts、host_counts_serial及relay_rows；此轮规划策略未改，relay计划应一致。
+
+与196fe73旧route的同参数结果比较；native本轮也必须保留，以识别运行环境漂移。若看到收益，再做三次独立进程确认。不要用不同rank或不同迭代的分位数相减，声称精确省掉了某个函数的时间。
+
+### 11.4 原生HCCL是否也需要event桥
+
+**需要同类依赖，不能因custom有READY/DONE就判定它比原生多一道同步。** 在Ascend公开TorchNPU源码中，ProcessGroupHCCL的syncStreams记录输入event并让通信流等待；完成event记录在通信流，WorkHCCL的同步路径让当前流等待它。这是设备流依赖，不等于每步CPU等待通信完成。见[ProcessGroupHCCL.cpp](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/distributed/ProcessGroupHCCL.cpp)。
+
+另一个应优先核实的差异是主机提交队列：该源码的AllToAllV经RunOpApiV3提交；普通流且task queue开启时，它将handler入队。custom的SubmitEidTransfer则经OrderedCcuTensorStream取得stream后直接调用route。公开源码的无参NPUStream::stream()会在相关队列初始化后等待主机队列清空。见[OpCommand.cpp](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/framework/OpCommand.cpp)和[NPUStream.cpp](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp)。
+
+这是可检查的调用方式差异；**尚未证明目标机所装torch_npu版本/队列配置一致，也未证明它贡献了全部50–70µs。** 主机队列清空不等于设备完成等待，action_us也不是HcommCcuKernelLaunch单函数耗时。
+
+下一阶段优先量化OrderedCcuTensorStream（含队列清空/recordStream）、route token/layout、READY、SDK launch、DONE各段。若主机队列清空或内联提交占主导，再评估将整次custom提交放到同一种有序任务队列中，保留张量/计划/46项参数所有权及异步错误传播。不能只把stream()改成stream(false)：这样会使原始ACL提交越过尚未下发的Torch任务。
+
+当前bridge在Bind时创建两个event，每次仅record/wait，已经不逐次创建/销毁；mainThread与routeThread相同的情况也已经绕过桥。能否进一步减少桥接，应结合SDK对CCU线程/stream/die绑定的约束验证，而不能任意将不同IO die的执行迁回模型流。本轮不调整它。

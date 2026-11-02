@@ -16,9 +16,11 @@ public:
 class EidAllToAllVTaskArg : public a5ccu::CcuTaskArg {
 public:
     uint64_t input, output, inputToken, outputToken;
-    EidAllToAllVLayout layout;
+    // Borrowed only until synchronous host argument packing returns.
+    const EidAllToAllVLayout& layout;
     EidAllToAllVTaskArg(uint64_t in, uint64_t out, uint64_t it, uint64_t ot, const EidAllToAllVLayout& l)
         : input(in), output(out), inputToken(it), outputToken(ot), layout(l) {}
+    EidAllToAllVTaskArg(uint64_t,uint64_t,uint64_t,uint64_t,const EidAllToAllVLayout&&)=delete;
 };
 class EidAllToAllVKernel : public GroupedLocalCopyKernel {
 public:
@@ -26,6 +28,8 @@ public:
         : GroupedLocalCopyKernel(arg), rank_(dynamic_cast<const EidAllToAllVKernelArg&>(arg).rank),
           paths_(dynamic_cast<const EidAllToAllVKernelArg&>(arg).paths),
           stage_(dynamic_cast<const EidAllToAllVKernelArg&>(arg).stage) {}
+    uint32_t InlineArgumentCount() const override { return 46; }
+    bool FillInlineArgs(const a5ccu::CcuTaskArg&,uint64_t*,size_t) override;
 protected:
     HcclResult Algorithm() override;
     std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg&) override;

@@ -104,10 +104,13 @@ static void RegistrationStages() {
 }
 static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nullptr) {
     std::array<std::unique_ptr<Kernel>,8> kernels;
+    std::array<EidLayoutTopology,8> topologies;
+    std::array<EidAllToAllVLayout,8> layouts;
     std::array<uint8_t,64> allowed{};
     for(int s=0;s<8;++s) for(auto path:Catalog(s,relayLimit)) if(path.relay>=0) allowed[s*8+path.peer]|=1u<<path.relay;
     for(uint32_t r=0;r<8;++r) {
         auto paths=Catalog(r,relayLimit);std::vector<ChannelHandle> channels;
+        assert(topologies[r].Init(r,paths));
         for(auto p:paths) channels.push_back(p.peer*9+p.relay+2);
         EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));
         const auto before=hcomm::CcuRep::EventAllocations();
@@ -140,18 +143,22 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
             assert(plan.actions.size()==4 && std::accumulate(m.begin(),m.end(),uint64_t{0})==241);
             assert(*std::max_element(plan.loads.begin(),plan.loads.end())==1281);
         }
-        std::array<EidAllToAllVLayout,8> layouts;
         std::array<std::vector<unsigned char>,8> input,output,original;
         std::array<hcomm::CcuRep::Env,8> envs;
         uint64_t published[8][8][9][2]{};
         for(uint32_t r=0;r<8;++r) {
-            assert(BuildEidAllToAllVLayout(r,c.data(),64,rb,k.data(),m.data(),allowed,Catalog(r,relayLimit),&layouts[r]));
+            assert(topologies[r].Build(c.data(),64,rb,k.data(),m.data(),allowed,&layouts[r]));
             auto& l=layouts[r];input[r].assign(2*guard+std::max<uint64_t>(1,l.sendBytes),0xb7);
             output[r].assign(2*guard+std::max<uint64_t>(1,l.recvBytes),0xc3);
             for(size_t b=0;b<l.sendBytes;++b) input[r][guard+b]=(epoch*23+r*37+b)%251;
             original[r]=input[r];
             EidAllToAllVTaskArg task(reinterpret_cast<uint64_t>(input[r].data()+guard),reinterpret_cast<uint64_t>(output[r].data()+guard),11,22,l);
-            envs[r].args=kernels[r]->GeneArgs(task);assert(envs[r].args.size()==46);
+            std::array<uint64_t,46> args;
+            assert(kernels[r]->InlineArgumentCount()==46);
+            assert(kernels[r]->FillInlineArgs(task,args.data(),args.size()));
+            assert(!kernels[r]->FillInlineArgs(task,args.data(),45));
+            envs[r].args.assign(args.begin(),args.end());
+            assert(envs[r].args==kernels[r]->GeneArgs(task));
             envs[r].remote=[&,r](ChannelHandle ch,uint32_t slot){return published[r][(ch-1)/9][(ch-1)%9][slot];};
             for(size_t i=0;i<l.pathBytes.size();++i) if(!(l.activeMask&(uint64_t{1}<<i))) ++skipped;
         }

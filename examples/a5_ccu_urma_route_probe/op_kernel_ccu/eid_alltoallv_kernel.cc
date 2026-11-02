@@ -122,20 +122,27 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     for(auto i:control) {E_CHECK(NotifyWait(channels_[i],2,1));}
     return HCCL_SUCCESS;
 }
-std::vector<uint64_t> EidAllToAllVKernel::GeneArgs(const a5ccu::CcuTaskArg& arg) {
-    if (!EidStageAllowsPayload(stage_)) return {};
+bool EidAllToAllVKernel::FillInlineArgs(const a5ccu::CcuTaskArg& arg,uint64_t* args,size_t capacity) {
+    if (!args || capacity!=46 || !EidStageAllowsPayload(stage_)) return false;
     const auto* t=dynamic_cast<const EidAllToAllVTaskArg*>(&arg);
-    if(!t || t->layout.pathBytes.size()!=channels_.size() || (t->layout.activeMask>>channels_.size())) return {};
+    if(!t || t->layout.pathBytes.size()!=channels_.size() || (t->layout.activeMask>>channels_.size())) return false;
     std::array<uint64_t,4> go{};
-    if(t->layout.selfBytes && !BuildGroupCopyPlan(t->layout.selfBytes,&go)) return {};
-    std::vector<uint64_t> args{t->input,t->output,t->inputToken,t->outputToken,
-                             t->layout.selfSourceOffset,t->layout.selfDestinationOffset};
-    args.insert(args.end(),go.begin(),go.end());args.push_back(t->layout.activeMask);
+    if(t->layout.selfBytes && !BuildGroupCopyPlan(t->layout.selfBytes,&go)) return false;
+    args[0]=t->input;args[1]=t->output;args[2]=t->inputToken;args[3]=t->outputToken;
+    args[4]=t->layout.selfSourceOffset;args[5]=t->layout.selfDestinationOffset;
+    for(size_t i=0;i<4;++i) args[6+i]=go[i];
+    args[10]=t->layout.activeMask;
+    size_t j=11;
     for(const auto& p:t->layout.peerArgs) {
-        if(p[3]>p[2]) return {};
-        args.insert(args.end(),{p[0],p[1],p[2]-p[3],p[3],p[4]});
+        if(p[3]>p[2]) return false;
+        args[j++]=p[0];args[j++]=p[1];args[j++]=p[2]-p[3];args[j++]=p[3];args[j++]=p[4];
     }
-    return args;
+    return true;
+}
+std::vector<uint64_t> EidAllToAllVKernel::GeneArgs(const a5ccu::CcuTaskArg& arg) {
+    std::array<uint64_t,46> args;
+    if(!FillInlineArgs(arg,args.data(),args.size())) return {};
+    return {args.begin(),args.end()};
 }
 std::unique_ptr<a5ccu::CcuKernel> CreateEidAllToAllVKernel(const a5ccu::CcuKernelArg& a) {
     return std::unique_ptr<a5ccu::CcuKernel>(new EidAllToAllVKernel(a));

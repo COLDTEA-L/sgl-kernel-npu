@@ -255,6 +255,17 @@ int main() {
             self.assertNotEqual(subprocess.run(cmd, capture_output=True).returncode,0)
 
     @unittest.skipUnless(shutil.which('g++'), 'g++ required')
+    def test_submit_layout_reuse_matches_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary=str(Path(tmp)/'submit_layout')
+            subprocess.run(['g++','-std=c++14','-Wall','-Wextra','-Werror',
+                            str(ROOT/'tests/cpp/test_a5_ccu_eid_submit_fast.cpp'),'-o',binary],check=True,timeout=90)
+            result=subprocess.run([binary],capture_output=True,text=True,check=True,timeout=90)
+            self.assertIn('cases=9600',result.stdout)
+            self.assertIn('allocations_after_bind=0',result.stdout)
+            print(result.stdout.strip())
+
+    @unittest.skipUnless(shutil.which('g++'), 'g++ required')
     def test_production_ccu_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = str(Path(tmp) / 'graph')
