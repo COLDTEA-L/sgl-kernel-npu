@@ -83,6 +83,8 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh \
 
 ## 4. DeepSeek在机器上执行的性能对照
 
+2026-11-02补充：分析dynamic劣化前，先读第8节。已有结果优先按8.2提取，缺项或需要确认稳定性时才按8.3补测。
+
 **使用同一个新wheel，分别选择greedy和bottleneck。不要在两个不同提交的旧测试脚本间比较。** 两种策略均与native HCCL和custom direct同进程交替测量。
 
 先测试随仓库保存的真实样本，两种dtype：
@@ -185,3 +187,163 @@ host.run(combine_counts, bf16_send, bf16_recv)
 - 原始失败日志仍应优先保留 `environment.log`、`arguments.txt`、`commit.txt` 和首个底层错误。默认日志级别不会屏蔽Python阶段标记；外层终端末尾没有标记，不代表完整run.log没有。
 
 CPU回归新增真实673-token矩阵的生产CCU指令图回放，检查FP8/BF16交替时的地址范围、完整数据与guard；另检查同一host在固定327680字节relay容量下按两种行宽分别规划。CPU回放不模拟硬件EID转发、传输时序或HCCL启动，不能作为新机挂起已修复的证据。选路、route/kernel与all_gather后端均未因这次报告改动。
+
+## 8. 交给DeepSeek：纠正dynamic归因并补齐性能证据（2026-11-02）
+
+### 8.1 必须纠正的结论
+
+当前目标是 `participant_eid_ccu_urma`，不是旧HBM pipeline。先阅读本节，再解读第4节的性能表。
+
+| 原总结 | 应改为 |
+|---|---|
+| 每次dynamic执行 `planner.plan()`，约30 µs | 每次dynamic调用的是C++ `host.run()`；Python `planner.plan()`用于计时外检查和报告。30 µs不是当前链路的已测分段结果。模型侧也不得先plan再run而重复规划。 |
+| 每次layout/chunk/workspace约55 µs | 当前没有chunk切分或relay HBM workspace。route仍计算字节偏移、复制资源和构造参数，但其耗时未被单独测出。旧HBM执行器耗时不可移植到EID。 |
+| Python开销约15 µs | 这是总差减去其他估计值的余额，不是实测Python耗时。 |
+| native dynamic−prepared=205.1 µs，所以计数获取恰好205.1 µs | 差值混合了计数、D2H、分配及同步边界改变后的重叠效果。两种实现调用同一计数函数，实际等待时间也未必相同。 |
+| multipath多100 µs，全部属于规划+布局 | 需补齐custom direct和host_counts。route参数构造、token获取、事件桥和CCU提交在prepared与dynamic中都存在。 |
+| prepared 1.009x证明稳定获益 | 约1.6 µs、0.9%的差异需独立进程重复及逐轮数据确认。prepared包含主机提交和完成等待，不是纯链路或纯kernel时间。 |
+| 峰值降低6.6%，所以必然节省约11 µs | 仅在时间完全由该边等带宽负载决定时可这样估算；固定开销、共享资源和转发时序会改变收益。 |
+| 241行已接近全局最优 | 对该样本、目标1281行，4条原始超限边至少需移走241行，当前方案达到这个目标所需的行数下限；不证明最优目标、最优时延或全局最优路由。 |
+| config_allgather挂起证明BF16计划非法，或证明仍是HCCL_BUFFSIZE导致 | 该次尚未进入规划/建链；故障位置明确，底层原因未确认，后来恢复也不能单独证明根因。 |
+
+开发机当前C++规划微基准（`cam_lyw_92`、`-O2`、真实样本、复用Plan、5组×10000次、每组均值取中位数）：direct约0.09 µs、greedy约4.38 µs、bottleneck约2.69 µs。它仅测 `Planner::MakeInto()`，不含Python入口、NPU、HCCL或route，且为缓存较热的重复矩阵；不能当作目标机器或真实请求的端到端耗时。
+
+此次只增加文档。固定参数存储、减少资源/layout复制、连续CPU计数入口是下一轮优化候选，尚未实现，不能写成当前版本的已完成项。
+
+### 8.2 第一优先：从已有结果提取，不占NPU
+
+在新机容器的仓库根目录运行。查找真实673-token样本、`mode=all`、8rank完整成功的结果；每个策略/dtype取最近一份成功记录，打印路径、提交、三口径九个耗时和逐轮值。不会启动Torch或占卡。较新的失败运行不会覆盖旧成功结果，务必保留实际路径与提交，不把旧成功结果称作刚复跑。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+python3 - <<'PY'
+from pathlib import Path
+import json, sys
+sys.path.insert(0, 'scripts')
+from summarize_a5_ccu_eid import load
+root = Path('/home/l00934901/profiling')
+fixture = json.loads(Path('tests/data/ep8_prefill_673.json').read_text())['counts']
+latest = {}
+for path in sorted(root.glob('a5-ep8-eid.*/results/rank0.json'), key=lambda p: p.stat().st_mtime):
+    run = path.parents[1]
+    try:
+        raw = json.loads(path.read_text()); opt = raw['options']
+        if opt.get('mode') != 'all' or opt.get('suite') == 'create' or opt.get('width') != 5120: continue
+        if not any(r.get('counts') == fixture for r in raw['reports']): continue
+        result, topology = load(run)  # 校验exit.status、8rank报告和PASS标记
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+    latest[(opt.get('planner', 'greedy'), opt['dtype'])] = (run, result)
+for key in [('greedy','float8_e4m3fn'), ('bottleneck','float8_e4m3fn'),
+            ('greedy','bfloat16'), ('bottleneck','bfloat16')]:
+    if key not in latest:
+        print('MISSING_RUN', key); continue
+    run, result = latest[key]; opt = result['options']
+    print('\nRUN', run, 'policy/dtype=', key)
+    print('COMMIT', (run/'commit.txt').read_text().strip() if (run/'commit.txt').exists() else 'unknown')
+    print('OPTIONS', {k: opt.get(k) for k in ('mode','width','warmup','iters','rounds','dynamic_iters')})
+    if (run/'environment.log').exists(): print((run/'environment.log').read_text().strip())
+    for report in result['reports']:
+        if report['counts'] != fixture: continue
+        plan = report.get('plan', {})
+        print('PLAN', 'relay_rows=', report['relay_rows'], 'executed_relay=', report['executed_relay'],
+              'actions=', len(plan['actions']) if 'actions' in plan else 'unknown',
+              'evaluations=', plan.get('candidate_evaluations'),
+              'peak_bytes=', (plan.get('direct_peak_bytes'), plan.get('planned_link_peak_bytes')))
+        for metric in ('prepared', 'host_counts', 'dynamic'):
+            values = report['median_us'].get(metric, {})
+            if any(m not in values for m in ('native','direct','multipath')):
+                print('MISSING_METRIC', metric); continue
+            print(metric, {m: round(values[m],3) for m in ('native','direct','multipath')})
+            samples = report.get('samples_us', {}).get(metric, {})
+            print('ROUND_US', {m: [round(v,3) for v in samples.get(m, [])]
+                               for m in ('native','direct','multipath')})
+PY
+```
+
+优先回传bottleneck的FP8、BF16两份完整输出。最缺的是 `host_counts native/direct/multipath` 和 `dynamic direct`；同轮prepared三项、逐轮样本、relay动作/行数、结果目录也要保留。不要只贴比值。旧greedy结果可参考，但核对wheel、参数和拓扑之前，不作为严格策略A/B结论。
+
+### 8.3 缺项或需要验证稳定性时，才补跑NPU
+
+使用第2节同一套环境和已验证的wheel/route。文档更新不需要重编；旧wheel缺 `ep8_bottleneck_planner_abi=1` 才需按第2节重编wheel。无需重复注册探针或完整7case扫描，benchmark本身先做数据正确性检查。
+
+本轮只测bottleneck：进程内轮换native/direct/multipath，独立启动3轮并交替FP8/BF16顺序。不打profiler、不启动模型，不与其他八卡任务重叠。已有greedy结果无需再补一遍。
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+(
+set -Ee -o pipefail
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64
+export A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+mkdir -p "$A5_OUTPUT_ROOT"
+A5_AUDIT=$(mktemp -d "$A5_OUTPUT_ROOT/ep8-dynamic-audit.XXXXXX")
+for A5_REPEAT in 1 2 3; do
+  if (( A5_REPEAT % 2 )); then
+    A5_DTYPES=(float8_e4m3fn bfloat16)
+  else
+    A5_DTYPES=(bfloat16 float8_e4m3fn)
+  fi
+  for A5_DTYPE in "${A5_DTYPES[@]}"; do
+    A5_LOG="$A5_AUDIT/repeat${A5_REPEAT}_${A5_DTYPE}.log"
+    if bash scripts/run_a5_ccu_eid_alltoallv.sh \
+      --suite benchmark --mode all --planner bottleneck \
+      --matrix-json tests/data/ep8_prefill_673.json \
+      --dtype "$A5_DTYPE" --width 5120 \
+      --warmup 3 --iters 10 --rounds 6 --dynamic-iters 100 \
+      > "$A5_LOG" 2>&1; then
+      tail -25 "$A5_LOG"
+    else
+      A5_RC=$?
+      echo "FAILED rc=$A5_RC log=$A5_LOG"
+      tail -100 "$A5_LOG"
+      exit "$A5_RC"
+    fi
+  done
+done
+echo "AUDIT_DIR=$A5_AUDIT"
+)
+```
+
+失败立即停止并保留目录，不靠循环重试挑成功样本。64只是固定对照配置，不保证规避任何同步故障；若再停在config_allgather，按第7节回报，不写成算子执行失败。`--mode`只选择计时模式，计时前正确性检查仍执行三个模式，不能把单独 `--mode native` 当作完全不执行custom的隔离探针。
+
+实际结果目录在外层log第一行“结果目录”中。回传六份log末尾的完整汇总及各自结果目录，不只回传8.2选出的最近一轮。三轮FP8或三轮BF16分别比较，不跨dtype混合取中位数。所有结果位于 `/home/l00934901/profiling`。
+
+### 8.4 能判断什么，暂时不能判断什么
+
+| 对照 | 用途 | 不能声称 |
+|---|---|---|
+| host_counts multipath vs direct | 不含计数交换时，启用规划和relay后的整体差异 | 差值全是planner CPU时间，两者传输计划也不同 |
+| host_counts direct vs native | custom调用/提交/执行整体与原生的差异 | 差值全是route布局或event桥 |
+| 同模式host_counts vs prepared | 新C输入、规划/校验等动态host路径的影响 | 精确拆分Python、规划、校验各多少µs |
+| 同模式dynamic vs host_counts | 加上计数交换和D2H后的实际影响 | 差值等于独立D2H耗时 |
+| 三次独立进程的逐轮数据 | 0.9%变化是否可重复、是否受启动次序影响 | 已证明模型端到端获益 |
+
+每个模式的逐轮数值已经取八rank最大值，各模式的最慢rank可能不同；相减只作工作负载对照，不是精确CPU阶段剖析。
+
+本轮不要求profiler或修改SDK。先拿齐九项耗时，再决定是否增加route内部细分计时。脚本尚未单独输出token查询、资源复制、布局、事件桥、DFX、kernel提交六项耗时，不能把推算值当实测。`host.run()`返回 `[规划和host校验耗时, 0, 提交耗时]`，不含进入C++前的Python计数转换，提交时间也不是设备完成时间；中间的0不能命名为EID布局耗时。
+
+先不重启大模型。归因完成后，再按第5节使用profile结束后的真实dispatch C、combine C分别测试。把同一个dispatch C换成BF16是在隔离行宽变量，不能称为真实combine结果；每层真实C变化时也不能沿用旧计划。
+
+### 8.5 回报模板
+
+```text
+分支/提交：
+wheel与route路径/版本（同一套）：
+HCCL_BUFFSIZE、devices、拓扑/manifest目录：
+实际结果目录（每次独立启动一项）：
+case、dtype、row_bytes、warmup/iters/rounds/dynamic_iters：
+每轮是否全部通过；若失败，最后阶段和首个底层错误：
+
+metric       native_us   direct_us   multipath_us
+prepared
+host_counts
+dynamic
+
+每轮原始samples_us：
+relay_rows / actions / candidate_evaluations / peak_before→after：
+三次独立启动的差异：
+说明：仅真实样本通信微基准；不把估算阶段成本写成实测，不将BF16同C测试称为真实combine。
+```
