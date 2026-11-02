@@ -1,6 +1,30 @@
 """Instrument startup collectives without changing the communication backend."""
-from datetime import timedelta
+from datetime import datetime, timedelta
+import json
 import time
+
+
+def make_phase_logger(path, context, last_phase):
+    """Merge stage fields explicitly; tensor dtype can differ from payload dtype.
+
+    Pure Python so the real logger and collective probe can be tested without NPU.
+    The caller supplies payload_dtype separately to retain both dtype meanings.
+    """
+    context = dict(context)
+
+    def phase(name, **fields):
+        last_phase.clear()
+        last_phase.update(phase=name, register_stage=context.get('register_stage', 'full'))
+        last_phase.update(fields)
+        record = dict(context)
+        record.update(fields)
+        record.update(phase=name, time=datetime.now().astimezone().isoformat(timespec='microseconds'))
+        line = json.dumps(record)
+        with path.open('a') as journal:
+            journal.write(line + '\n')
+        print('EP8_EID_PHASE ' + line, flush=True)
+
+    return phase
 
 
 def traced_all_gather(torch, dist, output, input_tensor, phase, prefix='config_allgather'):

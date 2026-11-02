@@ -265,6 +265,8 @@ PY
 
 ### 8.3 缺项或需要验证稳定性时，才补跑NPU
 
+若之前遇到dtype重复参数错误，先按8.6更新并短验证，再运行本节。
+
 使用第2节同一套环境和已验证的wheel/route。文档更新不需要重编；旧wheel缺 `ep8_bottleneck_planner_abi=1` 才需按第2节重编wheel。无需重复注册探针或完整7case扫描，benchmark本身先做数据正确性检查。
 
 本轮只测bottleneck：进程内轮换native/direct/multipath，独立启动3轮并交替FP8/BF16顺序。不打profiler、不启动模型，不与其他八卡任务重叠。已有greedy结果无需再补一遍。
@@ -347,3 +349,58 @@ relay_rows / actions / candidate_evaluations / peak_before→after：
 三次独立启动的差异：
 说明：仅真实样本通信微基准；不把估算阶段成本写成实测，不将BF16同C测试称为真实combine。
 ```
+
+### 8.6 dtype日志冲突修复后，DeepSeek按此顺序恢复测试
+
+**先读本节，再执行8.3。无需stash或回退9102cc3。** `ede46d4`新增日志时，`dict(dtype=args.dtype, **fields)`与配置探针传入的 `fields['dtype']='torch.int32'`重复，触发Python运行时TypeError；`10bed4b`继承了这段脚本。此前“9102cc3到10bed4b只差文档”的表述不准确，中间包含诊断脚本变更。wheel/route的算子实现则没有因这次日志修复变化。
+
+修复把阶段日志提取成纯Python的 `make_phase_logger()`，先创建默认字段，再显式update阶段字段：
+
+- `dtype`表示阶段传入的dtype，未传入时用payload默认值。
+- 新增 `payload_dtype`，始终保留配置的FP8/BF16数据类型。配置探针可同时记录 `dtype=torch.int32` 和 `payload_dtype=bfloat16`，不再冲突。
+- 保留逐rank日志和原始失败信息，不捕获吞掉通信异常、不自动重试、不跳过配置检查。
+
+**步骤1：更新测试代码，无需重编。** 开发服务器push后，新机容器执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git status --short
+git fetch origin feature/a5-ccu-ep8-bottleneck-alltoallv
+git switch feature/a5-ccu-ep8-bottleneck-alltoallv
+git merge --ff-only origin/feature/a5-ccu-ep8-bottleneck-alltoallv
+git log -1 --oneline
+```
+
+保留自己的接入改动；若fast-forward失败，先处理分支差异，不用reset或stash回退旧脚本。继续使用已通过验证、带bottleneck能力的现有wheel和EID route。
+
+**步骤2：先跑不占NPU的日志回归。** 下面2项测试直接组合正式日志函数与配置同步探针，用模拟通信检查正常/异常路径。FP8和BF16都覆盖，不导入Torch，不启动进程组。
+
+```bash
+PYTHONPATH="tests/python/deepep:python/deep_ep/deep_ep${PYTHONPATH:+:$PYTHONPATH}" \
+python3 -m unittest \
+  test_a5_ccu_eid_cpu.EidTests.test_phase_logger_collective_dtype_override \
+  test_a5_ccu_eid_cpu.EidTests.test_phase_logger_preserves_collective_failure
+```
+
+要求 `Ran 2 tests`、`OK`。开发容器已通过这2项及原有的2项配置探针回归，共4项；这是Python日志回归，不是目标机器HCCL通过的证明。
+
+**步骤3：八卡空闲时，仅做一轮BF16短验证。** 沿用第2节环境，在仓库根目录执行：
+
+```bash
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64
+export A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite benchmark --mode all --planner bottleneck \
+  --matrix-json tests/data/ep8_prefill_673.json \
+  --dtype bfloat16 --width 5120 \
+  --warmup 1 --iters 2 --rounds 1 --dynamic-iters 2
+```
+
+要求最终 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`。只看config_allgather完成或注册成功还不够。这轮用来快速检查脚本和完整数据路径，不用于性能结论，不与正式6轮×100次结果混合；8.2自动提取若选中了它，会显示不同OPTIONS，应据此排除。
+
+**步骤4：短验证成功后，原样执行8.3，再按8.5回报。** FP8/BF16各3次独立启动，共6份成功记录；不重新启动DeepSeek模型，不额外开profiler。目录 `ep8-dynamic-audit.153535`中的旧失败记录保留，不覆盖、也不算性能样本。新命令使用mktemp建立新目录。
+
+8.3已有失败即停止的逻辑，按整个命令块运行；若第一份失败，不要继续手工补跑其余5份。回报实际结果目录、最后阶段及首个异常；若是设备同步错误，要与本次Python dtype重复参数错误区分。

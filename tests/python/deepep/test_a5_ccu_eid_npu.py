@@ -2,7 +2,7 @@
 """EP8 end-to-end explicit-EID AllToAllV; one communicator, no relay HBM."""
 import argparse
 import ctypes
-from datetime import datetime, timedelta
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -99,18 +99,10 @@ def main():
     rank = int(os.environ['RANK'])
     args.run_dir.mkdir(parents=True, exist_ok=True)
     phase_path = args.run_dir / f'rank{rank}.phases.jsonl'
-    def phase(name, **fields):
-        _last_phase.clear()
-        _last_phase.update(phase=name, register_stage=args.register_stage)
-        _last_phase.update(fields)
-        record = dict(rank=rank, pid=os.getpid(), phase=name, planner=args.planner,
-                      dtype=args.dtype, width=args.width,
-                      time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)
-        line = json.dumps(record)
-        # Separate files survive watchdog SIGABRT without interleaved SDK stdout.
-        # All phase calls remain outside timed intervals; no new collective.
-        with phase_path.open('a') as journal: journal.write(line + '\n')
-        print('EP8_EID_PHASE ' + line, flush=True)
+    from a5_ccu_startup_probe import make_phase_logger, traced_all_gather
+    phase = make_phase_logger(phase_path, dict(
+        rank=rank, pid=os.getpid(), planner=args.planner, dtype=args.dtype,
+        payload_dtype=args.dtype, width=args.width, register_stage=args.register_stage), _last_phase)
     phase('startup_resources', custom_channels_acquired=0, custom_plans=0,
           process_groups_requested=1, hccl_buffsize_mb=os.environ.get('HCCL_BUFFSIZE'),
           minimal=args.minimal, config_prewarm=args.config_prewarm, register_stage=args.register_stage)
@@ -127,7 +119,6 @@ def main():
     hashes = [torch.empty_like(digest) for _ in range(8)]
     torch.npu.synchronize()
     phase('config_digest_complete')
-    from a5_ccu_startup_probe import traced_all_gather
     for warmup in range(args.config_prewarm):
         traced_all_gather(torch, dist, hashes, digest, phase, f'config_prewarm_{warmup}')
     traced_all_gather(torch, dist, hashes, digest, phase)

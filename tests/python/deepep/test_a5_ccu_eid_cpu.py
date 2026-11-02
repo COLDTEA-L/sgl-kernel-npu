@@ -1,5 +1,7 @@
 """EP8 participant-EID catalog, production CCU graph and C++ host checks."""
 import importlib.util
+import io
+from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -10,12 +12,66 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
-from a5_ccu_startup_probe import traced_all_gather
+from a5_ccu_startup_probe import make_phase_logger, traced_all_gather
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from prepare_a5_ccu_ep8_topology import build_eid_topology
 
 class EidTests(unittest.TestCase):
+    def test_phase_logger_collective_dtype_override(self):
+        for dtype in ('float8_e4m3fn', 'bfloat16'):
+            with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)/'rank0.phases.jsonl'
+                last = {}
+                context = dict(rank=0, pid=123, planner='bottleneck', dtype=dtype,
+                               payload_dtype=dtype, width=5120, register_stage='full')
+                phase = make_phase_logger(path, context, last)
+                tensor = SimpleNamespace(dtype='torch.int32', shape=(32,), numel=lambda:32, element_size=lambda:4)
+                wait, sync = Mock(return_value=True), Mock()
+                torch = SimpleNamespace(npu=SimpleNamespace(
+                    current_stream=lambda:SimpleNamespace(npu_stream=456), synchronize=sync))
+                dist = SimpleNamespace(all_gather=Mock(return_value=SimpleNamespace(wait=wait)))
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    traced_all_gather(torch, dist, [tensor]*8, tensor, phase)
+                    phase('payload_allocate_begin', dtype=dtype, row_bytes=5120 if dtype.startswith('float8') else 10240)
+                records = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual(records[0]['phase'], 'config_allgather_begin')
+                self.assertEqual(records[0]['dtype'], 'torch.int32')
+                self.assertEqual(records[0]['payload_dtype'], dtype)
+                self.assertEqual(records[0]['shape'], [32])
+                self.assertEqual(records[0]['rank'], 0)
+                self.assertEqual(records[-2]['phase'], 'config_allgather_complete')
+                self.assertEqual(records[-1]['dtype'], dtype)
+                self.assertEqual(context['dtype'], dtype)  # merge must not mutate defaults
+                self.assertEqual(last['phase'], 'payload_allocate_begin')
+                self.assertEqual(last['register_stage'], 'full')
+                self.assertNotIn('shape', last)
+                printed = [json.loads(line[len('EP8_EID_PHASE '):]) for line in stdout.getvalue().splitlines()]
+                self.assertEqual(printed, records)
+                dist.all_gather.assert_called_once()
+                wait.assert_called_once()
+                sync.assert_called_once()
+
+    def test_phase_logger_preserves_collective_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'rank1.phases.jsonl'
+            last = {}
+            phase = make_phase_logger(path, dict(rank=1, dtype='bfloat16', payload_dtype='bfloat16'), last)
+            tensor = SimpleNamespace(dtype='torch.int32', shape=(32,), numel=lambda:32, element_size=lambda:4)
+            torch = SimpleNamespace(npu=SimpleNamespace(
+                current_stream=lambda:SimpleNamespace(npu_stream=789),
+                synchronize=Mock(side_effect=RuntimeError('injected device sync failure'))))
+            dist = SimpleNamespace(all_gather=Mock(return_value=SimpleNamespace(wait=Mock(return_value=True))))
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'injected device sync failure'):
+                traced_all_gather(torch, dist, [tensor]*8, tensor, phase)
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(records[-1]['phase'], 'config_allgather_failed')
+            self.assertEqual(records[-1]['stage'], 'device_sync')
+            self.assertEqual(records[-1]['error'], 'injected device sync failure')
+            self.assertEqual(last['stage'], 'device_sync')
+            self.assertNotIn('config_allgather_complete', [r['phase'] for r in records])
+
     def test_create_buffer_default_and_explicit_override(self):
         clean = {k: v for k, v in os.environ.items() if k != 'HCCL_BUFFSIZE'}
         script = 'source "$1"; shift; a5_ccu_prepare_eid_buffer_env "$@"; printf "%s" "${HCCL_BUFFSIZE:-unset}"'
