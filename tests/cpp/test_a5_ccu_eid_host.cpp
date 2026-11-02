@@ -97,4 +97,20 @@ static void RunSuite(bool bottleneck) {
     std::cout<<"EP8_EID_HOST_PASS ranks=8 alternating=100 row_bytes=5120,10240 submissions_per_call=1 relay_hbm_bytes=0\n";
 }
 
-int main() { RunSuite(false); RunSuite(true); }
+static void FixedByteCapacity() {
+    Batch batch;auto runtime=std::make_shared<Runtime>(batch,0);
+    std::vector<std::vector<U>> allowed(64);allowed[1]={2};
+    std::vector<U> capacity(8,0);capacity[2]=64*5120;
+    Planner planner(allowed,5120,1,0,56,capacity);
+    EidHost host(planner.WithBottleneck(),0,runtime);
+    Matrix c{};c[1]=100;
+    auto fp8=Make(c,at::kFloat8_e4m3fn,5120,0);
+    auto bf16=Make(c,at::kBFloat16,5120,0);
+    auto a=host.Prepare(c,fp8.sends[0]),b=host.Prepare(c,bf16.sends[0]);
+    Require(a->rowBytes==5120 && b->rowBytes==10240);
+    Require(a->plan.moved[1]==50 && b->plan.moved[1]==25);
+    Require(a->plan.moved[1]*a->rowBytes<=capacity[2] && b->plan.moved[1]*b->rowBytes<=capacity[2]);
+    host.Close();
+    std::cout<<"EP8_EID_FIXED_BYTE_CAPACITY_PASS capacity_bytes=327680 fp8_rows=50 bf16_rows=25\n";
+}
+int main() { RunSuite(false); RunSuite(true); FixedByteCapacity(); }

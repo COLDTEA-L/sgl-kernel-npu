@@ -1,7 +1,10 @@
 // Execute the actual EID CCU instruction graph. Hardware EID forwarding is NOT emulated.
 #include "../../examples/a5_ccu_urma_route_probe/op_kernel_ccu/eid_alltoallv_kernel.h"
 #include "../../examples/a5_ccu_urma_route_probe/common/peer_plan.h"
+#include "../../csrc/deepep/ep8_relay_planner.hpp"
 #include <cassert>
+#include <fstream>
+#include <numeric>
 #include <cstring>
 #include <iostream>
 #include <set>
@@ -99,7 +102,7 @@ static void RegistrationStages() {
     }
     std::cout<<"EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17\n";
 }
-static void RunGraph(unsigned relayLimit) {
+static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nullptr) {
     std::array<std::unique_ptr<Kernel>,8> kernels;
     std::array<uint8_t,64> allowed{};
     for(int s=0;s<8;++s) for(auto path:Catalog(s,relayLimit)) if(path.relay>=0) allowed[s*8+path.peer]|=1u<<path.relay;
@@ -112,10 +115,14 @@ static void RunGraph(unsigned relayLimit) {
         assert(hcomm::CcuRep::EventAllocations()-before==14); // no default-construct then overwrite
     }
     if(relayLimit==6) FixedDirectControl(*kernels[0]);
+    std::vector<std::vector<uint64_t>> candidates(64);
+    for(size_t f=0;f<64;++f) for(unsigned k=0;k<8;++k)
+        if(allowed[f]&(1u<<k)) candidates[f].push_back(k);
+    auto planner=deep_ep::ep8::Planner(candidates,5120,1,0,56,{}).WithBottleneck();
     uint32_t bits[8][8][9][3]{};
     constexpr size_t guard=37;
     size_t activeRelay=0, skipped=0;
-    for(unsigned epoch=0;epoch<100;++epoch) {
+    for(unsigned epoch=0;epoch<(real?4u:100u);++epoch) {
         std::array<uint64_t,64> c{},m{};std::array<int32_t,64> k;k.fill(-1);
         if(epoch%10==1) for(unsigned r=0;r<8;++r) c[r*8+r]=r+1;
         else if(epoch%10>=2) for(unsigned s=0;s<8;++s) for(unsigned d=0;d<8;++d) {
@@ -126,7 +133,13 @@ static void RunGraph(unsigned relayLimit) {
                 m[f]=epoch%4?c[f]/2:c[f];if(m[f]) k[f]=relay;
             }
         }
-        const uint64_t rb=std::array<uint64_t,5>{{1,2,257,5120,10240}}[epoch%5];
+        const uint64_t rb=real?(epoch%2?10240:5120):std::array<uint64_t,5>{{1,2,257,5120,10240}}[epoch%5];
+        if(real) {
+            c=*real;auto plan=planner.WithRowBytes(rb).Make(c);
+            m=plan.moved;k=plan.relays;
+            assert(plan.actions.size()==4 && std::accumulate(m.begin(),m.end(),uint64_t{0})==241);
+            assert(*std::max_element(plan.loads.begin(),plan.loads.end())==1281);
+        }
         std::array<EidAllToAllVLayout,8> layouts;
         std::array<std::vector<unsigned char>,8> input,output,original;
         std::array<hcomm::CcuRep::Env,8> envs;
@@ -194,7 +207,18 @@ static void RunGraph(unsigned relayLimit) {
         }
     }
     assert(bool(activeRelay)==bool(relayLimit) && skipped);
+    if(real) {
+        std::cout<<"EP8_EID_REAL_GRAPH_PASS epochs=4 row_bytes=5120,10240 actions=4 relay_rows=241 byte_guards=verified\n";
+        return;
+    }
     std::cout<<"EP8_EID_GRAPH_PASS epochs=100 launches=800 task_args=46 relay_limit="<<relayLimit<<" relay_writes="<<activeRelay<<" skipped="<<skipped<<"\n";
 }
 
-int main() { Invalid(); RegistrationStages(); for(unsigned limit:{0u,1u,6u}) RunGraph(limit); }
+int main(int argc,char** argv) {
+    Invalid(); RegistrationStages(); for(unsigned limit:{0u,1u,6u}) RunGraph(limit);
+    if(argc==2) {
+        std::ifstream in(argv[1]);deep_ep::ep8::Matrix counts{};
+        for(auto& n:counts) {in>>n;assert(in);}
+        uint64_t extra;assert(!(in>>extra));RunGraph(6,&counts);
+    }
+}

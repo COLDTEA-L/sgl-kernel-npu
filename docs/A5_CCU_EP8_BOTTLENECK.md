@@ -171,3 +171,17 @@ host.run(combine_counts, bf16_send, bf16_recv)
 - `cam_lyw_92` / CANN9.2：完整DeepEP扩展8个编译单元及 `--no-undefined` 严格链接成功，日志 `extension.log`。
 - 实际完整扩展导入成功，FP8/BF16行宽分别得到4次动作、241行relay、峰值1281行、54次候选评估，日志 `import.log`。这一步只调用CPU规划，不启动NPU通信。
 - 上述构建和导入日志均在 `/home/liuyuanwen/profiling/a5-ep8-bottleneck/`。尚未完成新机CANN9.3八卡正确性及性能验证；目标机器仍需重编安装匹配其Python/CANN环境的wheel。
+
+## 7. 前置配置同步失败与BF16排查
+
+现场 `a5-ep8-eid.1AWrFE` 的8个rank均到达 `config_allgather_wait_complete`，随后在 `config_allgather_sync_begin` 后失败；尚无catalog或case标记。该次失败发生在前置配置同步，不能归因为bottleneck/BF16计划非法。`Work.wait()`返回并不等于设备工作已完成。与历史失败位置相同，也不证明底层原因相同；恢复运行不能单独证明某个修复有效。
+
+测试未设置 `relay_capacity_bytes`，不会因BF16行宽翻倍而触发一个配置的relay容量上限。显式设置容量时，host通过 `WithRowBytes()` 按实际行宽重新换算。`--suite create --dtype bfloat16`仍只是注册验证，不执行BF16数据，无法替代BF16正确性测试。
+
+新增诊断均在计时区间外，不新增collective或设备同步：
+
+- `results/rankN.phases.jsonl`：每rank独立阶段记录，避免多进程/SDK日志粘连；区分验证提交、验证同步、预热、测量前barrier、测量执行完成和计时all_reduce。
+- `results/rankN.external.plan.json`（其他case替换external）：首次提交前保存实际行数、relay选择、行宽、指纹、字节偏移及buffer大小。已有run.log中的阶段标记继续保留。
+- 原始失败日志仍应优先保留 `environment.log`、`arguments.txt`、`commit.txt` 和首个底层错误。默认日志级别不会屏蔽Python阶段标记；外层终端末尾没有标记，不代表完整run.log没有。
+
+CPU回归新增真实673-token矩阵的生产CCU指令图回放，检查FP8/BF16交替时的地址范围、完整数据与guard；另检查同一host在固定327680字节relay容量下按两种行宽分别规划。CPU回放不模拟硬件EID转发、传输时序或HCCL启动，不能作为新机挂起已修复的证据。选路、route/kernel与all_gather后端均未因这次报告改动。

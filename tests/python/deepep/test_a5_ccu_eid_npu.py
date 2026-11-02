@@ -97,12 +97,20 @@ def main():
         fn = getattr(route, symbol); fn.restype = ctypes.c_int
         if fn() != expected: raise RuntimeError('rebuild route: ' + symbol)
     rank = int(os.environ['RANK'])
+    args.run_dir.mkdir(parents=True, exist_ok=True)
+    phase_path = args.run_dir / f'rank{rank}.phases.jsonl'
     def phase(name, **fields):
         _last_phase.clear()
         _last_phase.update(phase=name, register_stage=args.register_stage)
         _last_phase.update(fields)
-        print('EP8_EID_PHASE ' + json.dumps(dict(rank=rank, pid=os.getpid(), phase=name,
-              time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)), flush=True)
+        record = dict(rank=rank, pid=os.getpid(), phase=name, planner=args.planner,
+                      dtype=args.dtype, width=args.width,
+                      time=datetime.now().astimezone().isoformat(timespec='microseconds'), **fields)
+        line = json.dumps(record)
+        # Separate files survive watchdog SIGABRT without interleaved SDK stdout.
+        # All phase calls remain outside timed intervals; no new collective.
+        with phase_path.open('a') as journal: journal.write(line + '\n')
+        print('EP8_EID_PHASE ' + line, flush=True)
     phase('startup_resources', custom_channels_acquired=0, custom_plans=0,
           process_groups_requested=1, hccl_buffsize_mb=os.environ.get('HCCL_BUFFSIZE'),
           minimal=args.minimal, config_prewarm=args.config_prewarm, register_stage=args.register_stage)
@@ -189,6 +197,7 @@ def main():
     for case, counts in cases:
         phase('correctness_begin', case=case)
         sends, recvs = list(counts[rank*8:(rank+1)*8]), list(counts[rank::8])
+        phase('payload_allocate_begin', case=case, row_bytes=row_bytes, send_bytes=sum(sends)*row_bytes, recv_bytes=sum(recvs)*row_bytes)
         source = make_payload(sum(sends), args.width, rank, dtype)
         expected = cat_payload([make_payload(sum(counts[s*8:(s+1)*8]), args.width, s, dtype)[
             sum(counts[s*8:s*8+rank]):sum(counts[s*8:s*8+rank])+counts[s*8+rank]] for s in range(8)])
@@ -197,8 +206,25 @@ def main():
         send = input_store[guard:-guard].reshape(sum(sends), args.width)
         stores = {mode: full_payload((expected.numel()+2*guard,), -17, dtype, 'npu') for mode in ('native', 'direct', 'multipath')}
         outputs = {mode: store[guard:-guard].reshape(sum(recvs), args.width) for mode, store in stores.items()}
-        prepared = {mode: host.prepare(counts, send) for mode, host in hosts.items()}
+        phase('payload_allocate_complete', case=case)
         plan = planners['multipath'].plan(counts)
+        actions_bytes = []
+        for src, dst, relay, rows, _ in plan.actions:
+            direct_rows = counts[src*8+dst] - rows
+            actions_bytes.append(dict(src=src, dst=dst, relay=relay, rows=rows,
+                bytes=rows*row_bytes,
+                send_offset=(sum(counts[src*8:src*8+dst])+direct_rows)*row_bytes,
+                recv_offset=(sum(counts[s*8+dst] for s in range(src))+direct_rows)*row_bytes))
+        plan_record = dict(rank=rank, case=case, planner=args.planner, dtype=args.dtype,
+            plan=plan.report(), relay_capacity_bytes=None, actions_bytes=actions_bytes,
+            send_bytes=send.nbytes, recv_bytes=outputs['multipath'].nbytes,
+            send_pointer=hex(send.data_ptr()), recv_pointer=hex(outputs['multipath'].data_ptr()))
+        plan_path = args.run_dir / f'rank{rank}.{case}.plan.json'
+        plan_path.write_text(json.dumps(plan_record, indent=2))
+        phase('prepare_begin', case=case, row_bytes=row_bytes,
+              plan_fingerprint=plan.fingerprint, plan_file=str(plan_path))
+        prepared = {mode: host.prepare(counts, send) for mode, host in hosts.items()}
+        phase('prepare_complete', case=case)
         if prepared['multipath'].describe() != (plan.counts, plan.relay_rank, plan.relay_rows, plan.actions):
             raise AssertionError('host/reference plan mismatch')
         if case == 'single_hot' and not plan.uses_relay and not args.allow_no_relay:
@@ -220,10 +246,18 @@ def main():
         for epoch in range(2):
             setup(epoch)
             for mode in ('native', 'direct', 'multipath'):
-                op(mode); torch.npu.synchronize(); check(mode, epoch)
+                phase('validate_submit_begin', case=case, mode=mode, epoch=epoch, api='execute')
+                op(mode)
+                phase('validate_sync_begin', case=case, mode=mode, epoch=epoch, api='execute')
+                torch.npu.synchronize(); check(mode, epoch)
+                phase('validate_complete', case=case, mode=mode, epoch=epoch, api='execute')
+            phase('validate_submit_begin', case=case, mode='multipath', epoch=epoch, api='run')
             hosts['multipath'].run(counts, send, outputs['multipath'])
+            phase('validate_sync_begin', case=case, mode='multipath', epoch=epoch, api='run')
             torch.npu.synchronize(); check('multipath', epoch)
+            phase('validate_complete', case=case, mode='multipath', epoch=epoch, api='run')
         # Producer/consumer ordering and repeated notification epochs, no fence between calls.
+        phase('queued_validation_begin', case=case)
         snapshots = []
         for epoch in (7, 13, 19):
             copy_payload_(send, shifted_payload(source, epoch))
@@ -231,6 +265,7 @@ def main():
         torch.npu.synchronize()
         for epoch, snapshot in snapshots:
             if not equal_payload(snapshot, shifted_payload(expected, epoch)): raise AssertionError('queued ordering mismatch')
+        phase('queued_validation_complete', case=case)
         local_counts = torch.tensor(sends, dtype=torch.int64, device='npu')
         def dynamic(mode):
             current = gather_routing_counts(local_counts)
@@ -246,18 +281,25 @@ def main():
                 order = selected[round_id % len(selected):] + selected[:round_id % len(selected)]
                 if round_id % 2: order = tuple(reversed(order))
                 for mode in order:
-                    phase('measure_begin', case=case, metric=metric, mode=mode, round=round_id)
+                    phase('warmup_begin', case=case, metric=metric, mode=mode, round=round_id)
                     setup(round_id)
                     for _ in range(args.warmup): call(mode)
-                    torch.npu.synchronize(); dist.barrier(); torch.npu.synchronize()
+                    phase('warmup_sync_begin', case=case, metric=metric, mode=mode, round=round_id)
+                    torch.npu.synchronize()
+                    phase('measure_barrier_begin', case=case, metric=metric, mode=mode, round=round_id)
+                    dist.barrier(); torch.npu.synchronize()
+                    phase('measure_begin', case=case, metric=metric, mode=mode, round=round_id)
                     start = time.perf_counter()
                     for _ in range(iterations): call(mode)
                     torch.npu.synchronize()
                     elapsed = (time.perf_counter()-start)*1e6/iterations
+                    phase('measure_execution_complete', case=case, metric=metric, mode=mode, round=round_id)
                     check(mode, round_id)
+                    phase('measure_check_complete', case=case, metric=metric, mode=mode, round=round_id)
                     # Slowest participant, outside measured interval. HCCL rejects
                     # FP64; FP32 is sufficient for microsecond timing samples.
                     value = torch.tensor([elapsed], dtype=torch.float32, device='npu')
+                    phase('timing_reduce_begin', case=case, metric=metric, mode=mode, round=round_id)
                     dist.all_reduce(value, op=dist.ReduceOp.MAX)
                     samples[metric][mode].append(value.item())
                     phase('measure_complete', case=case, metric=metric, mode=mode, round=round_id)

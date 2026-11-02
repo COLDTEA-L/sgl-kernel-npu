@@ -202,18 +202,22 @@ int main() {
     def test_production_ccu_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = str(Path(tmp) / 'graph')
-            subprocess.run(['g++', '-std=c++14', '-Wall', '-Wextra', '-Werror',
+            subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                 '-DA5_TEST_CCU_V1_ONLY',
                 '-I' + str(ROOT / 'tests/cpp/fake_ccu'),
                 str(ROOT / 'tests/cpp/test_a5_ccu_eid.cpp'),
                 str(ROOT / 'examples/a5_ccu_urma_route_probe/op_kernel_ccu/eid_alltoallv_kernel.cc'),
                 str(ROOT / 'tests/cpp/group_copy_model_stub.cc'), '-o', binary], check=True, timeout=90)
-            result = subprocess.run([binary], capture_output=True, text=True, timeout=90)
+            counts = json.loads((ROOT/'tests/data/ep8_prefill_673.json').read_text())['counts']
+            fixture = Path(tmp)/'counts.txt'
+            fixture.write_text(' '.join(map(str, counts)))
+            result = subprocess.run([binary, str(fixture)], capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('EP8_EID_GRAPH_PASS epochs=100 launches=800', result.stdout)
             self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17', result.stdout)
             self.assertIn('EP8_EID_FIXED_CONTROL_PASS masks=202', result.stdout)
             self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 3)
+            self.assertIn('EP8_EID_REAL_GRAPH_PASS epochs=4 row_bytes=5120,10240 actions=4 relay_rows=241 byte_guards=verified', result.stdout)
             print(result.stdout.strip())
 
     @staticmethod
@@ -272,6 +276,7 @@ int main() {
             result=subprocess.run([binary],capture_output=True,text=True,timeout=180)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
             self.assertIn('EP8_EID_HOST_PASS',result.stdout)
+            self.assertIn('EP8_EID_FIXED_BYTE_CAPACITY_PASS capacity_bytes=327680 fp8_rows=50 bf16_rows=25',result.stdout)
             print(result.stdout.strip())
 
 if __name__=='__main__': unittest.main()
