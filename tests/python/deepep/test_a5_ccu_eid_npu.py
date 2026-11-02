@@ -39,6 +39,8 @@ def main():
     p.add_argument('--iters', type=int, default=10)
     p.add_argument('--rounds', type=int, default=6)
     p.add_argument('--dynamic-iters', type=int, default=100)
+    p.add_argument('--combination-audit', action='store_true',
+                   help='extra host-boundary/control measurements; fixed matrix only, not a model fast path')
     p.add_argument('--counts-path', choices=('legacy', 'reuse', 'stream'), default='legacy',
                    help='dynamic/counts_only: old adapter, reusable buffers, or reusable dedicated count stream')
     p.add_argument('--bidirectional-iters', type=int, default=0)
@@ -47,6 +49,8 @@ def main():
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
     p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static', 'mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'), default='full', help='create-only registration graph; mask probes are isolated from production')
     args = p.parse_args()
+    if args.combination_audit and args.suite == 'create':
+        p.error('--combination-audit requires payload measurements, not create')
     if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
         p.error('--register-stage probes require --suite create without --minimal')
     os.environ['A5_EID_REGISTER_STAGE'] = args.register_stage
@@ -282,9 +286,10 @@ def main():
             phase('counts_exchange_validate_complete', case=case, counts_path=args.counts_path)
         last_counts = None
         def read_counts():
-            return exchange.gather(local_counts) if exchange is not None else gather_routing_counts(local_counts)
-        def dynamic(mode):
-            current = read_counts()
+            nonlocal last_counts
+            last_counts = exchange.gather(local_counts) if exchange is not None else gather_routing_counts(local_counts)
+            return last_counts
+        def submit_counts(mode, current):
             if mode == 'native':
                 # HCCL's public split API still requires host integer lists.
                 if exchange is not None: current = current.tolist()
@@ -293,6 +298,8 @@ def main():
                 hosts[mode].run_counts_tensor(current, send, outputs[mode])
             else:
                 hosts[mode].run(current, send, outputs[mode])
+        def dynamic(mode):
+            submit_counts(mode, read_counts())
         def host_counts(mode):
             if mode == 'native': native_transfer(send, outputs[mode], sends, recvs)
             else: hosts[mode].run(counts, send, outputs[mode])
@@ -305,12 +312,26 @@ def main():
         def check_counts():
             actual = last_counts.tolist() if exchange is not None else last_counts
             if tuple(actual) != counts: raise AssertionError('count exchange mismatch')
+        from a5_ccu_combination_audit import AUDIT_METRICS, CombinationAudit
+        prepared_controls = {}
+        def prepare_only(mode, current):
+            if mode == 'native':
+                if exchange is not None: current = current.tolist()
+                prepared_controls[mode] = (list(current[rank*8:(rank+1)*8]), list(current[rank::8]))
+            elif exchange is not None:
+                prepared_controls[mode] = hosts[mode].prepare_counts_tensor(current, send)
+            else:
+                prepared_controls[mode] = hosts[mode].prepare(current, send)
+        audit = CombinationAudit(read_counts, submit_counts, op, prepare_only, torch.npu.synchronize)
+        rank_local_audit = []
         metrics = ('prepared', 'host_counts', 'host_counts_serial', 'counts_only', 'dynamic')
+        if args.combination_audit: metrics += AUDIT_METRICS
         samples = {metric: {mode: [] for mode in selected} for metric in metrics}
         for metric in metrics:
             iterations = args.iters if metric == 'prepared' else args.dynamic_iters
-            call = dict(prepared=op, host_counts=host_counts, host_counts_serial=host_counts_serial,
-                        counts_only=counts_only, dynamic=dynamic)[metric]
+            call = (lambda mode: audit.call(metric, mode)) if metric in AUDIT_METRICS else dict(
+                prepared=op, host_counts=host_counts, host_counts_serial=host_counts_serial,
+                counts_only=counts_only, dynamic=dynamic)[metric]
             for round_id in range(args.rounds):
                 order = selected[round_id % len(selected):] + selected[:round_id % len(selected)]
                 if round_id % 2: order = tuple(reversed(order))
@@ -323,13 +344,29 @@ def main():
                     phase('measure_barrier_begin', case=case, metric=metric, mode=mode, round=round_id)
                     dist.barrier(); torch.npu.synchronize()
                     phase('measure_begin', case=case, metric=metric, mode=mode, round=round_id)
+                    audit.reset()  # discard warmup samples before the measured loop
                     start = time.perf_counter()
                     for _ in range(iterations): call(mode)
+                    drain_start = time.perf_counter() if metric in AUDIT_METRICS else None
                     torch.npu.synchronize()
-                    elapsed = (time.perf_counter()-start)*1e6/iterations
+                    stop = time.perf_counter()
+                    elapsed = (stop-start)*1e6/iterations
+                    if metric in AUDIT_METRICS:
+                        rank_local_audit.append(dict(metric=metric, mode=mode, round=round_id,
+                            iterations=iterations, elapsed_host_us=elapsed,
+                            final_drain_host_us=(stop-drain_start)*1e6,
+                            samples=list(audit.samples)))
                     phase('measure_execution_complete', case=case, metric=metric, mode=mode, round=round_id)
-                    if metric == 'counts_only': check_counts()
-                    else: check(mode, round_id)
+                    if metric == 'counts_only' or metric in AUDIT_METRICS:
+                        check_counts()
+                    if metric == 'audit_counts_prepare_only':
+                        control = prepared_controls[mode]
+                        if mode == 'native':
+                            if control != (sends, recvs): raise AssertionError('native split control mismatch')
+                        elif control.describe() != prepared[mode].describe():
+                            raise AssertionError('prepare-only plan differs from reference')
+                    elif metric != 'counts_only':
+                        check(mode, round_id)
                     phase('measure_check_complete', case=case, metric=metric, mode=mode, round=round_id)
                     # Slowest participant, outside measured interval. HCCL rejects
                     # FP64; FP32 is sufficient for microsecond timing samples.
@@ -343,8 +380,11 @@ def main():
                       executed_relay=plan.uses_relay, planner=args.planner, plan=plan.report(), samples_us=samples,
                       median_us={metric: {mode: statistics.median(values) for mode, values in modes.items()} for metric, modes in samples.items()},
                       workspace={mode: host.stats() for mode, host in hosts.items()})
+        if args.combination_audit:
+            report['rank_local_audit'] = rank_local_audit
         reports.append(report)
-        print('EP8_EID_CASE_PASS ' + json.dumps(dict(rank=rank, **report)), flush=True)
+        # Keep per-iteration diagnostics in rank JSON; avoid flooding shared stdout.
+        print('EP8_EID_CASE_PASS ' + json.dumps(dict(rank=rank, **{k:v for k,v in report.items() if k != 'rank_local_audit'})), flush=True)
     for host in hosts.values(): host.close()
     destroy = route.HcclCcuUrmaPeerPlanDestroy
     destroy.argtypes = [ctypes.c_uint64]; destroy.restype = ctypes.c_int

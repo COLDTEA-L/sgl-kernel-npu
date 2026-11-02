@@ -544,3 +544,116 @@ host.close()
 - 文档命令通过bash语法检查。
 
 开发日志：`/home/liuyuanwen/profiling/a5-ep8-bottleneck/counts-cpu.log`、`counts-extension.log`、`counts-import.log`。这不是9.3.0八卡NPU性能结果；独立流的HCCL依赖、pinned D2H和实际收益仍按9.3节验收。目标机须重打自己的cp311 wheel，不能使用开发侧cp312编译产物。
+
+## 10. 三条计数路径通过后：定位组合路径中的等待
+
+### 10.1 最新实测支持什么
+
+用户在de5b412完成三条路径×两dtype的全部正确性和性能测试：FP8 dynamic的native/multipath约0.795–0.802，复用和独立流均未明显缩小差距；custom direct自身已经比native慢约86–95µs，multipath比direct再慢约5–11µs。当前优先定位custom共用提交路径与计数交换的组合，而不是继续改relay量。
+
+必须保留以下边界：
+
+- 这组结果不支持“计数分配/列表转换是主要差距来源”，但不能证明它们开销为零。
+- `stream`仍保留producer依赖，并且测试里begin后立即finish；没有模型permute可重叠。独立流未改善，不能反过来写成“已证明同一流交替是根因”。
+- `counts_only`不调用C++ host，约13µs改善属于计数适配器整体，不能用于测量`run_counts_tensor`收益。
+- `host_counts`包含完整A2A，且在三条counts_path中都调用原有host入口，因此其一致性不验证新增C++入口的性能。
+- BF16不同路径只各一次独立启动，native自身也有变化，不能给reuse或stream作稳定优劣排序。
+
+### 10.2 新增对照，不更换算子
+
+增加 `--combination-audit`，保留原五口径，并追加四个诊断口径。仍使用真实payload、相同group、原生产EID kernel；不注册新的空CCU kernel，不改变拓扑或同步协议。
+
+| 诊断口径 | 每次操作 | 主要用途 |
+|---|---|---|
+| audit_dynamic | 取当前C → 原dynamic提交 | 带分段主机计时的参照；先与不插桩dynamic比较扰动 |
+| audit_dynamic_serial | 取当前C → 原dynamic提交 → device synchronize | 将可能拖入下一次计数获取的未完成任务显式收尾 |
+| audit_dynamic_prepared | 取当前C → 执行固定prepared计划 | 保留计数collective和真实A2A，去掉本次host规划/计数入口处理 |
+| audit_counts_prepare_only | 取当前C → 仅准备主机计划，无payload提交 | “空custom”的主机侧对照；不模拟CCU/DFX/event桥开销 |
+
+最后一项native只构造split列表；custom调用已有host.prepare或prepare_counts_tensor。它会创建新的host prepared对象，而run复用内部plan对象，所以不能直接相减当作精确planner时间。计时外验证其计划与参考计划相同，不把未执行的数据通信判成正确性PASS。
+
+`audit_dynamic_prepared`只用于固定C的微基准：输入local_counts在计时中固定，计时外校验收集结果和prepared C一致，仍校验输出及guard。它不能用来指导真实模型忽略变化的C，不能把该时间当作完整dynamic性能。
+
+每个rank在JSON中的`rank_local_audit`保存各迭代：
+
+- `counts_host_us`：从调用计数适配器至返回CPU C，可能含前序工作等待。
+- `action_host_us`：从拿到C到对应submit/execute/prepare返回，包括入口转换及其中的阻塞；不是设备传输时间。
+- `fence_host_us`：serial的显式同步；其他模式只是两次时钟读取之间的间隔。
+- `call_host_us`：上述三段的合计。
+- 每轮另记`final_drain_host_us`：整个循环之后的最终同步时间，没有偷偷塞进某次提交。
+
+计时循环内不打印日志、不做阶段all_reduce。逐次记录本身有Python/时钟开销，所以`audit_dynamic`必须和原dynamic同时保留。各模式依旧轮换顺序、计时后取rank最大值。
+
+### 10.3 DeepSeek下一步执行
+
+**本次仅测试脚本/文档变更，不重编wheel，不重编route。** 继续使用已通过测试的de5b412 wheel（counts ABI=1）。先按第8.6步骤1拉取本分支；现场改动先保留diff，新脚本包含原五口径，不要覆盖回旧版本。
+
+先做不占NPU的回归：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+PYTHONPATH="tests/python/deepep:python/deep_ep/deep_ep${PYTHONPATH:+:$PYTHONPATH}" \
+python3 -m unittest test_a5_ccu_combination_audit -v
+```
+
+要求5项OK，覆盖诊断动作选择、计时边界、错误不伪造样本、同rank分段汇总和完整运行记录校验。
+
+再做一次FP8短验证，先固定legacy路径，避免继续扩大变量组合：
+
+```bash
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64 A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite benchmark --mode all --planner bottleneck --counts-path legacy \
+  --combination-audit --matrix-json tests/data/ep8_prefill_673.json \
+  --dtype float8_e4m3fn --width 5120 \
+  --warmup 1 --iters 2 --rounds 1 --dynamic-iters 2
+```
+
+必须出现 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`，不是仅create或计数通过。然后做两次正式诊断（两dtype各一次），暂时不用把三条counts_path各重跑三轮：
+
+```bash
+(
+set -Ee -o pipefail
+cd /home/l00934901/sgl-kernel-npu
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+export HCCL_BUFFSIZE=64 A5_EID_LOG_LEVEL=3 A5_EID_LOG_STDOUT=0
+export A5_CCU_RESOURCE_DIAGNOSTICS=0
+unset A5_EID_RELAY_SCHEDULE
+A5_COMBO_RUN=$(mktemp -d "$A5_OUTPUT_ROOT/ep8-combination-audit.XXXXXX")
+for A5_COMBO_DTYPE in float8_e4m3fn bfloat16; do
+  A5_COMBO_LOG="$A5_COMBO_RUN/${A5_COMBO_DTYPE}.log"
+  bash scripts/run_a5_ccu_eid_alltoallv.sh \
+    --suite benchmark --mode all --planner bottleneck --counts-path legacy \
+    --combination-audit --matrix-json tests/data/ep8_prefill_673.json \
+    --dtype "$A5_COMBO_DTYPE" --width 5120 \
+    --warmup 3 --iters 10 --rounds 6 --dynamic-iters 100 \
+    > "$A5_COMBO_LOG" 2>&1 || { tail -100 "$A5_COMBO_LOG"; exit 1; }
+  tail -55 "$A5_COMBO_LOG"
+  A5_COMBO_RESULT=$(sed -n 's/^结果目录：//p' "$A5_COMBO_LOG" | head -n 1)
+  python3 scripts/summarize_a5_ccu_combination_audit.py "$A5_COMBO_RESULT" \
+    | tee "$A5_COMBO_RUN/${A5_COMBO_DTYPE}.boundaries.log"
+done
+echo "$A5_COMBO_RUN"
+)
+```
+
+汇总器先校验exit=0及8个rank完整PASS。每轮先选一个总耗时最大的rank，再使用**同一rank**的所有分段；禁止分别取不同rank的阶段最大值拼接。输出各列的跨轮中位数，列中位数不保证相加等于总时间中位数；`loop_other_us`保留循环/记录等未计入call内部的开销。原始每rank每轮数据仍在JSON，可进一步检查rank偏斜。
+
+回传：两份完整普通耗时摘要、两份`boundaries.log`、结果目录、提交/wheel版本。若插桩的audit_dynamic与原dynamic差别很大，首先报告扰动，不把插桩值直接解释成原始调用分项。
+
+### 10.4 根据结果决定下一处改动
+
+| 观察 | 下一步方向 | 不可直接推出 |
+|---|---|---|
+| audit_dynamic_prepared仍有custom/native差距 | 优先查真实提交/流依赖/前序通信完成，而非本次规划 | 排除了全部host成本；route每次仍有参数和token处理 |
+| prepared对照消除了大部分差距 | 查host.run计数入口、规划及校验；用主机准备对照交叉验证 | 差值全部等于planner时间 |
+| custom的counts_host更大，显式收尾后转移到fence | 检查前序A2A完成、rank偏斜与下一轮计数的依赖 | 必然是all_gather本身更慢 |
+| custom的action_host明显更大 | 再对route token/layout/event/DFX/launch细分 | 已经证明某个具体SDK函数有问题 |
+| counts_prepare_only接近counts_only，而真实A2A后差距出现 | 主机准备不足以解释差距，查真实通信相关路径 | 任意“空函数调用”能复现CCU上下文切换 |
+
+当前不删除必要的event、不更换配置all_gather、不增加额外通信组。先把剩余差距定位到可修改的具体等待边界，再针对该边界优化。
+
+开发侧验证：专用cam_lyw_92中15项CPU测试通过，包含5项新组合诊断回归、5项计数交换回归及5项日志/结果判定回归；Python编译检查与文档bash语法检查通过。没有新增C++或route代码，因此无需重新编译二进制。目标9.3.0八卡诊断尚需按10.3执行，不能把CPU模拟通过当作NPU性能结论。
