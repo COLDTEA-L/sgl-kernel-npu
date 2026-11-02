@@ -1,8 +1,9 @@
-"""EP8 one-relay greedy planner and eager two-stage CCU executor.
+"""EP8 host planners and legacy eager two-stage executor.
 
 This module is import-safe without Torch. Counts are *packed rows*, not expert
 hit counts. Every rank supplies the same 8x8 matrix in communicator rank order.
-The executor forwards through participant HBM; it is not UB source routing.
+The legacy executor in this module uses participant HBM. ep8_eid_create uses
+these planners with a separate CCU+URMA EID backend, without relay HBM.
 """
 from dataclasses import dataclass, field
 import hashlib
@@ -117,7 +118,12 @@ class RelayPlanner:
     This object owns only static topology/options, no counts or plan cache.
     """
     def __init__(self, row_bytes, allowed_relays, *, min_chunk_bytes=1, min_gain_bytes=0,
-                 max_actions=56, relay_capacity_bytes=None, native_module=None):
+                 max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy"):
+        if strategy not in ("greedy", "bottleneck"):
+            raise ValueError("strategy must be greedy or bottleneck")
+        self.strategy = strategy
+        if strategy == "bottleneck" and getattr(native_module, "ep8_bottleneck_planner_abi", None) != 1:
+            raise RuntimeError("bottleneck requires rebuilt native ep8_bottleneck_planner_abi=1")
         self.row_bytes = _uint(row_bytes, 'row_bytes', 1)
         self.relays = normalize_relays(allowed_relays)
         self.options = dict(min_chunk_bytes=_uint(min_chunk_bytes, 'min_chunk_bytes', 1),
@@ -137,6 +143,8 @@ class RelayPlanner:
             self._native = native_module.Ep8RelayPlanner(
                 self.relays, self.row_bytes, min_chunk_bytes, min_gain_bytes, max_actions,
                 () if relay_capacity_bytes is None else relay_capacity_bytes)
+        if strategy == 'bottleneck':
+            self._native = self._native.with_bottleneck()
         self.backend = 'native' if self._native is not None else 'python'
 
     def plan(self, counts):

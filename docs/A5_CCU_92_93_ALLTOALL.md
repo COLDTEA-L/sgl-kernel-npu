@@ -758,3 +758,7 @@ bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --mode all \
 结果仍写入 `/home/l00934901/profiling`。部分rank的 `EP8_EID_BIDIRECTIONAL_PASS` 与 `measure_begin` 是阶段进展；需最终 `EP8_EID_ALL_RANKS_AND_EXIT_PASS` 才能宣告本轮完整验证通过。若再失败，保留首个 `EP8_EID_FAILURE`（含last_phase）及traceback。
 
 mask_init未到注册与mask_negative End成功但rc=1，仍不能据缺少PASS判定为汇总器假阴性：mask_init应注册kernel，只有`--minimal`才不注册。现有partial专用PASS允许reports为空，但必须等正常清理完成才能写出；不新增跳过失败的PASS出口。它们的退出原因仍待失败目录的原始日志。
+
+### 11.15 真实请求矩阵：减少非瓶颈分流
+
+`feature/a5-ccu-ep8-bottleneck-alltoallv` 新增可选 `strategy="bottleneck"`，旧greedy保留；EID测试新增 `--planner bottleneck|greedy` 和 `host_counts` 计时。只改主机侧规划，已通过121e8f4的EID route不必重编，必须重编wheel。模型普通RelayPlanner默认仍为greedy，需要显式切换策略。新机操作、真实673-token样本与三种计时口径见 [EP8瓶颈规划与性能测试](A5_CCU_EP8_BOTTLENECK.md)。

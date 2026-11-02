@@ -28,6 +28,7 @@ def main():
     p.add_argument('--topology-json', type=Path, required=True)
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--matrix-json', type=Path)
+    p.add_argument('--planner', choices=('greedy', 'bottleneck'), default='bottleneck')
     p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
@@ -171,7 +172,7 @@ def main():
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
     # Same registered channels/kernel for direct and multipath; only policy differs.
     planners = {mode: RelayPlanner(row_bytes, allowed, max_actions=0 if mode == 'direct' else 56,
-                                   native_module=native) for mode in ('direct', 'multipath')}
+                                   native_module=native, strategy=args.planner) for mode in ('direct', 'multipath')}
     hosts = {mode: native.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
              for mode, planner in planners.items()}
     def native_transfer(send, recv, sends, recvs):
@@ -235,9 +236,12 @@ def main():
             current = gather_routing_counts(local_counts)
             if mode == 'native': native_transfer(send, outputs[mode], list(current[rank*8:(rank+1)*8]), list(current[rank::8]))
             else: hosts[mode].run(current, send, outputs[mode])
-        samples = {metric: {mode: [] for mode in selected} for metric in ('prepared', 'dynamic')}
-        for metric, iterations in (('prepared', args.iters), ('dynamic', args.dynamic_iters)):
-            call = op if metric == 'prepared' else dynamic
+        def host_counts(mode):
+            if mode == 'native': native_transfer(send, outputs[mode], sends, recvs)
+            else: hosts[mode].run(counts, send, outputs[mode])
+        samples = {metric: {mode: [] for mode in selected} for metric in ('prepared', 'host_counts', 'dynamic')}
+        for metric, iterations in (('prepared', args.iters), ('host_counts', args.dynamic_iters), ('dynamic', args.dynamic_iters)):
+            call = {'prepared': op, 'host_counts': host_counts, 'dynamic': dynamic}[metric]
             for round_id in range(args.rounds):
                 order = selected[round_id % len(selected):] + selected[:round_id % len(selected)]
                 if round_id % 2: order = tuple(reversed(order))
@@ -258,7 +262,7 @@ def main():
                     samples[metric][mode].append(value.item())
                     phase('measure_complete', case=case, metric=metric, mode=mode, round=round_id)
         report = dict(case=case, row_bytes=row_bytes, counts=counts, relay_rows=sum(plan.relay_rows),
-                      executed_relay=plan.uses_relay, samples_us=samples,
+                      executed_relay=plan.uses_relay, planner=args.planner, plan=plan.report(), samples_us=samples,
                       median_us={metric: {mode: statistics.median(values) for mode, values in modes.items()} for metric, modes in samples.items()},
                       workspace={mode: host.stats() for mode, host in hosts.items()})
         reports.append(report)

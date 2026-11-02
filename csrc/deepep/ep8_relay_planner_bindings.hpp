@@ -44,6 +44,7 @@ inline Matrix HostCounts(const pybind11::object& obj) {
 inline void BindPlanner(pybind11::module_& m) {
     namespace py = pybind11;
     m.attr("ep8_relay_planner_abi") = 2;
+    m.attr("ep8_bottleneck_planner_abi") = 1;
     m.attr("ep8_fast_selector_abi") = 1;
     py::class_<FastDecision>(m, "Ep8FastDecision")
         .def_property_readonly("uses_relay", &FastDecision::UsesRelay)
@@ -72,11 +73,13 @@ inline void BindPlanner(pybind11::module_& m) {
         }, py::keep_alive<0, 1>());
     py::class_<Planner>(m, "Ep8RelayPlanner")
         .def(py::init<const std::vector<std::vector<U>>&, U, U, U, U, const std::vector<U>&>())
+        .def("with_bottleneck", &Planner::WithBottleneck)
         .def("plan", [](const Planner& planner, const Matrix& counts) {
             auto p = planner.Make(counts);
             return py::make_tuple(Scalars(p.counts), Scalars(p.relays), Scalars(p.moved),
                                  Scalars(p.loads), Rows(p.actions), p.evaluations,
-                                 p.exhausted ? "no_profitable_candidate" : "action_limit");
+                                 planner.IsBottleneck() ? (p.actions.empty() ? "no_bottleneck_plan" : "target_reached") :
+                                 (p.exhausted ? "no_profitable_candidate" : "action_limit"));
         })
         .def("layout", [](const Planner& planner, const Matrix& counts, const Relays& relays,
                           const Matrix& moved, U chunkBytes, U maxChunks, int rank) {

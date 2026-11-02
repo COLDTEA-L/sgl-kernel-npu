@@ -108,6 +108,10 @@ public:
     }
 
     U RowBytes() const { return rowBytes_; }
+    // Opt-in policy; old constructors and two/four-rank interfaces are unchanged.
+    Planner WithBottleneck() const { Planner out=*this; out.bottleneck_=true; return out; }
+    bool IsBottleneck() const { return bottleneck_; }
+
     // Preserve byte thresholds rather than scaling already rounded row counts.
     Planner WithRowBytes(U bytes) const {
         if (!bytes || bytes > Max) throw std::invalid_argument("invalid EP8 row bytes");
@@ -125,6 +129,7 @@ public:
 
     // Reuse host storage, but recompute every decision for the actual matrix.
     void MakeInto(const Matrix& counts, Plan& p) const {
+        if (bottleneck_) { MakeBottleneck(counts, p); return; }
         CheckCounts(counts, rowBytes_);
         p.counts = counts; p.relays.fill(-1); p.moved.fill(0);
         p.actions.clear(); p.evaluations = 0; p.exhausted = false;
@@ -231,6 +236,80 @@ public:
         }
     }
 private:
+    // Lower bound only, not a promise of a feasible one-relay assignment.
+    // All directed cuts take O(256*8) using subset recurrence. The single-flow
+    // bound also accounts for splitting one commodity into at most two paths.
+    static U BottleneckLowerBound(const Matrix& c, U peak) {
+        std::array<U,8> outgoing{};
+        for (size_t f=0;f<64;++f) if (f/8!=f%8) outgoing[f/8]+=c[f];
+        std::array<U,256> cut{};
+        std::array<unsigned,256> size{};
+        U lower=peak/2+peak%2;
+        for (unsigned mask=1;mask<255;++mask) {
+            unsigned v=0;while (!(mask&(1u<<v))) ++v;
+            unsigned prev=mask&~(1u<<v);
+            size[mask]=size[prev]+1;
+            cut[mask]=cut[prev]+outgoing[v];
+            for (unsigned u=0;u<8;++u) if (prev&(1u<<u))
+                cut[mask]-=c[v*8+u]+c[u*8+v];
+            U edges=size[mask]*(8-size[mask]);
+            lower=std::max(lower,cut[mask]/edges+(cut[mask]%edges!=0));
+        }
+        return lower;
+    }
+    void MakeBottleneck(const Matrix& counts, Plan& p) const {
+        CheckCounts(counts,rowBytes_);
+        Matrix original{};
+        std::array<size_t,56> order{};size_t n=0;
+        for (size_t f=0;f<64;++f) if (f/8!=f%8) {original[f]=counts[f];order[n++]=f;}
+        p.counts=counts;p.evaluations=0;p.exhausted=true;
+        auto reset=[&] {p.loads=original;p.moved.fill(0);p.relays.fill(-1);p.actions.clear();};
+        reset();
+        U peak=*std::max_element(original.begin(),original.end());
+        if (!peak || !maxActions_) return;
+        U lower=BottleneckLowerBound(counts,peak);
+        if (lower>=peak) return;
+        std::sort(order.begin(),order.end(),[&](size_t a,size_t b) {
+            return original[a]!=original[b]?original[a]>original[b]:a<b;
+        });
+        const U budget=std::min<U>(maxActions_,8);
+        p.actions.reserve(budget);
+        U gap=peak-lower;
+        // Four deterministic attempts, no feasibility binary-search assumption.
+        // First feasible target wins; failed attempts never publish partial plans.
+        std::array<U,4> targets{lower,lower+gap/7+(gap%7!=0),
+                                     lower+gap/3+(gap%3!=0),lower+gap/2+gap%2};
+        U previous=Max;
+        for (U target:targets) {
+            if (target==previous || target>=peak) continue;
+            previous=target;
+            if ((peak-target)*rowBytes_<minGain_) continue;
+            reset();std::array<U,8> used{};bool success=true;
+            for (size_t f:order) {
+                U a=p.loads[f];if (a<=target) continue;
+                if (p.actions.size()>=budget) {success=false;break;}
+                U x=std::max(a-target,chunkRows_);
+                if (x>counts[f]) {success=false;break;}
+                bool found=false;size_t best=0;U bestPeak=Max;
+                for (size_t k=0;k<8;++k) if (masks_[f]&(1u<<k)) {
+                    ++p.evaluations;
+                    U left=p.loads[f/8*8+k],right=p.loads[k*8+f%8];
+                    if (left>target || right>target || x>target-left || x>target-right ||
+                        x>capacity_[k]-used[k]) continue;
+                    U next=std::max(left,right)+x;
+                    if (!found || next<bestPeak ||
+                        (next==bestPeak && used[k]<used[best])) {found=true;best=k;bestPeak=next;}
+                }
+                if (!found) {success=false;break;}
+                p.relays[f]=static_cast<int>(best);p.moved[f]=x;used[best]+=x;
+                p.loads[f]-=x;p.loads[f/8*8+best]+=x;p.loads[best*8+f%8]+=x;
+                p.actions.push_back({f/8,f%8,best,x,a-std::max(a-x,bestPeak)});
+            }
+            if (success) return; // Every edge is <= target < original peak.
+        }
+        reset(); // Direct fallback, not native fallback; evaluations retained.
+    }
+    bool bottleneck_=false;
     U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;
     std::vector<U> capacityBytes_;
     std::array<unsigned, 64> masks_{};

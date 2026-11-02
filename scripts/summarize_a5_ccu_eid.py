@@ -53,8 +53,8 @@ def main():
     if args.compare:
         other, other_topology = load(args.compare)
         if other['options']['suite'] == 'create': raise ValueError('create/probe cannot be a performance baseline')
-        for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters'):
-            if result['options'][key] != other['options'][key]: raise ValueError('different measurement option: '+key)
+        for key in ('dtype', 'width', 'row_scale', 'warmup', 'iters', 'rounds', 'dynamic_iters', 'planner'):
+            if result['options'].get(key, 'greedy' if key == 'planner' else None) != other['options'].get(key, 'greedy' if key == 'planner' else None): raise ValueError('different measurement option: '+key)
         for key in ('devices', 'allowed_relays', 'links', 'relay_routes'):
             if topology[key] != other_topology[key]: raise ValueError('different topology: '+key)
         if len(result['reports']) != len(other['reports']): raise ValueError('different case lists')
@@ -63,7 +63,14 @@ def main():
         for key in ('case', 'counts', 'row_bytes'):
             if report[key] != baseline[key]: raise ValueError('different payload: '+key)
         print(f"case={report['case']} row_bytes={report['row_bytes']} executed_relay={report['executed_relay']}")
+        if 'plan' in report:
+            plan = report['plan']
+            print(f"planner={report.get('planner')} actions={len(plan['actions'])} "
+                  f"relay_rows={report['relay_rows']} evaluations={plan['candidate_evaluations']} "
+                  f"peak_bytes={plan['direct_peak_bytes']}->{plan['planned_link_peak_bytes']} "
+                  f"extra_bytes={plan['relay_bytes']} stop={plan['stop_reason']}")
         for metric, values in report['median_us'].items():
+            if metric not in baseline['median_us']: raise ValueError('baseline missing timing metric: '+metric)
             comparison = baseline['median_us'][metric]
             print(metric + ': ' + ' '.join(f'{mode}={us:.1f}us' for mode, us in values.items()))
             if args.compare and ('native' not in comparison or 'multipath' not in values): raise ValueError('compare needs native baseline and multipath candidate')
