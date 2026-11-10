@@ -8,6 +8,10 @@ namespace l0l1 {
 constexpr uint64_t Alignment = 256;
 constexpr uint64_t Guard = 256;
 struct Slice { uint64_t offset, bytes; };
+inline bool SinglePortPair(int localStatus, uint32_t localCoeff,
+                           int remoteStatus, uint32_t remoteCoeff) {
+    return localStatus == 0 && remoteStatus == 0 && localCoeff == 1 && remoteCoeff == 1;
+}
 inline std::array<Slice, 2> Split(uint64_t bytes, unsigned l0Percent) {
     if (bytes < 2 * Alignment || bytes > (256ULL << 20) || bytes % Alignment ||
         l0Percent == 0 || l0Percent >= 100)

@@ -4,6 +4,31 @@
 
 目标是验证当前机器的两张 NPU 能否通过 **L0 fullmesh**、**L1 CLOS 网络**分别通信，以及同时使用两者是否增加吞吐。拓扑有 L1 端口、端口 UP、SDK 返回 L1 链路、通道建链、数据正确、物理流量走 L1、性能增加，是不同层次的证据。
 
+## 0. 单端口版本：默认仅选择单端口 L1 候选
+
+旧版 `4ee4ca9` 现场选择的一个 L1 逻辑通道实际使用了 p1/p2 两个端口，因此 32MiB 下 L1 约90GB/s、L0约47GB/s并不矛盾。新版默认 `--l1-port-policy single`：查询每条 L1 链路两端的 `ENDPOINT_ATTR_BW_COEFF`，仅在查询均成功且两端系数都等于1时允许选中。Ascend950 的公开 rank graph 实现用接口 `GetPorts().size()` 返回这个系数；它仍是拓扑声明，最终需要端口计数验证。
+
+**这是选择已存在单端口端点的版本，不是把聚合 EID 强行拆成单端口的接口。** 当前9.2 SDK的 CCU/UB_CTP channel descriptor 没有 port-id/port-mask 字段；`ubMemAttr.pathMode` 只用于 UB_MEM，不能拿来控制 UB_CTP。本用例不改 EID 字节、不关物理口、不改系统 rootinfo/Atlas，不影响其他用户。
+
+默认 single 模式的 `--l1-index` 指过滤后的 `single_index`；`--l1-port-policy any` 才使用原来的完整 catalog `index`，仅供复现旧聚合实验。新旧结果会记录不同 policy，不能当成相同路径比较。L0筛选和 EP8 均未改动。
+
+拉取更新后先重编独立二进制，再运行：
+
+```bash
+bash scripts/build_a5_ccu_l0_l1_probe.sh "$A5_CANN_PATH" \
+  /home/l00934901/profiling/ccu-l0-l1-build
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite discover
+# 查看两个 rank 的 L1_SINGLE_PORT_DISCOVERY、L0L1_CATALOG。
+# 只有两端都有匹配的 single_index 才继续：
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite correctness --mode all --bytes 8388608
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode l1 \
+  --bytes 33554432 --rounds 2 --capture-ports
+```
+
+`L0L1_SELECTED` 的 L1 必须显示 `l1_port_policy=single bw_coeff=1 remote_bw_coeff=1`，端口计数还必须显示每张卡只有一个 L1 数据端口承担主体载荷；不能只看逻辑通道数或速度降到50GB/s。
+
+如果 `L1_SINGLE_PORT_DISCOVERY candidates=0`，说明**当前运行时没有暴露满足条件的 L1 链路**；discovery 可以正常退出，但 create/execute 会在建链前以 `L1_SINGLE_PORT_UNAVAILABLE` 停止，不回退到双端口。已知现场 rootinfo 的 L1 组为2口和6口，因此确实可能遇到这个结果。请发回两 rank 的 CANDIDATE/CATALOG/DISCOVERY 行；届时需要该版本 SDK/驱动支持的单端口 EID 暴露或绑定方案，不能靠减半字节数、改比例或缩小 rootinfo 的 ports 数组伪造单端口通信。未取得该能力前，不宣称已经实现该机器上的物理端口强制绑定。
+
 ## 1. 用例与执行边界
 
 每张卡发送 B 字节给另一张卡，同时接收 B 字节；没有 self 数据、没有第三张卡、没有 relay HBM。

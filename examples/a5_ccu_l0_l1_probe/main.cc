@@ -32,7 +32,7 @@ struct Options {
     unsigned rank=0, device=0, warmup=20, iters=50, rounds=6, l0Percent=50;
     unsigned l0Index=0, l1Index=0;
     uint64_t bytes=8ULL<<20;
-    std::string dir, mode="all", suite="all", timing="block";
+    std::string dir, mode="all", suite="all", timing="block", l1PortPolicy="single";
 };
 uint64_t Number(const std::string& s) {
     if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos)
@@ -48,6 +48,7 @@ Options Parse(int argc, char** argv) {
         else if(k=="--mode") o.mode=v;
         else if(k=="--suite") o.suite=v;
         else if(k=="--timing") o.timing=v;
+        else if(k=="--l1-port-policy") o.l1PortPolicy=v;
         else if(k=="--bytes") o.bytes=Number(v);
         else {
             auto n=Number(v);
@@ -66,7 +67,8 @@ Options Parse(int argc, char** argv) {
     if(o.rank>1 || o.device>1 || o.dir.empty() || !o.iters || !o.rounds || o.rounds>1000 ||
        (o.mode!="all" && o.mode!="l0" && o.mode!="l1" && o.mode!="split") ||
        (o.suite!="discover" && o.suite!="create" && o.suite!="correctness" && o.suite!="benchmark" && o.suite!="all") ||
-       (o.timing!="block" && o.timing!="serial")) throw std::runtime_error("invalid options");
+       (o.timing!="block" && o.timing!="serial") ||
+       (o.l1PortPolicy!="single" && o.l1PortPolicy!="any")) throw std::runtime_error("invalid options");
     l0l1::Split(o.bytes,o.l0Percent);
     return o;
 }
@@ -100,7 +102,12 @@ std::string EndpointKey(const EndpointDesc& ep) {
     for(auto x:ep.commAddr.eid) s << std::setw(2) << unsigned(x);
     return s.str();
 }
-struct Path { CommLink link{}; uint32_t layer=0, die=0, remoteDie=0; std::string key; };
+struct Path {
+    CommLink link{};
+    uint32_t layer=0, die=0, remoteDie=0, bwCoeff=0, remoteBwCoeff=0;
+    int bwStatus=-1, remoteBwStatus=-1;
+    std::string key;
+};
 std::vector<Path> Discover(HcclComm comm, const Options& o) {
     uint32_t *raw=nullptr, n=0;
     CHECK(HcclRankGraphGetLayers(comm,&raw,&n));
@@ -128,12 +135,20 @@ std::vector<Path> Discover(HcclComm comm, const Options& o) {
                 ENDPOINT_ATTR_DIE_ID,sizeof(p.die),&p.die);
             auto rs=HcclRankGraphGetEndpointInfo(comm,1-o.rank,&link.dstEndpointDesc,
                 ENDPOINT_ATTR_DIE_ID,sizeof(p.remoteDie),&p.remoteDie);
+            p.bwStatus=HcclRankGraphGetEndpointInfo(comm,o.rank,&link.srcEndpointDesc,
+                ENDPOINT_ATTR_BW_COEFF,sizeof(p.bwCoeff),&p.bwCoeff);
+            p.remoteBwStatus=HcclRankGraphGetEndpointInfo(comm,1-o.rank,&link.dstEndpointDesc,
+                ENDPOINT_ATTR_BW_COEFF,sizeof(p.remoteBwCoeff),&p.remoteBwCoeff);
             p.key=l0l1::PairKey(o.rank,EndpointKey(link.srcEndpointDesc),EndpointKey(link.dstEndpointDesc));
             bool usable=eligible && ds==HCCL_SUCCESS && rs==HCCL_SUCCESS && p.die<2 && p.remoteDie<2;
             std::cout << "L0L1_CANDIDATE rank=" << o.rank << " layer=" << layer
                       << " hop=" << unsigned(link.linkAttr.hop) << " protocol=" << int(link.linkAttr.linkProtocol)
                       << " die=" << p.die << " remote_die=" << p.remoteDie << " die_status=" << ds
-                      << " remote_die_status=" << rs << " eligible=" << usable << " key=" << p.key << std::endl;
+                      << " remote_die_status=" << rs << " bw_coeff=" << p.bwCoeff
+                      << " remote_bw_coeff=" << p.remoteBwCoeff << " bw_status=" << p.bwStatus
+                      << " remote_bw_status=" << p.remoteBwStatus
+                      << " single_port_candidate=" << l0l1::SinglePortPair(p.bwStatus,p.bwCoeff,p.remoteBwStatus,p.remoteBwCoeff)
+                      << " eligible=" << usable << " key=" << p.key << std::endl;
             if(usable) paths.push_back(p);
         }
     }
@@ -143,14 +158,27 @@ std::vector<Path> Discover(HcclComm comm, const Options& o) {
     paths.erase(std::unique(paths.begin(),paths.end(),[](const Path& a,const Path& b){
         return a.layer==b.layer && a.key==b.key;
     }),paths.end());
-    unsigned indexes[2]={0,0};
-    for(const auto& p:paths)
+    unsigned indexes[2]={0,0}, singleIndex=0;
+    for(const auto& p:paths) {
+        const bool single=l0l1::SinglePortPair(p.bwStatus,p.bwCoeff,p.remoteBwStatus,p.remoteBwCoeff);
         std::cout << "L0L1_CATALOG rank=" << o.rank << " layer=" << p.layer << " index=" << indexes[p.layer]++
-                  << " die=" << p.die << " key=" << p.key << std::endl;
+                  << " die=" << p.die << " bw_coeff=" << p.bwCoeff << " remote_bw_coeff=" << p.remoteBwCoeff
+                  << " single_index=" << (p.layer==1 && single?std::to_string(singleIndex++):"none")
+                  << " key=" << p.key << std::endl;
+    }
+    std::cout << "L1_SINGLE_PORT_DISCOVERY rank=" << o.rank << " candidates=" << singleIndex
+              << " policy=" << o.l1PortPolicy << " physical_counter_validation=required" << std::endl;
     return paths;
 }
-Path Select(const std::vector<Path>& paths,unsigned layer,unsigned index) {
-    for(const auto& p:paths) if(p.layer==layer) { if(!index--) return p; }
+Path Select(const std::vector<Path>& paths,unsigned layer,unsigned index,const std::string& policy) {
+    for(const auto& p:paths) if(p.layer==layer) {
+        if(layer==1 && policy=="single" && !l0l1::SinglePortPair(
+            p.bwStatus,p.bwCoeff,p.remoteBwStatus,p.remoteBwCoeff)) continue;
+        if(!index--) return p;
+    }
+    if(layer==1 && policy=="single") throw std::runtime_error(
+        "L1_SINGLE_PORT_UNAVAILABLE: requested single_index absent; both endpoint BW_COEFF must be 1; "
+        "cannot split a port-group EID via HcclChannelDesc; no aggregate fallback");
     throw std::runtime_error("PATH_UNAVAILABLE layer="+std::to_string(layer)+"; no fallback or fabricated EID");
 }
 struct Lane { Path path; aclrtStream stream=nullptr; ThreadHandle thread=0; ChannelHandle channel=0; CcuKernelHandle kernel=0; };
@@ -193,7 +221,8 @@ void Run(const Options& o) {
     if(devices!=2) throw std::runtime_error("exactly two visible devices required");
     std::ostringstream config;
     config << o.bytes << ':' << o.mode << ':' << o.suite << ':' << o.warmup << ':' << o.iters << ':'
-           << o.rounds << ':' << o.l0Percent << ':' << o.l0Index << ':' << o.l1Index << ':' << o.timing;
+           << o.rounds << ':' << o.l0Percent << ':' << o.l0Index << ':' << o.l1Index << ':' << o.timing
+           << ':' << o.l1PortPolicy;
     Agree(o,"config",config.str());
     Phase(o,"comm_init"); HcclRootInfo root{};
     if(!o.rank) { CHECK(HcclGetRootInfo(&root)); Save(o.dir+"/root.bin",std::string(reinterpret_cast<char*>(&root),sizeof(root))); }
@@ -211,14 +240,15 @@ void Run(const Options& o) {
     std::vector<Lane> lanes;
     for(unsigned layer=0;layer<2;++layer) {
         if((o.mode=="l0" && layer==1)||(o.mode=="l1" && layer==0)) continue;
-        Lane lane; lane.path=Select(paths,layer,layer==0?o.l0Index:o.l1Index); lanes.push_back(lane);
+        Lane lane; lane.path=Select(paths,layer,layer==0?o.l0Index:o.l1Index,o.l1PortPolicy); lanes.push_back(lane);
     }
     if(lanes.size()==2 && lanes[0].path.key==lanes[1].path.key)
         throw std::runtime_error("PATH_ALIAS: L0 and L1 have identical endpoint pairs");
     for(auto& l:lanes) {
         const auto& p=l.path;
         const auto signature=p.key+":"+std::to_string(p.link.linkAttr.hop)+":"+
-            std::to_string(o.rank?p.remoteDie:p.die)+":"+std::to_string(o.rank?p.die:p.remoteDie);
+            std::to_string(o.rank?p.remoteDie:p.die)+":"+std::to_string(o.rank?p.die:p.remoteDie)+":"+
+            std::to_string(o.rank?p.remoteBwCoeff:p.bwCoeff)+":"+std::to_string(o.rank?p.bwCoeff:p.remoteBwCoeff);
         Agree(o,"selected_L"+std::to_string(p.layer),signature);
     }
     Phase(o,"query_instance"); CcuInsHandle instance=0; uint32_t count=1;
@@ -252,6 +282,8 @@ void Run(const Options& o) {
         auto& l=lanes[i]; l.channel=channels[i];
         std::cout << "L0L1_SELECTED rank=" << o.rank << " layer=" << l.path.layer << " die=" << l.path.die
                   << " remote_die=" << l.path.remoteDie << " hop=" << unsigned(l.path.link.linkAttr.hop)
+                  << " l1_port_policy=" << o.l1PortPolicy << " bw_coeff=" << l.path.bwCoeff
+                  << " remote_bw_coeff=" << l.path.remoteBwCoeff
                   << " channel=" << l.channel << " state=" << states[i] << " key=" << l.path.key << std::endl;
         if(states[i]!=0) throw std::runtime_error("channel not ready");
     }
@@ -325,7 +357,8 @@ void Run(const Options& o) {
             const auto b0=mode=="l0"?o.bytes:mode=="l1"?0:split[0].bytes;
             const auto b1=o.bytes-b0;
             std::ostringstream row; row<<std::setprecision(12)<<"{\"rank\":"<<o.rank<<",\"round\":"<<round
-                <<",\"mode\":\""<<mode<<"\",\"timing\":\""<<o.timing<<"\",\"bytes_per_direction\":"<<o.bytes
+                <<",\"mode\":\""<<mode<<"\",\"timing\":\""<<o.timing<<"\",\"l1_port_policy\":\""<<o.l1PortPolicy
+                <<"\",\"bytes_per_direction\":"<<o.bytes
                 <<",\"l0_bytes\":"<<b0<<",\"l1_bytes\":"<<b1<<",\"wall_us\":"<<wall
                 <<",\"enqueue_or_serial_us\":"<<host<<"}";
             results<<row.str()<<std::endl; std::cout<<"L0L1_SAMPLE "<<row.str()<<std::endl;

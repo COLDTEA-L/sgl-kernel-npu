@@ -55,6 +55,23 @@ class SummaryTest(unittest.TestCase):
         (self.root / 'rank1.log').write_text('')
         with self.assertRaises(ValueError): probe.summarize(self.root)
 
+    def test_aggregate_results_cannot_be_reported_as_single(self):
+        p = self.root / 'options.json'
+        opts = json.loads(p.read_text()); opts['l1_port_policy'] = 'single'
+        p.write_text(json.dumps(opts))
+        with self.assertRaises(ValueError): probe.summarize(self.root)
+
+    def test_single_policy_preserved(self):
+        p = self.root / 'options.json'
+        opts = json.loads(p.read_text()); opts['l1_port_policy'] = 'single'
+        p.write_text(json.dumps(opts))
+        for rank in range(2):
+            p = self.root / ('rank%d.jsonl' % rank)
+            rows = [json.loads(s) for s in p.read_text().splitlines()]
+            for row in rows: row['l1_port_policy'] = 'single'
+            p.write_text('\n'.join(json.dumps(row) for row in rows))
+        self.assertEqual(probe.summarize(self.root)['l1_port_policy'], 'single')
+
 
 if __name__ == '__main__':
     unittest.main()

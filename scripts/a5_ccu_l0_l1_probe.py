@@ -41,6 +41,7 @@ def summarize(directory):
                 raise ValueError('unexpected/duplicate sample')
             b0 = options['bytes'] if row['mode'] == 'l0' else 0 if row['mode'] == 'l1' else split0
             if (row['bytes_per_direction'] != options['bytes'] or row['l0_bytes'] != b0 or
+                    row.get('l1_port_policy', 'any') != options.get('l1_port_policy', 'any') or
                     row['l1_bytes'] != options['bytes'] - b0 or row['timing'] != options['timing'] or
                     not math.isfinite(row['wall_us']) or row['wall_us'] <= 0):
                 raise ValueError('sample boundary mismatch')
@@ -49,6 +50,7 @@ def summarize(directory):
             raise ValueError('missing samples')
         ranks.append(records)
     result = {'suite': options['suite'], 'both_ranks_pass': True,
+              'l1_port_policy': options.get('l1_port_policy', 'any'),
               'timing': options['timing'], 'bytes_per_direction': options['bytes'], 'modes': {}}
     for mode in modes:
         samples = [max(ranks[0][r, mode]['wall_us'], ranks[1][r, mode]['wall_us'])
@@ -80,6 +82,8 @@ def parser():
     p.add_argument('--l0-percent', type=int, default=50)
     p.add_argument('--l0-index', type=int, default=0)
     p.add_argument('--l1-index', type=int, default=0)
+    p.add_argument('--l1-port-policy', choices=['single', 'any'], default='single',
+                   help='single requires BW_COEFF=1 at both L1 endpoints; any restores the aggregate experiment')
     p.add_argument('--timeout', type=int, default=600)
     p.add_argument('--capture-ports', action='store_true', help='read hccn dev_info/stat before and after workers')
     p.add_argument('--hccn-tool', default='/usr/local/Ascend/driver/tools/hccn_tool')
@@ -137,7 +141,7 @@ def run(args):
     try:
         for rank in range(2):
             cmd = [str(args.binary.resolve()), '--rank', str(rank), '--device', str(rank), '--dir', str(root)]
-            for key in ['suite', 'mode', 'timing', 'bytes', 'warmup', 'iters', 'rounds', 'l0_percent', 'l0_index', 'l1_index']:
+            for key in ['suite', 'mode', 'timing', 'bytes', 'warmup', 'iters', 'rounds', 'l0_percent', 'l0_index', 'l1_index', 'l1_port_policy']:
                 cmd += ['--' + key.replace('_', '-'), str(getattr(args, key))]
             (root / ('command%d.json' % rank)).write_text(json.dumps(cmd))
             f = (root / ('rank%d.log' % rank)).open('w'); files.append(f)

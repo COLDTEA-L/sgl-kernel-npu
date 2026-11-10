@@ -2,6 +2,12 @@
 #include <cassert>
 #include <iostream>
 int main() {
+    assert(l0l1::SinglePortPair(0,1,0,1));
+    assert(!l0l1::SinglePortPair(0,2,0,2));
+    assert(!l0l1::SinglePortPair(0,1,0,6));
+    assert(!l0l1::SinglePortPair(0,0,0,0));
+    assert(!l0l1::SinglePortPair(6,1,0,1));
+    assert(!l0l1::SinglePortPair(0,1,6,1));
     for(uint64_t size: {512ULL,768ULL,65536ULL,8388608ULL,268435456ULL}) {
         for(unsigned share: {25U,50U,75U}) {
             if(size*share/100<256) continue;
