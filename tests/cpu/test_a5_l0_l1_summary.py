@@ -61,6 +61,12 @@ class SummaryTest(unittest.TestCase):
         p.write_text(json.dumps(opts))
         with self.assertRaises(ValueError): probe.summarize(self.root)
 
+    def test_graph_samples_cannot_be_reported_as_explicit(self):
+        p = self.root / 'options.json'
+        opts = json.loads(p.read_text()); opts['explicit_eids'] = 'candidate.json'
+        p.write_text(json.dumps(opts))
+        with self.assertRaises(ValueError): probe.summarize(self.root)
+
     def test_single_policy_preserved(self):
         p = self.root / 'options.json'
         opts = json.loads(p.read_text()); opts['l1_port_policy'] = 'single'
@@ -71,6 +77,57 @@ class SummaryTest(unittest.TestCase):
             for row in rows: row['l1_port_policy'] = 'single'
             p.write_text('\n'.join(json.dumps(row) for row in rows))
         self.assertEqual(probe.summarize(self.root)['l1_port_policy'], 'single')
+
+
+class ExplicitEidTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / 'pair.json'
+        self.data = dict(mapping_note='test fixture only', endpoints=[
+            dict(rank=0, device=0, die=0, eid='0000:0000:0401:0600:0010:0000:df76:0156'),
+            dict(rank=1, device=1, die=0, eid='000000000401060000100000df762156')])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load(self):
+        self.path.write_text(json.dumps(self.data))
+        return probe.load_explicit_pair(self.path, ['0', '1'])
+
+    def test_normalize_full_addresses(self):
+        out = self.load()
+        self.assertEqual(out['endpoints'][0]['eid'], '000000000401060000100000df760156')
+
+    def test_reject_wrong_physical_mapping(self):
+        self.data['endpoints'][0]['device'] = 4
+        with self.assertRaises(ValueError): self.load()
+
+    def test_reject_suffix_and_guessed_address(self):
+        self.data['endpoints'][0]['eid'] = '0401'
+        with self.assertRaises(ValueError): self.load()
+
+    def test_require_mapping_evidence(self):
+        self.data['mapping_note'] = ''
+        with self.assertRaises(ValueError): self.load()
+
+    def test_reject_duplicate_endpoints(self):
+        self.data['endpoints'][1]['eid'] = self.data['endpoints'][0]['eid']
+        with self.assertRaises(ValueError): self.load()
+
+    def test_endpoint_pass_not_payload_validation(self):
+        root = Path(self.tmp.name)
+        (root / 'options.json').write_text(json.dumps(dict(suite='endpoint', explicit_eids='pair.json')))
+        (root / 'exit.status').write_text('0\n')
+        for rank in range(2):
+            (root / ('rank%d.log' % rank)).write_text('L0L1_RANK_PASS rank=%d suite=endpoint channel_tested=0 payload_tested=0\n' % rank)
+        out = probe.summarize(root)
+        self.assertEqual(out['note'], 'no payload validation')
+        self.assertEqual(out['endpoint_source'], 'explicit')
+
+    def test_failure_preserves_stage_and_status(self):
+        root = Path(self.tmp.name)
+        (root / 'rank0.log').write_text('L0L1_STAGE rank=0 stage=channel_acquire status=6\n')
+        self.assertIn('status=6', probe.failure_report(root)['ranks'][0]['diagnostics'][0])
 
 
 if __name__ == '__main__':

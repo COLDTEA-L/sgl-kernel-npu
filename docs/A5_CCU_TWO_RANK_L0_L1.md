@@ -199,3 +199,196 @@ python3 scripts/a5_ccu_l0_l1_probe.py --summarize /home/l00934901/profiling/a5-l
 ```
 
 当前仅完成开发容器编译/ABI和CPU回归；不承诺本机 L1 一定可建链，也不把两卡吞吐提升外推为 EP8/MoE 加速。待路径与收益验证完成后，再设计 EP8 改造。
+
+## 8. 显式单口 EID 实验：不在 rank graph 中，还能否建 CCU 通道？
+
+### 8.1 本轮回答的问题与边界
+
+新增 `--explicit-eids <JSON>`，让两端使用指定的完整 EID。新增 `--suite endpoint`，只测试
+`HcommEndpointCreate/Destroy`，不申请通道、不注册 kernel、不发送 payload。
+
+后续 `create/correctness/benchmark` 仍使用 **`HcclChannelAcquire + COMM_ENGINE_CCU`**：
+从选中的 L1 graph 路径复制 EndpointDesc 的物理位置和协议，仅覆盖 EID；本地/对端 die
+由经过核实的 JSON 指定，必须与所选模板相同。对新 EID 的 graph 查询失败会记录，
+但不会在应用侧提前拒绝建链。若查询成功而 die 不一致，立即拒绝。
+
+这是分层实验，不是宣称已实现完全无通信域的 `HcommChannelCreate` 后端。
+独立 endpoint 创建成功不等于通道可用，更不等于 CCU 能传输。如果 managed acquire
+仍因 graph 查询失败而失败，下一步才核对现场 SDK 的 domainless socket/内存交换/CCU
+资源契约；不能拿普通 host URMA 或 UB_MEM 传输替代 CCU 对照，也不能据此宣布硬件不支持。
+
+不会修改 rootinfo、Atlas、驱动 EID、全局端口状态，不会自动 fallback 聚合 EID。
+原 EP8、route 包、wheel 均不改。所有结果在 profiling，每个命令使用独立双 worker。
+
+### 8.2 编译与发现（先做）
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git switch feature/a5-ccu-two-rank-l0-l1-probe
+git pull --ff-only
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_DEVICES=0,1
+export HCCL_BUFFSIZE=64
+export A5_EXPLICIT_ROOT=/home/l00934901/profiling/l0-l1-explicit
+mkdir -p "$A5_EXPLICIT_ROOT"
+bash scripts/build_a5_ccu_l0_l1_probe.sh "$A5_CANN_PATH" \
+  /home/l00934901/profiling/ccu-l0-l1-build
+python3 tests/cpu/test_a5_l0_l1_summary.py
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite discover --mode l1 \
+  --l1-port-policy any
+```
+
+构建应出现 `L0L1_EXPLICIT_EID_ABI version=1`、`L0L1_BUILD_PASS`。无需重新打 wheel/route。
+`discover` 新增可选的 SDK 枚举 `HcommEndpointGetDescNum/GetDescs`，通过 dlsym 查询，
+旧 SDK 没有符号或返回失败会明确记录，不影响原探针。
+
+保留两 rank 的 `L0L1_DRIVER_ENDPOINT`（包含 EID/protocol/物理位置）、
+`L0L1_CATALOG`、`L0L1_ENDPOINT_INVENTORY`。它们帮助把候选 EID 映射到选中的 NPU。
+不要把 URMA 设备名的 c/d/e 编号直接当作物理 NPU ID；不要仅凭 0401/0441 等地址片段
+猜完整 EID；不要把 FE=2 和 FE=6 当成相同端点。驱动清单也不直接证明 L1 归属。
+
+### 8.3 先建聚合 EID 手填对照，再准备单口候选
+
+从上一步输出的目录选一个 L1 catalog `index`（这是 `--l1-port-policy any` 的 index）。
+下面只读提取两个 rank 实际发现的 EID/die，不编造地址。
+
+```bash
+export A5_DISCOVERY_DIR=/home/l00934901/profiling/a5-l0-l1-替换为刚才目录
+export A5_TEMPLATE_INDEX=0  # 依实际 catalog 选择，后续命令保持一致
+python3 - <<'PY'
+import json, os, re
+from pathlib import Path
+root = Path(os.environ['A5_DISCOVERY_DIR'])
+idx = int(os.environ['A5_TEMPLATE_INDEX'])
+env = json.loads((root/'environment.json').read_text())
+devices = env['ASCEND_RT_VISIBLE_DEVICES'].split(',')
+records = []
+for rank in range(2):
+    lines = (root/f'rank{rank}.log').read_text(errors='replace').splitlines()
+    hits = [s for s in lines if re.search(rf'L0L1_CATALOG rank={rank} layer=1 index={idx}\b', s)]
+    if len(hits) != 1: raise SystemExit(f'rank{rank}: expected exactly one catalog entry')
+    die = int(re.search(r'\bdie=(\d+)', hits[0]).group(1))
+    key = re.search(r'\bkey=(\S+)', hits[0]).group(1)
+    eids = re.findall(r'\d+:\d+:([0-9a-f]{32})', key)
+    if len(eids) != 2: raise SystemExit('invalid canonical EID pair')
+    records.append((key, dict(rank=rank, device=int(devices[rank]), die=die, eid=eids[rank])))
+if records[0][0] != records[1][0]: raise SystemExit('rank catalog mismatch')
+out = Path(os.environ['A5_EXPLICIT_ROOT'])/'aggregate.json'
+out.write_text(json.dumps(dict(mapping_note=f'graph catalog {root}, index={idx}',
+                                endpoints=[r[1] for r in records]), indent=2))
+print(out.read_text())
+PY
+```
+
+依次测试 graph 选择、同一个 EID 手填 endpoint、同一个 EID 手填 managed create：
+
+```bash
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite create --mode l1 \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 65536
+for A5_SUITE in endpoint create; do
+  bash scripts/run_a5_ccu_l0_l1_probe.sh --suite "$A5_SUITE" --mode l1 \
+    --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 65536 \
+    --explicit-eids "$A5_EXPLICIT_ROOT/aggregate.json" || break
+done
+```
+
+三项全通过再测候选。若聚合 endpoint 单独创建不支持而 managed create 支持，记录这一差别，
+它说明独立端点入口存在限制；不要把它归因到单口候选。
+
+复制 aggregate.json 为 `single.json`，只将 `eid` 换成两张选定物理 NPU 上**实际枚举到、
+且物理映射已确认**的单口 EID；`die` 必须真实对应该端口，并选择同 die 的 L1 模板。
+`mapping_note` 写明证据文件、URMA 设备名、源/目标端口及其 L1 归属。保留完整128位地址。
+
+JSON 示例结构（下列说明文字不是可执行 EID，禁止照填）：
+
+```json
+{
+  "mapping_note": "物理NPU与URMA设备的对应证据；两个端口的L1归属证据",
+  "endpoints": [
+    {"rank": 0, "device": 0, "die": 0, "eid": "实际源卡完整32位十六进制EID"},
+    {"rank": 1, "device": 1, "die": 0, "eid": "实际目的卡完整32位十六进制EID"}
+  ]
+}
+```
+
+`device` 必须对应 `A5_DEVICES` 的顺序；die 示例不是固定要求。程序校验 rank/device/die、
+完整地址、两端不同和非空 mapping_note，但 **mapping_note 是操作者提供的证据说明，
+程序不能据此证明线路归属**。本轮不自动合成任何新 EID。
+
+### 8.4 单口候选：端点 → 建链/注册 → 正确性
+
+逐条执行，检查上一条结果后再继续。`endpoint` 与 `create` 是独立实验，前者失败不自动
+证明后者失败；失败保留目录，不让脚本自动批量重试。
+
+```bash
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite endpoint --mode l1 \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 65536 \
+  --explicit-eids "$A5_EXPLICIT_ROOT/single.json"
+
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite create --mode l1 \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 65536 \
+  --explicit-eids "$A5_EXPLICIT_ROOT/single.json"
+```
+
+`create` 两 rank clean PASS 后才执行：
+
+```bash
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite correctness --mode l1 \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 65536 \
+  --explicit-eids "$A5_EXPLICIT_ROOT/single.json"
+```
+
+使用 `any` 是因为候选端点可能不在 graph，无法用 BW_COEFF=1 筛选；
+**不是允许 fallback，也不是声明它已物理单口化**。日志必须显示 `endpoint_source=explicit`、
+`L0L1_EXPLICIT_PAIR actual=...` 与 single.json 完全一致。
+独立 endpoint suite 不会被汇总器误报成数据验证通过。
+
+### 8.5 只有正确性通过后，验证物理端口及 L0+单口 L1 性能
+
+先独立占用测试窗口，确认没有其他作业在这两个 NPU/相关共享链路上产生流量。
+
+```bash
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode l1 \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 33554432 \
+  --explicit-eids "$A5_EXPLICIT_ROOT/single.json" \
+  --warmup 20 --iters 50 --rounds 2 --capture-ports
+```
+
+对照 §5 的端口计数，确认 payload 主要落在**两端各一个已核对的 L1 物理口**，而非依旧
+p1/p2 各半。端点名称、EID 数量、`port_count=1`、带宽约50GB/s均不能替代物理计数证据。
+
+物理验证通过后再跑三种模式：
+
+```bash
+for A5_REP in 1 2 3; do
+  bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode all \
+    --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" --bytes 33554432 \
+    --explicit-eids "$A5_EXPLICIT_ROOT/single.json" \
+    --l0-percent 50 --warmup 20 --iters 50 --rounds 6 || break
+done
+```
+
+L0 保持原 graph 选路，只有 L1 使用显式 EID。每方向总量32MiB，split 各16MiB，
+无中间 relay 卡、无 relay HBM；两路径仍是独立 stream、先全部提交再等完成。
+不保证50/50最优，更不能只凭两类端口都有流量推断时间上真正并行。
+
+### 8.6 如何判读，回报什么
+
+| 结果 | 能支持的结论 | 不能推出的结论 |
+|---|---|---|
+| 聚合手填 create 失败，graph create 成功 | 先查手填参数、模板、版本和实验入口 | 不能判单口不可用 |
+| 候选 endpoint_create 成功，graph 查询失败 | 独立端点入口认识该地址，当前 graph 不认识 | 不能判 CCU 通道/传输可用 |
+| 候选 channel_acquire 失败 | 当前 managed CCU 入口未建立该通道；看首个底层错误 | 不能只凭状态码判定一定依赖 graph，或硬件不支持 |
+| acquire 成功，注册失败 | 问题推进到 CCU 资源/注册环节 | 不是端点枚举问题 |
+| create 成功，执行或数据校验失败 | 注册成功不等于可用，继续查同步/数据路径 | 不能跑性能后宣称通过 |
+| graph 查询失败，但正确性和单口计数均通过 | 此版本可用显式 EID 在当前 managed 路径建立单口 CCU 通道 | 不能外推所有 FE/端口/SDK 版本 |
+| 正确性通过，多个物理口有 payload | 显式地址没有达到预期的物理单口效果 | 不能称为单口 L1 性能 |
+
+请发回每个实验的目录、命令、`explicit_eids.json`、`environment.json`、`git.txt`、
+两 rank 的 `L0L1_ENDPOINT_INVENTORY` / `L0L1_DRIVER_ENDPOINT` / `L0L1_EXPLICIT_QUERY` /
+`L0L1_EXPLICIT_PAIR` / `L0L1_STAGE` / `L0L1_SELECTED`，以及 `summary.json`。
+失败提供 `failure_summary.json`、`worker_exit.json` 和同 PID plog 首个错误；
+不要只给最后的 status=4/7。阶段有 begin、status、elapsed_us，可区分未进入、返回失败和超时。
+候选不在 graph 时产生的查询错误是预期诊断，需与后续 acquire/register 的错误区分。
+
+本轮编译验证在 cam_lyw_92；现场9.3建链和物理端口验证尚待以上实验。

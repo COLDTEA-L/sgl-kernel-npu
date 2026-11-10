@@ -31,6 +31,7 @@ void Check(long status, const char* expr) {
 struct Options {
     unsigned rank=0, device=0, warmup=20, iters=50, rounds=6, l0Percent=50;
     unsigned l0Index=0, l1Index=0;
+    std::string eid[2]; unsigned eidDie[2]={0,0};
     uint64_t bytes=8ULL<<20;
     std::string dir, mode="all", suite="all", timing="block", l1PortPolicy="single";
 };
@@ -49,11 +50,15 @@ Options Parse(int argc, char** argv) {
         else if(k=="--suite") o.suite=v;
         else if(k=="--timing") o.timing=v;
         else if(k=="--l1-port-policy") o.l1PortPolicy=v;
+        else if(k=="--eid0") o.eid[0]=v;
+        else if(k=="--eid1") o.eid[1]=v;
         else if(k=="--bytes") o.bytes=Number(v);
         else {
             auto n=Number(v);
             if(n>1000000) throw std::runtime_error("numeric option too large");
-            if(k=="--rank") o.rank=n;
+            if(k=="--eid-die0") o.eidDie[0]=n;
+            else if(k=="--eid-die1") o.eidDie[1]=n;
+            else if(k=="--rank") o.rank=n;
             else if(k=="--device") o.device=n;
             else if(k=="--warmup") o.warmup=n;
             else if(k=="--iters") o.iters=n;
@@ -66,9 +71,20 @@ Options Parse(int argc, char** argv) {
     }
     if(o.rank>1 || o.device>1 || o.dir.empty() || !o.iters || !o.rounds || o.rounds>1000 ||
        (o.mode!="all" && o.mode!="l0" && o.mode!="l1" && o.mode!="split") ||
-       (o.suite!="discover" && o.suite!="create" && o.suite!="correctness" && o.suite!="benchmark" && o.suite!="all") ||
+       (o.suite!="endpoint" && o.suite!="discover" && o.suite!="create" && o.suite!="correctness" && o.suite!="benchmark" && o.suite!="all") ||
        (o.timing!="block" && o.timing!="serial") ||
        (o.l1PortPolicy!="single" && o.l1PortPolicy!="any")) throw std::runtime_error("invalid options");
+    const bool explicitEid=!o.eid[0].empty() || !o.eid[1].empty();
+    if(explicitEid) {
+        for(unsigned r=0;r<2;++r) {
+            if(o.eid[r].size()!=32 || o.eid[r].find_first_not_of("0123456789abcdef")!=std::string::npos || o.eidDie[r]>1)
+                throw std::runtime_error("explicit EIDs must be 32 lowercase hex digits with die 0/1");
+        }
+        if(o.eid[0]==o.eid[1] || o.mode=="l0" || o.l1PortPolicy!="any")
+            throw std::runtime_error("explicit EID experiment requires distinct EIDs, L1 mode and policy any (single port not yet proven)");
+    }
+    if(o.suite=="endpoint" && (!explicitEid || o.mode!="l1"))
+        throw std::runtime_error("endpoint suite requires explicit EIDs and mode l1");
     l0l1::Split(o.bytes,o.l0Percent);
     return o;
 }
@@ -101,6 +117,33 @@ std::string EndpointKey(const EndpointDesc& ep) {
     s << int(ep.protocol) << ":" << int(ep.commAddr.type) << ":" << std::hex << std::setfill('0');
     for(auto x:ep.commAddr.eid) s << std::setw(2) << unsigned(x);
     return s.str();
+}
+template<class F> void Stage(const Options& o,const std::string& stage,F fn) {
+    Phase(o,stage+"_begin"); const auto begin=Clock::now();
+    const auto status=fn();
+    std::cout << "L0L1_STAGE rank=" << o.rank << " stage=" << stage << " status=" << status
+              << " elapsed_us=" << std::chrono::duration<double,std::micro>(Clock::now()-begin).count() << std::endl;
+    Check(static_cast<long>(status),stage.c_str());
+}
+// Optional symbols: old installations can still build/run the original probe.
+void Inventory(const Options& o) {
+    using Num=int (*)(int32_t,uint32_t*);
+    using Descs=int (*)(int32_t,uint32_t*,EndpointDesc*);
+    auto num=reinterpret_cast<Num>(dlsym(RTLD_DEFAULT,"HcommEndpointGetDescNum"));
+    auto descs=reinterpret_cast<Descs>(dlsym(RTLD_DEFAULT,"HcommEndpointGetDescs"));
+    if(!num || !descs) { std::cout<<"L0L1_ENDPOINT_INVENTORY rank="<<o.rank<<" available=0"<<std::endl; return; }
+    uint32_t n=0; int status=num(o.device,&n);
+    std::cout<<"L0L1_ENDPOINT_INVENTORY rank="<<o.rank<<" available=1 status="<<status<<" count="<<n<<std::endl;
+    if(status || !n || n>4096) return;
+    std::vector<EndpointDesc> eps(n); const auto capacity=n; status=descs(o.device,&n,eps.data());
+    std::cout<<"L0L1_ENDPOINT_INVENTORY rank="<<o.rank<<" stage=descs status="<<status<<" count="<<n<<std::endl;
+    if(status || n>capacity) return;
+    for(unsigned i=0;i<n;++i) {
+        const auto& ep=eps[i];
+        std::cout<<"L0L1_DRIVER_ENDPOINT rank="<<o.rank<<" index="<<i<<" key="<<EndpointKey(ep)
+                 <<" loc_type="<<int(ep.loc.locType)<<" dev_phy_id="<<ep.loc.device.devPhyId
+                 <<" super_dev_id="<<ep.loc.device.superDevId<<std::endl;
+    }
 }
 struct Path {
     CommLink link{};
@@ -181,6 +224,31 @@ Path Select(const std::vector<Path>& paths,unsigned layer,unsigned index,const s
         "cannot split a port-group EID via HcclChannelDesc; no aggregate fallback");
     throw std::runtime_error("PATH_UNAVAILABLE layer="+std::to_string(layer)+"; no fallback or fabricated EID");
 }
+// Keep the graph endpoint's physical location, but replace only its address.
+// The caller must independently verify the candidate belongs to this NPU/die.
+Path ExplicitPath(HcclComm comm,const Options& o,Path p) {
+    if(p.die!=o.eidDie[o.rank] || p.remoteDie!=o.eidDie[1-o.rank])
+        throw std::runtime_error("EXPLICIT_DIE_TEMPLATE_MISMATCH: select an aggregate L1 template on the same dies");
+    const auto old=p.key;
+    EndpointDesc* eps[]={&p.link.srcEndpointDesc,&p.link.dstEndpointDesc};
+    for(unsigned side=0;side<2;++side) {
+        unsigned r=side?1-o.rank:o.rank;
+        for(unsigned b=0;b<16;++b) eps[side]->commAddr.eid[b]=std::stoul(o.eid[r].substr(b*2,2),nullptr,16);
+        uint32_t die=0,coeff=0;
+        auto ds=HcclRankGraphGetEndpointInfo(comm,r,eps[side],ENDPOINT_ATTR_DIE_ID,sizeof(die),&die);
+        auto bs=HcclRankGraphGetEndpointInfo(comm,r,eps[side],ENDPOINT_ATTR_BW_COEFF,sizeof(coeff),&coeff);
+        std::cout<<"L0L1_EXPLICIT_QUERY rank="<<o.rank<<" endpoint_rank="<<r<<" die_status="<<ds
+                 <<" graph_die="<<die<<" declared_die="<<o.eidDie[r]<<" bw_status="<<bs<<" bw_coeff="<<coeff<<std::endl;
+        // Failed graph lookup is the subject of this experiment, not a reason to silently substitute an endpoint.
+        if(ds==HCCL_SUCCESS && die!=o.eidDie[r]) throw std::runtime_error("EXPLICIT_DIE_GRAPH_MISMATCH");
+        if(!side) { p.bwStatus=bs; p.bwCoeff=bs==HCCL_SUCCESS?coeff:0; }
+        else { p.remoteBwStatus=bs; p.remoteBwCoeff=bs==HCCL_SUCCESS?coeff:0; }
+    }
+    p.key=l0l1::PairKey(o.rank,EndpointKey(*eps[0]),EndpointKey(*eps[1]));
+    std::cout<<"L0L1_EXPLICIT_PAIR rank="<<o.rank<<" template="<<old<<" actual="<<p.key
+             <<" source=manual physical_port_verified=0 graph_failure_is_nonfatal=1"<<std::endl;
+    return p;
+}
 struct Lane { Path path; aclrtStream stream=nullptr; ThreadHandle thread=0; ChannelHandle channel=0; CcuKernelHandle kernel=0; };
 // A separate kernel per selected path/die. Positive size only: no CCU compare,
 // branch, dynamic mask, synthetic relay or intermediate NPU memory.
@@ -208,6 +276,7 @@ CcuResult Exchange(CcuKernelArg opaque) {
     }
 }
 void Libraries() {
+    std::cout << "L0L1_EXPLICIT_EID_ABI version=1" << std::endl;
     if(!HcommCcuKernelRegisterStart || !HcommCcuKernelRegister || !HcommCcuKernelRegisterEnd || !HcommCcuKernelLaunch)
         throw std::runtime_error("public CCU entry points unavailable");
     Dl_info info{};
@@ -219,10 +288,11 @@ void Run(const Options& o) {
     Libraries(); CHECK(aclInit(nullptr)); CHECK(aclrtSetDevice(o.device));
     uint32_t devices=0; CHECK(aclrtGetDeviceCount(&devices));
     if(devices!=2) throw std::runtime_error("exactly two visible devices required");
+    Inventory(o);
     std::ostringstream config;
     config << o.bytes << ':' << o.mode << ':' << o.suite << ':' << o.warmup << ':' << o.iters << ':'
            << o.rounds << ':' << o.l0Percent << ':' << o.l0Index << ':' << o.l1Index << ':' << o.timing
-           << ':' << o.l1PortPolicy;
+           << ':' << o.l1PortPolicy << ':' << o.eid[0] << ':' << o.eid[1] << ':' << o.eidDie[0] << ':' << o.eidDie[1];
     Agree(o,"config",config.str());
     Phase(o,"comm_init"); HcclRootInfo root{};
     if(!o.rank) { CHECK(HcclGetRootInfo(&root)); Save(o.dir+"/root.bin",std::string(reinterpret_cast<char*>(&root),sizeof(root))); }
@@ -240,7 +310,9 @@ void Run(const Options& o) {
     std::vector<Lane> lanes;
     for(unsigned layer=0;layer<2;++layer) {
         if((o.mode=="l0" && layer==1)||(o.mode=="l1" && layer==0)) continue;
-        Lane lane; lane.path=Select(paths,layer,layer==0?o.l0Index:o.l1Index,o.l1PortPolicy); lanes.push_back(lane);
+        Lane lane; lane.path=Select(paths,layer,layer==0?o.l0Index:o.l1Index,o.l1PortPolicy);
+        if(layer==1 && !o.eid[0].empty()) lane.path=ExplicitPath(comm,o,lane.path);
+        lanes.push_back(lane);
     }
     if(lanes.size()==2 && lanes[0].path.key==lanes[1].path.key)
         throw std::runtime_error("PATH_ALIAS: L0 and L1 have identical endpoint pairs");
@@ -250,6 +322,16 @@ void Run(const Options& o) {
             std::to_string(o.rank?p.remoteDie:p.die)+":"+std::to_string(o.rank?p.die:p.remoteDie)+":"+
             std::to_string(o.rank?p.remoteBwCoeff:p.bwCoeff)+":"+std::to_string(o.rank?p.bwCoeff:p.remoteBwCoeff);
         Agree(o,"selected_L"+std::to_string(p.layer),signature);
+    }
+    if(o.suite=="endpoint") {
+        EndpointHandle endpoint{};
+        Stage(o,"endpoint_create",[&]{return HcommEndpointCreate(&lanes[0].path.link.srcEndpointDesc,&endpoint);});
+        if(!endpoint) throw std::runtime_error("endpoint_create returned null handle");
+        Agree(o,"endpoints_created");
+        Stage(o,"endpoint_destroy",[&]{return HcommEndpointDestroy(endpoint);});
+        Agree(o,"endpoints_destroyed"); CHECK(HcclCommDestroy(comm));
+        CHECK(aclrtResetDevice(o.device)); CHECK(aclFinalize());
+        std::cout<<"L0L1_RANK_PASS rank="<<o.rank<<" suite=endpoint channel_tested=0 payload_tested=0"<<std::endl; return;
     }
     Phase(o,"query_instance"); CcuInsHandle instance=0; uint32_t count=1;
     CHECK(HcclCommQueryCcuIns(comm,&instance,&count));
@@ -274,7 +356,7 @@ void Run(const Options& o) {
         d.localEndpoint=p.link.srcEndpointDesc; d.remoteEndpoint=p.link.dstEndpointDesc;
         d.memHandles=regs; d.memHandleNum=2;
     }
-    CHECK(HcclChannelAcquire(comm,COMM_ENGINE_CCU,descs.data(),descs.size(),channels.data()));
+    Stage(o,"channel_acquire",[&]{return HcclChannelAcquire(comm,COMM_ENGINE_CCU,descs.data(),descs.size(),channels.data());});
     if(channels.size()==2 && channels[0]==channels[1]) throw std::runtime_error("CHANNEL_ALIAS: identical handles");
     std::vector<int32_t> states(lanes.size(),-1);
     CHECK(HcommChannelGetStatus(channels.data(),channels.size(),states.data()));
@@ -282,18 +364,18 @@ void Run(const Options& o) {
         auto& l=lanes[i]; l.channel=channels[i];
         std::cout << "L0L1_SELECTED rank=" << o.rank << " layer=" << l.path.layer << " die=" << l.path.die
                   << " remote_die=" << l.path.remoteDie << " hop=" << unsigned(l.path.link.linkAttr.hop)
-                  << " l1_port_policy=" << o.l1PortPolicy << " bw_coeff=" << l.path.bwCoeff
+                  << " endpoint_source=" << (l.path.layer==1 && !o.eid[0].empty()?"explicit":"graph") << " l1_port_policy=" << o.l1PortPolicy << " bw_coeff=" << l.path.bwCoeff
                   << " remote_bw_coeff=" << l.path.remoteBwCoeff
                   << " channel=" << l.channel << " state=" << states[i] << " key=" << l.path.key << std::endl;
         if(states[i]!=0) throw std::runtime_error("channel not ready");
     }
-    Phase(o,"register_start"); CHECK(HcommCcuKernelRegisterStart(instance));
+    Stage(o,"register_start",[&]{return HcommCcuKernelRegisterStart(instance);});
     for(auto& l:lanes) {
         Phase(o,"register_kernel_L"+std::to_string(l.path.layer));
         const void* args[]={&l.channel}; const auto name="L0L1PositiveWriteL"+std::to_string(l.path.layer);
-        CHECK(HcommCcuKernelRegister(instance,l.path.die,name.c_str(),reinterpret_cast<const void*>(Exchange),args,1,&l.kernel));
+        Stage(o,"register_kernel_L"+std::to_string(l.path.layer),[&]{return HcommCcuKernelRegister(instance,l.path.die,name.c_str(),reinterpret_cast<const void*>(Exchange),args,1,&l.kernel);});
     }
-    Phase(o,"register_end"); CHECK(HcommCcuKernelRegisterEnd(instance));
+    Stage(o,"register_end",[&]{return HcommCcuKernelRegisterEnd(instance);});
     for(const auto& l:lanes) { uint32_t args=0; CHECK(HcommCcuGetTaskArgsNum(l.kernel,&args));
         if(args!=5) throw std::runtime_error("unexpected task argument count"); }
     uint64_t inToken=0,outToken=0;
@@ -358,7 +440,7 @@ void Run(const Options& o) {
             const auto b1=o.bytes-b0;
             std::ostringstream row; row<<std::setprecision(12)<<"{\"rank\":"<<o.rank<<",\"round\":"<<round
                 <<",\"mode\":\""<<mode<<"\",\"timing\":\""<<o.timing<<"\",\"l1_port_policy\":\""<<o.l1PortPolicy
-                <<"\",\"bytes_per_direction\":"<<o.bytes
+                <<"\",\"endpoint_source\":\""<<(o.eid[0].empty()?"graph":"explicit")<<"\",\"bytes_per_direction\":"<<o.bytes
                 <<",\"l0_bytes\":"<<b0<<",\"l1_bytes\":"<<b1<<",\"wall_us\":"<<wall
                 <<",\"enqueue_or_serial_us\":"<<host<<"}";
             results<<row.str()<<std::endl; std::cout<<"L0L1_SAMPLE "<<row.str()<<std::endl;
