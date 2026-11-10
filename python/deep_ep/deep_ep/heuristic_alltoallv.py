@@ -84,6 +84,7 @@ class RoutePlan:
     candidate_evaluations: int
     stop_reason: str
     _native_layout: object = field(default=None, repr=False, compare=False)
+    l1_info: object = field(default=None, repr=False, compare=False)
 
     @property
     def uses_relay(self):
@@ -97,7 +98,7 @@ class RoutePlan:
     def report(self):
         original = [v if f // N != f % N else 0 for f, v in enumerate(self.counts)]
         lower, mask = cut_lower_bound_rows(self.counts)
-        return dict(fingerprint=self.fingerprint, counts=list(self.counts), row_bytes=self.row_bytes,
+        result = dict(fingerprint=self.fingerprint, counts=list(self.counts), row_bytes=self.row_bytes,
                     relay_rank=list(self.relay_rank), relay_rows=list(self.relay_rows),
                     actions=list(self.actions), stop_reason=self.stop_reason,
                     candidate_evaluations=self.candidate_evaluations,
@@ -108,6 +109,18 @@ class RoutePlan:
                     transmitted_network_bytes=sum(self.link_rows) * self.row_bytes,
                     cut_lower_bound_bytes=lower * self.row_bytes,
                     bottleneck_cut=[r for r in range(N) if mask & (1 << r)])
+        if self.l1_info is not None:
+            info=self.l1_info
+            result.update(info)
+            result['planned_link_peak_bytes']=max(max(self.link_rows), max(info['l1_tx_port_rows']),
+                                                  max(info['l1_rx_port_rows']))*self.row_bytes
+            result['l1_rows']=sum(v for r,v in zip(self.relay_rank,self.relay_rows) if r==8)
+            result['participant_relay_rows']=sum(v for r,v in zip(self.relay_rank,self.relay_rows) if 0<=r<8)
+            result['transmitted_network_bytes']=(sum(self.link_rows)+result['l1_rows'])*self.row_bytes
+            result['cut_lower_bound_bytes']=info['resource_lower_bound_rows']*self.row_bytes
+            result['bottleneck_cut']=None  # Old L0-only cut is inapplicable.
+            result['route_selector_8']='single_port_l1'
+        return result
 
 
 class RelayPlanner:
@@ -118,10 +131,14 @@ class RelayPlanner:
     This object owns only static topology/options, no counts or plan cache.
     """
     def __init__(self, row_bytes, allowed_relays, *, min_chunk_bytes=1, min_gain_bytes=0,
-                 max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy"):
-        if strategy not in ("greedy", "bottleneck"):
-            raise ValueError("strategy must be greedy or bottleneck")
+                 max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy", l1_resources=None):
+        if strategy not in ("greedy", "bottleneck", "l1_bottleneck"):
+            raise ValueError("strategy must be greedy, bottleneck or l1_bottleneck")
         self.strategy = strategy
+        if (l1_resources is not None) != (strategy == 'l1_bottleneck'):
+            raise ValueError('L1 resources and l1_bottleneck must be supplied together')
+        if strategy == 'l1_bottleneck' and getattr(native_module,'ep8_single_port_l1_abi',None)!=1:
+            raise RuntimeError('rebuild DeepEP: ep8_single_port_l1_abi=1 required')
         if strategy == "bottleneck" and getattr(native_module, "ep8_bottleneck_planner_abi", None) != 1:
             raise RuntimeError("bottleneck requires rebuilt native ep8_bottleneck_planner_abi=1")
         self.row_bytes = _uint(row_bytes, 'row_bytes', 1)
@@ -145,15 +162,21 @@ class RelayPlanner:
                 () if relay_capacity_bytes is None else relay_capacity_bytes)
         if strategy == 'bottleneck':
             self._native = self._native.with_bottleneck()
+        if strategy == 'l1_bottleneck':
+            self._native = self._native.with_l1_routes(l1_resources)
         self.backend = 'native' if self._native is not None else 'python'
 
     def plan(self, counts):
         if self._native is None:
             return make_plan(counts, self.row_bytes, self.relays, **self.options)
         c = normalize_counts(counts)
-        c, chosen, moved, loads, actions, evaluations, reason = self._native.plan(c)
+        info = None
+        if self.strategy == 'l1_bottleneck':
+            c, chosen, moved, loads, actions, evaluations, reason, info = self._native.plan_l1(c)
+        else:
+            c, chosen, moved, loads, actions, evaluations, reason = self._native.plan(c)
         return RoutePlan(c, self.row_bytes, chosen, moved, loads, actions, evaluations, reason,
-                         self._native.layout)
+                         self._native.layout, info)
 
 
 class FastRelayPlanner:

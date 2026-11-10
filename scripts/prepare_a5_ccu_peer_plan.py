@@ -102,6 +102,7 @@ def build_rows(devices, available, policy, entries, edges, direct_route=0, net_l
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--l1-config", type=Path)
     p.add_argument("--devices", required=True)
     p.add_argument("--available-phys", default="0,1,2,3,4,5,6,7")
     relay_options = p.add_mutually_exclusive_group()
@@ -121,13 +122,16 @@ def main():
             raise ValueError("direct route must be nonnegative")
         policy = load_requested_policy(devices, args.relay_map, args.relay_phys)
         normalized, limit = validate_policy(devices, available, policy)
+        if args.l1_config:
+            from a5_ccu_l1_policy import validate_config
+            validate_config(args.l1_config, devices, args.root_info)
         if args.validate_only:
             print("PEER_POLICY_VALIDATED " + json.dumps(dict(devices=devices,
                 available_devices=available, relay_limit_per_peer=limit, relay_policy=policy)))
             return
         if args.topology is not None:
             raise ValueError("--topology TXT input has been removed; use --root-info and --hccn-tool")
-        if any(normalized.values()):
+        if any(normalized.values()) or args.l1_config:
             required = set(devices) | {spec["physical_device"]
                                       for specs in normalized.values() for spec in specs}
             entries, edges, provenance = load_machine(args, required)
@@ -138,8 +142,23 @@ def main():
             provenance = {"source": "hccl_direct_discovery"}
         rows, summary = build_rows(devices, available, policy, entries, edges,
                                    args.direct_route, args.net_layer)
+        if args.l1_config:
+            from a5_ccu_machine_topology import directed_links, connected_pair
+            from a5_ccu_l1_policy import apply_l1
+            for row in rows:
+                if row['kind'] != 'direct': continue
+                matches={}
+                for link in directed_links(edges,row['src_phy'],row['dst_phy'],args.net_layer):
+                    for a,b in connected_pair(entries,row['src_phy'],link['endpoint_port'],row['dst_phy'],link['relay_port'],args.net_layer):
+                        matches[(a['eid'],b['eid'])]=(a,b)
+                if len(matches)!=1: raise ValueError('L1 needs a unique machine-bound direct path per peer')
+                a,b=next(iter(matches.values()))
+                row.update(src_eid=a['eid'],dst_eid=b['eid'],src_die=a['die'],dst_die=b['die'])
+            rows, l1_policy=apply_l1(rows,devices,args.l1_config,provenance['root_info'])
+            summary.update(l1_policy=l1_policy,rows=rows,channels_per_rank=[sum(k in (v['src_rank'],v['dst_rank']) for v in rows) for k in range(len(devices))])
+            if any(9+3*n>48 for n in summary['channels_per_rank']): raise ValueError('L1 catalog exceeds CCU argument budget')
         summary["machine_topology"] = provenance
-        summary["policy_source"] = ("command_line" if args.relay_phys is not None
+        summary["policy_source"] = ("l1_config" if args.l1_config else "command_line" if args.relay_phys is not None
                                     else "json" if args.relay_map is not None else "direct_only")
         summary["requested_relay_policy"] = policy
     except (ValueError, KeyError, TypeError, OSError) as exc:

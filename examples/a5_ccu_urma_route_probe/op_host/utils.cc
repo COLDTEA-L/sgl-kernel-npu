@@ -312,19 +312,26 @@ HcclResult EnumeratePaths(HcclComm comm, uint32_t rank, uint32_t peer,
     uint32_t *layers = nullptr;
     HcclResult status = HcclRankGraphGetLayers(comm, &layers, &layerNum);
     if (status != HCCL_SUCCESS) return status;
+    if (!layerNum) return HCCL_E_NOT_FOUND;
+    if (!layers) return HCCL_E_PTR;
+    const std::vector<uint32_t> layerIds(layers,layers+layerNum);
     for (uint32_t layerIndex = 0; layerIndex < layerNum; ++layerIndex) {
         uint32_t listSize = 0;
         CommLink *linkList = nullptr;
-        status = HcclRankGraphGetLinks(comm, layers[layerIndex], rank, peer,
+        status = HcclRankGraphGetLinks(comm, layerIds[layerIndex], rank, peer,
                                        &linkList, &listSize);
         if (status != HCCL_SUCCESS) return status;
+        if (!listSize) continue;
+        if (!linkList) return HCCL_E_PTR;
+        // SDK-owned arrays must not be retained across further graph queries.
+        const std::vector<CommLink> links(linkList,linkList+listSize);
         for (uint32_t linkIndex = 0; linkIndex < listSize; ++linkIndex) {
-            const CommLink &link = linkList[linkIndex];
+            const CommLink &link = links[linkIndex];
             if (link.linkAttr.linkProtocol != COMM_PROTOCOL_UBC_CTP) continue;
             PathCandidate candidate;
             candidate.link = link;
             candidate.ordinal = static_cast<uint32_t>(candidates->size());
-            candidate.layer = layers[layerIndex];
+            candidate.layer = layerIds[layerIndex];
             candidate.linkIndex = linkIndex;
             candidate.uid = PathUid(link, candidate.layer);
             const EndpointInfo srcInfo = QueryEndpointInfo(comm, rank, link.srcEndpointDesc);
@@ -1244,9 +1251,9 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     if (eidAllToAllV) {
         if (!allToAllV || r.rankSize != 8) return HCCL_E_PARA;
         for (const auto& p : specs) {physicalRanks[p.srcPhy]=p.srcRank;physicalRanks[p.dstPhy]=p.dstRank;}
-        for (const auto& p : specs) if (p.relay) {
-            if (!physicalRanks.count(p.relayPhy)) return HCCL_E_PARA;
-            const auto k=physicalRanks.at(p.relayPhy);
+        for (const auto& p : specs) if (p.relay || p.l1) {
+            if (!p.l1 && !physicalRanks.count(p.relayPhy)) return HCCL_E_PARA;
+            const auto k=p.l1 ? 8u : physicalRanks.at(p.relayPhy);
             result.eidAllowed[p.srcRank*8+p.dstRank] |= 1u<<k;
             result.eidAllowed[p.dstRank*8+p.srcRank] |= 1u<<k;
         }
@@ -1277,22 +1284,41 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                 std::fprintf(stderr, "PEER_PLAN_INVALID physical device mapping differs from communicator\n");
                 return HCCL_E_PARA;
             }
-            if (p.relay) {
+            if (p.relay || p.l1) {
                 uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
                 status = ParseEidText("src_eid", p.srcEid.c_str(), src);
                 if (status != HCCL_SUCCESS) return status;
                 status = ParseEidText("dst_eid", p.dstEid.c_str(), dst);
                 if (status != HCCL_SUCCESS) return status;
+                if (p.l1) {
+                    // Ascend950 EID encoding is a classification check, not an
+                    // address generator. Network membership comes from the
+                    // machine-bound inventory compiled into the manifest.
+                    if ((src[5] >> 6) != p.srcDie || (dst[5] >> 6) != p.dstDie ||
+                        (src[5] & 63) > 8 || (dst[5] & 63) > 8) {
+                        std::fprintf(stderr,"L1_ENDPOINT_INVALID aggregate/unsupported port or die\n");
+                        return HCCL_E_PARA;
+                    }
+                }
                 std::copy(forward ? src : dst, (forward ? src : dst) + EID_BYTE_NUM,
                           desc.localEndpoint.commAddr.eid);
                 std::copy(forward ? dst : src, (forward ? dst : src) + EID_BYTE_NUM,
                           desc.remoteEndpoint.commAddr.eid);
                 die = forward ? p.srcDie : p.dstDie;
-                uid = "relay" + std::to_string(p.relayPhy) + "-" +
+                if (p.l1) {
+                    const auto info=QueryEndpointInfo(comm,r.rank,desc.localEndpoint);
+                    std::printf("L1_ENDPOINT_BIND rank=%u peer=%u declared_die=%u graph_status=%d graph_die=%u\n",
+                                r.rank,peer,die,int(info.dieStatus),info.dieId);
+                    if (info.dieStatus==HCCL_SUCCESS && info.dieId!=die) return HCCL_E_PARA;
+                    // A driver-enumerated explicit EID need not be in rank graph.
+                    // The remote rank validates its own endpoint, not a failing
+                    // remote GetEndpointInfo lookup on this process.
+                }
+                uid = (p.l1 ? "l1_single" : "relay" + std::to_string(p.relayPhy)) + "-" +
                     CommAddrToString(desc.localEndpoint.commAddr) + "-" +
                     CommAddrToString(desc.remoteEndpoint.commAddr);
             }
-            if (!p.relay && !p.srcEid.empty()) {
+            if (!p.relay && !p.l1 && !p.srcEid.empty()) {
                 uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
                 status = ParseEidText("bound_src_eid", p.srcEid.c_str(), src);
                 if (status != HCCL_SUCCESS) return status;
@@ -1315,18 +1341,23 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             }
             haveDie = true; r.dieId = die;
             descs.push_back(desc); result.peers.push_back(peer);
-            if (eidAllToAllV) result.eidChannels.push_back({peer, p.relay ? static_cast<int32_t>(physicalRanks.at(p.relayPhy)) : -1});
+            if (eidAllToAllV) result.eidChannels.push_back({peer, p.l1 ? 8 : p.relay ? static_cast<int32_t>(physicalRanks.at(p.relayPhy)) : -1});
             r.weights.push_back(p.weight); r.routeIndices.push_back(static_cast<uint32_t>(i));
             r.pathUids.push_back(uid);
             std::printf("PEER_PATH_DESC rank=%u peer=%u kind=%s relay_phy=%u weight=%u die=%u local=%s remote=%s\n",
-                r.rank, peer, p.relay ? "relay" : "direct", p.relayPhy, p.weight, die,
+                r.rank, peer, p.l1 ? "l1_single" : p.relay ? "relay" : "direct", p.relayPhy, p.weight, die,
                 CommAddrToString(desc.localEndpoint.commAddr).c_str(),
                 CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
         }
     }
     if (eidAllToAllV) {
         if (!ValidateEidChannels(r.rank, result.eidChannels) || syncMode != ChannelSyncMode::BASELINE) return HCCL_E_PARA;
-        std::printf("EP8_EID_CATALOG rank=%u channels=%zu task_args=46 participant_relays=1 hbm_relay=0\n", r.rank, descs.size());
+        const auto l1Count=std::count_if(result.eidChannels.begin(),result.eidChannels.end(),
+            [](const EidChannel& p) {return p.relay==8;});
+        const bool hasParticipant=std::any_of(result.eidChannels.begin(),result.eidChannels.end(),
+            [](const EidChannel& p) {return p.relay>=0 && p.relay<8;});
+        std::printf("EP8_EID_CATALOG rank=%u channels=%zu task_args=46 participant_relays=%u l1_paths=%zu hbm_relay=0\n",
+            r.rank,descs.size(),unsigned(hasParticipant),static_cast<size_t>(l1Count));
     } else if ((allToAllV && (r.rankSize != 8 || descs.size() != 7 || syncMode != ChannelSyncMode::BASELINE)) ||
         descs.empty() || (allToAllV ? 10 : r.ccuGroupCopy ? 9 : r.ccuSelfCopy ? 6 : 4) + 3 * descs.size() > 48) return HCCL_E_PARA;
     std::fflush(stdout);

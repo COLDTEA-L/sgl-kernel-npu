@@ -1,5 +1,7 @@
 # CANN 9.2 / 9.3 完整多路径 AllToAll 分支
 
+单口 L1 扩展见 [2/4 卡与 EP8 L1 接入指南](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md)。它位于独立分支，需重建 route/wheel 并使用当前机器端点清单；本文原配置继续默认 L0。
+
 分支：`feature/a5-ccu-92-93-alltoall`。从原 `feature/a5-ccu-8rank-heuristic-alltoallv` 的 `370a14d` 建立，原 9.1 分支和旧容器安装产物不修改。本分支要求新公开 CCU API，不用于 9.1。
 
 ## 1. 迁移范围与验证边界

@@ -283,7 +283,7 @@ int main() {
             self.assertIn('EP8_EID_GRAPH_PASS epochs=100 launches=800', result.stdout)
             self.assertIn('EP8_EID_REGISTER_STAGES_PASS stages=18 payload_disabled=17', result.stdout)
             self.assertIn('EP8_EID_FIXED_CONTROL_PASS masks=202', result.stdout)
-            self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 3)
+            self.assertEqual(result.stdout.count('EP8_EID_GRAPH_PASS epochs=100 launches=800'), 5)
             self.assertIn('EP8_EID_REAL_GRAPH_PASS epochs=4 row_bytes=5120,10240 actions=4 relay_rows=241 byte_guards=verified', result.stdout)
             print(result.stdout.strip())
 

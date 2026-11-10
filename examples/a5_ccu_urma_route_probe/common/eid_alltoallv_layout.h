@@ -4,8 +4,8 @@
 #include <algorithm>
 
 namespace a5_ccu_urma_probe {
-constexpr size_t EP8_EID_MAX_CHANNELS = 49;
-// One end-to-end channel per (peer, relay rank); -1 denotes the direct path.
+constexpr size_t EP8_EID_MAX_CHANNELS = 56;
+// Route selectors: -1 L0 direct; 0..7 participant relay; 8 single-port L1.
 struct EidChannel { uint32_t peer; int32_t relay; };
 struct EidAllToAllVLayout : AllToAllVLayout {
     // src offset, destination offset, original bytes, suffix bytes, relay rank.
@@ -16,7 +16,7 @@ inline bool ValidateEidChannels(uint32_t rank, const std::vector<EidChannel>& ch
     if (rank >= 8 || channels.size() < 7 || channels.size() > EP8_EID_MAX_CHANNELS) return false;
     std::array<uint32_t, 8> masks{}, directs{};
     for (const auto& c : channels) {
-        if (c.peer >= 8 || c.peer == rank || c.relay < -1 || c.relay >= 8 ||
+        if (c.peer >= 8 || c.peer == rank || c.relay < -1 || c.relay > 8 ||
             c.relay == static_cast<int32_t>(rank) || c.relay == static_cast<int32_t>(c.peer)) return false;
         if (c.relay < 0) ++directs[c.peer];
         else { if (masks[c.peer] & (1u << c.relay)) return false; masks[c.peer] |= 1u << c.relay; }
@@ -24,20 +24,20 @@ inline bool ValidateEidChannels(uint32_t rank, const std::vector<EidChannel>& ch
     for (uint32_t p = 0; p < 8; ++p) if (p != rank && directs[p] != 1) return false;
     return true;
 }
-inline bool ValidateEidPolicy(const uint64_t* counts, const int32_t* relays, const uint64_t* moved,
-                              uint32_t count, const std::array<uint8_t, 64>& allowed) {
+template<class Mask> inline bool ValidateEidPolicy(const uint64_t* counts, const int32_t* relays, const uint64_t* moved,
+                              uint32_t count, const std::array<Mask, 64>& allowed) {
     if (!counts || !relays || !moved || count != 64) return false;
     for (size_t f = 0; f < 64; ++f) {
-        if (relays[f] < -1 || relays[f] >= 8 || moved[f] > counts[f]) return false;
+        if (relays[f] < -1 || relays[f] > 8 || moved[f] > counts[f]) return false;
         if (moved[f]) {
             if (f/8 == f%8 || relays[f] < 0 || !(allowed[f] & (1u << relays[f]))) return false;
         } else if (relays[f] != -1) return false;
     }
     return true;
 }
-inline bool BuildEidAllToAllVLayout(uint32_t rank, const uint64_t* counts, uint32_t count,
+template<class Mask> inline bool BuildEidAllToAllVLayout(uint32_t rank, const uint64_t* counts, uint32_t count,
     uint64_t rowBytes, const int32_t* relays, const uint64_t* moved,
-    const std::array<uint8_t, 64>& allowed, const std::vector<EidChannel>& channels,
+    const std::array<Mask, 64>& allowed, const std::vector<EidChannel>& channels,
     EidAllToAllVLayout* out) {
     if (!out || !ValidateEidChannels(rank, channels) || !ValidateEidPolicy(counts, relays, moved, count, allowed)) return false;
     std::vector<uint32_t> peers;
@@ -83,9 +83,9 @@ public:
         }
         valid_=true;return true;
     }
-    bool Build(const uint64_t* counts,uint32_t count,uint64_t rowBytes,
+    template<class Mask> bool Build(const uint64_t* counts,uint32_t count,uint64_t rowBytes,
                const int32_t* relays,const uint64_t* moved,
-               const std::array<uint8_t,64>& allowed,EidAllToAllVLayout* out) const {
+               const std::array<Mask,64>& allowed,EidAllToAllVLayout* out) const {
         if(!valid_ || !out || !rowBytes || !ValidateEidPolicy(counts,relays,moved,count,allowed)) return false;
         // Preserve all original overflow/capacity checks, including other ranks.
         std::array<uint64_t,8> sends{},recvs{};
@@ -128,7 +128,7 @@ private:
     uint32_t rank_=0;
     size_t size_=0;
     std::array<EidChannel,EP8_EID_MAX_CHANNELS> channels_{};
-    std::array<uint8_t,8> relayMasks_{};
+    std::array<uint16_t,8> relayMasks_{};
 };
 } // namespace a5_ccu_urma_probe
 #endif

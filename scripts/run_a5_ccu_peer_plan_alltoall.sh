@@ -4,6 +4,7 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 devices=0,1,2,3
 available=0,1,2,3,4,5,6,7
 relay_map=
+l1_config=${A5_L1_CONFIG:-}
 relay_phys=
 relay_map_set=0
 relay_phys_set=0
@@ -28,6 +29,7 @@ while (($#)); do
     case "$1" in
         --devices) devices=$2; shift 2;;
         --available-phys) available=$2; shift 2;;
+        --l1-config) l1_config=$2; shift 2;;
         --relay-map) relay_map=$2; relay_map_set=1; shift 2;;
         --relay-phys) relay_phys=$2; relay_phys_set=1; shift 2;;
         --direct-route) direct_route=$2; shift 2;;
@@ -78,6 +80,7 @@ fi
 # same argument vector for manifest generation; never hard-code a relay pool.
 plan_args=(--devices "$devices" --available-phys "$available" --direct-route "$direct_route"
     "${machine_args[@]}")
+[[ -z "$l1_config" ]] || plan_args+=(--l1-config "$l1_config")
 ((relay_map_set == 0)) || plan_args+=(--relay-map "$relay_map")
 ((relay_phys_set == 0)) || plan_args+=(--relay-phys "$relay_phys")
 python3 "${repo}/scripts/prepare_a5_ccu_peer_plan.py" "${plan_args[@]}" --validate-only

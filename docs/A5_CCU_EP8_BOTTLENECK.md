@@ -1,5 +1,7 @@
 # EP8 EID：只对瓶颈分流的规划器与新机性能测试
 
+可选的单口 L1 资源感知策略 `l1_bottleneck` 见 [L1 接入与测试指南](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md)。原 `bottleneck` 的 L0 选路保持兼容。
+
 分支：`feature/a5-ccu-ep8-bottleneck-alltoallv`，基于 `feature/a5-ccu-92-93-alltoall` 的 `121e8f4`。新策略名 `bottleneck`，旧策略 `greedy` 保留。只修改EP8主机侧规划和测试，不修改route/kernel、2/4卡接口。仍为通信组内CCU+URMA EID转发，不落relay HBM，每次一次CCU kernel launch，不分chunk。
 
 ## 1. 算法

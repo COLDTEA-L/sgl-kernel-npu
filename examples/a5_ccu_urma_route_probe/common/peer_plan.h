@@ -11,6 +11,7 @@ namespace a5_ccu_urma_probe {
 struct PeerPathSpec {
     uint32_t srcRank = 0, dstRank = 0, srcPhy = 0, dstPhy = 0;
     bool relay = false;
+    bool l1 = false; // Explicit single-port L1 network path; no participant relay.
     uint32_t relayPhy = UINT32_MAX, directRoute = 0, weight = 2;
     uint32_t srcDie = 0, dstDie = 0;
     std::string srcEid, dstEid;
@@ -33,7 +34,7 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
         if (p.srcRank >= p.dstRank || p.dstRank >= rankSize || p.srcPhy == p.dstPhy ||
             p.weight == 0 || p.srcDie > 1 || p.dstDie > 1)
             return fail("invalid canonical rank pair, weight, physical IDs or endpoint die");
-        if (rankSize == 8 && p.relay && !participantRelays) return fail("8-rank plans are direct-only");
+        if (rankSize == 8 && (p.relay || p.l1) && !participantRelays) return fail("8-rank plans are direct-only");
         for (auto endpoint : {std::make_pair(p.srcRank, p.srcPhy),
                               std::make_pair(p.dstRank, p.dstPhy)}) {
             const auto inserted = mapping.emplace(endpoint);
@@ -54,11 +55,15 @@ inline bool ValidatePeerPlan(uint32_t rankSize, uint32_t availableCards,
             const auto found = pairs.find({a, b});
             if (found == pairs.end()) return fail("every unordered peer pair needs a direct row");
             const auto &paths = found->second;
-            if (paths.front()->relay) return fail("first path for each peer must be direct");
+            if (paths.front()->relay || paths.front()->l1) return fail("first path for each peer must be direct");
             std::set<uint32_t> relays;
-            size_t directs = 0;
+            size_t directs = 0, l1s = 0;
             for (const auto *path : paths) {
-                if (!path->relay) {
+                if (path->l1) {
+                    if (path->relay || ++l1s > 1 || path->relayPhy != UINT32_MAX ||
+                        path->srcEid.empty() || path->dstEid.empty())
+                        return fail("one explicit single-port L1 path per pair; no relay physical ID");
+                } else if (!path->relay) {
                     ++directs;
                 } else {
                     if ((participantRelays ? (!members.count(path->relayPhy) || path->relayPhy == path->srcPhy || path->relayPhy == path->dstPhy)

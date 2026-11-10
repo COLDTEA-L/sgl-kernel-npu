@@ -99,8 +99,11 @@ HcclResult Load(const char *path, uint32_t rankSize, uint32_t availableCards,
             p.relay = true;
             if (!Uint(get("relay_phy"), &p.relayPhy)) return HCCL_E_PARA;
             p.srcEid = get("src_eid"); p.dstEid = get("dst_eid");
+        } else if (get("kind") == "l1_single") {
+            if (get("relay_phy") != "-" || (rankSize == 8 && !eidAllToAllV)) return HCCL_E_PARA;
+            p.l1 = true; p.srcEid = get("src_eid"); p.dstEid = get("dst_eid");
         } else if (get("kind") != "direct") return HCCL_E_PARA;
-        else if (rankSize == 8 && (get("src_eid") != "-" || get("dst_eid") != "-")) {
+        else if ((get("src_eid") != "-" || get("dst_eid") != "-")) {
             if (get("src_eid").empty() || get("dst_eid").empty() ||
                 get("src_eid") == "-" || get("dst_eid") == "-") return HCCL_E_PARA;
             p.srcEid = get("src_eid"); p.dstEid = get("dst_eid");
@@ -492,3 +495,5 @@ extern "C" HcclResult HcclCcuUrmaPeerPlanSynchronize(uint64_t handle) {
     for(auto stream:streams) if(aclrtSynchronizeStream(stream)!=ACL_SUCCESS) status=HCCL_E_RUNTIME;
     return status;
 }
+
+extern "C" int A5CcuSinglePortL1AbiVersion() { return 1; }

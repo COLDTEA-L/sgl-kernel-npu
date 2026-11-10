@@ -6,8 +6,8 @@ namespace a5_ccu_urma_probe {
 a5ccu::CcuKernelSignature EidAllToAllVKernelArg::GetKernelSignature() const {
     a5ccu::CcuKernelSignature s;
     std::vector<uint32_t> ids;
-    for (const auto& p : paths) ids.push_back(p.peer*9+static_cast<uint32_t>(p.relay+1));
-    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V4DirectControl", ids, channels)); s.Append(EidRegisterStageName(stage)); return s;
+    for (const auto& p : paths) ids.push_back(p.peer*10+static_cast<uint32_t>(p.relay+1));
+    s.Append(MakePathKernelSignature("A5CcuEidAllToAllV8V5SinglePortL1", ids, channels)); s.Append(EidRegisterStageName(stage)); return s;
 }
 HcclResult EidAllToAllVKernel::Algorithm() {
     if (channels_.size() != paths_.size() || !ValidateEidChannels(rank_, paths_)) return HCCL_E_PARA;
@@ -24,7 +24,7 @@ HcclResult EidAllToAllVKernel::Algorithm() {
     std::array<a5ccu::CcuRep::Variable,4> go;
     for (auto& v:go) Load(v);
     Load(active);
-    // 11 + 7*5 = 46 task arguments, independent of up to 49 cached channels.
+    // 11 + 7*5 = 46 task arguments, independent of up to 56 cached channels.
     std::array<std::array<a5ccu::CcuRep::Variable,5>,7> peer;
     // Public Variable subtraction exists in headers but is unsupported by
     // the V1 instruction generator (repType 11). GeneArgs supplies direct bytes.

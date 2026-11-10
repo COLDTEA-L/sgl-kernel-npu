@@ -93,6 +93,7 @@ def build_eid_topology(devices, entries, edges, net_layer=0, direct_route=0, max
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--l1-config', type=Path)
     p.add_argument('--devices', default='0,1,2,3,4,5,6,7')
     p.add_argument('--direct-route', type=int, default=0)
     p.add_argument('--executor', choices=('eid', 'hbm'), default='eid')
@@ -109,6 +110,12 @@ def main():
             rows, topology = build_eid_topology(devices, entries, edges, args.net_layer, args.direct_route, args.max_relays_per_peer)
         else:
             rows, topology = build_topology(devices, entries, edges, args.net_layer, args.direct_route)
+        if args.l1_config:
+            if args.executor != 'eid': raise ValueError('L1 requires EID executor')
+            from a5_ccu_l1_policy import apply_l1
+            rows, policy = apply_l1(rows, devices, args.l1_config, provenance['root_info'])
+            topology.update(version=3, l1_policy=policy, l1_resources=policy['l1_resources'])
+            topology['channels_per_rank']=[sum(r in (v['src_rank'],v['dst_rank']) for v in rows) for r in range(8)]
     except (ValueError, KeyError, TypeError, OSError) as exc:
         p.error(str(exc))
     args.output_dir.mkdir(parents=True, exist_ok=True)

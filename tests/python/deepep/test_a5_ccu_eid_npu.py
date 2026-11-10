@@ -28,7 +28,7 @@ def main():
     p.add_argument('--topology-json', type=Path, required=True)
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--matrix-json', type=Path)
-    p.add_argument('--planner', choices=('greedy', 'bottleneck'), default='bottleneck')
+    p.add_argument('--planner', choices=('greedy', 'bottleneck', 'l1_bottleneck'), default='bottleneck')
     p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
@@ -64,11 +64,14 @@ def main():
     if args.bidirectional_iters and not args.dtype.startswith('float8_'):
         p.error('bidirectional test requires an FP8 dispatch dtype')
     topology = json.loads(args.topology_json.read_text())
-    if topology['version'] != 2 or topology['executor'] != 'participant_eid_ccu_urma':
+    if topology['version'] not in (2,3) or topology['executor'] != 'participant_eid_ccu_urma':
         raise ValueError('requires generated EP8 explicit-EID topology v2')
     if topology['devices'] != [int(v) for v in os.environ['ASCEND_RT_VISIBLE_DEVICES'].split(',')]:
         raise ValueError('topology rank/device mapping mismatch')
     allowed = normalize_relays(topology['allowed_relays'])
+    l1_resources = topology.get('l1_resources')
+    if (args.planner == 'l1_bottleneck') != (l1_resources is not None):
+        raise ValueError('l1_bottleneck requires --l1-config topology and vice versa')
     if args.matrix_json:
         data = json.loads(args.matrix_json.read_text())
         if 'devices' in data and data['devices'] != topology['devices']:
@@ -90,6 +93,8 @@ def main():
     if args.counts_path != 'legacy' and getattr(native, 'ep8_eid_host_counts_tensor_abi', None) != 1:
         raise RuntimeError('rebuild/install DeepEP: ep8_eid_host_counts_tensor_abi=1 required')
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
+    if l1_resources is not None and route.A5CcuSinglePortL1AbiVersion()!=1:
+        raise RuntimeError("rebuild route: A5CcuSinglePortL1AbiVersion=1 required")
     required_abis = [
         ('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
         ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1),
@@ -179,7 +184,7 @@ def main():
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
     # Same registered channels/kernel for direct and multipath; only policy differs.
     planners = {mode: RelayPlanner(row_bytes, allowed, max_actions=0 if mode == 'direct' else 56,
-                                   native_module=native, strategy=args.planner) for mode in ('direct', 'multipath')}
+                                   native_module=native, strategy=args.planner, l1_resources=l1_resources) for mode in ('direct', 'multipath')}
     hosts = {mode: native.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
              for mode, planner in planners.items()}
     def native_transfer(send, recv, sends, recvs):

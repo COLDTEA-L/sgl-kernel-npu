@@ -10,9 +10,11 @@
 #include <set>
 using namespace a5_ccu_urma_probe;
 struct Kernel:EidAllToAllVKernel {using EidAllToAllVKernel::EidAllToAllVKernel;using EidAllToAllVKernel::GeneArgs;size_t Loads()const{return loadIndex_;}};
+static bool l1Test=false;
 static std::vector<EidChannel> Catalog(uint32_t rank, unsigned relayLimit=6) {
     std::vector<EidChannel> v;
     for(uint32_t p=0;p<8;++p) if(p!=rank) {v.push_back({p,-1});unsigned count=0;for(int k=0;k<8;++k) if(k!=int(rank)&&k!=int(p)&&count<relayLimit) {v.push_back({p,k});++count;}}
+    if(l1Test) for(uint32_t p=0;p<8;++p) if(p!=rank) v.push_back({p,8});
     return v;
 }
 static void Invalid() {
@@ -29,7 +31,7 @@ static void Invalid() {
     auto bad=specs;bad[1].relayPhy=8;assert(!ValidatePeerPlan(8,8,bad,&error,true));
     bad=specs;bad[1].relayPhy=bad[1].srcPhy;assert(!ValidatePeerPlan(8,8,bad,&error,true));
     auto paths=Catalog(0);paths.push_back(paths[0]);assert(!ValidateEidChannels(0,paths));
-    std::array<uint64_t,64> c{},m{};std::array<int32_t,64> k;k.fill(-1);std::array<uint8_t,64> allowed{};
+    std::array<uint64_t,64> c{},m{};std::array<int32_t,64> k;k.fill(-1);std::array<uint16_t,64> allowed{};
     EidAllToAllVLayout out;
     assert(BuildEidAllToAllVLayout(0,c.data(),64,5120,k.data(),m.data(),allowed,Catalog(0),&out));
     c[1]=4;m[1]=2;k[1]=2;
@@ -62,7 +64,7 @@ static void FixedDirectControl(Kernel& kernel) {
         }
         const auto paths=Catalog(0);
         for(size_t i=0;i<paths.size();++i) {
-            const auto ch=paths[i].peer*9+paths[i].relay+2;
+            const auto ch=paths[i].peer*10+paths[i].relay+2;
             assert(bool(published.count(ch))==bool(paths[i].relay<0));
         }
     }
@@ -70,7 +72,7 @@ static void FixedDirectControl(Kernel& kernel) {
 }
 static void RegistrationStages() {
     auto paths=Catalog(0);std::vector<ChannelHandle> channels;
-    for (auto p:paths) channels.push_back(p.peer*9+p.relay+2);
+    for (auto p:paths) channels.push_back(p.peer*10+p.relay+2);
     EidRegisterStage parsed;
     assert(ParseEidRegisterStage(nullptr,&parsed) && parsed==EidRegisterStage::FULL);
     assert(!ParseEidRegisterStage("invalid",&parsed));
@@ -106,23 +108,23 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
     std::array<std::unique_ptr<Kernel>,8> kernels;
     std::array<EidLayoutTopology,8> topologies;
     std::array<EidAllToAllVLayout,8> layouts;
-    std::array<uint8_t,64> allowed{};
+    std::array<uint16_t,64> allowed{};
     for(int s=0;s<8;++s) for(auto path:Catalog(s,relayLimit)) if(path.relay>=0) allowed[s*8+path.peer]|=1u<<path.relay;
     for(uint32_t r=0;r<8;++r) {
         auto paths=Catalog(r,relayLimit);std::vector<ChannelHandle> channels;
         assert(topologies[r].Init(r,paths));
-        for(auto p:paths) channels.push_back(p.peer*9+p.relay+2);
+        for(auto p:paths) channels.push_back(p.peer*10+p.relay+2);
         EidAllToAllVKernelArg arg(channels,r,paths);kernels[r].reset(new Kernel(arg));
         const auto before=hcomm::CcuRep::EventAllocations();
         assert(kernels[r]->Init()==0);
         assert(hcomm::CcuRep::EventAllocations()-before==14); // no default-construct then overwrite
     }
-    if(relayLimit==6) FixedDirectControl(*kernels[0]);
+    if(relayLimit==6 && !l1Test) FixedDirectControl(*kernels[0]);
     std::vector<std::vector<uint64_t>> candidates(64);
     for(size_t f=0;f<64;++f) for(unsigned k=0;k<8;++k)
         if(allowed[f]&(1u<<k)) candidates[f].push_back(k);
     auto planner=deep_ep::ep8::Planner(candidates,5120,1,0,56,{}).WithBottleneck();
-    uint32_t bits[8][8][9][3]{};
+    uint32_t bits[8][8][10][3]{};
     constexpr size_t guard=37;
     size_t activeRelay=0, skipped=0;
     for(unsigned epoch=0;epoch<(real?4u:100u);++epoch) {
@@ -132,7 +134,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
             size_t f=s*8+d;c[f]=(s*17+d*31+epoch*7)%9;
             if(s==7 || d==6) c[f]=0;
             if(c[f]&&s!=d&&(s+d+epoch)%3&&allowed[f]) {
-                int relay=(s+3*d+epoch)%8;while(!(allowed[f]&(1u<<relay))) relay=(relay+1)%8;
+                int relay=(s+3*d+epoch)%9;while(!(allowed[f]&(1u<<relay))) relay=(relay+1)%9;
                 m[f]=epoch%4?c[f]/2:c[f];if(m[f]) k[f]=relay;
             }
         }
@@ -145,7 +147,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
         }
         std::array<std::vector<unsigned char>,8> input,output,original;
         std::array<hcomm::CcuRep::Env,8> envs;
-        uint64_t published[8][8][9][2]{};
+        uint64_t published[8][8][10][2]{};
         for(uint32_t r=0;r<8;++r) {
             assert(topologies[r].Build(c.data(),64,rb,k.data(),m.data(),allowed,&layouts[r]));
             auto& l=layouts[r];input[r].assign(2*guard+std::max<uint64_t>(1,l.sendBytes),0xb7);
@@ -159,7 +161,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
             assert(!kernels[r]->FillInlineArgs(task,args.data(),45));
             envs[r].args.assign(args.begin(),args.end());
             assert(envs[r].args==kernels[r]->GeneArgs(task));
-            envs[r].remote=[&,r](ChannelHandle ch,uint32_t slot){return published[r][(ch-1)/9][(ch-1)%9][slot];};
+            envs[r].remote=[&,r](ChannelHandle ch,uint32_t slot){return published[r][(ch-1)/10][(ch-1)%10][slot];};
             for(size_t i=0;i<l.pathBytes.size();++i) if(!(l.activeMask&(uint64_t{1}<<i))) ++skipped;
         }
         std::array<size_t,8> pc{};std::array<std::vector<bool>,8> conditions;std::array<std::set<int>,8> completed;
@@ -174,7 +176,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
                 if(i.op=="if_begin") conditions[r].push_back(active&&i.len.eval(e));
                 else if(i.op=="if_end") {assert(!conditions[r].empty());conditions[r].pop_back();}
                 else if(active) {
-                    const uint32_t peer=(i.channel-1)/9,path=(i.channel-1)%9;
+                    const uint32_t peer=(i.channel-1)/10,path=(i.channel-1)%10;
                     if(i.op=="record") {
                         assert(!(bits[peer][r][path][i.slot]&i.mask));bits[peer][r][path][i.slot]|=i.mask;
                         if(i.slot<2) published[peer][r][path][i.slot]=i.len.eval(e);
@@ -213,7 +215,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
             for(auto& peer:bits[d]) for(auto& path:peer) for(auto v:path) assert(v==0);
         }
     }
-    assert(bool(activeRelay)==bool(relayLimit) && skipped);
+    assert(bool(activeRelay)==bool(relayLimit || l1Test) && skipped);
     if(real) {
         std::cout<<"EP8_EID_REAL_GRAPH_PASS epochs=4 row_bytes=5120,10240 actions=4 relay_rows=241 byte_guards=verified\n";
         return;
@@ -223,6 +225,7 @@ static void RunGraph(unsigned relayLimit, const deep_ep::ep8::Matrix* real = nul
 
 int main(int argc,char** argv) {
     Invalid(); RegistrationStages(); for(unsigned limit:{0u,1u,6u}) RunGraph(limit);
+    l1Test=true;RunGraph(0);RunGraph(6);l1Test=false;
     if(argc==2) {
         std::ifstream in(argv[1]);deep_ep::ep8::Matrix counts{};
         for(auto& n:counts) {in>>n;assert(in);}

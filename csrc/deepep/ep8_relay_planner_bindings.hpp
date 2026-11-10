@@ -44,6 +44,7 @@ inline Matrix HostCounts(const pybind11::object& obj) {
 inline void BindPlanner(pybind11::module_& m) {
     namespace py = pybind11;
     m.attr("ep8_relay_planner_abi") = 2;
+    m.attr("ep8_single_port_l1_abi") = 1;
     m.attr("ep8_bottleneck_planner_abi") = 1;
     m.attr("ep8_fast_selector_abi") = 1;
     py::class_<FastDecision>(m, "Ep8FastDecision")
@@ -74,6 +75,17 @@ inline void BindPlanner(pybind11::module_& m) {
     py::class_<Planner>(m, "Ep8RelayPlanner")
         .def(py::init<const std::vector<std::vector<U>>&, U, U, U, U, const std::vector<U>&>())
         .def("with_bottleneck", &Planner::WithBottleneck)
+        .def("with_l1_routes", &Planner::WithL1Routes)
+        .def("plan_l1", [](const Planner& planner, const Matrix& counts) {
+            if(!planner.HasL1()) throw py::value_error("L1 planner required");
+            auto p=planner.Make(counts);py::dict info;
+            info["l1_tx_port_rows"]=Scalars(p.l1Tx);info["l1_rx_port_rows"]=Scalars(p.l1Rx);
+            info["resource_lower_bound_rows"]=p.resourceLowerBound;
+            info["model"]="equal_bandwidth_l0_edges_and_l1_physical_ports";
+            return py::make_tuple(Scalars(p.counts),Scalars(p.relays),Scalars(p.moved),
+                Scalars(p.loads),Rows(p.actions),p.evaluations,
+                p.actions.empty()?"no_bottleneck_plan":"target_reached",info);
+        })
         .def("plan", [](const Planner& planner, const Matrix& counts) {
             auto p = planner.Make(counts);
             return py::make_tuple(Scalars(p.counts), Scalars(p.relays), Scalars(p.moved),

@@ -24,7 +24,9 @@ printf 'EID_LOG_ENV global=%s modules=%s stdout=%s resource_diagnostics=%s hccl_
   "${A5_CCU_RESOURCE_DIAGNOSTICS:-0}" "$HCCL_BUFFSIZE" | tee "$A5_EID_RUN/environment.log"
 printf '%s\n' "$@" > "$A5_EID_RUN/arguments.txt"
 git rev-parse HEAD > "$A5_EID_RUN/commit.txt"
-python3 scripts/prepare_a5_ccu_ep8_topology.py --executor eid \
+A5_L1_ARGS=()
+[[ -z "${A5_L1_CONFIG:-}" ]] || A5_L1_ARGS+=(--l1-config "$A5_L1_CONFIG")
+python3 scripts/prepare_a5_ccu_ep8_topology.py --executor eid "${A5_L1_ARGS[@]}" \
   --max-relays-per-peer "${A5_EID_MAX_RELAYS_PER_PEER:-6}" \
   --devices "$ASCEND_RT_VISIBLE_DEVICES" \
   --root-info "${A5_ROOT_INFO:-/etc/hccl_rootinfo.json}" \

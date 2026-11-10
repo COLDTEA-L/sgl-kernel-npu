@@ -48,7 +48,7 @@ struct PeerPlanResources {
     RouteResources route;
     std::vector<uint32_t> peers;
     std::vector<EidChannel> eidChannels;
-    std::array<uint8_t, 64> eidAllowed{};
+    std::array<uint16_t, 64> eidAllowed{};
 };
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,

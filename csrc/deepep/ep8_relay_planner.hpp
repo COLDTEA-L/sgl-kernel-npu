@@ -39,6 +39,8 @@ struct CopySpans {
 
 struct Plan {
     Matrix counts{}, moved{}, loads{};
+    std::array<U,144> l1Tx{}, l1Rx{};
+    U resourceLowerBound=0;
     Relays relays{};
     std::vector<Action> actions;
     U evaluations = 0;
@@ -111,6 +113,38 @@ public:
     // Opt-in policy; old constructors and two/four-rank interfaces are unchanged.
     Planner WithBottleneck() const { Planner out=*this; out.bottleneck_=true; return out; }
     bool IsBottleneck() const { return bottleneck_; }
+    bool HasL1() const { return l1_; }
+    // Resources are physical (rank*18 + die*9 + port), NOT EID/channel IDs.
+    // One configured network path per directed flow; reverse must match.
+    Planner WithL1Routes(const std::vector<std::vector<U>>& ports) const {
+        if (ports.size()!=64) throw std::invalid_argument("L1 resources require 64 entries");
+        Planner out=*this;out.l1_=true;out.bottleneck_=true;
+        for(size_t f=0;f<64;++f) {
+            if(ports[f].empty()) {out.l1Ports_[f]={-1,-1};continue;}
+            if(ports[f].size()!=2 || f/8==f%8 || ports[f][0]>=144 || ports[f][1]>=144 ||
+               ports[f][0]/18!=f/8 || ports[f][1]/18!=f%8)
+                throw std::invalid_argument("invalid L1 physical resource ownership");
+            out.l1Ports_[f]={int(ports[f][0]),int(ports[f][1])};
+        }
+        for(size_t f=0;f<64;++f) {
+            auto a=out.l1Ports_[f],b=out.l1Ports_[f%8*8+f/8];
+            if(a[0]!=b[1] || a[1]!=b[0]) throw std::invalid_argument("asymmetric L1 catalog");
+        }
+        // Topology-only cut capacity is compiled once, not on every dynamic call.
+        out.l1CutExtra_.fill(0);
+        for(unsigned mask=1;mask<255;++mask) {
+            std::array<bool,144> tx{},rx{};U nt=0,nr=0;
+            for(size_t f=0;f<64;++f) if((mask&(1u<<(f/8))) && !(mask&(1u<<(f%8)))) {
+                const auto a=out.l1Ports_[f];
+                if(a[0]>=0) {
+                    if(!tx[a[0]]) {tx[a[0]]=true;++nt;}
+                    if(!rx[a[1]]) {rx[a[1]]=true;++nr;}
+                }
+            }
+            out.l1CutExtra_[mask]=std::min(nt,nr);
+        }
+        return out;
+    }
 
     // Preserve byte thresholds rather than scaling already rounded row counts.
     Planner WithRowBytes(U bytes) const {
@@ -174,6 +208,7 @@ public:
 
     void BuildInto(const Matrix& counts, const Relays& relays, const Matrix& moved,
                    U chunkBytes, U maxChunks, int rank, Layout& out, bool compact) const {
+        if (l1_) throw std::invalid_argument("L1 plans require EID executor, not HBM pipeline");
         CheckCounts(counts, rowBytes_);
         if (!chunkBytes || chunkBytes > Max || !maxChunks || maxChunks > Max || rank < -1 || rank >= 8)
             throw std::invalid_argument("invalid chunk bounds");
@@ -239,7 +274,7 @@ private:
     // Lower bound only, not a promise of a feasible one-relay assignment.
     // All directed cuts take O(256*8) using subset recurrence. The single-flow
     // bound also accounts for splitting one commodity into at most two paths.
-    static U BottleneckLowerBound(const Matrix& c, U peak) {
+    U BottleneckLowerBound(const Matrix& c, U peak) const {
         std::array<U,8> outgoing{};
         for (size_t f=0;f<64;++f) if (f/8!=f%8) outgoing[f/8]+=c[f];
         std::array<U,256> cut{};
@@ -253,6 +288,8 @@ private:
             for (unsigned u=0;u<8;++u) if (prev&(1u<<u))
                 cut[mask]-=c[v*8+u]+c[u*8+v];
             U edges=size[mask]*(8-size[mask]);
+            // Optimistic equal-port fabric capacity, cached at catalog creation.
+            if(l1_) edges+=l1CutExtra_[mask];
             lower=std::max(lower,cut[mask]/edges+(cut[mask]%edges!=0));
         }
         return lower;
@@ -263,11 +300,11 @@ private:
         std::array<size_t,56> order{};size_t n=0;
         for (size_t f=0;f<64;++f) if (f/8!=f%8) {original[f]=counts[f];order[n++]=f;}
         p.counts=counts;p.evaluations=0;p.exhausted=true;
-        auto reset=[&] {p.loads=original;p.moved.fill(0);p.relays.fill(-1);p.actions.clear();};
-        reset();
+        auto reset=[&] {if(l1_) {p.l1Tx.fill(0);p.l1Rx.fill(0);} p.loads=original;p.moved.fill(0);p.relays.fill(-1);p.actions.clear();};
+        reset();p.resourceLowerBound=0;
         U peak=*std::max_element(original.begin(),original.end());
         if (!peak || !maxActions_) return;
-        U lower=BottleneckLowerBound(counts,peak);
+        U lower=BottleneckLowerBound(counts,peak);p.resourceLowerBound=lower;
         if (lower>=peak) return;
         std::sort(order.begin(),order.end(),[&](size_t a,size_t b) {
             return original[a]!=original[b]?original[a]>original[b]:a<b;
@@ -300,7 +337,23 @@ private:
                     if (!found || next<bestPeak ||
                         (next==bestPeak && used[k]<used[best])) {found=true;best=k;bestPeak=next;}
                 }
+                if(l1_ && l1Ports_[f][0]>=0) {
+                    ++p.evaluations;const auto ports=l1Ports_[f];
+                    U tx=p.l1Tx[ports[0]],rx=p.l1Rx[ports[1]];
+                    if(tx<=target && rx<=target && x<=target-tx && x<=target-rx) {
+                        U next=std::max(tx,rx)+x;
+                        // On equal modeled load prefer no intra-group forwarding.
+                        if(!found || next<=bestPeak) {found=true;best=8;bestPeak=next;}
+                    }
+                }
                 if (!found) {success=false;break;}
+                if(best==8) {
+                    const auto ports=l1Ports_[f];
+                    p.relays[f]=8;p.moved[f]=x;p.loads[f]-=x;
+                    p.l1Tx[ports[0]]+=x;p.l1Rx[ports[1]]+=x;
+                    p.actions.push_back({f/8,f%8,8,x,a-std::max(a-x,bestPeak)});
+                    continue;
+                }
                 p.relays[f]=static_cast<int>(best);p.moved[f]=x;used[best]+=x;
                 p.loads[f]-=x;p.loads[f/8*8+best]+=x;p.loads[best*8+f%8]+=x;
                 p.actions.push_back({f/8,f%8,best,x,a-std::max(a-x,bestPeak)});
@@ -309,7 +362,9 @@ private:
         }
         reset(); // Direct fallback, not native fallback; evaluations retained.
     }
-    bool bottleneck_=false;
+    bool bottleneck_=false, l1_=false;
+    std::array<std::array<int,2>,64> l1Ports_{};
+    std::array<U,256> l1CutExtra_{};
     U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;
     std::vector<U> capacityBytes_;
     std::array<unsigned, 64> masks_{};
