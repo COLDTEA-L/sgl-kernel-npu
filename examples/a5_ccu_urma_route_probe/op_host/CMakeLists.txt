@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 set(op_host_src_list
+    ${CMAKE_CURRENT_SOURCE_DIR}/public_ccu.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/route_probe.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/all_to_all_multiroute.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/peer_plan_runtime.cc

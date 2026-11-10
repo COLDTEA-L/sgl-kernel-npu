@@ -51,9 +51,9 @@ CommandBlockWorkerKernelArg::CommandBlockWorkerKernelArg(
     channels = inputChannels;
 }
 
-hcomm::CcuKernelSignature CommandBlockWorkerKernelArg::GetKernelSignature() const
+a5ccu::CcuKernelSignature CommandBlockWorkerKernelArg::GetKernelSignature() const
 {
-    hcomm::CcuKernelSignature signature;
+    a5ccu::CcuKernelSignature signature;
     signature.Append("A5CcuHbmCommandBlockWorkerV1");
     for (size_t i = 0; i < routeIndices_.size(); ++i) {
         signature.Append(routeIndices_[i]);
@@ -64,8 +64,8 @@ hcomm::CcuKernelSignature CommandBlockWorkerKernelArg::GetKernelSignature() cons
     return signature;
 }
 
-CommandBlockWorkerKernel::CommandBlockWorkerKernel(const hcomm::CcuKernelArg &arg)
-    : hcomm::CcuKernel(arg)
+CommandBlockWorkerKernel::CommandBlockWorkerKernel(const a5ccu::CcuKernelArg &arg)
+    : a5ccu::CcuKernel(arg)
 {
     const auto *workerArg = dynamic_cast<const CommandBlockWorkerKernelArg *>(&arg);
     if (workerArg != nullptr) {
@@ -85,11 +85,11 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
                 "command_block=0x%lx\n", RegisterModeName(registerMode_),
                 channels_.size(), static_cast<unsigned long>(commandBlockAddress_));
     std::fflush(stdout);
-    using namespace hcomm;
-    using hcomm::CcuRep::CompletedEvent;
-    using hcomm::CcuRep::LocalAddr;
-    using hcomm::CcuRep::RemoteAddr;
-    using hcomm::CcuRep::Variable;
+    using namespace a5ccu;
+    using a5ccu::CcuRep::CompletedEvent;
+    using a5ccu::CcuRep::LocalAddr;
+    using a5ccu::CcuRep::RemoteAddr;
+    using a5ccu::CcuRep::Variable;
 
     // GeneArgs() supplies exactly one task argument.  Every working HCOMM CCU
     // kernel in this repository consumes each task argument with Load() while
@@ -271,17 +271,17 @@ HcclResult CommandBlockWorkerKernel::Algorithm()
 }
 
 std::vector<uint64_t> CommandBlockWorkerKernel::GeneArgs(
-    const hcomm::CcuTaskArg &arg)
+    const a5ccu::CcuTaskArg &arg)
 {
     const auto *taskArg = dynamic_cast<const CommandBlockWorkerTaskArg *>(&arg);
     if (taskArg == nullptr) return {};
     return {taskArg->commandBlockAddr};
 }
 
-std::unique_ptr<hcomm::CcuKernel> CreateCommandBlockWorkerKernel(
-    const hcomm::CcuKernelArg &arg)
+std::unique_ptr<a5ccu::CcuKernel> CreateCommandBlockWorkerKernel(
+    const a5ccu::CcuKernelArg &arg)
 {
-    return std::unique_ptr<hcomm::CcuKernel>(new CommandBlockWorkerKernel(arg));
+    return std::unique_ptr<a5ccu::CcuKernel>(new CommandBlockWorkerKernel(arg));
 }
 
 } // namespace a5_ccu_urma_probe

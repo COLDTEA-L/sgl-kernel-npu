@@ -2,7 +2,7 @@
 #include "route_kernel.h"
 #include "utils.h"
 
-#include <hcomm/ccu/hccl_ccu_res.h>
+#include "../common/public_ccu.h"
 #include <hcomm/hcomm_res.h>
 
 #include <cstdint>
@@ -64,9 +64,9 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
         }
     }
 
-    const uint64_t inputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t inputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(sendBuf), bytes);
-    const uint64_t outputToken = hcomm::CcuRep::GetTokenInfo(
+    const uint64_t outputToken = a5ccu::CcuRep::GetTokenInfo(
         reinterpret_cast<uint64_t>(recvBuf), bytes * resources.rankSize);
     uint64_t totalWeight = 0;
     for (const uint32_t weight : resources.weights) {
@@ -108,7 +108,7 @@ extern "C" HcclResult HcclCcuUrmaMultiRouteWrite(void *sendBuf, void *recvBuf,
                     resources.rank, static_cast<unsigned long>(resources.kernel),
                     static_cast<unsigned long>(bytes), resources.dieId);
     }
-    status = HcclCcuKernelLaunch(comm, resources.routeThread, resources.kernel, &taskArg);
+    status = a5ccu::LaunchKernel(comm, resources.routeThread, resources.kernel, &taskArg);
     if (DebugEnabled()) {
         std::printf("[A5 CCU URMA][rank=%u] HcclCcuKernelLaunch end: status=%d\n",
                     resources.rank, static_cast<int>(status));

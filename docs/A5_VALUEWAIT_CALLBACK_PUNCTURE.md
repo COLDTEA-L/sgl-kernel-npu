@@ -1,5 +1,10 @@
 # A5 ValueWait/ValueWrite + Host Callback 穿刺实验
 
+> **CANN 9.2/9.3 分支说明**：本文以下内容保留原 9.1 多路径实验设计。
+> 当前分支为 `feature/a5-ccu-valuewait-callback-puncture-92-93`，部署与两卡
+> direct 控制实验请看 [92/93 入口](A5_VALUEWAIT_CALLBACK_PUNCTURE_92_93.md)。
+> 不要预加载旧 patched HCCL；旧 runner 在本分支已禁用。两卡 gate/graph 尚待实机验证。
+
 ## 目标
 
 在不把 host 调度逻辑捕获进图的前提下，验证一条完整控制链：

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Retained as historical 9.1 implementation; never preload its patched HCCL
+# into the public-CCU 9.2/9.3 environment.
+echo "Legacy 9.1 multipath runner is disabled on the 92/93 branch." >&2
+echo "See docs/A5_VALUEWAIT_CALLBACK_PUNCTURE_92_93.md and Issue #13 for the two-card direct gate experiment." >&2
+exit 2
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "${script_dir}/.." && pwd)
 

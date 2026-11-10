@@ -8,8 +8,7 @@ src_phy=""
 dst_phy=""
 relay_phy=""
 plane=""
-topology="${repo_root}/docs/topology/a5_hccn_device_topology_raw.txt"
-topology_json=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+machine_args=(--query-timeout 15)
 bytes=4194304
 warmup=10
 iterations=100
@@ -24,8 +23,8 @@ while [[ $# -gt 0 ]]; do
         --dst-phy) dst_phy=$2; shift 2 ;;
         --relay-phy) relay_phy=$2; shift 2 ;;
         --plane) plane=$2; shift 2 ;;
-        --topology) topology=$2; shift 2 ;;
-        --topology-json) topology_json=$2; shift 2 ;;
+        --topology) echo "--topology TXT input removed; use --root-info, --topology-json and --hccn-tool" >&2; exit 2;;
+        --root-info|--rootinfo|--topology-json|--hccn-tool|--hccl-tool|--query-timeout|--net-layer|--net-instance-id|--plane-id|--diagnostics-json) machine_args+=("$1" "$2"); shift 2;;
         --bytes) bytes=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --iters) iterations=$2; shift 2 ;;
@@ -53,17 +52,12 @@ done
     exit 2
 }
 [[ "${repeats}" =~ ^[1-9][0-9]*$ ]] || { echo "--repeats must be positive" >&2; exit 2; }
-[[ -f "${topology}" ]] || { echo "topology file not found: ${topology}" >&2; exit 2; }
-[[ -f "${topology_json}" ]] || {
-    echo "driver topology JSON not found: ${topology_json}" >&2
-    exit 2
-}
 
 run_dir="${output_root}/a5_ccu_synthetic_causal_${src_phy}_${relay_phy}_${dst_phy}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${run_dir}/cases"
 manifest="${run_dir}/resolved_eid_pair.tsv"
 python3 "${script_dir}/resolve_a5_synthetic_relay_eids.py" \
-    --topology "${topology}" --topology-json "${topology_json}" \
+    --diagnostics-json "${run_dir}/machine_topology.json" "${machine_args[@]}" \
     --src-phy "${src_phy}" --dst-phy "${dst_phy}" \
     --relay-phy "${relay_phy}" --plane "${plane}" >"${manifest}"
 

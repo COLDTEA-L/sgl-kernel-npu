@@ -22,7 +22,7 @@ while (($#)); do
         --output-root) output_root=$2; shift 2;;
         --no-profile) profile=0; shift;;
         --profile) profile=1; shift;;
-        --dtype|--cann-root|--timeout-seconds|--topology|--topology-json|--direct-route|--available-phys)
+        --dtype|--cann-root|--timeout-seconds|--topology|--root-info|--rootinfo|--topology-json|--hccn-tool|--hccl-tool|--query-timeout|--net-layer|--net-instance-id|--plane-id|--diagnostics-json|--direct-route|--available-phys)
             extra+=("$1" "$2"); shift 2;;
         --help)
             echo 'A/B/C: baseline, packed, packed-ready; default compute 6,7 + explicit relays 0..5.'

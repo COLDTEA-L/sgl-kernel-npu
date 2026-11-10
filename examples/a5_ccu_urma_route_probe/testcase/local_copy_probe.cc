@@ -6,7 +6,7 @@
 #include <acl/acl_prof.h>
 #include <hccl/hccl_comm.h>
 #include <hccl/hccl_res.h>
-#include <hcomm/ccu/hccl_ccu_res.h>
+#include "../common/public_ccu.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 using namespace a5_local_probe;
-namespace CcuRep = hcomm::CcuRep; // required by the target SDK's CCU_WHILE macro
+namespace CcuRep = a5ccu::CcuRep; // required by the target SDK's CCU_WHILE macro
 namespace {
 struct Options {
     uint32_t rank = 0, ranks = 2, changed = 3, queued = 20;
@@ -99,21 +99,21 @@ std::string GeometryJson()
     return ",\"group_slice_bytes\":" + std::to_string(config.sliceBytes) +
         ",\"group_lanes\":" + std::to_string(config.lanes) + ",\"group_ms_budget\":64";
 }
-class LocalArg : public hcomm::CcuKernelArg {
+class LocalArg : public a5ccu::CcuKernelArg {
 public:
     LocalArg(bool chunked,bool group,uint32_t sliceBytes) : chunked(chunked),group(group),config(sliceBytes) {}
     bool chunked,group;
     a5_ccu_urma_probe::GroupCopyConfig config;
-    hcomm::CcuKernelSignature GetKernelSignature() const override
+    a5ccu::CcuKernelSignature GetKernelSignature() const override
     {
-        hcomm::CcuKernelSignature signature;
+        a5ccu::CcuKernelSignature signature;
         signature.Append(group ? "A5LocalGroupFixed64MsV3:slice=" + std::to_string(config.sliceBytes) +
             ":lanes=" + std::to_string(config.lanes) :
             chunked ? "A5LocalCopyOnlyChunk4KV1" : "A5LocalCopyOnlyDirectV1");
         return signature;
     }
 };
-class LocalTask : public hcomm::CcuTaskArg {
+class LocalTask : public a5ccu::CcuTaskArg {
 public:
     uint64_t input, output, inputToken, outputToken, bytes;
     LocalTask(uint64_t i, uint64_t o, uint64_t it, uint64_t ot, uint64_t n)
@@ -121,7 +121,7 @@ public:
 };
 class LocalKernel : public a5_ccu_urma_probe::GroupedLocalCopyKernel {
 public:
-    explicit LocalKernel(const hcomm::CcuKernelArg &arg) : GroupedLocalCopyKernel(arg)
+    explicit LocalKernel(const a5ccu::CcuKernelArg &arg) : GroupedLocalCopyKernel(arg)
     {
         const auto *local = dynamic_cast<const LocalArg *>(&arg);
         if (!local) throw std::runtime_error("wrong kernel argument type");
@@ -139,7 +139,7 @@ protected:
         source.addr = input; source.token = inputToken;
         destination.addr = output; destination.token = outputToken;
         if(grouped_) {
-            std::array<hcomm::CcuRep::Variable,4> go;
+            std::array<a5ccu::CcuRep::Variable,4> go;
             for(auto &v:go) {v=CreateVariable(); Load(v);}
             return GroupedLocalCopy(destination,source,go,config_);
         }
@@ -164,7 +164,7 @@ protected:
         }
         return HCCL_SUCCESS;
     }
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg &arg) override
     {
         const auto *task = dynamic_cast<const LocalTask *>(&arg);
         if (!task) return {};
@@ -181,9 +181,9 @@ private:
     bool grouped_ = false;
     a5_ccu_urma_probe::GroupCopyConfig config_;
 };
-std::unique_ptr<hcomm::CcuKernel> CreateKernel(const hcomm::CcuKernelArg &arg)
+std::unique_ptr<a5ccu::CcuKernel> CreateKernel(const a5ccu::CcuKernelArg &arg)
 {
-    return std::unique_ptr<hcomm::CcuKernel>(new LocalKernel(arg));
+    return std::unique_ptr<a5ccu::CcuKernel>(new LocalKernel(arg));
 }
 std::string Path(const std::string &name) { return options.directory + '/' + name; }
 void PublishRoot(const HcclRootInfo &root)
@@ -307,7 +307,7 @@ void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalT
     Check(aclrtSynchronizeStream(r.stream), "benchmark setup synchronize");
     Mark("benchmark_warmup");
     for (uint32_t i = 0; i < options.warmup; ++i)
-        Check(HcclCcuKernelLaunch(r.comm, thread, kernel, &task), "warmup local CCU launch");
+        Check(a5ccu::LaunchKernel(r.comm, thread, kernel, &task), "warmup local CCU launch");
     Check(aclrtSynchronizeStream(r.stream), "warmup batch synchronize");
     // Re-poison after warmup: a stale warmup output cannot pass formal checks.
     Check(aclrtMemcpyAsync(r.output, span, r.hostOutput, span, ACL_MEMCPY_HOST_TO_DEVICE, r.stream), "pre-profile poison");
@@ -317,7 +317,7 @@ void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalT
     Mark("benchmark_measure");
     const auto begin = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < options.iterations; ++i)
-        Check(HcclCcuKernelLaunch(r.comm, thread, kernel, &task), "formal local CCU launch");
+        Check(a5ccu::LaunchKernel(r.comm, thread, kernel, &task), "formal local CCU launch");
     Check(aclrtSynchronizeStream(r.stream), "formal batch synchronize");
     const double totalUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
     profile.Stop();
@@ -338,12 +338,12 @@ void Benchmark(Resources &r, ThreadHandle thread, CcuKernelHandle kernel, LocalT
 }
 void Run()
 {
-    ShowLibrary("HcclCcuKernelLaunch", reinterpret_cast<void *>(HcclCcuKernelLaunch));
+    ShowLibrary("HcommCcuKernelLaunch", reinterpret_cast<void *>(HcommCcuKernelLaunch));
     ShowLibrary("HcclCommInitRootInfo", reinterpret_cast<void *>(HcclCommInitRootInfo));
     ShowLibrary("HcclGetRootInfo", reinterpret_cast<void *>(HcclGetRootInfo));
     ShowLibrary("HcclThreadAcquireWithStream", reinterpret_cast<void *>(HcclThreadAcquireWithStream));
-    ShowLibrary("HcclCcuKernelRegister", reinterpret_cast<void *>(HcclCcuKernelRegister));
-    ShowLibrary("HcclCcuKernelRegisterFinish", reinterpret_cast<void *>(HcclCcuKernelRegisterFinish));
+    ShowLibrary("HcommCcuKernelRegister", reinterpret_cast<void *>(HcommCcuKernelRegister));
+    ShowLibrary("HcommCcuKernelRegisterEnd", reinterpret_cast<void *>(HcommCcuKernelRegisterEnd));
     Resources resources;
     Mark("acl_init"); Check(aclInit(nullptr), "aclInit"); resources.initialized = true;
     Check(aclrtSetDevice(static_cast<int32_t>(options.rank)), "aclrtSetDevice");
@@ -353,13 +353,17 @@ void Run()
     else root = ReadRoot();
     Mark("comm_init");
     Check(HcclCommInitRootInfo(options.ranks, &root, options.rank, &resources.comm), "HcclCommInitRootInfo");
+    CcuInsHandle instance = 0;
+    uint32_t instanceCount = 1;
+    Check(HcclCommQueryCcuIns(resources.comm, &instance, &instanceCount), "HcclCommQueryCcuIns");
+    if (!instance || instanceCount != 1) throw std::runtime_error("expected one borrowed CCU instance");
     Check(aclrtCreateStream(&resources.stream), "aclrtCreateStream");
     ThreadHandle thread = 0;
     Mark("thread_acquire");
     Check(HcclThreadAcquireWithStream(resources.comm, COMM_ENGINE_CCU, resources.stream, 1, &thread),
           "HcclThreadAcquireWithStream");
     LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); // channels intentionally empty
-    hcomm::KernelCreator creator = CreateKernel;
+    a5ccu::KernelCreator creator = CreateKernel;
     CcuKernelHandle kernel = 0;
     if (options.grouped) {
         const a5_ccu_urma_probe::GroupCopyConfig config(options.groupSliceBytes);
@@ -369,8 +373,7 @@ void Run()
         std::fflush(stdout); // retain requested geometry even if registration fails
     }
     Mark("kernel_register");
-    Check(HcclCcuKernelRegister(resources.comm, &kernel, &creator, &arg), "HcclCcuKernelRegister");
-    Check(HcclCcuKernelRegisterFinish(resources.comm), "HcclCcuKernelRegisterFinish");
+    Check(a5ccu::RegisterKernel(resources.comm, 0, &kernel, &creator, &arg), "HcommCcuKernelRegister");
     std::printf("LOCAL_COPY_KERNEL_REGISTERED rank=%u mode=%s channels=0\n", options.rank,
                 ModeName());
     const size_t span = options.bytes + 2 * GUARD, hostSpan = span * options.queued;
@@ -380,14 +383,14 @@ void Run()
     Check(aclrtMallocHost(reinterpret_cast<void **>(&resources.hostInput), hostSpan), "aclrtMallocHost(input)");
     Check(aclrtMallocHost(reinterpret_cast<void **>(&resources.hostOutput), hostSpan), "aclrtMallocHost(output)");
     Mark("tokens");
-    const auto inputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(resources.input), span);
-    const auto outputToken = hcomm::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(resources.output), span);
+    const auto inputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(resources.input), span);
+    const auto outputToken = a5ccu::CcuRep::GetTokenInfo(reinterpret_cast<uint64_t>(resources.output), span);
     LocalTask task(reinterpret_cast<uint64_t>(resources.input) + GUARD,
         reinterpret_cast<uint64_t>(resources.output) + GUARD, inputToken, outputToken, options.bytes);
     auto enqueue = [&](uint8_t *hostInput, uint8_t *hostOutput) {
         Check(aclrtMemcpyAsync(resources.input, span, hostInput, span, ACL_MEMCPY_HOST_TO_DEVICE, resources.stream), "H2D input");
         Check(aclrtMemcpyAsync(resources.output, span, hostOutput, span, ACL_MEMCPY_HOST_TO_DEVICE, resources.stream), "H2D poison");
-        Check(HcclCcuKernelLaunch(resources.comm, thread, kernel, &task), "HcclCcuKernelLaunch");
+        Check(a5ccu::LaunchKernel(resources.comm, thread, kernel, &task), "HcommCcuKernelLaunch");
         Check(aclrtMemcpyAsync(hostOutput, span, resources.output, span, ACL_MEMCPY_DEVICE_TO_HOST, resources.stream), "D2H snapshot");
         // Each pinned input slice is read by H2D first, then overwritten by
         // its D2H snapshot on the same stream. It is never reused by another
@@ -431,14 +434,9 @@ int main(int argc, char **argv)
 {
     try {
         options = Parse(argc, argv);
-        if (options.builder) {
-            LocalArg arg(options.chunked,options.grouped,options.groupSliceBytes); LocalKernel kernel(arg);
-            Check(kernel.Init(), "CcuKernel::Init");
-            std::printf("LOCAL_COPY_BUILDER_PASS mode=%s slice_bytes=%u lanes=%lu total_ms=%lu graph_only=1 hardware_copy_executed=0\n",
-                ModeName(),options.grouped ? options.groupSliceBytes : 0,
-                static_cast<unsigned long>(options.grouped ? arg.config.lanes : 0),
-                static_cast<unsigned long>(options.grouped ? arg.config.lanes*arg.config.MsStride() : 0));
-        } else Run();
+        if (options.builder)
+            throw std::runtime_error("Public API builder needs a registered instance; use a5_ccu_public_host_test without NPU");
+        Run();
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "LOCAL_COPY_FAILURE rank=%u phase=%s error=%s\n", options.rank, phase.c_str(), error.what());

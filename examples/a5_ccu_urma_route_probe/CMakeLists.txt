@@ -8,11 +8,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-cmake_minimum_required(VERSION 3.16.0)
+cmake_minimum_required(VERSION 3.18.0)
 project(a5_ccu_urma_route_probe)
+if(NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/include/hcomm/ccu/ccu_launch.h")
+    message(FATAL_ERROR "This branch requires public CCU headers (CANN 9.2/9.3); use the original branch for 9.1")
+endif()
 
 set(HCCL_CUSTOM_OPS_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(HCCL_CUSTOM_OPS_INCLUDE_LIST
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/op_host
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel_ccu
@@ -20,6 +24,7 @@ set(HCCL_CUSTOM_OPS_INCLUDE_LIST
     ${ASCEND_CANN_PACKAGE_PATH}/include
     ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
     ${ASCEND_CANN_PACKAGE_PATH}/include/hcomm
+    ${ASCEND_CANN_PACKAGE_PATH}/include/hcomm/ccu
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm/ccu
@@ -41,10 +46,10 @@ target_compile_options(a5_ccu_urma_route_probe PRIVATE
     -fstack-protector-all
 )
 target_compile_definitions(a5_ccu_urma_route_probe PRIVATE
-    _GLIBCXX_USE_CXX11_ABI=0
     -DHOST_COMPILE
 )
 target_link_options(a5_ccu_urma_route_probe PRIVATE
+    -Wl,-z,defs
     -Wl,-z,relro
     -Wl,-z,now
     -Wl,-z,noexecstack
@@ -72,3 +77,21 @@ install(FILES
 # 添加子目录
 add_subdirectory(op_host)
 add_subdirectory(op_kernel_ccu)
+
+option(A5_CCU_BUILD_HOST_TESTS "Test public API host lifecycle without NPU" OFF)
+if(A5_CCU_BUILD_HOST_TESTS)
+    enable_testing()
+    add_executable(a5_ccu_public_host_test
+        ../../tests/cpp/test_a5_ccu_public_api.cpp op_host/public_ccu.cc)
+    target_include_directories(a5_ccu_public_host_test SYSTEM PRIVATE ${HCCL_CUSTOM_OPS_INCLUDE_LIST})
+    target_compile_options(a5_ccu_public_host_test PRIVATE -std=c++14 -Wall -Wextra -Werror -UNDEBUG)
+    target_link_directories(a5_ccu_public_host_test PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+    target_link_libraries(a5_ccu_public_host_test PRIVATE hcomm c_sec ascendcl ${CMAKE_DL_LIBS})
+    add_test(NAME public_ccu_host COMMAND a5_ccu_public_host_test)
+    add_executable(a5_ccu_public_local_copy_probe testcase/local_copy_probe.cc
+        op_host/public_ccu.cc op_kernel_ccu/grouped_local_copy_kernel.cc)
+    target_include_directories(a5_ccu_public_local_copy_probe SYSTEM PRIVATE ${HCCL_CUSTOM_OPS_INCLUDE_LIST})
+    target_compile_options(a5_ccu_public_local_copy_probe PRIVATE -std=c++14 -Wall -Wextra -Werror)
+    target_link_directories(a5_ccu_public_local_copy_probe PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+    target_link_libraries(a5_ccu_public_local_copy_probe PRIVATE hccl hcomm c_sec ascendcl msprofiler ${CMAKE_DL_LIBS})
+endif()

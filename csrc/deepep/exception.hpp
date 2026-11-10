@@ -2,6 +2,8 @@
 
 #include <string>
 #include <exception>
+#include <sstream>
+#include <utility>
 
 namespace deep_ep {
 
@@ -50,20 +52,22 @@ void log_all(std::ostream &os, Args &&...args)
         }                                                                  \
     } while (0)
 
-#define ACL_CHECK(ret)                                                                            \
-    ;                                                                                             \
-    do {                                                                                          \
-        if (ret != ACL_SUCCESS) {                                                                 \
-            throw deep_ep::EPException("ACL Assertion", __FILE__, __LINE__, std::to_string(ret)); \
-        }                                                                                         \
+#define ACL_CHECK(ret)                                                                      \
+    do {                                                                                    \
+        const auto deep_ep_acl_status = (ret);                                              \
+        if (deep_ep_acl_status != ACL_SUCCESS) {                                            \
+            throw deep_ep::EPException("ACL Assertion", __FILE__, __LINE__,                 \
+                                      std::to_string(deep_ep_acl_status));                  \
+        }                                                                                   \
     } while (0)
 
-#define HCCL_CHECK(ret)                                                                            \
-    ;                                                                                              \
-    do {                                                                                           \
-        if (ret != HCCL_SUCCESS) {                                                                 \
-            throw deep_ep::EPException("HCCL Assertion", __FILE__, __LINE__, std::to_string(ret)); \
-        }                                                                                          \
+#define HCCL_CHECK(ret)                                                                     \
+    do {                                                                                    \
+        const auto deep_ep_hccl_status = (ret);                                             \
+        if (deep_ep_hccl_status != HCCL_SUCCESS) {                                          \
+            throw deep_ep::EPException("HCCL Assertion", __FILE__, __LINE__,                \
+                                      std::to_string(deep_ep_hccl_status));                 \
+        }                                                                                   \
     } while (0)
 
 #ifdef DEBUG_MODE

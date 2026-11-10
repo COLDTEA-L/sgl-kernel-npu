@@ -1,5 +1,10 @@
 # A5 ValueWait/ValueWrite + Host Callback 多路径穿刺实验设计
 
+> 本文是原 9.1 多路径方案的历史设计。CANN 9.2/9.3 的 CCU 注册、启动和
+> completion API 已迁移，不能直接照搬下文的旧 ABI 或部署命令。
+> 当前两卡 direct 实验以 [92/93 入口](A5_VALUEWAIT_CALLBACK_PUNCTURE_92_93.md)
+> 和 Issue #13 为准；保留本篇用于解释控制协议，不代表新环境已经上卡通过。
+
 ## 1. 文档目标
 
 本文设计一个两 rank、1 条 direct + 2 条 relay 的控制面穿刺实验，验证：

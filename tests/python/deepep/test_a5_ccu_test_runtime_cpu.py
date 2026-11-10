@@ -6,11 +6,81 @@ from pathlib import Path
 import sys
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 
 from a5_ccu_peer_test_support import measurement_start
-from a5_ccu_test_runtime import prepare_runtime
+from a5_ccu_test_runtime import (prepare_runtime, prepare_ccu_environment,
+                                ccu_pg_kwargs, log_ccu_communicator)
+
+
+class CommunicatorModeTests(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_default_matches_legacy_without_constructing_options(self):
+        self.assertEqual(ccu_pg_kwargs(object()), {})
+        self.assertEqual(os.environ['HCCL_OP_EXPANSION_MODE'], 'CCU_SCHED')
+
+    def test_explicit_comparison_uses_comm_config_enum_six(self):
+        os.environ['A5_CCU_PG_MODE'] = 'config6'
+        options = types.SimpleNamespace(hccl_config={})
+        constructor = mock.Mock(return_value=options)
+        npu = types.SimpleNamespace(_C=types.SimpleNamespace(_distributed_c10d=
+            types.SimpleNamespace(ProcessGroupHCCL=types.SimpleNamespace(Options=constructor))))
+        self.assertIs(ccu_pg_kwargs(npu)['pg_options'], options)
+        self.assertEqual(options.hccl_config, {"hccl_op_expansion_mode": 6})
+
+    def test_conflicting_environment_is_rejected_before_library_load(self):
+        os.environ['HCCL_OP_EXPANSION_MODE'] = 'AIV'
+        with mock.patch('a5_ccu_test_runtime.ctypes.CDLL') as load:
+            with self.assertRaisesRegex(RuntimeError, 'requires HCCL_OP_EXPANSION_MODE'):
+                prepare_runtime(__file__)
+            load.assert_not_called()
+
+    def test_invalid_pg_mode_is_not_silently_treated_as_legacy(self):
+        os.environ['A5_CCU_PG_MODE'] = 'typo'
+        with self.assertRaisesRegex(RuntimeError, 'invalid A5_CCU_PG_MODE'):
+            prepare_ccu_environment()
+
+    def check_mode(self, mode=5, query_status=0, lookup_status=0):
+        library = mock.Mock()
+        def lookup(name, output):
+            self.assertEqual(name, b"group_name_0")
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 123
+            return lookup_status
+        def query(comm, kind, size, output):
+            self.assertEqual((comm.value, kind, size), (123, 0, ctypes.sizeof(ctypes.c_int)))
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = mode
+            return query_status
+        library.HcomGetCommHandleByGroup.side_effect = lookup
+        library.HcclConfigGetInfo.side_effect = query
+        with mock.patch("a5_ccu_test_runtime.ctypes.CDLL", return_value=library), \
+             mock.patch('a5_ccu_test_runtime.Path.read_text', return_value=''):
+            return log_ccu_communicator("group_name_0")
+
+    def test_query_five_is_only_diagnostic(self):
+        self.assertEqual(self.check_mode(), (0, 5))
+
+    def test_t560_zero_does_not_block_actual_channel_acquire(self):
+        self.assertEqual(self.check_mode(mode=0), (0, 0))
+
+    def test_query_two_is_reported_without_reinterpreting_t560_enum(self):
+        self.assertEqual(self.check_mode(mode=2), (0, 2))
+
+    def test_query_error_is_reported_without_retrying_or_recreating(self):
+        self.assertEqual(self.check_mode(query_status=6), (6, 5))
+
+    def test_communicator_lookup_error_is_diagnostic(self):
+        self.assertIsNone(self.check_mode(lookup_status=1))
+
+    def test_missing_query_symbol_is_diagnostic(self):
+        with mock.patch('a5_ccu_test_runtime.ctypes.CDLL', return_value=object()), \
+             mock.patch('a5_ccu_test_runtime.Path.read_text', return_value=''):
+            self.assertIsNone(log_ccu_communicator('group_name_0'))
 
 
 class RuntimeSetupTests(unittest.TestCase):

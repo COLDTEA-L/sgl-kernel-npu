@@ -28,7 +28,7 @@ done
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
-source /usr/local/Ascend/cann-9.1.T560/set_env.sh
+source /usr/local/Ascend/cann-9.3.0/set_env.sh
 source python/deep_ep/deep_ep/vendors/hwcomputing/bin/set_env.bash
 export ASCEND_RT_VISIBLE_DEVICES="$devices"
 export HCCL_OP_EXPANSION_MODE=CCU_SCHED

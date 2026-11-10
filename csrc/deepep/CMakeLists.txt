@@ -92,6 +92,18 @@ target_link_libraries(deep_ep_cpp PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+# Public SDK distributions may split the communicator entry points into
+# hccl_fwk and the platform helpers into nnopbase. Link their actual providers
+# when shipped, rather than relying on torch_npu's prior RTLD_GLOBAL imports.
+foreach(_deepep_sdk_lib hccl_fwk nnopbase)
+    find_library(DEEPEP_${_deepep_sdk_lib}_LIBRARY NAMES ${_deepep_sdk_lib}
+        PATHS "${ASCEND_HOME_PATH}/lib64" "${ASCEND_HOME_PATH}/${DEEPEP_ARCH}-linux/lib64"
+        NO_DEFAULT_PATH)
+    if(DEEPEP_${_deepep_sdk_lib}_LIBRARY)
+        target_link_libraries(deep_ep_cpp PRIVATE ${DEEPEP_${_deepep_sdk_lib}_LIBRARY})
+    endif()
+endforeach()
+
 message(STATUS "TARGET_INSTALL_DIR = ${TARGET_INSTALL_DIR}")
 install(TARGETS deep_ep_cpp
     LIBRARY DESTINATION ${TARGET_INSTALL_DIR}/lib

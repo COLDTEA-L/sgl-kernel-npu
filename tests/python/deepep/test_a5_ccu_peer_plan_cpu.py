@@ -31,7 +31,7 @@ class PeerPlanTests(unittest.TestCase):
 
     def test_relay_cli_validates_without_topology_or_runtime(self):
         command = [sys.executable, str(ROOT / "scripts/prepare_a5_ccu_peer_plan.py"),
-                   "--devices", "3,2", "--topology", "/not-present/eids.txt",
+                   "--devices", "3,2", "--root-info", "/not-present/rootinfo.json",
                    "--topology-json", "/not-present/topology.json", "--validate-only"]
         for relays in ("0", "0,1", "0,1,4", "0,1,4,5", "0,1,4,5,6", "0,1,4,5,6,7"):
             result = subprocess.run(command + ["--relay-phys", relays],
@@ -109,9 +109,10 @@ class PeerPlanTests(unittest.TestCase):
                 validate_policy([0, 1, 2, 3], list(range(8)), policy)
 
     def test_resolve_edge_join(self):
-        entries = [dict(device=d, die=0, port_key=p, name="udmac0d0e3", index=0,
-                        eid=f"0000:0000:{p:04x}:0300:0010:0000:df12:{d:04x}")
-                   for d, p in ((2, 6), (3, 3))]
+        entries = [dict(device=d, die=die, port=p, net_layer=0, verified=True,
+                        plane_id="fabric0", net_instance_id="machine", name="udmac0d0e3", index=0,
+                        eid=f"0000:0000:0400:0300:0010:0000:df12:{d * 16 + p:04x}")
+                   for d, die, p in ((2, 0, 6), (3, 0, 3), (4, 1, 0), (4, 1, 3))]
         edges = [dict(net_layer=0, link_type="PEER2PEER", protocols=["UB_CTP"],
                       local_a=a, local_b=4, local_a_ports=[port], local_b_ports=[relayport])
                  for a, port, relayport in ((2, "0/6", "1/0"), (3, "0/3", "1/3"))]

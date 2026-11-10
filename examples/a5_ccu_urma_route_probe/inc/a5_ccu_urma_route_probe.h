@@ -20,6 +20,10 @@
 extern "C" {
 #endif
 
+/** Public CCU SDK backend marker: 1 requires CANN public HcommCcu* APIs.
+ * The original 9.1 branch does not export this capability. */
+int A5CcuPublicApiAbiVersion(void);
+
 HcclResult HcclCcuUrmaRouteProbe(void *sendBuf, void *recvBuf, uint64_t sendCount, HcclDataType dataType, HcclComm comm,
                                aclrtStream stream);
 
@@ -89,6 +93,19 @@ HcclResult HcclCcuUrmaPeerPlanExecute(void *send, void *recv, uint64_t elementsP
     HcclDataType dtype, HcclComm comm, aclrtStream stream, uint64_t handle,
     const uint32_t *policy, uint32_t policyCount);
 
+/** Independent ABI 1: 8-rank direct-only row-count AllToAllV. All ranks pass
+ * identical 64-entry counts[s*8+d]. Capacities are bytes and must be >=1 even
+ * for an empty tensor. Out-of-place, baseline sync, one local IO die per rank.
+ * BindStream and Destroy above also manage these handles. */
+int A5CcuAllToAllVAbiVersion(void);
+// Opt-in verification of discovered direct endpoint EIDs and local IO die.
+int A5CcuBoundDirectAbiVersion(void);
+HcclResult HcclCcuUrmaPeerPlanAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char *planId, const char *manifest, uint32_t availableCards, uint64_t *handle);
+HcclResult HcclCcuUrmaPeerPlanAllToAllVExecute(void *send, void *recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t *counts, uint32_t count);
+
 /**
  * Build and register all control-plane resources for one explicit multipath
  * plan. This call performs CommLink construction, HcclChannelAcquire and CCU
@@ -156,6 +173,20 @@ HcclResult HcclCcuUrmaCommandBlockWorkerCreate(
 
 HcclResult HcclCcuUrmaCommandBlockWorkerStop(
     uint64_t workerHandle, aclrtStream controlStream);
+
+// EP8 participant EID channels: no intermediate HBM payload, one route launch.
+int A5CcuEidAllToAllVAbiVersion(void);
+int A5CcuEidV1CompatAbiVersion(void);
+int A5CcuEidPeerResourceAbiVersion(void);
+HcclResult HcclCcuUrmaPeerPlanSynchronize(uint64_t handle);
+HcclResult HcclCcuUrmaEidAllToAllVCreate(HcclComm comm, aclrtStream stream,
+    const char* planId, const char* manifest, uint64_t* handle);
+// counts/relayRanks/relayRows are global row-major [8,8] host arrays, count=64.
+// relayRanks are communicator ranks, -1 when relayRows=0; each flow uses at most one.
+HcclResult HcclCcuUrmaEidAllToAllVExecute(void* send, void* recv,
+    uint64_t sendCapacity, uint64_t recvCapacity, uint64_t rowBytes, uint32_t rank,
+    HcclComm comm, aclrtStream stream, uint64_t handle, const uint64_t* counts,
+    const int32_t* relayRanks, const uint64_t* relayRows, uint32_t count);
 
 #ifdef __cplusplus
 }

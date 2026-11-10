@@ -25,9 +25,9 @@ AllToAllMultiRouteKernelArg::AllToAllMultiRouteKernelArg(
     channels = inputChannels;
 }
 
-hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
+a5ccu::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() const
 {
-    hcomm::CcuKernelSignature signature;
+    a5ccu::CcuKernelSignature signature;
     // Keep this signature in step with changes to the generated instruction
     // graph.  Otherwise HCOMM may reuse a kernel registered from an older
     // package in the same communicator.
@@ -38,8 +38,8 @@ hcomm::CcuKernelSignature AllToAllMultiRouteKernelArg::GetKernelSignature() cons
     return signature;
 }
 
-AllToAllMultiRouteKernel::AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg)
-    : hcomm::CcuKernel(arg)
+AllToAllMultiRouteKernel::AllToAllMultiRouteKernel(const a5ccu::CcuKernelArg &arg)
+    : a5ccu::CcuKernel(arg)
 {
     const auto *typedArg = dynamic_cast<const AllToAllMultiRouteKernelArg *>(&arg);
     serialized_ = typedArg != nullptr && typedArg->IsSerialized();
@@ -51,21 +51,21 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         return HCCL_E_PARA;
     }
 
-    hcomm::CcuRep::Variable input = CreateVariable();
-    hcomm::CcuRep::Variable output = CreateVariable();
-    hcomm::CcuRep::Variable inputToken = CreateVariable();
-    hcomm::CcuRep::Variable outputToken = CreateVariable();
-    hcomm::CcuRep::Variable selfSourceOffset = CreateVariable();
-    hcomm::CcuRep::Variable selfDestinationOffset = CreateVariable();
-    hcomm::CcuRep::Variable selfBytes = CreateVariable();
+    a5ccu::CcuRep::Variable input = CreateVariable();
+    a5ccu::CcuRep::Variable output = CreateVariable();
+    a5ccu::CcuRep::Variable inputToken = CreateVariable();
+    a5ccu::CcuRep::Variable outputToken = CreateVariable();
+    a5ccu::CcuRep::Variable selfSourceOffset = CreateVariable();
+    a5ccu::CcuRep::Variable selfDestinationOffset = CreateVariable();
+    a5ccu::CcuRep::Variable selfBytes = CreateVariable();
     Load(input); Load(output); Load(inputToken); Load(outputToken);
     Load(selfSourceOffset); Load(selfDestinationOffset); Load(selfBytes);
 
-    std::vector<hcomm::CcuRep::Variable> sourceOffsets;
-    std::vector<hcomm::CcuRep::Variable> remoteOffsets;
-    std::vector<hcomm::CcuRep::Variable> pathBytes;
-    std::vector<hcomm::CcuRep::Variable> remoteOutputs;
-    std::vector<hcomm::CcuRep::Variable> remoteTokens;
+    std::vector<a5ccu::CcuRep::Variable> sourceOffsets;
+    std::vector<a5ccu::CcuRep::Variable> remoteOffsets;
+    std::vector<a5ccu::CcuRep::Variable> pathBytes;
+    std::vector<a5ccu::CcuRep::Variable> remoteOutputs;
+    std::vector<a5ccu::CcuRep::Variable> remoteTokens;
     sourceOffsets.reserve(channels_.size());
     remoteOffsets.reserve(channels_.size());
     pathBytes.reserve(channels_.size());
@@ -89,15 +89,15 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
         CCU_KERNEL_CHECK(NotifyWait(channel, TOKEN_NOTIFY_INDEX, NOTIFY_MASK));
     }
 
-    hcomm::CcuRep::LocalAddr localSource = CreateLocalAddr();
+    a5ccu::CcuRep::LocalAddr localSource = CreateLocalAddr();
     localSource.addr = input; localSource.addr += selfSourceOffset; localSource.token = inputToken;
-    hcomm::CcuRep::LocalAddr localDestination = CreateLocalAddr();
+    a5ccu::CcuRep::LocalAddr localDestination = CreateLocalAddr();
     localDestination.addr = output; localDestination.addr += selfDestinationOffset;
     localDestination.token = outputToken;
-    hcomm::CcuRep::CompletedEvent localEvent = CreateCompletedEvent();
+    a5ccu::CcuRep::CompletedEvent localEvent = CreateCompletedEvent();
     CCU_KERNEL_CHECK(LocalCopyNb(localDestination, localSource, selfBytes, localEvent));
 
-    std::vector<hcomm::CcuRep::CompletedEvent> remoteEvents;
+    std::vector<a5ccu::CcuRep::CompletedEvent> remoteEvents;
     // WriteNb records references to these representation objects while the
     // CCU instruction graph is being built.  Growing the vector after the
     // first submission moves the wrappers and leaves those instructions
@@ -106,9 +106,9 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
     // rule before it submits concurrent writes.
     remoteEvents.reserve(channels_.size());
     for (size_t i = 0; i < channels_.size(); ++i) {
-        hcomm::CcuRep::LocalAddr source = CreateLocalAddr();
+        a5ccu::CcuRep::LocalAddr source = CreateLocalAddr();
         source.addr = input; source.addr += sourceOffsets[i]; source.token = inputToken;
-        hcomm::CcuRep::RemoteAddr destination = CreateRemoteAddr();
+        a5ccu::CcuRep::RemoteAddr destination = CreateRemoteAddr();
         destination.addr = remoteOutputs[i]; destination.addr += remoteOffsets[i];
         destination.token = remoteTokens[i];
         remoteEvents.push_back(CreateCompletedEvent());
@@ -142,7 +142,7 @@ HcclResult AllToAllMultiRouteKernel::Algorithm()
     return HCCL_SUCCESS;
 }
 
-std::vector<uint64_t> AllToAllMultiRouteKernel::GeneArgs(const hcomm::CcuTaskArg &arg)
+std::vector<uint64_t> AllToAllMultiRouteKernel::GeneArgs(const a5ccu::CcuTaskArg &arg)
 {
     const auto *taskArg = dynamic_cast<const AllToAllMultiRouteTaskArg *>(&arg);
     if (taskArg == nullptr || taskArg->pathBytes.size() != channels_.size() ||
@@ -163,9 +163,9 @@ std::vector<uint64_t> AllToAllMultiRouteKernel::GeneArgs(const hcomm::CcuTaskArg
     return args;
 }
 
-std::unique_ptr<hcomm::CcuKernel> CreateAllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg)
+std::unique_ptr<a5ccu::CcuKernel> CreateAllToAllMultiRouteKernel(const a5ccu::CcuKernelArg &arg)
 {
-    return std::unique_ptr<hcomm::CcuKernel>(new AllToAllMultiRouteKernel(arg));
+    return std::unique_ptr<a5ccu::CcuKernel>(new AllToAllMultiRouteKernel(arg));
 }
 
 } // namespace a5_ccu_urma_probe

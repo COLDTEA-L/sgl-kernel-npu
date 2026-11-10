@@ -1,3 +1,4 @@
+#include "../common/eid_register_stage.h"
 #ifndef A5_CCU_URMA_ROUTE_PROBE_UTILS_H
 #define A5_CCU_URMA_ROUTE_PROBE_UTILS_H
 
@@ -11,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include "../common/peer_plan.h"
+#include "../common/eid_alltoallv_layout.h"
 #include "../common/channel_sync_policy.h"
 
 namespace a5_ccu_urma_probe {
@@ -45,11 +47,14 @@ struct RouteResources {
 struct PeerPlanResources {
     RouteResources route;
     std::vector<uint32_t> peers;
+    std::vector<EidChannel> eidChannels;
+    std::array<uint8_t, 64> eidAllowed{};
 };
 
 HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     const std::vector<PeerPathSpec> &specs, PeerPlanResources *resources,
-    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE);
+    ChannelSyncMode syncMode = ChannelSyncMode::BASELINE, bool allToAllV = false, bool eidAllToAllV = false,
+    EidRegisterStage eidStage = EidRegisterStage::FULL);
 
 // Normalized two-rank control-plane request used by the production-facing
 // explicit multipath API.  The discovered route is always channel 0 and the

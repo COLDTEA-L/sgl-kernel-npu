@@ -71,8 +71,8 @@ if [[ -n "$umdk_root" ]]; then
 fi
 
 for library in \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhccl.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhcomm.so \
     /usr/local/Ascend/driver/lib64/driver/libascend_hal.so \
     /lib64/liburma.so /lib64/urma/liburma-udma.so \
     /usr/lib64/liburma.so /usr/lib64/urma/liburma-udma.so; do

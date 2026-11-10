@@ -43,8 +43,8 @@ make -C examples/a5_ccu_urma_route_probe/testcase \
 } >"$run_dir/inventory/environment.txt"
 
 for library in \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhccl.so \
-    /usr/local/Ascend/cann-9.1.T560/lib64/libhcomm.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhccl.so \
+    /usr/local/Ascend/cann-9.3.0/lib64/libhcomm.so \
     /usr/local/Ascend/driver/lib64/driver/libascend_hal.so \
     /usr/local/Ascend/driver/lib64/driver/libhccp.so \
     /lib64/liburma.so /lib64/urma/liburma-udma.so \

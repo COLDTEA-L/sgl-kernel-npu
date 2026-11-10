@@ -10,7 +10,7 @@ repeats=1
 sync_mode=batch
 timeout_seconds=600
 profile=0
-cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.T560}
+cann_root=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.3.0}
 output_root=/home/l00934901/profiling
 while (($#)); do
     case "$1" in

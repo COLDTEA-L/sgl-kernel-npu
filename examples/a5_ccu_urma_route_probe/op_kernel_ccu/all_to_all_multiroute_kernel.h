@@ -1,7 +1,7 @@
 #ifndef A5_CCU_URMA_ALL_TO_ALL_MULTI_ROUTE_KERNEL_H
 #define A5_CCU_URMA_ALL_TO_ALL_MULTI_ROUTE_KERNEL_H
 
-#include <hcomm/ccu/ccu_kernel.h>
+#include "public_ccu.h"
 
 #include <cstdint>
 #include <memory>
@@ -9,12 +9,12 @@
 
 namespace a5_ccu_urma_probe {
 
-class AllToAllMultiRouteKernelArg : public hcomm::CcuKernelArg {
+class AllToAllMultiRouteKernelArg : public a5ccu::CcuKernelArg {
 public:
     AllToAllMultiRouteKernelArg(const std::vector<ChannelHandle> &channels,
                                 const std::vector<uint32_t> &routeIndices,
                                 bool serialized = false);
-    hcomm::CcuKernelSignature GetKernelSignature() const override;
+    a5ccu::CcuKernelSignature GetKernelSignature() const override;
 
     bool IsSerialized() const { return serialized_; }
 
@@ -23,7 +23,7 @@ private:
     bool serialized_ = false;
 };
 
-class AllToAllMultiRouteTaskArg : public hcomm::CcuTaskArg {
+class AllToAllMultiRouteTaskArg : public a5ccu::CcuTaskArg {
 public:
     AllToAllMultiRouteTaskArg(uint64_t inputAddr, uint64_t outputAddr,
                               uint64_t inputToken, uint64_t outputToken,
@@ -49,19 +49,19 @@ public:
     std::vector<uint64_t> pathBytes;
 };
 
-class AllToAllMultiRouteKernel : public hcomm::CcuKernel {
+class AllToAllMultiRouteKernel : public a5ccu::CcuKernel {
 public:
-    explicit AllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg);
+    explicit AllToAllMultiRouteKernel(const a5ccu::CcuKernelArg &arg);
 
 protected:
     HcclResult Algorithm() override;
-    std::vector<uint64_t> GeneArgs(const hcomm::CcuTaskArg &arg) override;
+    std::vector<uint64_t> GeneArgs(const a5ccu::CcuTaskArg &arg) override;
 
 private:
     bool serialized_ = false;
 };
 
-std::unique_ptr<hcomm::CcuKernel> CreateAllToAllMultiRouteKernel(const hcomm::CcuKernelArg &arg);
+std::unique_ptr<a5ccu::CcuKernel> CreateAllToAllMultiRouteKernel(const a5ccu::CcuKernelArg &arg);
 
 } // namespace a5_ccu_urma_probe
 
