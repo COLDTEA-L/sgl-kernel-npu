@@ -46,7 +46,8 @@ def failure_report(root):
         lines = p.read_text(errors='replace').splitlines() if p.exists() else []
         report['ranks'].append({'rank': rank,
             'diagnostics': [x for x in lines if any(tag in x for tag in
-                ('L0L1_PHASE', 'L0L1_STAGE', 'L0L1_EXPLICIT_', 'L0L1_FAILED'))][-25:]})
+                ('L0L1_PHASE', 'L0L1_STAGE', 'L0L1_EXPLICIT_', 'L0L1_PEER_ATTR',
+                 'L0L1_RESOLVED', 'BW_COEFF_UNVERIFIABLE', 'L0L1_FAILED'))][-25:]})
     return report
 
 

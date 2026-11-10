@@ -1,5 +1,6 @@
 // Independent two-rank public-API probe. No EP8 code or route .so is linked.
 #include "layout.h"
+#include "endpoint_attrs.h"
 #include <acl/acl.h>
 #include <hccl/hccl.h>
 #include <hccl/hccl_ccu_res.h>
@@ -118,6 +119,16 @@ std::string EndpointKey(const EndpointDesc& ep) {
     for(auto x:ep.commAddr.eid) s << std::setw(2) << unsigned(x);
     return s.str();
 }
+bool IsUbEidEndpoint(const EndpointDesc& ep) {
+    return l0l1::UbEidAddress(ep.protocol==COMM_PROTOCOL_UBC_CTP,
+        ep.commAddr.type==COMM_ADDR_TYPE_EID || ep.commAddr.type==COMM_ADDR_TYPE_IP_V6, ep.commAddr.eid);
+}
+std::string EndpointIdentity(const EndpointDesc& ep) {
+    // Normalize ONLY the comparison key. Never change the descriptor sent to SDK.
+    auto key=ep;
+    if(IsUbEidEndpoint(ep)) key.commAddr.type=COMM_ADDR_TYPE_EID;
+    return EndpointKey(key);
+}
 template<class F> void Stage(const Options& o,const std::string& stage,F fn) {
     Phase(o,stage+"_begin"); const auto begin=Clock::now();
     const auto status=fn();
@@ -148,9 +159,35 @@ void Inventory(const Options& o) {
 struct Path {
     CommLink link{};
     uint32_t layer=0, die=0, remoteDie=0, bwCoeff=0, remoteBwCoeff=0;
-    int bwStatus=-1, remoteBwStatus=-1;
+    int dieStatus=-1, remoteDieStatus=-1, bwStatus=-1, remoteBwStatus=-1;
     std::string key;
 };
+void ResolveRemoteAttributes(const Options& o,std::vector<Path>& paths,const std::string& phase,bool explicitEid=false) {
+    l0l1::EndpointTable local;
+    for(const auto& p:paths) l0l1::AddEndpoint(local,EndpointIdentity(p.link.srcEndpointDesc),
+        {p.dieStatus,p.die,p.bwStatus,p.bwCoeff});
+    const auto prefix=o.dir+"/"+phase+".";
+    Save(prefix+std::to_string(o.rank),l0l1::EncodeEndpoints(o.rank,local));
+    const auto peer=l0l1::DecodeEndpoints(ReadWait(prefix+std::to_string(1-o.rank)),1-o.rank);
+    for(auto& p:paths) {
+        const auto key=EndpointIdentity(p.link.dstEndpointDesc);
+        const auto remote=l0l1::PeerEndpoint(peer,key,
+            {p.remoteDieStatus,p.remoteDie,p.remoteBwStatus,p.remoteBwCoeff});
+        if(explicitEid && remote.die!=p.remoteDie)
+            throw std::runtime_error("EXPLICIT_DIE_PEER_MISMATCH key="+key);
+        std::cout<<"L0L1_PEER_ATTR rank="<<o.rank<<" phase="<<phase<<" endpoint="<<key
+                 <<" graph_remote_die_status="<<p.remoteDieStatus<<" graph_remote_bw_status="<<p.remoteBwStatus
+                 <<" peer_local_die_status="<<remote.dieStatus<<" peer_local_bw_status="<<remote.bwStatus
+                 <<" die="<<remote.die<<" bw_coeff="<<remote.bw
+                 <<" die_source="<<(remote.dieStatus==0?"peer_local_graph":explicitEid?"declared_explicit":"unverified")
+                 <<" bw_source="<<(remote.bwStatus==0?"peer_local_graph":"unverified")<<std::endl;
+        p.remoteDieStatus=remote.dieStatus; p.remoteDie=remote.die;
+        p.remoteBwStatus=remote.bwStatus; p.remoteBwCoeff=remote.bwStatus==0?remote.bw:0;
+        if(p.layer==1 && (p.bwStatus!=0 || p.remoteBwStatus!=0 || !p.bwCoeff || !p.remoteBwCoeff))
+            std::cout<<"BW_COEFF_UNVERIFIABLE rank="<<o.rank<<" key="<<p.key
+                     <<" single_allowed=0 explicit_experiment=use_any_with_verified_mapping_and_port_counters"<<std::endl;
+    }
+}
 std::vector<Path> Discover(HcclComm comm, const Options& o) {
     uint32_t *raw=nullptr, n=0;
     CHECK(HcclRankGraphGetLayers(comm,&raw,&n));
@@ -169,32 +206,43 @@ std::vector<Path> Discover(HcclComm comm, const Options& o) {
         if(count) { if(!links) throw std::runtime_error("null links"); owned.assign(links,links+count); }
         for(auto link:owned) {
             const bool eligible=link.linkAttr.linkProtocol==COMM_PROTOCOL_UBC_CTP &&
-                link.srcEndpointDesc.commAddr.type==COMM_ADDR_TYPE_EID &&
-                link.dstEndpointDesc.commAddr.type==COMM_ADDR_TYPE_EID &&
+                IsUbEidEndpoint(link.srcEndpointDesc) &&
+                IsUbEidEndpoint(link.dstEndpointDesc) &&
                 ((layer==0 && link.linkAttr.hop==1) ||
                  (layer==1 && ts==HCCL_SUCCESS && topo==COMM_TOPO_CLOS));
             Path p; p.link=link; p.layer=layer;
-            auto ds=HcclRankGraphGetEndpointInfo(comm,o.rank,&link.srcEndpointDesc,
+            p.dieStatus=HcclRankGraphGetEndpointInfo(comm,o.rank,&link.srcEndpointDesc,
                 ENDPOINT_ATTR_DIE_ID,sizeof(p.die),&p.die);
-            auto rs=HcclRankGraphGetEndpointInfo(comm,1-o.rank,&link.dstEndpointDesc,
+            p.remoteDieStatus=HcclRankGraphGetEndpointInfo(comm,1-o.rank,&link.dstEndpointDesc,
                 ENDPOINT_ATTR_DIE_ID,sizeof(p.remoteDie),&p.remoteDie);
             p.bwStatus=HcclRankGraphGetEndpointInfo(comm,o.rank,&link.srcEndpointDesc,
                 ENDPOINT_ATTR_BW_COEFF,sizeof(p.bwCoeff),&p.bwCoeff);
             p.remoteBwStatus=HcclRankGraphGetEndpointInfo(comm,1-o.rank,&link.dstEndpointDesc,
                 ENDPOINT_ATTR_BW_COEFF,sizeof(p.remoteBwCoeff),&p.remoteBwCoeff);
-            p.key=l0l1::PairKey(o.rank,EndpointKey(link.srcEndpointDesc),EndpointKey(link.dstEndpointDesc));
-            bool usable=eligible && ds==HCCL_SUCCESS && rs==HCCL_SUCCESS && p.die<2 && p.remoteDie<2;
+            if(p.bwStatus!=HCCL_SUCCESS) p.bwCoeff=0;
+            if(p.remoteBwStatus!=HCCL_SUCCESS) p.remoteBwCoeff=0;
+            p.key=l0l1::PairKey(o.rank,EndpointIdentity(link.srcEndpointDesc),EndpointIdentity(link.dstEndpointDesc));
+            bool usable=eligible && p.dieStatus==HCCL_SUCCESS && p.die<2;
             std::cout << "L0L1_CANDIDATE rank=" << o.rank << " layer=" << layer
                       << " hop=" << unsigned(link.linkAttr.hop) << " protocol=" << int(link.linkAttr.linkProtocol)
-                      << " die=" << p.die << " remote_die=" << p.remoteDie << " die_status=" << ds
-                      << " remote_die_status=" << rs << " bw_coeff=" << p.bwCoeff
+                      << " die=" << p.die << " remote_die=" << p.remoteDie << " die_status=" << p.dieStatus
+                      << " remote_die_status=" << p.remoteDieStatus << " bw_coeff=" << p.bwCoeff
                       << " remote_bw_coeff=" << p.remoteBwCoeff << " bw_status=" << p.bwStatus
                       << " remote_bw_status=" << p.remoteBwStatus
                       << " single_port_candidate=" << l0l1::SinglePortPair(p.bwStatus,p.bwCoeff,p.remoteBwStatus,p.remoteBwCoeff)
-                      << " eligible=" << usable << " key=" << p.key << std::endl;
-            if(usable) paths.push_back(p);
+                      << " local_usable=" << usable << " address_eligible=" << eligible
+                      << " src_addr_type=" << int(link.srcEndpointDesc.commAddr.type)
+                      << " dst_addr_type=" << int(link.dstEndpointDesc.commAddr.type)
+                      << " resolution=pending_peer key=" << p.key << std::endl;
+            if(eligible) paths.push_back(p);
         }
     }
+    ResolveRemoteAttributes(o,paths,"discovery_endpoint_attrs");
+    paths.erase(std::remove_if(paths.begin(),paths.end(),[&](const Path& p) {
+        const bool usable=p.dieStatus==0 && p.remoteDieStatus==0 && p.die<2 && p.remoteDie<2;
+        std::cout<<"L0L1_RESOLVED rank="<<o.rank<<" eligible="<<usable<<" key="<<p.key<<std::endl;
+        return !usable;
+    }),paths.end());
     std::sort(paths.begin(),paths.end(),[](const Path& a,const Path& b){
         return a.layer!=b.layer ? a.layer<b.layer : a.key<b.key;
     });
@@ -205,7 +253,9 @@ std::vector<Path> Discover(HcclComm comm, const Options& o) {
     for(const auto& p:paths) {
         const bool single=l0l1::SinglePortPair(p.bwStatus,p.bwCoeff,p.remoteBwStatus,p.remoteBwCoeff);
         std::cout << "L0L1_CATALOG rank=" << o.rank << " layer=" << p.layer << " index=" << indexes[p.layer]++
-                  << " die=" << p.die << " bw_coeff=" << p.bwCoeff << " remote_bw_coeff=" << p.remoteBwCoeff
+                  << " die=" << p.die << " remote_die=" << p.remoteDie
+                  << " bw_status=" << p.bwStatus << " remote_bw_status=" << p.remoteBwStatus
+                  << " bw_coeff=" << p.bwCoeff << " remote_bw_coeff=" << p.remoteBwCoeff
                   << " single_index=" << (p.layer==1 && single?std::to_string(singleIndex++):"none")
                   << " key=" << p.key << std::endl;
     }
@@ -220,8 +270,8 @@ Path Select(const std::vector<Path>& paths,unsigned layer,unsigned index,const s
         if(!index--) return p;
     }
     if(layer==1 && policy=="single") throw std::runtime_error(
-        "L1_SINGLE_PORT_UNAVAILABLE: requested single_index absent; both endpoint BW_COEFF must be 1; "
-        "cannot split a port-group EID via HcclChannelDesc; no aggregate fallback");
+        "L1_SINGLE_PORT_UNAVAILABLE: requested single_index absent; both local and peer-reported BW_COEFF must be verified and 1; "
+        "check BW_COEFF_UNVERIFIABLE; use --l1-port-policy any for explicit experiments with port counters; no aggregate fallback");
     throw std::runtime_error("PATH_UNAVAILABLE layer="+std::to_string(layer)+"; no fallback or fabricated EID");
 }
 // Keep the graph endpoint's physical location, but replace only its address.
@@ -241,10 +291,10 @@ Path ExplicitPath(HcclComm comm,const Options& o,Path p) {
                  <<" graph_die="<<die<<" declared_die="<<o.eidDie[r]<<" bw_status="<<bs<<" bw_coeff="<<coeff<<std::endl;
         // Failed graph lookup is the subject of this experiment, not a reason to silently substitute an endpoint.
         if(ds==HCCL_SUCCESS && die!=o.eidDie[r]) throw std::runtime_error("EXPLICIT_DIE_GRAPH_MISMATCH");
-        if(!side) { p.bwStatus=bs; p.bwCoeff=bs==HCCL_SUCCESS?coeff:0; }
-        else { p.remoteBwStatus=bs; p.remoteBwCoeff=bs==HCCL_SUCCESS?coeff:0; }
+        if(!side) { p.dieStatus=ds; p.bwStatus=bs; p.bwCoeff=bs==HCCL_SUCCESS?coeff:0; }
+        else { p.remoteDieStatus=ds; p.remoteBwStatus=bs; p.remoteBwCoeff=bs==HCCL_SUCCESS?coeff:0; }
     }
-    p.key=l0l1::PairKey(o.rank,EndpointKey(*eps[0]),EndpointKey(*eps[1]));
+    p.key=l0l1::PairKey(o.rank,EndpointIdentity(*eps[0]),EndpointIdentity(*eps[1]));
     std::cout<<"L0L1_EXPLICIT_PAIR rank="<<o.rank<<" template="<<old<<" actual="<<p.key
              <<" source=manual physical_port_verified=0 graph_failure_is_nonfatal=1"<<std::endl;
     return p;
@@ -276,7 +326,7 @@ CcuResult Exchange(CcuKernelArg opaque) {
     }
 }
 void Libraries() {
-    std::cout << "L0L1_EXPLICIT_EID_ABI version=1" << std::endl;
+    std::cout << "L0L1_EXPLICIT_EID_ABI version=1 graph_compat=1" << std::endl;
     if(!HcommCcuKernelRegisterStart || !HcommCcuKernelRegister || !HcommCcuKernelRegisterEnd || !HcommCcuKernelLaunch)
         throw std::runtime_error("public CCU entry points unavailable");
     Dl_info info{};
@@ -313,6 +363,12 @@ void Run(const Options& o) {
         Lane lane; lane.path=Select(paths,layer,layer==0?o.l0Index:o.l1Index,o.l1PortPolicy);
         if(layer==1 && !o.eid[0].empty()) lane.path=ExplicitPath(comm,o,lane.path);
         lanes.push_back(lane);
+    }
+    if(!o.eid[0].empty()) {
+        std::vector<Path> selected;
+        for(const auto& lane:lanes) selected.push_back(lane.path);
+        ResolveRemoteAttributes(o,selected,"selected_endpoint_attrs",true);
+        for(size_t i=0;i<lanes.size();++i) lanes[i].path=selected[i];
     }
     if(lanes.size()==2 && lanes[0].path.key==lanes[1].path.key)
         throw std::runtime_error("PATH_ALIAS: L0 and L1 have identical endpoint pairs");

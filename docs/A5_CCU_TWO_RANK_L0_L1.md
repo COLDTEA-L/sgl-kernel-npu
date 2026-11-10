@@ -202,6 +202,8 @@ python3 scripts/a5_ccu_l0_l1_probe.py --summarize /home/l00934901/profiling/a5-l
 
 ## 8. 显式单口 EID 实验：不在 rank graph 中，还能否建 CCU 通道？
 
+若现场发现 UB 地址 type=IPv6、远端属性查询返回6，请先阅读并执行 §9 的兼容回归。
+
 ### 8.1 本轮回答的问题与边界
 
 新增 `--explicit-eids <JSON>`，让两端使用指定的完整 EID。新增 `--suite endpoint`，只测试
@@ -392,3 +394,111 @@ L0 保持原 graph 选路，只有 L1 使用显式 EID。每方向总量32MiB，
 候选不在 graph 时产生的查询错误是预期诊断，需与后续 acquire/register 的错误区分。
 
 本轮编译验证在 cam_lyw_92；现场9.3建链和物理端口验证尚待以上实验。
+
+## 9. CANN 9.3 现场兼容：UB 地址类型与远端属性查询
+
+### 9.1 问题与修复语义
+
+用户在物理卡2/3的现场验证发现：GetLinks 返回 UB_CTP 的正确16字节地址，但 type 为
+`COMM_ADDR_TYPE_IP_V6`；GetDescs 对相同地址返回 `COMM_ADDR_TYPE_EID`。此外，
+本 rank 的 DIE_ID/BW_COEFF 查询成功，对端 rank 的查询返回 NOT_FOUND(6)。
+2a09314 同时要求 EID type 和两端直接查询成功，因而将这些真实链路全部筛掉。
+这份证据指向探针的兼容条件，不能用换容器/更换拓扑文件代替修复，也不意味着所有9.3安装都有同样行为。
+
+本修复：
+
+- 地址 helper 只接受 UB_CTP +（EID 或 IPv6 标记）+ 非零16字节，不接受任意 type/协议。
+- SDK 入参中的 EndpointDesc、地址字节和 type 保留；仅用于去重/匹配的身份 key 将上述
+  两种 type 归一，避免同一个地址由于 API 标签差异不能配对。日志保留 src/dst 原始 type。
+- discover 暂存合格地址，不因为远端查询失败提前删除。每端把**自己本地**查询的
+  EID→die/status/BW/status 写入独立运行目录，通过原有文件握手交换。
+- 按完整地址与协议匹配对端报告；不从 EID 位段猜 die，不从端口个数猜 BW。若成功的远端
+  graph 查询与对端成功的本地查询不一致，报 `ENDPOINT_GRAPH_PEER_CONFLICT`；
+  缺少对应地址报 `PEER_ENDPOINT_MISSING`。不把未核实的默认0当成 die0或单口。
+- graph 路径必须有两端各自成功查询到的有效 die 才进入最终 catalog。`L0L1_CANDIDATE`
+  是查询原始结果，带 `resolution=pending_peer`；最终看 `L0L1_RESOLVED eligible=1`
+  和 `L0L1_CATALOG`，不要以原始 `remote_die_status=6` 判失败。
+- 显式 EID 覆盖后，再用单独一轮文件握手交换最终端点属性。graph 不认识显式端点时，
+  die 沿用双方已经确认一致的显式配置并标为 `declared_explicit`，BW 标为 unverified。
+  graph 若返回成功但与声明 die 不同，依旧立即拒绝。
+- `single` 仍要求两端可验证的 BW_COEFF 都为1；未知/零值输出 `BW_COEFF_UNVERIFIABLE`。
+  `any + --explicit-eids` 可继续探测，但必须用端口计数确认物理单口。BW=1也不是物理计数的替代品。
+
+发现属性文件 `discovery_endpoint_attrs.{0,1}`、显式覆盖后的
+`selected_endpoint_attrs.{0,1}` 都保留在结果目录。文件握手只在初始化执行，不在计时区间内；
+CCU kernel、数据分配比例、提交顺序不变。无需改 EP8、wheel、route 或系统 rootinfo。
+
+现场此前成功的数据来自用户的本地修补副本：单口 L1约47 GB/s、L0+单口L1约88–96 GB/s，
+并有端口计数。它们证明修复方向可行，**不是本提交在现场跑过的结果**。本提交仍需以下短回归。
+
+### 9.2 DeepSeek 执行步骤
+
+先保留现场补丁与原始结果。拉取本分支并按 §8.2 重编独立二进制；不要让旧的
+`A5_L0L1_BINARY` 指向现场副本或旧程序。以下命令在已配好 CANN 环境的同一 shell 执行：
+
+```bash
+cd /home/l00934901/sgl-kernel-npu
+git switch feature/a5-ccu-two-rank-l0-l1-probe
+git pull --ff-only
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_DEVICES=2,3
+export HCCL_BUFFSIZE=64
+export A5_L0L1_BINARY=/home/l00934901/profiling/ccu-l0-l1-build/a5_ccu_l0_l1_probe
+bash scripts/build_a5_ccu_l0_l1_probe.sh "$A5_CANN_PATH" \
+  /home/l00934901/profiling/ccu-l0-l1-build
+python3 tests/cpu/test_a5_l0_l1_summary.py
+g++ -std=c++14 -Wall -Wextra -Werror tests/cpu/test_a5_l0_l1_layout.cc \
+  -o /home/l00934901/profiling/ccu-l0-l1-build/layout_cpu_test
+/home/l00934901/profiling/ccu-l0-l1-build/layout_cpu_test
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite discover --mode l1 --l1-port-policy any
+```
+
+检查构建标记 `L0L1_EXPLICIT_EID_ABI version=1 graph_compat=1`。新 discover 应显示对端
+直接查询失败仍可通过 `L0L1_PEER_ATTR ... peer_local_die_status=0` 解析，最终出现可用 catalog。
+如果对端本地也失败，保留证据，不应把失败直接忽略后建链。
+
+依据新 catalog 重新选择 `A5_TEMPLATE_INDEX`，按 §8.3 导出聚合对照。然后复用现场已经
+验证的 single.json，但先确认 `device=2/3`、完整 EID、die、mapping_note 均正确，
+不能拿旧物理0/1的配置直接跑2/3。下列两个变量要填实际值：
+
+```bash
+export A5_TEMPLATE_INDEX=0  # 替换成新 catalog 中与候选 EID 同 die 的 L1 index
+export A5_SINGLE_PAIR=/home/l00934901/profiling/l0-l1-explicit/single.json
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite create --mode all \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" \
+  --explicit-eids "$A5_SINGLE_PAIR" --bytes 65536
+```
+
+create 两 rank clean PASS 后执行正确性：
+
+```bash
+for A5_BYTES in 65536 8388608; do
+  bash scripts/run_a5_ccu_l0_l1_probe.sh --suite correctness --mode all \
+    --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" \
+    --explicit-eids "$A5_SINGLE_PAIR" --bytes "$A5_BYTES" || break
+done
+```
+
+每个大小应两 rank 各9次 `L0L1_CORRECT`，包含 L0/L1/split ×3 epoch，且 clean PASS。
+正确性全过后，只需先做一次32MiB短复测，不必重复所有扫描：
+
+```bash
+bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode all \
+  --l1-port-policy any --l1-index "$A5_TEMPLATE_INDEX" \
+  --explicit-eids "$A5_SINGLE_PAIR" --bytes 33554432 \
+  --warmup 20 --iters 50 --rounds 6
+```
+
+若要重新证明单口，按 §8.5 另跑 `--mode l1 --capture-ports`；`mode all` 的总窗口包含三种
+模式，不能把全窗口端口增量当成单独 L1 或单独 split 的流量。
+报告区分 `median_us` 与 `effective_GBps_per_direction`：约47→90 GB/s 是带宽提升，
+对应32MiB耗时约714→373 µs，不是耗时翻倍。
+
+### 9.3 回报材料
+
+发 commit、二进制构建标记、结果目录和 `summary.json`，以及两 rank 的
+`L0L1_CANDIDATE`、`L0L1_PEER_ATTR`、`L0L1_RESOLVED`、`L0L1_CATALOG`、
+`L0L1_EXPLICIT_QUERY`、`BW_COEFF_UNVERIFIABLE`（若有）。
+失败追加两轮 endpoint_attrs 文件与 `failure_summary.json`。
+注意原始远端查询 status=6 可以继续出现；判据是对端上报值、最终 catalog、实际建链和正确性，
+不是让所有诊断查询都强行显示 status=0。
