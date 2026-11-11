@@ -228,3 +228,6 @@ planner = RelayPlanner(
 不是 CCU 指令构图或 rank graph 枚举。先完成指南 §1–3 的两卡裸提交，再做 §4 的实际 EP8 host/事件桥；
 §5 单独验证动态参数。当前 fixed prepared eager PASS 不代表已支持计算图，不能直接以移除
 `--enforce-eager` 代替最小验证。该指南包含待现场实现的诊断入口，未新增生产 graph API。
+
+现场单路径 G1 已通过、双流 G2 失败的后续步骤在指南 **§7–11**。尤其先核对 6/7 的
+L0 die=1 与显式 L1 die=0 的跨 die 变量；该实验不能直接否定本分支要求同 IO die 的生产路径。
