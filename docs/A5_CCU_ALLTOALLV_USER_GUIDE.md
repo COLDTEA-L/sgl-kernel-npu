@@ -1,0 +1,456 @@
+# A5 CCU+URMA 多路径 AllToAllV 使用、性能测试与模型接入教程
+
+面向有卡服务器上的 DeepSeek 执行者。适用分支：`feature/a5-ccu-single-port-l1-alltoall`；接口基线为 `dc66ebb`（L1 资源预算）和 `4c2f742`（L1 启动开关）。本教程按该版本源码核对，不代表下列现场测试已经全部执行。
+
+**第一次使用依次执行 §2–§5；测单算子看 §6；接 DeepSeek-V4.1 prefill 看 §7–§8；回报格式在 §10。** 已安装旧 wheel 的机器仍需更新 wheel：只更新 route 不会更新 Python 开关和 planner binding。
+
+## 1. 算子做什么，当前支持到哪里
+
+- 2/4 卡固定 AllToAll：显式策略配置 L0/L1 分流权重，入口见 §9。
+- MoE EP8 AllToAllV：输入全组一致的 8×8 行数矩阵 `C`，`C[i][j]` 是源 rank i 发往目的 rank j 的 **packed payload 行数**，不是原始 HTTP 请求数或未展开的 token 数。
+- 路径包括 L0 direct、组内 NPU 的 L0 fullmesh relay、显式单口 L1 网络路径。都使用 CCU+URMA；relay 不落中间 NPU HBM，源/目的 payload 本身仍在 NPU HBM。
+- 每条流至多一个备用路径：direct + 一个 L0 relay，或 direct + 一条 L1；不会同时给同一条流配置 L0 relay 和 L1。selector `8` 表示 L1，不是第九张卡。
+- L1 只接受实际枚举、与当前机器拓扑匹配的单口 EID，且与 L0 同 IO die。不能保证每张卡八个 L1 物理口都能被本执行器同时使用。聚合 EID 不在本教程范围。
+- L1 物理口按源 TX、目的 RX 分别累计负载；多个 peer 使用同一个口不能各自假设独占带宽。`C` 仍为 8×8，控制器可用冻结预算描述外部竞争；本版不是多节点 EP16 实现。
+- 模型接入先采用 **prefill eager**。固定 prepared 图验证成功不等于本次动态 routing 可以直接重放上次图；本教程不要求取消 `--enforce-eager`。
+
+L1 开关与目录配置：
+
+| 设置 | 生成/创建行为 |
+|---|---|
+| `A5_ENABLE_L1=0` | 禁用 L1，忽略传入的 L1 policy；Python `RelayPlanner` 将 `l1_bottleneck` 降为 `bottleneck`，保留 L0 relay |
+| `A5_ENABLE_L1=1` | 生成拓扑必须提供有效 L1 policy；使用 L1 算法需显式选择 `l1_bottleneck` |
+| 未设置 | 兼容旧的显式 config/strategy 选择；建议新部署明确设置 0 或 1 |
+| `A5_EID_MAX_RELAYS_PER_PEER=0` | 不建组内 L0 relay 候选；**不代表关闭 L1** |
+| `A5_EID_MAX_RELAYS_PER_PEER=6` | 每 peer 最多六个组内 L0 relay 候选，可与 L1 同时存在 |
+
+开关只接受 `0/1`，在拓扑和 planner 创建时读取。改变开关、policy 或预算后，需重新生成拓扑并重建 handle/host；不能让旧 prepared 计划配新目录。初测建议 L1=1、组内 relay=0，先隔离 L1 效果，再验证混合目录。
+
+## 2. 拉代码、环境和版本记录
+
+所有命令在**现场目标容器**中用 Bash 执行。路径按现场调整；只在获准使用的空闲卡上测试，不停止其他人的进程。构建与模型服务必须使用同一套 Python/Torch/torch_npu/CANN 环境。
+
+```bash
+export A5_REPO=/home/l00934901/sgl-kernel-npu
+cd "$A5_REPO"
+git status --short
+# 有未提交的现场诊断补丁时先保存并人工合并；不要 reset --hard。
+git fetch origin feature/a5-ccu-single-port-l1-alltoall
+# 本地分支不存在时：git switch --track origin/feature/a5-ccu-single-port-l1-alltoall
+# 本地分支已存在时：
+git switch feature/a5-ccu-single-port-l1-alltoall
+git pull --ff-only origin feature/a5-ccu-single-port-l1-alltoall
+
+export A5_CANN_PATH=/usr/local/Ascend/cann-9.3.0
+export A5_OUTPUT_ROOT=/home/l00934901/profiling
+mkdir -p "$A5_OUTPUT_ROOT"
+export A5_SESSION=$(mktemp -d "$A5_OUTPUT_ROOT/a5-user-guide.XXXXXX")
+source "$A5_CANN_PATH/set_env.sh"
+source scripts/a5_ccu_test_env.sh
+a5_ccu_prepare_test_env "$A5_CANN_PATH" "$A5_REPO"
+export HCCL_BUFFSIZE=64
+export HCCL_OP_EXPANSION_MODE=CCU_SCHED
+export A5_CCU_EP8_THREAD_BRIDGE=event
+export A5_DEVICES=0,1,2,3,4,5,6,7
+export A5_ROOT_INFO=/etc/hccl_rootinfo.json
+export A5_ATLAS_JSON=/usr/local/Ascend/driver/topo/950/atlas_950_1.json
+export A5_HCCN_TOOL=/usr/local/Ascend/driver/tools/hccn_tool
+export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:${LD_LIBRARY_PATH:-}
+git rev-parse HEAD | tee "$A5_SESSION/commit.txt"
+git diff --stat | tee "$A5_SESSION/local-changes.txt"
+```
+
+`HCCL_BUFFSIZE=64` 是现场复现实验的固定值，不是 L1 端口带宽参数，也不是所有模型的最佳值。改变它要重启进程，并保持 A/B 两组一致。模型启动时须继承环境；在宿主 shell export 不等于已有容器/服务进程已获得设置。
+
+## 3. 构建 route、wheel，核对实际加载版本
+
+### 3.1 route
+
+```bash
+bash scripts/build_a5_ccu_urma_route_probe.sh \
+  --cann-path "$A5_CANN_PATH" --build-dir "$A5_SESSION/route-build" \
+  --install --install-path "$A5_CANN_PATH"
+export A5_CCU_ROUTE_PROBE_LIB="$A5_CANN_PATH/opp/vendors/cust/lib64/liba5_ccu_urma_route_probe.so"
+export LD_LIBRARY_PATH="$(dirname "$A5_CCU_ROUTE_PROBE_LIB"):${LD_LIBRARY_PATH:-}"
+sha256sum "$A5_CCU_ROUTE_PROBE_LIB" | tee "$A5_SESSION/route.sha256"
+```
+
+必须出现 `PUBLIC_ROUTE_BUILD_PASS`、`PUBLIC_ROUTE_LOAD_PASS` 和单口 L1 ABI=1。已有同版本 route 可复用；第一次从旧 EP8 后端升级到 L1 分支必须重编。`4c2f742` 的开关本身没有新增 route ABI。
+
+### 3.2 wheel
+
+```bash
+(
+set -Ee -o pipefail
+cd "$A5_REPO"
+source scripts/a5_ccu_test_env.sh
+a5_ccu_prepare_test_env "$A5_CANN_PATH" "$A5_REPO"
+A5_WHEEL_BUILD=$(mktemp -d "$A5_SESSION/wheel.XXXXXX")
+mkdir -p "$A5_WHEEL_BUILD/tmp"
+export TMPDIR="$A5_WHEEL_BUILD/tmp"
+touch "$A5_WHEEL_BUILD/started"
+DEEPEP_SINGLE_OP=explicit_multipath_all2all_ccu bash build.sh -a deepep Ascend950 \
+  > "$A5_WHEEL_BUILD/build.log" 2>&1 || {
+  tail -100 "$A5_WHEEL_BUILD/build.log"; exit 1;
+}
+mapfile -t A5_WHEELS < <(find "$A5_REPO/output" -maxdepth 1 \
+  -name 'deep_ep-*.whl' -newer "$A5_WHEEL_BUILD/started" -print)
+[[ ${#A5_WHEELS[@]} == 1 ]] || { echo '请检查新生成的 wheel，禁止误装旧包'; exit 1; }
+python3 -m pip install --force-reinstall --no-deps "${A5_WHEELS[0]}"
+)
+```
+
+在模型使用的 Python 中验证，不要让另一份源码目录的 `PYTHONPATH` 意外遮盖安装包：
+
+```bash
+python3 - <<'PY'
+import ctypes, os
+import torch, torch_npu, deep_ep
+from deep_ep import deep_ep_cpp as cpp
+import deep_ep.ccu_l1_config as l1cfg
+print('torch', torch.__version__, 'torch_npu', torch_npu.__version__)
+print('package', deep_ep.__file__)
+print('extension', cpp.__file__)
+print('l1_switch', l1cfg.__file__)
+for name, expected in {
+    'ep8_eid_host_abi': 1,
+    'ep8_eid_host_counts_tensor_abi': 1,
+    'ep8_single_port_l1_abi': 1,
+    'ep8_l1_resource_planner_abi': 1,
+}.items():
+    actual = getattr(cpp, name, None)
+    print(name, actual)
+    assert actual == expected, (name, actual)
+route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'])
+for name in ('A5CcuSinglePortL1AbiVersion', 'A5CcuEidSubmitFastAbiVersion',
+             'A5CcuEidV1CompatAbiVersion'):
+    fn = getattr(route, name); fn.argtypes = []; fn.restype = ctypes.c_int
+    actual = fn(); print(name, actual); assert actual == 1
+PY
+```
+
+建议 CPU 回归分进程执行，避免 pybind 同名类型重复注册：
+
+```bash
+for A5_TEST in test_a5_ccu_l1_switch_cpu.py test_a5_ccu_l1_cpu.py test_a5_ccu_bottleneck_cpu.py; do
+  python3 -m unittest discover -s tests/python/deepep -p "$A5_TEST" -v || exit 1
+done
+```
+
+ABI 通过只证明接口存在，不代替数值校验和物理路径验证。
+
+## 4. 用当前机器生成路径
+
+### 4.1 有可用 L1：发现单口 EID
+
+```bash
+export A5_ENABLE_L1=1
+python3 scripts/discover_a5_single_port_l1.py \
+  --devices "$A5_DEVICES" --root-info "$A5_ROOT_INFO" \
+  --output-dir "$A5_SESSION/policy-8"
+export A5_L1_CONFIG="$A5_SESSION/policy-8/l1_policy.json"
+export A5_EID_MAX_RELAYS_PER_PEER=0
+```
+
+输出目录必须是新目录。检查 `inventory.json`、`candidates.json`、`l1_policy.json`：物理卡顺序、完整 EID、die/port、plane/instance、rootinfo/inventory 摘要须对应当前机器。不要复制旧机器的 EID 或把聚合地址改几个字节当单口地址。没有有效候选时停止 L1 验证，改测 L0 模式。
+
+EID 被枚举且建链成功仍不足以证明只走一个物理口。首次上机按[单口 L1 指南 §7](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md#7-性能判据与物理路径验证)做两卡端口计数差分；与空窗口背景比较，核对选中端口承担 payload、相邻未选口没有分摊 payload。
+
+### 4.2 没有 L1 或只测 L0
+
+```bash
+export A5_ENABLE_L1=0
+unset A5_L1_CONFIG
+export A5_EID_MAX_RELAYS_PER_PEER=6
+```
+
+以下统一传 `--planner l1_bottleneck`，禁用时 wrapper 会转成 `bottleneck`。须在日志中确认实际 strategy；这不表示 `A5_ENABLE_L1=1` 会自动把显式指定的 `greedy` 改成 L1 策略。
+
+### 4.3 EP8 持久拓扑（模型也用这一份）
+
+```bash
+A5_L1_ARGS=()
+if [[ "$A5_ENABLE_L1" == 1 ]]; then
+  A5_L1_ARGS+=(--l1-config "$A5_L1_CONFIG")
+fi
+export A5_MODEL_PLANS="$A5_SESSION/model-plans"
+python3 scripts/prepare_a5_ccu_ep8_topology.py --executor eid \
+  --devices "$A5_DEVICES" --max-relays-per-peer "$A5_EID_MAX_RELAYS_PER_PEER" \
+  --root-info "$A5_ROOT_INFO" --topology-json "$A5_ATLAS_JSON" \
+  --hccn-tool "$A5_HCCN_TOOL" "${A5_L1_ARGS[@]}" \
+  --output-dir "$A5_MODEL_PLANS"
+```
+
+预期 `EP8_TOPOLOGY_PASS`、executor=`participant_eid_ccu_urma`。模型必须从这个目录**配套读取** `peer_plan.tsv` 和 `topology.json`。旧 `participant_hbm_two_stage_ccu` 文件即使时间戳一致也不能复用。
+
+官方单算子脚本每次会现场生成独立拓扑，不直接读取 `A5_MODEL_PLANS`；它读取同一组环境变量及 policy。路径/预算修改后重跑生成，不能只改模型 planner、不重建实际通道。
+
+资源预算及控制器扩展见[单口 L1 指南 §11](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md#11-资源预算版-planner单节点现在可用多节点预留接口)。默认不声明外部背景流量，不能据此断言网络空闲。预算按规划窗口中的字节数和容量千分比描述，不能直接填累计 flit 计数。
+
+## 5. 先验证正确性，再测性能
+
+```bash
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite create --register-stage full --planner l1_bottleneck
+
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite correctness --mode all --planner l1_bottleneck --max-actions 56 \
+  --dtype float8_e4m3fn --width 5120 --row-scale 1 \
+  --warmup 3 --iters 10 --rounds 1 --dynamic-iters 100 --bidirectional-iters 100
+
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite correctness --mode all --planner l1_bottleneck --max-actions 56 \
+  --dtype bfloat16 --width 5120 --row-scale 1 \
+  --warmup 3 --iters 10 --rounds 1 --dynamic-iters 100
+```
+
+不带外部矩阵时 correctness 会覆盖 zero/self/single_hot/competing/asymmetric/uniform/cut；双向循环另测 FP8/BF16 切换。验收必须同时满足：
+
+1. create 出现 `EP8_EID_CREATE_ALL_RANKS_AND_EXIT_PASS`；它仅证明建链和注册。
+2. correctness 出现 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`，8 rank 干净退出，结果目录 `exit.status=0`。
+3. L1 验证至少有实际 `l1_rows>0` 的 case 数值正确。全走直连不能记为 L1 PASS。
+4. 启用六个 L0 relay 候选时，重新执行 create 和 correctness，不能用 L1-only 目录的结果代替混合目录验证。
+
+`--max-actions 56` 是算法允许的上限，不是每次都发 56 个动作；原 L0 bottleneck 仍有内部最多八动作限制。均匀矩阵若要所有跨卡边同时削峰，可能需要 56 个动作，设为 8/16 可能合法退回 direct。
+
+## 6. 单算子性能：怎么测、怎么解释
+
+### 6.1 输入真实矩阵，生成 combine 转置
+
+当前 harness 的 JSON 字段是 **`counts`**，支持长度 64 或 8×8；可附 `devices`，顺序必须匹配拓扑。不要只提供名为 `C` 的字段。
+
+将真实 dispatch 矩阵保存为 `$A5_SESSION/dispatch.json`，例如结构 `{"devices":[0,1,2,3,4,5,6,7],"counts":[[...八行...]]}`；这里省略号只是格式说明，实际必须 64 个非负整数。然后执行：
+
+```bash
+export A5_DISPATCH_JSON="$A5_SESSION/dispatch.json"
+export A5_COMBINE_JSON="$A5_SESSION/combine.json"
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+src = json.loads(Path(os.environ['A5_DISPATCH_JSON']).read_text())
+c = src['counts']
+flat = [x for row in c for x in row] if len(c) == 8 and all(isinstance(r, list) for r in c) else c
+assert len(flat) == 64 and all(type(x) is int and x >= 0 for x in flat)
+out = {'counts': [[flat[j*8+i] for j in range(8)] for i in range(8)]}
+if 'devices' in src: out['devices'] = src['devices']
+Path(os.environ['A5_COMBINE_JSON']).write_text(json.dumps(out, indent=2) + '\n')
+PY
+```
+
+dispatch FP8：width=5120，row_bytes=5120；combine BF16：同 width，row_bytes=10240，**使用 C.T**。只换 dtype、不转置 C 是另外一个实验，不是该模型的 combine。
+
+先对外部矩阵再跑一次 correctness（用上节命令添加 `--matrix-json`，相应选择 FP8/C 或 BF16/C.T），通过后做三次独立进程复测：
+
+```bash
+(
+set -Ee -o pipefail
+for A5_REP in 1 2 3; do
+  for A5_DIR in dispatch combine; do
+    if [[ "$A5_DIR" == dispatch ]]; then
+      A5_TYPE=float8_e4m3fn; A5_MATRIX="$A5_DISPATCH_JSON"
+    else
+      A5_TYPE=bfloat16; A5_MATRIX="$A5_COMBINE_JSON"
+    fi
+    bash scripts/run_a5_ccu_eid_alltoallv.sh \
+      --suite benchmark --mode all --planner l1_bottleneck --max-actions 56 \
+      --matrix-json "$A5_MATRIX" --dtype "$A5_TYPE" --width 5120 \
+      --counts-path legacy --warmup 20 --iters 50 --rounds 6 --dynamic-iters 100 \
+      | tee "$A5_SESSION/${A5_DIR}-r${A5_REP}.launch.log"
+  done
+done
+)
+```
+
+脚本输出每次独立结果目录；保留目录中的 `commit.txt`、`arguments.txt`、`environment.log`、`topology.log`、`run.log`、`exit.status`、`plans/`、`results/rank*.json`。不要只抄终端单个 median。
+
+### 6.2 三种模式与五种口径
+
+| 模式 | 含义 |
+|---|---|
+| native / N | 实际 HCCL AllToAllV 基线 |
+| direct / D | 同一 custom host 执行体系、相同 handle/通道目录，规划不分流 |
+| multipath / M | 启用实际 planner，可能走 L0 relay、L1，也可能合法选择 direct |
+
+`D−M` 衡量分流带来的净收益；`N−M` 衡量替换原生实现的收益。L1-only 和 L0+L1 的两次独立目录对比还包含目录差异，不能直接称为纯路径收益。
+
+| 口径 | 当前脚本实际执行的工作 |
+|---|---|
+| prepared | 计时外 prepare；计时内执行固定计划及 payload 传输 |
+| host_counts | CPU counts 已就绪；custom 每次 `host.run()`，含重新规划和 payload 传输 |
+| host_counts_serial | 上一项加每次调用完成同步，减少连续调用重叠 |
+| counts_only | 只获取/交换 counts，不做 payload AllToAllV |
+| dynamic | 每次获取 counts，再执行本次规划和 payload 传输 |
+
+**host_counts 不是“只测计数”或“只测 host”；prepared 也不是纯设备链路时间。** 当前 harness 在计时前预热、同步、跨 rank 对齐；每轮多次调用后最终同步，按每次耗时做全 rank MAX，再汇总 rounds。50 次连续提交组成一个块样本，不是 50 次独立实验。输出 buffer 已在计时外分配，因此这里的 dynamic 不是模型适配层全程。
+
+真实模型已提供 CPU C 时，`host_counts` / `host_counts_serial` 更接近算子入口；不能把微基准额外 counts collective 成本再次算到模型。要分段诊断，可给同一命令加 `--combination-audit`，但主机 action_us 不等于设备传输时间，各段中位数也不能直接相加当精确总耗时。
+
+报告两个不同的百分比：加速比=`N/M`；时延降低率=`(N−M)/N`。三轮方向不一致或量级接近噪声时写“未检出稳定收益”。不要用逻辑峰值降低 9% 直接推导整个算子快 9%。
+
+## 7. 模型接入：数据契约与调用示例
+
+### 7.1 修改位置与职责
+
+现场 vllm-ascend 的 `vllm_ascend/ops/fused_moe/token_dispatcher.py` 负责 routing、counts、split 和前后置排列；`ep8_multipath_a2a.py` 适配层负责持久 engine、输出分配和一次 C++ 调用。以下是接口示例，不是对任意 vllm-ascend 提交直接可套的补丁；先核对现场这两个文件。
+
+- 用模型现有 EP group，`rank` 是组内 rank，不能直接用物理 device ID。manifest 的物理卡顺序必须对应该 EP group 的 rank 顺序。
+- packed send 按目的 rank 连续排列；recv 按源 rank 连续排列。FP8 payload 与 BF16 payload 原样搬运，量化 scale、专家排序、权重及 combine reduction 仍由原模型处理。
+- 所有 rank 本次使用同一个 C。`input_splits[j]=C[rank,j]`，`output_splits[i]=C[i,rank]`，它们是本 rank 的一行/一列，不是全局矩阵的行和/列和。
+- 只有本 rank 的两个 split 无法恢复完整 C。若模型已有设备上的全局 expert counts，按专家归属聚合为 C；复用其 collective，不额外跑一次全组 counts gather。
+- C 只 D2H 一次；由这份 CPU C 派生模型 splits 和 planner 输入。若 CPU C 已存在，直接复用。异步 D2H 必须在读取 `.numpy()`、splits 或调用 C++ 前确认完成，不能假设 `.numpy()` 自动等待拷贝。
+- combine 使用对应本次 dispatch 的 `C.T.contiguous()`，不再 D2H；这是行数转置。FP8/BF16 行宽不同，要按 combine 行宽重新规划，不能直接重放 dispatch 的 action。
+
+### 7.2 engine 在初始化阶段创建一次
+
+下例由每个 EP rank 在正确 device 和将用于调用的 caller stream 上执行。`ep_group` 由模型提供；`A5_MODEL_PLANS` 是 §4.3 生成的目录。不要在每层调用时重建通信组/Buffer/handle。
+
+```python
+import ctypes
+import json
+import os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+import deep_ep
+from deep_ep import deep_ep_cpp as cpp
+from deep_ep.heuristic_alltoallv import RelayPlanner
+
+plans_dir = Path(os.environ['A5_MODEL_PLANS'])
+topology = json.loads((plans_dir / 'topology.json').read_text())
+assert topology['executor'] == 'participant_eid_ccu_urma'
+assert dist.get_world_size(ep_group) == 8
+rank = dist.get_rank(ep_group)
+# 部署时还须核对 topology['devices'] 与 group rank -> 物理卡映射。
+l1_on = os.environ.get('A5_ENABLE_L1') == '1'
+assert os.environ.get('A5_ENABLE_L1') in ('0', '1')
+assert l1_on == (topology.get('l1_resources') is not None)
+
+planner = RelayPlanner(
+    5120, topology['allowed_relays'], native_module=cpp,
+    strategy='l1_bottleneck' if l1_on else 'bottleneck',
+    l1_resources=topology.get('l1_resources'),
+    l1_budget=topology.get('l1_budget'), max_actions=56)
+buffer = deep_ep.Buffer(ep_group, num_nvl_bytes=0, num_rdma_bytes=0)
+handle = buffer.prepare_ccu_urma_eid_alltoallv(
+    'ep8-model-eid', str(plans_dir / 'peer_plan.tsv'))
+host = cpp.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
+# engine 强引用保存 planner/buffer/handle/host/EP group 和 caller stream。
+```
+
+本路径不需要旧 HBM 执行器的 `PipelineContext`、三 lane、`attach_lane` 或 first/second-hop 通信组。host 绑定创建时的 device/caller stream；不要换流调用或并发复用同一个 host。
+
+### 7.3 每次只规划一次
+
+```python
+def run_with_cpu_counts(host, counts_cpu, send, recv_rows):
+    # counts_cpu: 已完成 D2H 的 CPU int64 contiguous [8,8] 或 [64]
+    # send: contiguous NPU payload，第一维是 packed rows
+    # recv_rows: 直接复用模型已算好的 sum(output_splits)
+    recv = send.new_empty((recv_rows, *send.shape[1:]))
+    host.run_counts_tensor(counts_cpu, send, recv)
+    return recv
+```
+
+`run_counts_tensor()` 返回内部计时信息，不是输出 tensor；输出写入传入的 recv。不要在它前面再调用 `planner.plan()` 或 `host.prepare()`，否则重复规划。生产热路径不用 `.tolist()` 仅为把同一份 counts 再传回 C++；诊断指纹仅在诊断打开时构造。
+
+同一个 host 可按顺序处理 dispatch FP8 和 combine BF16，不同 row_bytes 会按本次 payload 处理。示意：
+
+```python
+# C_cpu 属于本次 batch、本层 dispatch，不能被另一在途请求覆盖。
+dispatch_recv = run_with_cpu_counts(host, C_cpu, dispatch_send, dispatch_recv_rows)
+# 原模型完成专家计算及 combine 前的排列后：
+combine_C_cpu = C_cpu.reshape(8, 8).transpose(0, 1).contiguous()
+combine_recv = run_with_cpu_counts(host, combine_C_cpu, combine_send, combine_recv_rows)
+```
+
+必须保留模型原来的流依赖和输出消费顺序。共享输出 buffer 只能在前一消费者已完成时复用；不能因为形状一样就覆盖在途 payload。不要逐调用新增整 device synchronize 来“保证安全”，应先沿用已验证的 host 流契约。多 batch/层交错时，以调用上下文保存 C 和对应 combine，不能只保存一个会被覆盖的全局矩阵。
+
+准备固定计划的接口仅用于真实固定 C 的场合：`prepared = host.prepare_counts_tensor(C_cpu, send)`，随后 `host.execute(prepared, send, recv)`。C、方向、dtype/row_bytes、owner host 或拓扑改变时，旧 prepared 不应复用。
+
+### 7.4 关闭顺序与失败处理
+
+停止发起新调用后，在 NPU context、caller stream、buffer 和 EP group 仍有效时：
+
+```python
+host.close()  # 等待相关工作并释放 host 缓存；不销毁外部 route handle
+route = ctypes.CDLL(os.environ['A5_CCU_ROUTE_PROBE_LIB'])
+destroy = route.HcclCcuUrmaPeerPlanDestroy
+destroy.argtypes = [ctypes.c_uint64]
+destroy.restype = ctypes.c_int
+status = destroy(handle)  # 唯一 owner 只销毁一次
+if status != 0:
+    raise RuntimeError(f'EID plan destroy failed: {status}')
+```
+
+多个 host 共享 handle 时，先关闭全部 host，再由唯一 owner destroy。之后由模型框架正常销毁共享 EP group；不要在单层适配器中 destroy 模型通信组。不能依赖 Python 进程退出后析构，也不要在 stream 已销毁后才 close。route plan destroy 不等于独立释放通信域持有的所有资源，通信域仍需按框架生命周期结束。
+
+自定义执行已经提交或某 rank 出错后，不要只在该 rank 捕获异常并直接原生回退；其他 rank 可能仍等待 custom 通信。只允许在**全 rank 一致、尚未提交**的准入判断处选择 native/custom；执行期错误应整体停止并保留第一条失败阶段。
+
+## 8. 模型启动与端到端性能验证
+
+沿用现场已经成功的 DeepSeek-V4.1 prefill 启动脚本，保持 DP8/TP1/EP8、token/sequence 预算、量化、请求集及 eager 设置一致。先完成 §5，再接模型。以下变量是已有现场适配层的约定，**算子仓本身不会自动替你修改 vllm-ascend**；确认适配层读取了它们：
+
+```bash
+export A5_MODEL_PLANS="$A5_SESSION/model-plans"
+export VLLM_ASCEND_EP8_PLAN_DIR="$A5_MODEL_PLANS"
+export VLLM_ASCEND_EP8_MULTIPATH=1
+export VLLM_ASCEND_EP8_COMBINE=1
+export VLLM_ASCEND_EP8_DIAG_EVERY=0
+# A5_ENABLE_L1、route 路径、HCCL_BUFFSIZE 等同样传入每个服务进程。
+# 然后执行现场已验证的 prefill 启动脚本，继续使用 --enforce-eager。
+```
+
+`A5_L1_CONFIG` 用于生成拓扑；服务中真正配对使用的是生成的 manifest/topology。只设置 policy 环境变量、适配层仍读取旧 HBM 目录，是错误接入。启动记录 requested/effective strategy、L1 开关、目录摘要、实际模块路径和两方向 row_bytes。
+
+建议分两步验收：
+
+1. **短功能验证，诊断开。** 跳过 profile/dummy 数据的收益统计，但不能随意破坏它们原有通信流程；核对真实调用的 C、local splits、combine 转置、每次一次 host.run、输出形状和完整请求成功。记录 L1/L0 relay 实际行数；不把“启用开关”当成“发生分流”。
+2. **性能验证，诊断关。** 固定真实请求文本、tokenizer、发送方式、并发数；baseline 原生与 multipath 交替独立启动，至少三组。只关闭现场适配开关来测 baseline，不更改 eager、预算或 HCCL_BUFFSIZE。记录成功率、输入 token 分布、P50/P90/P99、吞吐和各 rank 实际 scheduled tokens。
+
+不能把 custom 的 plan/alloc/submit 全程与 native 的异步提交区间直接相减。native 也有分配、提交与完成依赖；`py_run` 可能包住 `cpp_plan/cpp_submit`，这些嵌套时间不能相加。分别记录 CPU counts 就绪、分配、host 调用、内部 plan/submit、原流程已有 wait；不额外同步改变生产重叠。最终收益以 DIAG=0 的端到端 A/B 为准。
+
+收益筛选应作为独立实验：先验证无筛选接入，再用冻结规则决定是否启用 custom。规则从全组一致的 C 和配置推导，各 rank 决策一致，且放在昂贵规划/输出分配之前。此前 `peak_share`/接收压力规则只在特定 L0 样本上验证过，不能直接宣称适用于新增 L1；需用未参与调参的真实矩阵验证误判和收益。L1 可用与“值得分流”是两个不同条件。
+
+## 9. 2/4 卡固定 AllToAll 的入口
+
+它们不是 EP8 MoE host 接口。按实际 devices 另生成 policy，不复用八卡 policy：
+
+```bash
+export A5_ENABLE_L1=1
+python3 scripts/discover_a5_single_port_l1.py --devices 2,3 \
+  --root-info "$A5_ROOT_INFO" --output-dir "$A5_SESSION/policy-2"
+export A5_L1_CONFIG="$A5_SESSION/policy-2/l1_policy.json"
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --available-phys 2,3 --cann-root "$A5_CANN_PATH" \
+  --self-copy-mode ccu --bytes 65536 --warmup 3 --iters 10 --repeats 1
+# 正确性通过后，固定每 peer 32 MiB，连续提交口径：
+bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
+  --devices 2,3 --available-phys 2,3 --cann-root "$A5_CANN_PATH" \
+  --self-copy-mode ccu --sync-mode batch --bytes 33554432 \
+  --warmup 20 --iters 50 --repeats 3
+```
+
+只列获准使用的物理卡作为 `available-phys`，避免生成涉及他人卡的 relay。四卡改成四个实际 device，重新发现 policy。L0-only 对照用 `A5_ENABLE_L1=0 bash scripts/run_a5_ccu_peer_plan_alltoall.sh ...` 并保持其余参数相同。静态 `l0_weight:l1_weight` 控制该 pair 分流比例；EP8 的 L1 资源预算并不适用于这个静态权重算法。返回 EP8 前恢复八卡 `A5_L1_CONFIG`，避免拿两卡 policy 跑八卡。
+
+## 10. DeepSeek 执行与回报清单
+
+按顺序完成，失败先定位当前阶段，不直接继续长性能测试：
+
+| 阶段 | 必须回报 |
+|---|---|
+| 安装 | commit + 本地补丁、wheel/extension 实际路径、route SHA、ABI、Python/Torch/CANN |
+| 拓扑 | devices/rank 顺序、rootinfo 摘要、L1 开关、policy generation、manifest/topology 配套路径、实际端口验证 |
+| 正确性 | create/数值 PASS、8 rank exit.status、FP8/BF16、实际 L1/L0 relay 行数 |
+| 单算子 | C 与 C.T、row_bytes、配置、三次独立结果目录、N/D/M 五口径逐轮数据、actions/moved/端口预算 |
+| 模型 | 适配层 diff、每次规划/分配次数、counts/splits/转置验证、两方向耗时边界、DIAG=0 三组端到端数据 |
+
+常见问题与第一检查点：
+
+- `config_allgather` 未完成：还没到算子创建；核对本进程 HCCL_BUFFSIZE、设备占用、首个 runtime 错误，不先归因 planner。
+- create/register 失败：保留 `CCU_CREATE_STAGE_*`，确认同一 route/SDK/拓扑版本；create 成功并不说明 payload 正确。
+- `validate_plan_device_layout`：核对 C、容量、payload 地址/对齐、行宽、manifest 与 planner 路径是否一致。不要把所有 status=1 都叫 HCCL 内核错误。
+- `l1_rows=0`：先看实际 strategy、policy 是否装入、max_actions 与资源预算；可能是合法 direct，不是一定未生效。
+- `.close()` 的 stream invalid：检查是否在 Torch/NPU 或共享通信域已销毁后才释放 host。
+- 基准很快、模型很慢：先对齐 CPU counts 就绪边界、重复规划、分配和等待；不要把微基准 prepared 收益直接乘 80 当端到端收益。
+
+需要进一步定位时阅读：[单口 L1 设计与预算](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md)、[EP8 bottleneck 与计时诊断](A5_CCU_EP8_BOTTLENECK.md)、[ACL Graph 验证边界](A5_CCU_ACL_GRAPH_VALIDATION.md)。本教程完成前，不需要为了 prefill eager 接入额外解决动态入图。
