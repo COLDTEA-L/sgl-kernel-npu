@@ -15,7 +15,7 @@ _last_phase = {}
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
-from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, gather_routing_counts
+from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, normalize_l1_budget, gather_routing_counts
 from test_a5_ccu_heuristic_npu import synthetic
 from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, full_payload,
     cat_payload, byte_payload_view, copy_payload_, fill_payload_, equal_payload,
@@ -29,6 +29,7 @@ def main():
     p.add_argument('--run-dir', type=Path, required=True)
     p.add_argument('--matrix-json', type=Path)
     p.add_argument('--planner', choices=('greedy', 'bottleneck', 'l1_bottleneck'), default='bottleneck')
+    p.add_argument('--max-actions', type=int, default=56, help='L1 action budget 0..56; legacy bottleneck remains capped at 8')
     p.add_argument('--suite', choices=('create', 'correctness', 'benchmark'), default='benchmark')
     p.add_argument('--case', choices=('zero', 'self', 'single_hot', 'competing', 'asymmetric', 'uniform', 'cut'), default='single_hot')
     p.add_argument('--mode', choices=('all', 'native', 'direct', 'multipath'), default='all')
@@ -49,6 +50,8 @@ def main():
     p.add_argument('--config-prewarm', type=int, default=0, help='optional startup all_gather count; fail immediately on error, no retries')
     p.add_argument('--register-stage', choices=('minimal', 'args', 'mask', 'channel_vars', 'sync', 'direct', 'relay', 'self', 'full', 'mask_init', 'mask_negative', 'mask_compare', 'mask_add', 'mask_static', 'mask_equal', 'mask_not_equal', 'mask_compare_zero', 'mask_compare_single'), default='full', help='create-only registration graph; mask probes are isolated from production')
     args = p.parse_args()
+    if not 0 <= args.max_actions <= 56:
+        p.error('--max-actions must be in [0,56]')
     if args.combination_audit and args.suite == 'create':
         p.error('--combination-audit requires payload measurements, not create')
     if args.register_stage != 'full' and (args.suite != 'create' or args.minimal):
@@ -72,6 +75,9 @@ def main():
     l1_resources = topology.get('l1_resources')
     if (args.planner == 'l1_bottleneck') != (l1_resources is not None):
         raise ValueError('l1_bottleneck requires --l1-config topology and vice versa')
+    if topology.get('l1_budget') is not None:
+        if l1_resources is None: raise ValueError('L1 budget requires L1 paths')
+        normalize_l1_budget(topology['l1_budget'])
     if args.matrix_json:
         data = json.loads(args.matrix_json.read_text())
         if 'devices' in data and data['devices'] != topology['devices']:
@@ -183,8 +189,8 @@ def main():
     dtype = getattr(torch, args.dtype)
     row_bytes = args.width * torch.empty((), dtype=dtype).element_size()
     # Same registered channels/kernel for direct and multipath; only policy differs.
-    planners = {mode: RelayPlanner(row_bytes, allowed, max_actions=0 if mode == 'direct' else 56,
-                                   native_module=native, strategy=args.planner, l1_resources=l1_resources) for mode in ('direct', 'multipath')}
+    planners = {mode: RelayPlanner(row_bytes, allowed, max_actions=0 if mode == 'direct' else args.max_actions,
+                                   native_module=native, strategy=args.planner, l1_resources=l1_resources, l1_budget=topology.get('l1_budget')) for mode in ('direct', 'multipath')}
     hosts = {mode: native.ep8_eid_create(planner._native, rank, buffer.runtime, handle)
              for mode, planner in planners.items()}
     def native_transfer(send, recv, sends, recvs):

@@ -55,14 +55,14 @@
 
 算法在 C++ 中运行；各有向割的 L1 可用端口容量在 planner 构造期缓存，不逐调用枚举 EID 或重复扫描拓扑：
 
-1. 从 C 去掉 self 得到初始 L0 边负载。L1 TX/RX 负载从零开始；只统计本通信组本次调用，不推测外部业务占用。
-2. 计算目标下界：原有有向割加上可用 L1 源/目的物理口数量所给的乐观容量；并保留单流最多两路的 `ceil(peak/2)` 下界。这里假设 L0/L1 单口等带宽，尚未建模交换网络内部争用、端点聚合带宽和 HBM 带宽，不能将削峰率当时延收益。
-3. 最多尝试原来的四个目标 `LB`、`LB+ceil(gap/7)`、`/3`、`/2`。只处理超过目标的边，每流移动最少的超出行数，同时遵守最小 chunk、最小收益及最多 8 个动作的约束。
-4. L0 relay 候选检查两条借道边；L1 候选检查源 TX 物理口和目的 RX 物理口的**累计负载**。多个逻辑通道共享同一端口时，共用该预算；反向 RX/TX 分开，按全双工建模。
+1. 从 C 去掉 self 得到初始 L0 边负载。L1 TX/RX 默认零背景流量，也可读取控制器冻结的端口背景字节数和可用带宽预算（§11）。不自动推测外部业务占用；流量 C 仍为 8×8。
+2. 计算目标下界：原有有向割加上去重后 L1 源/目的物理口的可用带宽容量；并保留单流最多两路的 `ceil(peak/2)` 下界。默认 L0/L1 单口等带宽，允许 L1 按千分比降额；背景流量形成不可削减的负载下界。尚未建模交换网络内部争用、端点聚合带宽和 HBM 带宽，不能将削峰率当时延收益。
+3. 最多尝试原来的四个目标 `LB`、`LB+ceil(gap/7)`、`/3`、`/2`。只处理超过目标的边，每流移动最少的超出行数，同时遵守最小 chunk、最小收益及显式 `max_actions`（0..56）的约束。仅 L1 策略解除旧的内部 8 动作上限；原 L0 bottleneck 保持最多 8 个动作。
+4. L0 relay 候选检查两条借道边；L1 候选检查源 TX 物理口和目的 RX 物理口的**本次累计字节 + 背景字节 / 可用带宽**。多个逻辑通道共享同一端口时，共用该预算；反向 RX/TX 分开，按全双工建模。
 5. 选加入这部分流量后候选资源峰值更低的路径，同值优先 L1。每条流只选一个备用路径。若不能让所有相关资源都压到目标下，丢弃这一整次尝试；全失败保持 direct。
 6. C++ host 按本次 counts 和 row_bytes 更新参数并执行。dispatch FP8 与 combine BF16 都支持；combine 用 C 的转置，**重新按转置方向和当前行宽规划**，不能直接交换旧 relay action。
 
-可观测字段：`route_selector_8`、`l1_rows`、`participant_relay_rows`、`l1_tx_port_rows`、`l1_rx_port_rows`、`resource_lower_bound_rows`、`planned_link_peak_bytes`、`candidate_evaluations`。L1 的源出口和目的入口不是两份有效载荷，`transmitted_network_bytes` 对 L1 部分只计一次；它也不等于交换机内部 hop-byte 计数。
+可观测字段：`route_selector_8`、`l1_rows`、`participant_relay_rows`、`l1_tx_port_rows`、`l1_rx_port_rows`、`resource_lower_bound_rows`、`resource_peak_before_equivalent_rows`、`resource_peak_after_equivalent_rows`、`l1_budget_generation`、`planned_link_peak_bytes`、`candidate_evaluations`。带 `equivalent_rows` 的字段是按一个 L0 口归一化的资源负载，包含背景字节和带宽降额；`planned_link_peak_bytes` 仍是本算子原始字节负载，二者不能混用。L1 的源出口和目的入口不是两份有效载荷，`transmitted_network_bytes` 对 L1 部分只计一次；它也不等于交换机内部 hop-byte 计数。
 
 ## 4. 构建与 CPU 回归
 
@@ -85,7 +85,7 @@ export A5_CCU_ROUTE_PROBE_LIB="$A5_CANN_PATH/opp/vendors/cust/lib64/liba5_ccu_ur
 
 预期 `PUBLIC_ROUTE_ABI A5CcuSinglePortL1AbiVersion=1`、`PUBLIC_ROUTE_LOAD_PASS`、`PUBLIC_ROUTE_BUILD_PASS`。route 构建同时生成可选的 `a5_ccu_l1_inventory` SDK 库存查询工具。
 
-按 [9.2/9.3 构建指南 §4](A5_CCU_92_93_ALLTOALL.md#4-重建目标-deepep-wheel) 重建并安装当前分支 wheel，确认 `deep_ep_cpp.ep8_single_port_l1_abi == 1`。该指南的旧分支名只用于历史说明，本次不要切回旧分支。
+按 [9.2/9.3 构建指南 §4](A5_CCU_92_93_ALLTOALL.md#4-重建目标-deepep-wheel) 重建并安装当前分支 wheel，确认 `deep_ep_cpp.ep8_single_port_l1_abi == 1` 和 `deep_ep_cpp.ep8_l1_resource_planner_abi == 1`。该指南的旧分支名只用于历史说明，本次不要切回旧分支。
 
 CPU 回归分别运行，避免测试模块重复注册同名 pybind 类：
 
@@ -210,7 +210,8 @@ python3 scripts/prepare_a5_ccu_ep8_topology.py --executor eid \
 ```python
 planner = RelayPlanner(
     row_bytes, topology['allowed_relays'], native_module=cpp_ext,
-    strategy='l1_bottleneck', l1_resources=topology['l1_resources'])
+    strategy='l1_bottleneck', l1_resources=topology['l1_resources'],
+    l1_budget=topology.get('l1_budget'), max_actions=56)
 # 后续 ep8_eid_create / run_counts_tensor 沿用现有接口。
 ```
 
@@ -233,3 +234,111 @@ planner = RelayPlanner(
 DeepSeek 本轮重点读指南 **§12–15**：§13 是 DS4.1 原生 prefill、CPU splits 和 attention task update
 的源码核对，§14.1 先不占卡确认现场版本，§14.2 再做短 native 路径验证，§14.3–14.4 是条件性动态图探针。
 可读模型源为 `56debc1`，不等于现场旧版加补丁；不能把 decode MC2 入图当成 prefill AllToAllV 更新 splits 的证明。
+
+
+## 11. 资源预算版 planner：单节点现在可用，多节点预留接口
+
+### 11.1 改动与不变项
+
+本次改的是 host planner、配置编译、库存默认选口和测试入口；CCU kernel、route ABI、selector=8、task args=46 不变。**需要重编 wheel**。已有本分支 route ABI=1 可继续使用；不必因 planner 改动单独重编 route。
+
+- 8×8 C 只表示 EP8 的需求；端口不是新的 rank，不扩张 C。
+- 每个 flow 仍是 L0 + 最多一个备用路径。多个 peer 可以使用不同单口 L1 路径，但不会把一条 flow 拆到八个 L1 EID。
+- 保留现有单 IO die 限制；库存中另一 die 的单口不能因“有八个 L1 口”直接加入本 kernel。实际可用路径以现场生成 policy 为准。
+- 默认库存选口改为优先使用已经分配 peer 最少的源/目的物理口；不同 EID 若对应同一物理口仍共用配额。不改已有 policy，需重新发现并在新目录生成才能使用这个默认分配；显式 policy 仍优先。
+- L1 策略最多四个 target 尝试、每流最多一个动作、最多 56 个动作，不做无界全局求解。不保证找到可行最优解，也不保证模型削峰等于时延收益。
+
+算法的候选约束（target 单位为 L0 等效行数）：
+
+```text
+可增加行数 = floor(max(0,
+    target × row_bytes × capacity_permille / 1000
+    − background_bytes − 本次已分配字节) / row_bytes)
+```
+
+源 TX 和目的 RX 都够才允许 L1 分流；TX/RX 独立记账。端口 capacity=0 表示不可新增，background 必须为零（否则配置自相矛盾）。成功结果再次检查所有资源不超过 target，失败尝试整份回滚。
+
+纯 CPU 资源模型用例（跨卡每流 3072 行，self 不参与）：
+
+| 已配置资源 | 新 planner 可得结果 | 动作数 |
+|---|---|---|
+| 每卡一个共享等带宽 L1 口 | 每条 L0 2688；每流 L1 384；每卡 L1 TX/RX 各 2688 | 56 |
+| 每 peer 独立等带宽 L1 口 | 每条 L0 1536；对应 L1 1536 | 56 |
+| 上一行的 L1 每口仅 50% 可用带宽 | 每条 L0 2048；对应 L1 1024，等效负载 2048 | 56 |
+| 动作预算只有 8/16、均匀矩阵所有边都超过 target | 整份尝试失败，保持 direct | 0 |
+
+第二行是资源模型验证，不是声称当前机器同 IO die 有七个独立 L1 口。是否能取得该拓扑、是否有共享内部瓶颈，须按实际 policy/端口计数验证。
+
+### 11.2 控制器预算格式（可选，当前无外部占用可不填）
+
+在 EP8 的 `l1_policy.json` 顶层加 `resource_budget`；下面字段示例的 device/die/port 必须替换为该 policy 已配置的端口：
+
+```json
+{
+  "resource_budget": {
+    "generation": "budget-window-001",
+    "ports": [{
+      "device_id": 0, "die": 0, "port": 1,
+      "tx_capacity_permille": 500, "rx_capacity_permille": 1000,
+      "tx_background_bytes": 1048576, "rx_background_bytes": 0
+    }]
+  }
+}
+```
+
+capacity 是相对一个 L0 单口的可用带宽，整数 0..1000；不填的端口默认 1000。background 是**同一规划窗口内需要竞争该口的其他字节量**，默认零，不能填端口历史累计计数或 bytes/s；若用带宽降额代表某项外部竞争，就不要又把同一项重复计入 background。
+
+背景字节在 FP8/BF16 两方向保持字节单位，planner 用本次 row_bytes 重算预算，不把 FP8 的行数套给 BF16。必须基于同一个窗口更新所有 rank 的配置，预算是一份不可变快照，不会每调用查询控制器或读取 JSON。更新预算需要在无在途操作时重新创建 planner/host 并丢弃旧 prepared 计划；不要只改 Python planner 却让 host 留用旧副本。
+
+`prepare_a5_ccu_ep8_topology.py` 将物理 device ID 映射到本通信组顺序的 `rank*18 + die*9 + port`，输出 `topology.l1_budget`，字段为 schema/generation 与四个 144 元素数组。harness 已自动传给 planner，且 topology 包含在跨 rank 配置摘要检查内；模型适配层按 §8 同时传 `l1_resources` 和可选 `l1_budget`，并在建 host 前确认所有 rank 的配置摘要一致。
+
+这个接口预留给跨节点/多组共享资源的控制器：它可以给每个 EP8 分配可用份额、估算竞争工作量。**它不是跨机 EP16 实现，不会自动发现交换机内部拥塞，也不执行带宽隔离。** 将来一个 EP16 覆盖两节点时，还需为跨机原始流建立基准路径与更上层资源协调；本次仅验证“已有 L1 负载不能当作空闲”这一局部契约。
+
+2/4 卡仍使用原显式权重执行接口，不读取 EP8 资源预算；给 2/4 policy 添加 `resource_budget` 会拒绝，避免静默忽略。
+
+### 11.3 DeepSeek 更新和验证步骤
+
+1. 拉取本分支，按 §4 重编/安装 wheel。检查 `ep8_single_port_l1_abi=1` 与 **`ep8_l1_resource_planner_abi=1`**；新 Python 配旧 wheel 会明确报错。保留现场未提交诊断补丁，先检查 `git diff`，不要强制 reset。
+2. 在空闲卡上按 §5/§6 重新生成一个新 policy 目录。比较新旧 `paths` 的实际物理口分布；如果继续旧 policy，只会更新 planner，不会自动换端口。
+3. 先 CPU 回归，再 create、短正确性；最后用同一机器 policy 测真实矩阵和 uniform。若预算限制导致无 relay，要如实记录，不能伪报 relay PASS。
+
+```bash
+# 在已安装新 wheel、配置好 CANN/route/rootinfo 等环境后运行。
+export A5_L1_CONFIG=/实际路径/新生成或已审核的policy-8/l1_policy.json
+export HCCL_BUFFSIZE=64
+export A5_EID_MAX_RELAYS_PER_PEER=0  # 首轮隔离 L1，之后再测 6
+python3 -m unittest discover -s tests/python/deepep -p test_a5_ccu_l1_cpu.py -v
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite create --planner l1_bottleneck
+bash scripts/run_a5_ccu_eid_alltoallv.sh --suite correctness --planner l1_bottleneck \
+  --case uniform --mode all --dtype float8_e4m3fn --width 5120 \
+  --max-actions 56 --warmup 3 --iters 3 --rounds 1 --dynamic-iters 3 \
+  --bidirectional-iters 3 --allow-no-relay
+
+# 真实矩阵；同目录 policy 固定，比较动作预算，不同时更换路径。
+export A5_MATRIX=/实际路径/real_counts.json
+for A5_ACTIONS in 8 16 56; do
+  bash scripts/run_a5_ccu_eid_alltoallv.sh --suite benchmark --planner l1_bottleneck \
+    --matrix-json "$A5_MATRIX" --mode all --dtype float8_e4m3fn --width 5120 \
+    --max-actions "$A5_ACTIONS" --warmup 20 --iters 50 --rounds 6 \
+    --dynamic-iters 100 --allow-no-relay
+done
+```
+
+将真实矩阵命令换成 `--case uniform` 再做预算对照；BF16 使用 `--dtype bfloat16 --width 5120`，combine 语义对照用真实矩阵的 Cᵀ。先短正确性，任何错误停止该轮。最后才接模型 eager，保持 native/multipath 相同配置；不需要为本次 planner 修改继续动态图验证。
+
+独立验证背景预算时，可在新 policy 副本里把所有已配置 L1 口的 TX/RX capacity 设为 0、background 设为 0；在 `MAX_RELAYS_PER_PEER=0` 下，应得全 direct。用原可用预算重新创建 planner 后才恢复 L1。policy 副本须与 inventory 同目录或调整正确的相对路径，不能破坏 SHA 绑定。
+
+回报：policy generation/SHA、budget generation、实际每卡端口数、actions、L1/participant moved、候选评估数、资源峰值前后、每口累计行数；prepared/host_counts_serial/dynamic 各自报告，做至少三次独立进程并交替模式顺序。模型等效峰值不是真实微秒数；最多 56 动作是否值得，需要这组设备结果决定。
+
+### 11.4 开发侧已验证与限制
+
+在本人 `cam_lyw_92` / CANN 9.2 完成实际 pybind planner 编译与 CPU 回归；资源模型测试包含 1000 组矩阵×两行宽、16000 份 executor 布局对照，另加 200 组带背景/带宽降额矩阵×两行宽；覆盖均匀分流、共享端口、关闭端口、整数边界、回滚及 FP8/BF16 字节单位。原 bottleneck 回归与机器拓扑回归通过。route 编译、host ctest、`PUBLIC_ROUTE_LOAD_PASS` / `PUBLIC_ROUTE_BUILD_PASS` 通过（未安装到运行环境）。
+
+纯 CPU 规划微基准已加入 `tests/cpp/bench_a5_ccu_l1_planner.cpp`，5 批×10000 次，取中位；不含 Python、D2H、通信，不是设备时延。该开发容器不具备 Torch 完整 wheel 构建环境，现场仍须重编 wheel 并完成 NPU 正确性/吞吐测试。
+
+```bash
+c++ -O3 -std=c++17 -I csrc/deepep tests/cpp/bench_a5_ccu_l1_planner.cpp -o /tmp/l1-plan-bench
+/tmp/l1-plan-bench
+```
+
+同开发机本轮参考：matrix_few 共享口约 2.6 µs；独立 peer 口、14 动作约 2.7 µs；uniform 的 56 动作约 3.4 µs。旧版对应约 2.0/2.3/2.5 µs，但 uniform 旧版因内部 8 动作上限没有分流。此处增加的是约亚微秒至 1 µs 量级的 CPU 规划工作；不是 56 次 host launch，CCU 提交接口不变。结果受 CPU/编译器影响，应在目标机复测。

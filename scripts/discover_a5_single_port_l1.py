@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 from datetime import datetime, timezone
-from a5_ccu_l1_policy import sha, memberships, network_fes, single_port, validate_config
+from a5_ccu_l1_policy import sha, memberships, network_fes, single_port, validate_config, choose_single_port_pair
 from a5_ccu_machine_topology import normalize_eid, port_list
 from prepare_a5_ccu_peer_plan import parse_phys_ids
 
@@ -107,7 +107,7 @@ def main():
                 if a['addr_type'].upper()!='EID': continue
                 for die,port in port_list(a['ports']):
                     if (phy,die,port) not in member: l0dies[phy].add(die)
-    paths=[]
+    paths=[]; assignments={}
     for si,di in itertools.combinations(range(len(devices)),2):
         s,d=devices[si],devices[di]
         pairs=[(a,b) for a in candidates[s] for b in candidates[d]
@@ -116,7 +116,7 @@ def main():
         pairs.sort(key=lambda ab:(ab[0]['port'],ab[1]['port'],ab[0]['eid'],ab[1]['eid']))
         if not pairs: continue
         # Distribute peers over available local ports; never infer new EIDs.
-        a,b=pairs[(si+di)%len(pairs)]
+        a,b=choose_single_port_pair(pairs,assignments)
         paths.append(dict(id=f'l1-{s}-{d}',src_phy=s,dst_phy=d,src_eid=a['eid'],dst_eid=b['eid'],
                           src_die=a['die'],dst_die=b['die'],src_port=a['port'],dst_port=b['port'],
                           net_instance_id=a['net_instance_id'],plane_id=a['plane_id'],l0_weight=1,l1_weight=1))

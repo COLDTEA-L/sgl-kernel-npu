@@ -114,7 +114,7 @@ def main():
             if args.executor != 'eid': raise ValueError('L1 requires EID executor')
             from a5_ccu_l1_policy import apply_l1
             rows, policy = apply_l1(rows, devices, args.l1_config, provenance['root_info'])
-            topology.update(version=3, l1_policy=policy, l1_resources=policy['l1_resources'])
+            topology.update(version=3, l1_policy=policy, l1_resources=policy['l1_resources'], l1_budget=policy['l1_budget'])
             topology['channels_per_rank']=[sum(r in (v['src_rank'],v['dst_rank']) for v in rows) for r in range(8)]
     except (ValueError, KeyError, TypeError, OSError) as exc:
         p.error(str(exc))

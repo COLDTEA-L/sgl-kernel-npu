@@ -8,7 +8,7 @@ import tempfile
 import unittest
 ROOT=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(ROOT/'scripts'))
-from a5_ccu_l1_policy import single_port, sha, apply_l1, validate_config
+from a5_ccu_l1_policy import single_port, sha, apply_l1, validate_config, compile_budget, choose_single_port_pair
 
 
 class PolicyTests(unittest.TestCase):
@@ -44,6 +44,39 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_config(self.config,[3,2])
         self.root.write_text(self.root.read_text()+' ')
         with self.assertRaises(ValueError):validate_config(self.config,[2,3])
+    def test_controller_budget_mapping_and_rejection(self):
+        config = dict(paths=[dict(src_phy=6,dst_phy=7,src_die=0,dst_die=0,src_port=1,dst_port=2)],
+                      resource_budget=dict(generation='busy-window-1',ports=[dict(device_id=6,die=0,port=1,
+                        tx_capacity_permille=500,rx_capacity_permille=1000,
+                        tx_background_bytes=12345,rx_background_bytes=0)]))
+        devices=[6,7,0,1,2,3,4,5]
+        b=compile_budget(config,devices)
+        self.assertEqual(b['tx_background_bytes'][1],12345)
+        self.assertEqual(b['tx_capacity_permille'][1],500)
+        self.assertEqual(b['generation'],'busy-window-1')
+        for key,value in [('device_id',2),('port',63),('tx_capacity_permille',1001),
+                          ('tx_background_bytes',-1),('rx_background_bytes',True)]:
+            bad=copy.deepcopy(config);bad['resource_budget']['ports'][0][key]=value
+            with self.assertRaises(ValueError):compile_budget(bad,devices)
+        with self.assertRaises(ValueError):compile_budget(config,[6,7])
+        bad=copy.deepcopy(config);bad['resource_budget']['ports']*=2
+        with self.assertRaises(ValueError):compile_budget(bad,devices)
+
+    def test_catalog_spreads_physical_ports_not_eid_aliases(self):
+        candidates={r:[dict(device_id=r,die=0,port=p,eid=f'{r}-{p}') for p in range(7)] for r in range(8)}
+        use={}
+        for s in range(8):
+            for d in range(s+1,8):
+                pairs=[(a,b) for a in candidates[s] for b in candidates[d]]
+                choose_single_port_pair(pairs,use)
+        self.assertEqual(len(use),56)
+        self.assertEqual(set(use.values()),{1})
+        # Aliases of the same physical endpoint do not create extra capacity.
+        a=candidates[0][0];alias=dict(a,eid='alias');b=candidates[1][0]
+        use={};choose_single_port_pair([(a,b),(alias,b)],use)
+        choose_single_port_pair([(a,b),(alias,b)],use)
+        self.assertEqual(use,{(0,0,0):2,(1,0,0):2})
+
     def test_resource_conservation_cpp(self):
         binary=self.dir/'planner'
         subprocess.run(['c++','-std=c++17','-O2','-Wall','-Wextra','-Werror',str(ROOT/'tests/cpp/test_a5_ccu_l1_planner.cpp'),'-o',str(binary)],check=True)
@@ -69,6 +102,26 @@ class BindingTests(unittest.TestCase):
             self.assertEqual(report['l1_rows'],500)
             self.assertEqual(report['transmitted_network_bytes'],1000*5120)
             self.assertEqual(report['planned_link_peak_bytes'],500*5120)
+            self.assertEqual(native.ep8_l1_resource_planner_abi,1)
+            self.assertEqual(report['resource_peak_before_equivalent_rows'],1000)
+            self.assertEqual(report['resource_peak_after_equivalent_rows'],500)
+            budget=dict(schema='a5.l1-resource-budget.v1',generation='window-1',
+                        tx_capacity_permille=[1000]*144,rx_capacity_permille=[1000]*144,
+                        tx_background_bytes=[0]*144,rx_background_bytes=[0]*144)
+            budget['tx_background_bytes'][1]=5120*1000
+            busy=RelayPlanner(5120,[[] for _ in range(64)],strategy='l1_bottleneck',
+                              l1_resources=ports,l1_budget=budget,native_module=native)
+            self.assertFalse(busy.plan(counts).uses_relay)
+            self.assertEqual(busy.plan(counts).report()['l1_budget_generation'],'window-1')
+            budget['tx_background_bytes'][1]=0
+            self.assertFalse(busy.plan(counts).uses_relay) # Snapshot, no caller alias.
+            for key,value in [('tx_capacity_permille',[1001]*144),
+                              ('tx_background_bytes',[False]*144),('generation','')]:
+                bad=copy.deepcopy(budget);bad[key]=value
+                with self.assertRaises(ValueError):RelayPlanner(5120,[[] for _ in range(64)],
+                    strategy='l1_bottleneck',l1_resources=ports,l1_budget=bad,native_module=native)
+            with self.assertRaises(ValueError):RelayPlanner(5120,[[] for _ in range(64)],l1_budget=budget)
+
             with self.assertRaises(ValueError):RelayPlanner(5120,[[] for _ in range(64)],l1_resources=ports)
 
 

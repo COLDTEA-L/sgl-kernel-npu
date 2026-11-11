@@ -59,6 +59,31 @@ def normalize_relays(relays):
     return tuple(result)
 
 
+def normalize_l1_budget(budget):
+    """Frozen port budget; units survive dispatch/combine row_bytes changes."""
+    if not isinstance(budget, dict) or budget.get('schema') != 'a5.l1-resource-budget.v1':
+        raise ValueError('requires a5.l1-resource-budget.v1')
+    if not isinstance(budget.get('generation'), str) or not budget['generation']:
+        raise ValueError('L1 budget needs a nonempty generation')
+    fields = ('tx_capacity_permille', 'rx_capacity_permille',
+              'tx_background_bytes', 'rx_background_bytes')
+    if set(budget) != set(fields) | {'schema', 'generation'}:
+        raise ValueError('unknown or missing L1 budget fields')
+    arrays = []
+    for key in fields:
+        values = budget[key]
+        if not isinstance(values, (list, tuple)) or len(values) != 144:
+            raise ValueError(key + ' requires 144 physical resources')
+        values = tuple(_uint(v, key) for v in values)
+        if 'capacity' in key and any(v > 1000 for v in values):
+            raise ValueError('single-port capacity must be in [0,1000] relative to L0')
+        arrays.append(values)
+    for capacity, background in ((arrays[0], arrays[2]), (arrays[1], arrays[3])):
+        if any(not cap and load for cap, load in zip(capacity, background)):
+            raise ValueError('disabled L1 resource cannot carry background work')
+    return arrays
+
+
 def cut_lower_bound_rows(counts):
     counts = normalize_counts(counts)
     best, group = 0, 0
@@ -131,10 +156,16 @@ class RelayPlanner:
     This object owns only static topology/options, no counts or plan cache.
     """
     def __init__(self, row_bytes, allowed_relays, *, min_chunk_bytes=1, min_gain_bytes=0,
-                 max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy", l1_resources=None):
+                 max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy", l1_resources=None, l1_budget=None):
         if strategy not in ("greedy", "bottleneck", "l1_bottleneck"):
             raise ValueError("strategy must be greedy, bottleneck or l1_bottleneck")
         self.strategy = strategy
+        if l1_budget is not None and strategy != 'l1_bottleneck':
+            raise ValueError('L1 budget requires l1_bottleneck')
+        budget_arrays = None if l1_budget is None else normalize_l1_budget(l1_budget)
+        self.l1_budget_generation = None if l1_budget is None else l1_budget['generation']
+        if strategy == 'l1_bottleneck' and getattr(native_module, 'ep8_l1_resource_planner_abi', None) != 1:
+            raise RuntimeError('rebuild DeepEP: ep8_l1_resource_planner_abi=1 required')
         if (l1_resources is not None) != (strategy == 'l1_bottleneck'):
             raise ValueError('L1 resources and l1_bottleneck must be supplied together')
         if strategy == 'l1_bottleneck' and getattr(native_module,'ep8_single_port_l1_abi',None)!=1:
@@ -164,6 +195,8 @@ class RelayPlanner:
             self._native = self._native.with_bottleneck()
         if strategy == 'l1_bottleneck':
             self._native = self._native.with_l1_routes(l1_resources)
+            if budget_arrays is not None:
+                self._native = self._native.with_l1_budget(*budget_arrays)
         self.backend = 'native' if self._native is not None else 'python'
 
     def plan(self, counts):
@@ -173,6 +206,7 @@ class RelayPlanner:
         info = None
         if self.strategy == 'l1_bottleneck':
             c, chosen, moved, loads, actions, evaluations, reason, info = self._native.plan_l1(c)
+            info['l1_budget_generation'] = self.l1_budget_generation
         else:
             c, chosen, moved, loads, actions, evaluations, reason = self._native.plan(c)
         return RoutePlan(c, self.row_bytes, chosen, moved, loads, actions, evaluations, reason,

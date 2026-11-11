@@ -55,6 +55,61 @@ def network_fes(root):
     return out
 
 
+def choose_single_port_pair(pairs, assignments):
+    """Static catalog spreading; counts physical ports, not EID aliases.
+
+    This is not per-call routing or a promise that network paths are independent.
+    Controller-supplied policies can override this deterministic default.
+    """
+    def resource(endpoint):
+        return endpoint['device_id'], endpoint['die'], endpoint['port']
+    def score(pair):
+        a, b = pair
+        x, y = assignments.get(resource(a), 0), assignments.get(resource(b), 0)
+        return max(x, y), x+y, resource(a), resource(b), a['eid'], b['eid']
+    a, b = min(pairs, key=score)
+    for e in (a, b):
+        key = resource(e)
+        assignments[key] = assignments.get(key, 0) + 1
+    return a, b
+
+
+def compile_budget(config, devices):
+    """Map controller physical IDs into this EP8's local resource namespace."""
+    budget = config.get('resource_budget')
+    if budget is None:
+        return None
+    if len(devices) != 8 or not isinstance(budget, dict) or set(budget) != {'generation', 'ports'}:
+        raise ValueError('resource_budget is EP8 only and requires generation/ports')
+    if not isinstance(budget['generation'], str) or not budget['generation']:
+        raise ValueError('resource budget generation required')
+    out = dict(schema='a5.l1-resource-budget.v1', generation=budget['generation'],
+               tx_capacity_permille=[1000]*144, rx_capacity_permille=[1000]*144,
+               tx_background_bytes=[0]*144, rx_background_bytes=[0]*144)
+    known = {(p[side+'_phy'], p[side+'_die'], p[side+'_port'])
+             for p in config['paths'] for side in ('src', 'dst')}
+    seen = set()
+    if not isinstance(budget['ports'], list):
+        raise ValueError('budget ports must be a list')
+    keys = {'device_id', 'die', 'port', 'tx_capacity_permille', 'rx_capacity_permille',
+            'tx_background_bytes', 'rx_background_bytes'}
+    for item in budget['ports']:
+        if not isinstance(item, dict) or set(item) != keys or any(type(v) is not int for v in item.values()):
+            raise ValueError('budget port fields must be exact integers')
+        key = (item['device_id'], item['die'], item['port'])
+        if key not in known or key in seen:
+            raise ValueError('budget must name a unique configured L1 physical port')
+        seen.add(key)
+        r = devices.index(key[0])*18 + key[1]*9 + key[2]
+        for direction in ('tx', 'rx'):
+            cap, base = item[direction+'_capacity_permille'], item[direction+'_background_bytes']
+            if not 0 <= cap <= 1000 or not 0 <= base <= (1<<63)-1 or (cap == 0 and base):
+                raise ValueError('invalid single-port capacity/background bytes')
+            out[direction+'_capacity_permille'][r] = cap
+            out[direction+'_background_bytes'][r] = base
+    return out
+
+
 def validate_config(path, devices, root_path=None):
     path = Path(path)
     c = json.loads(path.read_text())
@@ -100,6 +155,7 @@ def validate_config(path, devices, root_path=None):
                 raise ValueError('path weights must be positive bounded integers')
     if not pairs:
         raise ValueError('empty L1 policy')
+    compile_budget(c, devices)
     return c
 
 
@@ -125,5 +181,5 @@ def apply_l1(rows, devices, path, root_path=None):
     rows.sort(key=lambda r:(r['src_rank'],r['dst_rank'],{'direct':0,'relay':1,'l1_single':2}[r['kind']]))
     return rows, dict(schema=c['schema'],generation=c['generation'],config_sha256=sha(path),
                       inventory_sha256=c['inventory_sha256'],rootinfo_sha256=c['rootinfo_sha256'],
-                      paths=c['paths'],l1_resources=resources,
+                      paths=c['paths'],l1_resources=resources,l1_budget=compile_budget(c,devices),
                       physical_single_port_verified=False)

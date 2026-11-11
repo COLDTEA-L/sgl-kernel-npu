@@ -40,7 +40,7 @@ struct CopySpans {
 struct Plan {
     Matrix counts{}, moved{}, loads{};
     std::array<U,144> l1Tx{}, l1Rx{};
-    U resourceLowerBound=0;
+    U resourceLowerBound=0, resourcePeakBefore=0, resourcePeakAfter=0;
     Relays relays{};
     std::vector<Action> actions;
     U evaluations = 0;
@@ -93,6 +93,7 @@ public:
             minGain > Max || maxActions > 56 || allowed.size() != 64 ||
             (!capacity.empty() && capacity.size() != 8))
             throw std::invalid_argument("invalid EP8 planner configuration");
+        l1TxCapacity_.fill(1000); l1RxCapacity_.fill(1000);
         chunkRows_ = minChunk / rowBytes + (minChunk % rowBytes != 0);
         capacity_.fill(Max);
         for (size_t k = 0; k < capacity.size(); ++k) {
@@ -130,19 +131,27 @@ public:
             auto a=out.l1Ports_[f],b=out.l1Ports_[f%8*8+f/8];
             if(a[0]!=b[1] || a[1]!=b[0]) throw std::invalid_argument("asymmetric L1 catalog");
         }
-        // Topology-only cut capacity is compiled once, not on every dynamic call.
-        out.l1CutExtra_.fill(0);
-        for(unsigned mask=1;mask<255;++mask) {
-            std::array<bool,144> tx{},rx{};U nt=0,nr=0;
-            for(size_t f=0;f<64;++f) if((mask&(1u<<(f/8))) && !(mask&(1u<<(f%8)))) {
-                const auto a=out.l1Ports_[f];
-                if(a[0]>=0) {
-                    if(!tx[a[0]]) {tx[a[0]]=true;++nt;}
-                    if(!rx[a[1]]) {rx[a[1]]=true;++nr;}
-                }
-            }
-            out.l1CutExtra_[mask]=std::min(nt,nr);
+        out.CompileL1Cuts();
+        return out;
+    }
+
+    // Immutable controller snapshot. Capacity is permille of one L0 link;
+    // background bytes are competing work in the SAME planning window, not
+    // cumulative port counters. TX/RX are separately budgeted (full duplex).
+    Planner WithL1Budget(const std::vector<U>& txCapacity, const std::vector<U>& rxCapacity,
+                         const std::vector<U>& txBase, const std::vector<U>& rxBase) const {
+        if (!l1_ || txCapacity.size()!=144 || rxCapacity.size()!=144 ||
+            txBase.size()!=144 || rxBase.size()!=144)
+            throw std::invalid_argument("L1 budget requires four arrays of 144 resources");
+        Planner out=*this;
+        for (size_t r=0;r<144;++r) {
+            if (txCapacity[r]>1000 || rxCapacity[r]>1000 || txBase[r]>Max || rxBase[r]>Max ||
+                (!txCapacity[r] && txBase[r]) || (!rxCapacity[r] && rxBase[r]))
+                throw std::invalid_argument("invalid L1 capacity/background budget");
+            out.l1TxCapacity_[r]=txCapacity[r];out.l1RxCapacity_[r]=rxCapacity[r];
+            out.l1TxBase_[r]=txBase[r];out.l1RxBase_[r]=rxBase[r];
         }
+        out.CompileL1Cuts();
         return out;
     }
 
@@ -271,6 +280,48 @@ public:
         }
     }
 private:
+    using Wide = unsigned __int128;
+    // All targets are L0-equivalent rows, rounded upwards. Use wide arithmetic
+    // so background bytes, row_bytes changes and fractional bandwidth cannot wrap.
+    U PortTime(U rows, U background, U capacity) const {
+        if (!rows && !background) return 0;
+        if (!background && capacity==1000) return rows;
+        Wide bytes=Wide(rows)*rowBytes_+background;
+        if (!capacity) return bytes ? Max : 0;
+        Wide denom=Wide(rowBytes_)*capacity;
+        Wide value=(bytes*1000+denom-1)/denom;
+        return value>Max ? Max : U(value);
+    }
+    U PortRoom(U target, U rows, U background, U capacity) const {
+        if (!background && capacity==1000) return target>rows ? target-rows : 0;
+        Wide budget=Wide(target)*rowBytes_*capacity/1000;
+        Wide occupied=Wide(rows)*rowBytes_+background;
+        if (budget<=occupied) return 0;
+        Wide value=(budget-occupied)/rowBytes_;
+        return value>Max ? Max : U(value);
+    }
+    U ResourcePeak(const Plan& p) const {
+        U peak=*std::max_element(p.loads.begin(),p.loads.end());
+        if(l1_) for(size_t r=0;r<144;++r) {
+            peak=std::max(peak,PortTime(p.l1Tx[r],l1TxBase_[r],l1TxCapacity_[r]));
+            peak=std::max(peak,PortTime(p.l1Rx[r],l1RxBase_[r],l1RxCapacity_[r]));
+        }
+        return peak;
+    }
+    void CompileL1Cuts() {
+        l1CutExtra_.fill(0);
+        for(unsigned mask=1;mask<255;++mask) {
+            std::array<bool,144> tx{},rx{};U nt=0,nr=0;
+            for(size_t f=0;f<64;++f) if((mask&(1u<<(f/8))) && !(mask&(1u<<(f%8)))) {
+                const auto a=l1Ports_[f];
+                if(a[0]>=0) {
+                    if(!tx[a[0]]) {tx[a[0]]=true;nt+=l1TxCapacity_[a[0]];}
+                    if(!rx[a[1]]) {rx[a[1]]=true;nr+=l1RxCapacity_[a[1]];}
+                }
+            }
+            l1CutExtra_[mask]=std::min(nt,nr); // permille, shared ports counted once
+        }
+    }
     // Lower bound only, not a promise of a feasible one-relay assignment.
     // All directed cuts take O(256*8) using subset recurrence. The single-flow
     // bound also accounts for splitting one commodity into at most two paths.
@@ -287,10 +338,17 @@ private:
             cut[mask]=cut[prev]+outgoing[v];
             for (unsigned u=0;u<8;++u) if (prev&(1u<<u))
                 cut[mask]-=c[v*8+u]+c[u*8+v];
-            U edges=size[mask]*(8-size[mask]);
-            // Optimistic equal-port fabric capacity, cached at catalog creation.
+            U edges=size[mask]*(8-size[mask])*1000;
+            // Optimistic usable physical-port capacity, cached with the catalog/budget.
             if(l1_) edges+=l1CutExtra_[mask];
-            lower=std::max(lower,cut[mask]/edges+(cut[mask]%edges!=0));
+            // Normal MoE sizes stay on native 64-bit division; use wide only
+            // near the integer limit, where scaling by permille could overflow.
+            U bound;
+            if(cut[mask]<=Max/1000) {
+                U scaled=cut[mask]*1000;
+                bound=scaled/edges+(scaled%edges!=0);
+            } else bound=U((Wide(cut[mask])*1000+edges-1)/edges);
+            lower=std::max(lower,bound);
         }
         return lower;
     }
@@ -300,16 +358,23 @@ private:
         std::array<size_t,56> order{};size_t n=0;
         for (size_t f=0;f<64;++f) if (f/8!=f%8) {original[f]=counts[f];order[n++]=f;}
         p.counts=counts;p.evaluations=0;p.exhausted=true;
-        auto reset=[&] {if(l1_) {p.l1Tx.fill(0);p.l1Rx.fill(0);} p.loads=original;p.moved.fill(0);p.relays.fill(-1);p.actions.clear();};
+        auto reset=[&] {p.l1Tx.fill(0);p.l1Rx.fill(0); p.loads=original;p.moved.fill(0);p.relays.fill(-1);p.actions.clear();};
         reset();p.resourceLowerBound=0;
-        U peak=*std::max_element(original.begin(),original.end());
-        if (!peak || !maxActions_) return;
-        U lower=BottleneckLowerBound(counts,peak);p.resourceLowerBound=lower;
+        U directPeak=*std::max_element(original.begin(),original.end());
+        U peak=ResourcePeak(p);
+        p.resourcePeakBefore=p.resourcePeakAfter=peak;
+        if (!directPeak || !maxActions_) return;
+        U lower=BottleneckLowerBound(counts,directPeak);
+        if(l1_) for(size_t r=0;r<144;++r) {
+            lower=std::max(lower,PortTime(0,l1TxBase_[r],l1TxCapacity_[r]));
+            lower=std::max(lower,PortTime(0,l1RxBase_[r],l1RxCapacity_[r]));
+        }
+        p.resourceLowerBound=lower;
         if (lower>=peak) return;
         std::sort(order.begin(),order.end(),[&](size_t a,size_t b) {
             return original[a]!=original[b]?original[a]>original[b]:a<b;
         });
-        const U budget=std::min<U>(maxActions_,8);
+        const U budget=l1_ ? maxActions_ : std::min<U>(maxActions_,8);
         p.actions.reserve(budget);
         U gap=peak-lower;
         // Four deterministic attempts, no feasibility binary-search assumption.
@@ -320,7 +385,7 @@ private:
         for (U target:targets) {
             if (target==previous || target>=peak) continue;
             previous=target;
-            if ((peak-target)*rowBytes_<minGain_) continue;
+            if (Wide(peak-target)*rowBytes_<minGain_) continue;
             reset();std::array<U,8> used{};bool success=true;
             for (size_t f:order) {
                 U a=p.loads[f];if (a<=target) continue;
@@ -340,8 +405,10 @@ private:
                 if(l1_ && l1Ports_[f][0]>=0) {
                     ++p.evaluations;const auto ports=l1Ports_[f];
                     U tx=p.l1Tx[ports[0]],rx=p.l1Rx[ports[1]];
-                    if(tx<=target && rx<=target && x<=target-tx && x<=target-rx) {
-                        U next=std::max(tx,rx)+x;
+                    if(x<=PortRoom(target,tx,l1TxBase_[ports[0]],l1TxCapacity_[ports[0]]) &&
+                       x<=PortRoom(target,rx,l1RxBase_[ports[1]],l1RxCapacity_[ports[1]])) {
+                        U next=std::max(PortTime(tx+x,l1TxBase_[ports[0]],l1TxCapacity_[ports[0]]),
+                                        PortTime(rx+x,l1RxBase_[ports[1]],l1RxCapacity_[ports[1]]));
                         // On equal modeled load prefer no intra-group forwarding.
                         if(!found || next<=bestPeak) {found=true;best=8;bestPeak=next;}
                     }
@@ -358,13 +425,17 @@ private:
                 p.loads[f]-=x;p.loads[f/8*8+best]+=x;p.loads[best*8+f%8]+=x;
                 p.actions.push_back({f/8,f%8,best,x,a-std::max(a-x,bestPeak)});
             }
-            if (success) return; // Every edge is <= target < original peak.
+            if (success) {
+                p.resourcePeakAfter=ResourcePeak(p);
+                if(p.resourcePeakAfter<=target && p.resourcePeakAfter<peak) return;
+            }
         }
-        reset(); // Direct fallback, not native fallback; evaluations retained.
+        reset();p.resourcePeakAfter=peak; // Direct fallback; evaluations retained.
     }
     bool bottleneck_=false, l1_=false;
     std::array<std::array<int,2>,64> l1Ports_{};
     std::array<U,256> l1CutExtra_{};
+    std::array<U,144> l1TxCapacity_{},l1RxCapacity_{},l1TxBase_{},l1RxBase_{};
     U rowBytes_, chunkRows_, minGain_, maxActions_, minChunkBytes_;
     std::vector<U> capacityBytes_;
     std::array<unsigned, 64> masks_{};
