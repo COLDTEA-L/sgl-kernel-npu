@@ -502,3 +502,10 @@ bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode all \
 失败追加两轮 endpoint_attrs 文件与 `failure_summary.json`。
 注意原始远端查询 status=6 可以继续出现；判据是对端上报值、最终 catalog、实际建链和正确性，
 不是让所有诊断查询都强行显示 status=0。
+
+## 10. 计算图捕获与重放（显式 L1 EID）
+
+见 [CCU + URMA 计算图验证指南](A5_CCU_ACL_GRAPH_VALIDATION.md)。DeepSeek 先读该文 §1–3，
+按说明新增独立 graph 诊断入口，再执行 L0、显式单口 L1、双流 split 捕获/重放。
+现有 eager correctness/benchmark 不能证明计算图支持；现有 launcher 尚无 `--suite graph`。
+两卡通过后才继续该文 §4 的 EP8 READY/DONE 桥和 §5 的动态参数验证。

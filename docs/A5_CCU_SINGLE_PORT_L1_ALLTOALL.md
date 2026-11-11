@@ -221,3 +221,10 @@ planner = RelayPlanner(
 开发容器 `cam_lyw_92` / CANN 9.2：route 和 SDK 库存工具编译，route 加载/ABI 检查；新 planner 的实际 pybind 扩展编译和 CPU 执行；端口预算与配置校验；CCU 指令图的 CPU 数据回放。编译不需要占用 NPU。
 
 该容器没有 Torch/torch_npu，完整 DeepEP wheel 和 Torch host 回归留给目标环境重建/执行；CPU graph 模拟不模拟真实 EID 转发网络。尚未验证新生产 2/4/8 卡 L1 目录的 9.3 建链、设备正确性、端口落点与性能。用户先完成 §4–6，再做 §7；通过后才按 §8 接模型。
+
+## 10. 计算图支持性验证
+
+见 [CCU + URMA 计算图验证指南](A5_CCU_ACL_GRAPH_VALIDATION.md)。这项验证针对 ACL Graph 捕获/重放，
+不是 CCU 指令构图或 rank graph 枚举。先完成指南 §1–3 的两卡裸提交，再做 §4 的实际 EP8 host/事件桥；
+§5 单独验证动态参数。当前 fixed prepared eager PASS 不代表已支持计算图，不能直接以移除
+`--enforce-eager` 代替最小验证。该指南包含待现场实现的诊断入口，未新增生产 graph API。
