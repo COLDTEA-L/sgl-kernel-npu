@@ -138,7 +138,7 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh --devices 0,1,2,3 \
   --self-copy-mode ccu --bytes 65536 --warmup 3 --iters 10 --repeats 1
 ```
 
-对照 L0-only 时用 `env -u A5_L1_CONFIG bash ...`，保持 bytes、dtype、时序口径不变。不要将不同通道目录之间的差全部归于路径带宽。4 卡共享 L1 端口的静态分流未做动态流量优化，不承诺线性叠加带宽。
+对照 L0-only 时用 `A5_ENABLE_L1=0 bash ...`，保持 bytes、dtype、时序口径不变。不要将不同通道目录之间的差全部归于路径带宽。4 卡共享 L1 端口的静态分流未做动态流量优化，不承诺线性叠加带宽。
 
 ## 6. EP8：先 L1-only 备用目录，再加入组内 relay
 
@@ -342,3 +342,55 @@ c++ -O3 -std=c++17 -I csrc/deepep tests/cpp/bench_a5_ccu_l1_planner.cpp -o /tmp/
 ```
 
 同开发机本轮参考：matrix_few 共享口约 2.6 µs；独立 peer 口、14 动作约 2.7 µs；uniform 的 56 动作约 3.4 µs。旧版对应约 2.0/2.3/2.5 µs，但 uniform 旧版因内部 8 动作上限没有分流。此处增加的是约亚微秒至 1 µs 量级的 CPU 规划工作；不是 56 次 host launch，CCU 提交接口不变。结果受 CPU/编译器影响，应在目标机复测。
+
+
+## 12. L1 总开关：不同机器按启动配置启用
+
+```bash
+# 无 L1 连通条件的机器，或只测 L0 fullmesh：
+export A5_ENABLE_L1=0
+# 有已验证单口 L1 的机器：
+export A5_ENABLE_L1=1
+export A5_L1_CONFIG=/实际路径/本机policy-8/l1_policy.json
+```
+
+| 设置 | 拓扑生成（2/4/8 卡） | EP8 planner |
+|---|---|---|
+| `0` | 忽略 --l1-config/A5_L1_CONFIG，不读取对应 L1 policy/inventory，不生成 L1 数据通道 | l1_bottleneck 转成 bottleneck，丢弃 L1 resources/budget，保留 L0 direct/fullmesh relay |
+| `1` | 必须有显式 L1 config，执行本机单口 EID/拓扑校验；失败报错，不静默改走另一条路径 | 允许 l1_bottleneck；仍须选择该策略且提供 l1_resources，显式 greedy/bottleneck 不自动改策略 |
+| 未设置 | 兼容原行为：有显式 L1 config 才生成 L1 | 兼容原行为：显式 l1_bottleneck 才用 L1 |
+
+只接受字符串 `0`/`1`，空字符串、true、auto、2 都报错。建议所有生产启动脚本明确设置 0 或 1。当前单口限制不变，开关不会启用聚合 EID，也不自动证明网络连通性。
+
+**开关须在生成 manifest、创建 handle/host 之前设置，所有 rank 一致。** 关闭后重新生成本机 L0-only manifest/topology 并重启对应算子资源；不能仅改环境变量后继续用旧的 L1 handle/prepared plan。仅新建一个禁用 L1 的 planner 可以阻止它选择 selector=8，但不会销毁已经注册的 L1 通道。
+
+官方 harness 已统一处理：
+
+```bash
+# 即使环境中保留旧 A5_L1_CONFIG，关闭也不会读取那个文件。
+A5_ENABLE_L1=0 bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite correctness --planner l1_bottleneck --mode all \
+  --dtype float8_e4m3fn --width 5120 --warmup 3 --iters 3 --rounds 1 \
+  --dynamic-iters 3 --allow-no-relay
+
+# 新目录生成本机 L1 拓扑；不能复用别的机器的 policy。
+A5_ENABLE_L1=1 bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite correctness --planner l1_bottleneck --mode all \
+  --dtype float8_e4m3fn --width 5120 --warmup 3 --iters 3 --rounds 1 \
+  --dynamic-iters 3 --allow-no-relay
+```
+
+关闭时打印 `L1_SWITCH enabled=0`、`L1_PLANNER_SWITCH requested=l1_bottleneck effective=bottleneck`。直接运行 NPU 测试并传入旧的含 L1 topology 时会拒绝，提示重新生成，避免仍创建 L1 通道后误称“已关闭”。如 `A5_EID_MAX_RELAYS_PER_PEER=0` 同时关闭 L1，则只剩 direct；要保留 fullmesh relay，使用原来的非零组内 relay 目录配置。
+
+模型接入：启动进程继承同一个 A5_ENABLE_L1；用相同设置运行 prepare 脚本生成配置，再按 §8 创建 RelayPlanner/host。`planner.requested_strategy`、`planner.strategy`、`planner.l1_enabled` 可记录实际选择。不要用代码直接调用底层 `native.Ep8RelayPlanner.with_l1_routes()` 绕过 Python 开关，也不要复用关闭前的 prepared plan。当前未自动修改现场 vllm-ascend 适配文件。
+
+本次开关是 Python/配置层改动，C++ 与 route ABI 不变。安装方式若从 wheel 读取 Python 文件，需要更新 wheel 中的 `heuristic_alltoallv.py` 与新模块 `ccu_l1_config.py`（建议按原步骤重新构建安装）；仅更新仓库不一定会更新服务实际加载的包。
+
+无卡回归：
+
+```bash
+python3 -m unittest discover -s tests/python/deepep -p test_a5_ccu_l1_switch_cpu.py -v
+python3 -m unittest discover -s tests/python/deepep -p test_a5_ccu_l1_cpu.py -v
+```
+
+覆盖：关闭时不读不存在的 L1 文件、生成 L0-only EP8 拓扑、非法开关值拒绝、显式开启缺配置拒绝、关闭后实际 native planner 仍能选择 L0 relay 且不会选择 L1。

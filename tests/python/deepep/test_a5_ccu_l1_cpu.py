@@ -1,5 +1,7 @@
 """Machine-bound L1 policy, actual planner bindings and shared port budgets."""
 import copy
+import os
+from unittest.mock import patch
 import json
 from pathlib import Path
 import subprocess
@@ -84,6 +86,10 @@ class PolicyTests(unittest.TestCase):
 
 
 class BindingTests(unittest.TestCase):
+    def setUp(self):
+        env=patch.dict(os.environ,{'A5_ENABLE_L1':'1'})
+        env.start();self.addCleanup(env.stop)
+
     def test_actual_native_l1_binding_and_report(self):
         # Native pybind classes are global; isolate from other planner test modules.
         if not __import__('os').environ.get('A5_L1_BINDING_CHILD'):
@@ -103,6 +109,23 @@ class BindingTests(unittest.TestCase):
             self.assertEqual(report['transmitted_network_bytes'],1000*5120)
             self.assertEqual(report['planned_link_peak_bytes'],500*5120)
             self.assertEqual(native.ep8_l1_resource_planner_abi,1)
+            allowed=[[] for _ in range(64)];allowed[1]=[2]
+            with patch.dict(os.environ,{'A5_ENABLE_L1':'0'}), patch.object(native,'ep8_l1_resource_planner_abi',None):
+                off=RelayPlanner(5120,allowed,strategy='l1_bottleneck',l1_resources=ports,
+                                 l1_budget={'ignored':'invalid'},native_module=native)
+                self.assertEqual(off.requested_strategy,'l1_bottleneck')
+                self.assertEqual(off.strategy,'bottleneck')
+                self.assertFalse(off.l1_enabled)
+                off_plan=off.plan(counts)
+                self.assertEqual(off_plan.relay_rank[1],2)
+                self.assertGreater(off_plan.relay_rows[1],0)
+                self.assertNotIn(8,off_plan.relay_rank)
+                self.assertIsNone(off_plan.l1_info)
+            with patch.dict(os.environ,{'A5_ENABLE_L1':'1'}):
+                on=RelayPlanner(5120,allowed,strategy='l1_bottleneck',l1_resources=ports,native_module=native)
+                self.assertTrue(on.l1_enabled)
+                self.assertEqual(on.plan(counts).relay_rank[1],8)
+
             self.assertEqual(report['resource_peak_before_equivalent_rows'],1000)
             self.assertEqual(report['resource_peak_after_equivalent_rows'],500)
             budget=dict(schema='a5.l1-resource-budget.v1',generation='window-1',

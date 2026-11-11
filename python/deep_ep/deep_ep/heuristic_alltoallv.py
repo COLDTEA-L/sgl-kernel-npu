@@ -16,6 +16,11 @@ try:
 except ImportError:
     from ccu_payload import payload_dtypes, copy_payload_
 
+try:
+    from .ccu_l1_config import planner_l1_options
+except ImportError:
+    from ccu_l1_config import planner_l1_options
+
 N = 8
 MAX_I64 = (1 << 63) - 1
 
@@ -159,7 +164,10 @@ class RelayPlanner:
                  max_actions=56, relay_capacity_bytes=None, native_module=None, strategy="greedy", l1_resources=None, l1_budget=None):
         if strategy not in ("greedy", "bottleneck", "l1_bottleneck"):
             raise ValueError("strategy must be greedy, bottleneck or l1_bottleneck")
+        self.requested_strategy = strategy
+        strategy, l1_resources, l1_budget = planner_l1_options(strategy, l1_resources, l1_budget)
         self.strategy = strategy
+        self.l1_enabled = strategy == 'l1_bottleneck'
         if l1_budget is not None and strategy != 'l1_bottleneck':
             raise ValueError('L1 budget requires l1_bottleneck')
         budget_arrays = None if l1_budget is None else normalize_l1_budget(l1_budget)

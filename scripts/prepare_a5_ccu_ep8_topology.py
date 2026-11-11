@@ -10,6 +10,9 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python/deep_ep/deep_ep"))
+from ccu_l1_config import select_l1_config
 
 from a5_ccu_machine_topology import add_machine_arguments, load_machine, directed_links, connected_pair, relay_candidates
 from prepare_a5_ccu_peer_plan import FIELDS, parse_phys_ids
@@ -102,6 +105,7 @@ def main():
     add_machine_arguments(p)
     args = p.parse_args()
     try:
+        args.l1_config = select_l1_config(args.l1_config)
         if args.direct_route < 0:
             raise ValueError('direct-route must be nonnegative')
         devices = parse_phys_ids(args.devices, '--devices')

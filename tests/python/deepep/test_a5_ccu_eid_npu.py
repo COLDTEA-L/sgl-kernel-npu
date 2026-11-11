@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, normalize_l1_budget, gather_routing_counts
 from test_a5_ccu_heuristic_npu import synthetic
+from ccu_l1_config import planner_l1_options, l1_enabled
 from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, full_payload,
     cat_payload, byte_payload_view, copy_payload_, fill_payload_, equal_payload,
     guards_intact, shifted_payload, clone_payload)
@@ -73,6 +74,11 @@ def main():
         raise ValueError('topology rank/device mapping mismatch')
     allowed = normalize_relays(topology['allowed_relays'])
     l1_resources = topology.get('l1_resources')
+    if l1_resources is not None and not l1_enabled(True):
+        raise ValueError('L1 disabled but manifest/topology contains L1; regenerate with A5_ENABLE_L1=0')
+    args.requested_planner = args.planner
+    args.planner, l1_resources, _ = planner_l1_options(args.planner, l1_resources, topology.get('l1_budget'))
+    print(f'L1_PLANNER_SWITCH requested={args.requested_planner} effective={args.planner}', flush=True)
     if (args.planner == 'l1_bottleneck') != (l1_resources is not None):
         raise ValueError('l1_bottleneck requires --l1-config topology and vice versa')
     if topology.get('l1_budget') is not None:

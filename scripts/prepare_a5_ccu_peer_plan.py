@@ -5,6 +5,9 @@ import csv
 import itertools
 import json
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python/deep_ep/deep_ep"))
+from ccu_l1_config import select_l1_config
 
 from resolve_a5_explicit_multirelay_eids import resolve_relay
 from a5_ccu_machine_topology import add_machine_arguments, load_machine
@@ -116,6 +119,7 @@ def main():
     if not args.validate_only and args.output_dir is None:
         p.error("--output-dir is required unless --validate-only is used")
     try:
+        args.l1_config = select_l1_config(args.l1_config)
         devices = parse_phys_ids(args.devices, "--devices")
         available = parse_phys_ids(args.available_phys, "--available-phys")
         if args.direct_route < 0:
