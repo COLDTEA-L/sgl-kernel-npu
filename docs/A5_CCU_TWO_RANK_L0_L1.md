@@ -510,5 +510,6 @@ bash scripts/run_a5_ccu_l0_l1_probe.sh --suite benchmark --mode all \
 现有 eager correctness/benchmark 不能证明计算图支持；现有 launcher 尚无 `--suite graph`。
 两卡通过后才继续该文 §4 的 EP8 READY/DONE 桥和 §5 的动态参数验证。
 
-现场已完成 G0/G1、G2 失败后的下一步见该文 **§7–11**：external 事件不能证明跨流支持；
-先 P0 核对事件创建 API 和两流 modelRI，再 P1 纯本地双流、P2 同 die split，必要时 P3 双图隔离。
+早期 G2 失败排查保留在该文 §7–11。2026-11-11 现场已回报 G1/G2/G3 通过，当前边界与计时修正见
+**§12**；DS4.1 原生 prefill/CPU splits 的真实调用链、可借鉴的 task-group update，以及现场后续验证见
+**§13–15**。固定图通过不等于动态 C 会随 replay 自动更新，也不是加入 L1 才产生的限制。

@@ -229,5 +229,7 @@ planner = RelayPlanner(
 §5 单独验证动态参数。当前 fixed prepared eager PASS 不代表已支持计算图，不能直接以移除
 `--enforce-eager` 代替最小验证。该指南包含待现场实现的诊断入口，未新增生产 graph API。
 
-现场单路径 G1 已通过、双流 G2 失败的后续步骤在指南 **§7–11**。尤其先核对 6/7 的
-L0 die=1 与显式 L1 die=0 的跨 die 变量；该实验不能直接否定本分支要求同 IO die 的生产路径。
+2026-11-11 现场已回报 G1/G2/G3 固定图通过、G4 两张固定图交替通过；同图动态 C 更新未验证。
+DeepSeek 本轮重点读指南 **§12–15**：§13 是 DS4.1 原生 prefill、CPU splits 和 attention task update
+的源码核对，§14.1 先不占卡确认现场版本，§14.2 再做短 native 路径验证，§14.3–14.4 是条件性动态图探针。
+可读模型源为 `56debc1`，不等于现场旧版加补丁；不能把 decode MC2 入图当成 prefill AllToAllV 更新 splits 的证明。

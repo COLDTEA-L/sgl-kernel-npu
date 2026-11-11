@@ -3,10 +3,10 @@
 适用分支：`feature/a5-ccu-single-port-l1-alltoall`，生产基线 `86acba6`；两卡探针也可单独移植本诊断。目标环境 CANN 9.3.0 / Ascend950DT。
 
 本文的“图”是 **ACL Graph 计算图**，不是 HCCL rank graph，也不是 CCU kernel 指令构图。
-现场已经验证 rank graph 未列出的真实单口 EID 可以建链、注册、eager 通信；最新现场 G1 已验证其单流固定参数捕获与重放，G2 多流仍待定位，见 §7–11。
+现场已经验证 rank graph 未列出的真实单口 EID 可以建链、注册、eager 通信。2026-11-11 更新：现场回报 G1/G2/G3 通过，G4 两张固定图交替通过；同一张图更新动态 C 尚未通过，见 §12–15。§7–11 保留为早期 G2 失败的排查记录，不再是当前阻塞结论。
 之前模型采用 `--enforce-eager`，不能据此宣称已支持计算图。
 
-**交付范围：本文是给现场 DeepSeek 的诊断实施与测试说明，仅更新文档。仓库基线 launcher 没有 `--suite graph`；现场已在 2dd863a 上增加未提交诊断实现，须保存该补丁。§2–3 说明该入口的实现契约；§7–11 是本轮后续步骤。不要把现场未提交功能当作拉取后已自带的功能。**
+**交付范围：本文是给现场 DeepSeek 的诊断实施与测试说明，仅更新文档。仓库基线 launcher 没有 `--suite graph`；现场已在 2dd863a 上增加未提交诊断实现，须保存该补丁。§2–3 说明该入口的实现契约；当前后续步骤在 §14–15。不要把现场未提交功能当作拉取后已自带的功能。**
 不修改生产选路算法、EID、拓扑或 EP8 提交行为来绕过失败。
 
 ## 1. 先固定环境和 API
@@ -348,3 +348,185 @@ epoch_101/137/211_correct, guards_ok, clean_exit, result_dir
 验数失败追加：word index、字节偏移、期望值、实际值、是否仍为清空 sentinel、所属 L0/L1 分片、图中任务/stream 导出。`word=8256` 要按实际元素宽度和 guard 算偏移，不能仅凭编号断言必定没捕获（也可能是错地址、错参数或完成等待缺失）。
 
 **本轮通过标准是同一张图中两条流任务都存在、三个新 epoch 数据和 guard 正确、只等主流即可保证消费者可读。** 单独 `CaptureEnd=0`、某一条流 `ACTIVE`、或两张单图各自 PASS 都不能替代这个标准。
+
+## 12. 2026-11-11 更新：G3 计时修正与 G4 能力边界
+
+以现场最新回报为准：G3 的 single_hot/uniform/competing、BF16/FP8、direct/multipath、C 转置等六组固定 prepared 捕获、变 epoch 重放均通过。现场还回报 G2 已通过，须保留最终事件实现补丁、流/die 配置，不能只保存最早失败的版本。
+
+此前“graph 比 eager 慢三倍”的结论撤回。旧测试没有 replay 预热、计时前没有跨 rank 对齐；rank0 的验数结束比其他 rank 晚约 27 ms，其他 rank 的计时包含等待。修正为：
+
+```text
+图外 setup → replay warmup → device sync → 所有 rank barrier → device sync
+→ t0 → 连续 50 次 replay → t_enqueue → device sync → t_end
+```
+
+修正后的 single_hot/BF16（row_bytes=8192）graph 各 rank 为 359.3–360.7 µs，另次 eager 为 347.3 µs；约 3.7% 差异仍须同进程边界、交替顺序、独立进程重复确认，不能认定为内核退化。该行宽也不能替代模型 BF16 的 10240。计时前 barrier 在图外，不能每次 replay 插入 barrier 改变测量口径。
+
+G4-2a 同 host、非默认 caller stream、两张分别按 C0/C1 捕获的固定图交替通过，只证明“分别捕获的两种布局可重放”。G4-2b 给 `NPUGraph.update` 传回调失败，只说明该调用不符合接口契约；**不证明所有 task update 都不可用，也不证明已有动态 CCU 更新能力。**
+
+## 13. DS4.1 原生 prefill / CPU splits / 计算图：源码核对
+
+### 13.1 版本与结论范围
+
+本次实际读取服务器 `/home/liuyuanwen/vllm-ascend-dsv41`（另一个 `/home/liuyuanwen/vllm-ascend` 同 HEAD），提交 **`56debc194a42d473f8c456d4850369442d694c8f`**。下面行号均针对该提交；未改这个模型仓库。现场曾报告 `f171c530` 加接入补丁，该对象不在本次可读仓库中，所以不能把当前源码当成现场已安装版本的逐行证明。先执行 §14.1，确认实际加载代码。
+
+**查到的原生 AllToAllV 路径没有“捕获 C0 后自动更新 CPU splits”的实现。** DS4.1 模型代码明确把 A5 packaged cache 的支持范围写为 eager prefill 和 full-graph decode；`requires_uncompiled_fallback` 让 runtime NONE 绕过 compiled model。这不等于任何配置下 prefill 永远不能编译，而是当前已有实现与验证边界。
+
+[官方 DeepSeek-V4.1-Flash 部署文档](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V4.1-Flash.html)（2026-11-11 查询，950DT DP8 的 P/D 示例）也把 P 端配置为 eager、D 端为 FULL_DECODE_ONLY。该在线文档可能继续更新，不代替现场版本核对。
+
+| 源码定位（56debc1） | 实际行为 | 对当前算子的含义 |
+|---|---|---|
+| `models/deepseek_v41/model.py:1612`，模型构造函数 | A5 eager prefill / full-graph decode 说明，设置 `requires_uncompiled_fallback` | “模型支持图”不等于 prefill 的 CPU splits 分支在整图内 |
+| `ops/fused_moe/token_dispatcher.py:615`，All2AllV `_preprocess` | 当前 topk_ids → histogram；本地聚合得到 input_splits；gather 专家计数后聚合得到 output_splits；两者 `.to(cpu, non_blocking=True).numpy()` | 当前路由决定本次 CPU splits；没有跨 replay 更新机制 |
+| 同文件 `:518` / `:566` | dispatch 调用 `async_all_to_all` 后 `handle.wait()`；combine 交换使用 dispatch 保留的两份 splits | combine 不重新 routing；不能沿用上一个 batch 的 splits |
+| `ops/fused_moe/moe_utils.py:63` | 按 `sum(output_split_sizes)` 分配输出，调用 `dist.all_to_all_single(..., input_split_sizes=..., output_split_sizes=..., async_op=True)` | CPU sizes 是本次 host 调用参数，动态输出分配也是 host 工作 |
+| `compilation/acl_graph.py:155` | runtime NONE/模式不匹配时调用 runnable；图按 batch_descriptor 缓存 | 同一 batch shape 不代表同一 C；图键不能充当 routing 布局校验 |
+| `device/hardware_profile.py:338`、`ascend_forward_context.py:336` | A5 使用 CAPACITY_AND_WORLD_SIZE 选择策略；还受 fused 配置、token capacity、EP 等影响 | 必须记录实际 MoECommType，不能从“开启图”推断正在跑 AllToAllV |
+| `token_dispatcher.py:109`、`:232`、`:331` | MC2 dispatcher 调 `npu_moe_distribute_dispatch_v2` / `combine_v2`，传 expert_ids 等 tensor，保留 ep_recv_counts/assist_info 供 combine | 这是另一条通信接口，不是 CPU splits AllToAllV 自动支持动态 routing |
+
+在 rank r 上，`input_splits[j]=C[r,j]`，`output_splits[i]=C[i,r]`；它们是 C 的一行、一列，**不是全局行和/列和向量**。不能仅凭本 rank 的两个向量恢复全局 C。现有“一份 CPU C 派生模型 splits、combine 复用 Cᵀ”的接入仍然有意义。
+
+原生这段源码有 `non_blocking=True`，不应写成“`.numpy()` 一定自动等待 D2H”。应核对现场 CPU 首次读值前的实际完成保证。`num_local_experts>1` 分支还有动态 `repeat_interleave`，另一分支显式 synchronize；不能仅凭函数名推断所有版本的同步行为。这里也不能把 `Work.wait()` 的 host 返回时间直接解释为 device 完成时间。
+
+### 13.2 原生究竟怎样处理动态路由
+
+```text
+原生 prefill AllToAllV（本次查到的 eager 分支）
+  本次 hidden_states → router/topk_ids（device）
+  → 专家计数 + gather（device）
+  → 本次 CPU input/output splits
+  → host 分配输出、提交本次 AllToAllV
+  → 原有 wait/流依赖 → 专家计算 → 用该次交换后的 splits 做 combine
+
+模型采用计算图时
+  先根据运行时模式选择 eager / 分段图 / 整图和 MoE 后端
+  若是 MC2：传当前路由 tensor 给对应设备算子（不是 CPU splits 接口）
+  若是分段执行：CPU 代码只有留在图外并真正每次执行，才会读取新 splits
+  若整图重放：不会重新执行捕获时的 Python _preprocess/CPU planner
+```
+
+分段图一行是可采用的设计原则，**不是已证明现场 DS4.1 A5 自动把 AllToAllV 切出图**。本次源码反而对 runtime NONE 设置了 uncompiled fallback，不能直接照其他模型的 PIECEWISE 设置改上线。
+
+因此我们现在可直接沿用的是原生 eager prefill 的调用时机、同源 counts/splits、combine 元数据复用和依赖顺序。加入 L1 没有改变 C 的数据依赖。固定图需要动态参数这件事，旧 L0 relay 同样存在；此前 eager 能接模型不等于它已经支持动态整图重放。
+
+### 13.3 找到了 task update 的真实例子，但目前用于 attention
+
+`compilation/updatable_graph.py` 提供了 G4 当时缺的 handle 来源：
+
+```text
+捕获 register_task（约 :125）
+  ExternalEvent.wait/reset
+  graph_task_group_begin(current_stream)
+  operation(**capture_kwargs)
+  handle = graph_task_group_end(current_stream)
+  保存 operation / kwargs / provider / handle / event
+
+本轮更新 GraphUpdateTask.apply（约 :72）
+  graph_task_update_begin(update_stream, handle)
+  operation(**本轮 kwargs)
+  graph_task_update_end(update_stream)
+  event.record(update_stream)
+```
+
+`attention/attention_v1.py:687` 等处注册 attention op；`compilation/acl_graph.py:306` 从 **attention metadata** 解析本次参数。根据 enable_enpu，代码有 update→replay 或 replay→update 两种顺序，靠 external event 协调；不能只抄后两行而删除 event，也不能把任意 stream/CCU kernel handle 当作 task-group handle。
+
+这说明可借鉴其“捕获任务组—保存句柄—更新任务—事件放行”框架；**没有证明 `dist.all_to_all_single` 或 `HcommCcuKernelLaunch` 是该更新机制支持的任务类型**。本次检查的 All2AllV dispatcher 没有注册这样的 update task。也不能把新版本整个 UpdatableGraph 类直接复制进现场旧版 torch_npu，须先核对接口及版本。
+
+更关键的是：attention 的许多 host metadata 在 forward 前已知；**第 l 层的 C 依赖该次 forward 内、第 l 层 router 的输出，不能在重放整张模型图前凭上一轮 C 准备好。** 即使 CCU 参数更新探针成功，整模型仍须解决：router 完成 → counts D2H → CPU 规划 → 只放行对应通信任务；其余在途任务不能读旧计划或复用未完成的 buffer。这是与“图外已知 C 的裸算子探针”不同的第二道验证。
+
+## 14. DeepSeek 下一步：先核对现场原生路径，再决定是否需要动态图
+
+### 14.1 V0：无需占卡，固定实际加载源文件和版本
+
+在服务使用的同一个容器、Python、工作目录、PYTHONPATH 下运行，保留输出。不要换成另一个 checkout 的解释器：
+
+```bash
+python3 - <<'PY'
+import hashlib, importlib.util, importlib.metadata, pathlib, subprocess
+for name in ('vllm', 'vllm-ascend', 'torch', 'torch-npu', 'deep-ep'):
+    try:
+        print('VERSION', name, importlib.metadata.version(name))
+    except importlib.metadata.PackageNotFoundError:
+        print('VERSION', name, 'not found under this distribution name')
+spec = importlib.util.find_spec('vllm_ascend')
+root = pathlib.Path(next(iter(spec.submodule_search_locations))).resolve()
+print('LOADED_PACKAGE_ROOT', root)
+p = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                   text=True, capture_output=True)
+print('SOURCE_COMMIT', p.stdout.strip() if p.returncode == 0 else 'not a git checkout')
+files = (
+    'models/deepseek_v41/model.py', 'ascend_forward_context.py',
+    'ops/fused_moe/token_dispatcher.py', 'ops/fused_moe/moe_utils.py',
+    'compilation/acl_graph.py', 'compilation/updatable_graph.py',
+)
+keys = ('requires_uncompiled_fallback', 'class TokenDispatcher',
+        'def _preprocess', 'def async_all_to_all', 'all_to_all_single(',
+        'graph_task_', 'def _updatable_graph_replay', 'cudagraph_runtime_mode',
+        'npu_moe_distribute_dispatch', 'npu_moe_distribute_combine')
+for rel in files:
+    f = root / rel
+    if not f.exists():
+        print('MISSING', f)
+        continue
+    data = f.read_bytes()
+    print('FILE', f, 'SHA256', hashlib.sha256(data).hexdigest())
+    for n, line in enumerate(data.decode(errors='replace').splitlines(), 1):
+        if any(k in line for k in keys):
+            print(f'{n}: {line.strip()}')
+PY
+```
+
+同时保存现场 vLLM/vllm-ascend 的 `git diff`、G2/G3/G4 诊断补丁、实际 wheel/route SHA 和完整启动命令。输出只是索引；请贴命中函数的完整实现，尤其现场的 graph wrapper 和后端选择。若没有 updatable_graph.py，不代表所有旧版 update 不存在，继续检索 `graph_task_group` / `graph_task_update` 在 attention backend 的旧实现。
+
+### 14.2 V1：有卡后只做一轮短 native 路径核对
+
+先维持已通过的启动配置，不为测量直接删除 `--enforce-eager`。在 warmup/profile 后，只记录少量真实 prefill step；诊断不新增逐算子 synchronize。
+
+必须从**两个位置**记录，避免 graph replay 不执行 Python 而漏报：
+
+1. runner/graph wrapper：生效后的 compilation/cudagraph 配置、V1/V2 runner、每步 runtime_mode、batch_descriptor、实际 capture/replay/eager 分支；区分 prefill/decode、target/draft、profile/dummy。
+2. MoE dispatcher/后端选择：层号、step、实际 MoECommType、dispatcher 类、有效/padded tokens、CPU splits 首次读值位置、D2H 提交与已有完成保证；记录 `_preprocess` 在真实多步中是否每步调用。
+
+回报判定：
+
+| 实际结果 | 下一步 |
+|---|---|
+| Prefill runtime NONE + All2AllV | 沿用 eager 动态 C；本次 L1 接入无需等待 G4-2b，继续原有正确性/端到端对照 |
+| Decode full graph + MC2/FUSED_MC2 | 不是原生 CPU splits 先例；不能用其 PASS 证明我们的 host planner 入图 |
+| Prefill 分段图且 All2AllV 在图外 | 保存切分点及调用次数；评估按相同边界放多路径，检查 torch.compile 自定义算子/输出 shape 契约 |
+| Prefill full graph 且确实使用 CPU splits AllToAllV | 提供本次 routing 到 splits 的更新代码、task handle 来源；执行 V2，不能只以服务启动成功为证据 |
+
+不存在通用 CLI 能自动打印以上全部字段。请按现场代码添加只读诊断，保存补丁；不要虚构已经存在的 graph flag。
+
+### 14.3 V2：若要证明原生可更新 splits，做原生最小对照
+
+仅在 V1 有相应实现证据，或明确要验证 SDK 能力时执行；不需要先跑整个大模型。复用当前已通过的八卡 harness 初始化/分配/验数，分别测 native 和 custom，固定通信域、caller stream、缓冲地址、dtype、容量。
+
+- 构造 C0/C1：每个 rank 的发送总量和接收总量保持一致，但多条 peer counts 不同（可用合法的 2×2 增减保持行/列和）。这样 tensor shape 相同仍能检测 splits/offsets 是否真的更新；不能只换 epoch 而 C 不变。
+- 正对照：eager 按 C0/C1 交替每次提交、固定图 G(C0)/G(C1) 分别捕获后交替，均需先 PASS。
+- 一张图：按现场受支持的 task update 实现变更 C0/C1 的 splits/参数；每轮填新 epoch、清输出，再 replay、同步、按本轮布局逐元素验数及 guard。所有 rank 按同一顺序。
+- “只改 CPU list，不调用更新”不是实现方案；若作负对照，只用上述总容量不变矩阵，单独有超时进程运行，预期不能据此得到新布局，不能在失败 communicator 内继续测。
+- 记录捕获/更新/重放时 host wrapper 调用次数，防止实际 eager 执行了一遍而误报图更新 PASS。保留首次 API 返回码和任务组来源。
+
+相同行/列和的 PASS 后，再单独测总接收量变化但不超预分配容量、零流、Cᵀ/BF16；row_bytes 改变使用独立图，未验证前不能在同图直接改 dtype。原生动态 shape 更新是否允许也要独立核实，不能用“大 buffer 容量足够”代替运行时 shape 契约。
+
+### 14.4 V3：借鉴 task-group update，只做 CCU 最小能力探针
+
+这是候选实验，不是现成生产 API。先核对现场 torch_npu 的 group/update API 签名及其支持任务类型；缺正式契约时向 CANN 提供 G1/G3 PASS 与最小复现询证，不猜私有 ABI。
+
+按 §13.3 在捕获时从 `graph_task_group_end` 取得 handle；用现场支持的 external-event 协议更新同一任务组。先从单流、固定 buffer/行宽/通道/kernel 的裸 CCU launch 做 C0/C1 参数更新验证，再考虑完整 `host.execute`。后者含 caller/route 跨流桥，不能默认跨流任务都属于同一个可更新组。host.prepare/规划放在捕获和 task-update 区间之外。
+
+需要 CANN/实测明确：CCU task args 是否复制、参数内存存活到何时、可变字段/大小限制、更新是否允许改变分流 selector/字节数/offset、跨流组如何归属、何时可以安全更新与重放。若某一步失败，保留具体错误，结论限定为该任务/版本/字段，不宣称整个 ACL Graph 不支持动态参数。
+
+V3 正确后仍须验证 §13.3 的**模型内 routing 依赖**：不能用图外预存 C 冒充本次 router 输出。最小模型式链路是“设备生成两种不同 routing → 计数完成 → CPU 可读 → 规划/更新 → 对应通信 → 消费者验数”，必须有明确边界或受支持的等待/放行机制，不能让 CPU 在整图未结束时等整图完成而死锁。
+
+## 15. 本轮交付与执行优先级
+
+1. **现在做 V0**：确认现场版本、原生 AllToAllV 与 MC2、图更新代码是否与本次审阅一致。
+2. **卡空后做 V1 短验证**：优先回答“P 节点实际哪一段入图、哪一段还在 eager”。若仍为 eager prefill，不因 G4 未通阻塞 L1 多路径接入性能测试。
+3. **只有目标确实是动态图时做 V2/V3**：先验证原生接口/CCU 更新契约，再评估模型内 CPU 规划边界；不直接去掉 enforce-eager 长测。
+4. 图性能另作配对：replay 预热和计时前对齐、同 host/plan/地址/行宽、eager/graph 交替、至少三次独立进程，报告全 rank 最大 wall、enqueue、正确性和流依赖；不要重用旧三倍结论。
+
+回报最少字段：`source_commit+patch_sha / loaded_files_sha / wheel+route_sha / configured_mode / runtime_mode / actual_moe_backend / layer+step / C0_C1_hash / splits来源与完成保证 / capture_update_replay次数 / task_handle来源 / first_failed_API / payload+guard / clean_exit`。
+
+本轮只更新文档与源码结论；没有修改模型仓库、生产 CCU 算子或现场诊断脚本，没有在 NPU 上新增验证。**可直接复用的是原生当前 eager 数据流；可研究复用的是 task-group 参数更新框架；尚未证实的是动态 CPU routing 驱动整张模型图内 CCU 任务。**
