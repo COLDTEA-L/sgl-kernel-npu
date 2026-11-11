@@ -2,7 +2,7 @@
 
 面向有卡服务器上的 DeepSeek 执行者。适用分支：`feature/a5-ccu-single-port-l1-alltoall`；接口基线为 `dc66ebb`（L1 资源预算）和 `4c2f742`（L1 启动开关）。本教程按该版本源码核对，不代表下列现场测试已经全部执行。
 
-**第一次使用依次执行 §2–§5；测单算子看 §6；接 DeepSeek-V4.1 prefill 看 §7–§8；回报格式在 §10。** 已安装旧 wheel 的机器仍需更新 wheel：只更新 route 不会更新 Python 开关和 planner binding。
+**第一次使用依次执行 §2–§5；测单算子看 §6；接 DeepSeek-V4.1 prefill 看 §7–§8；回报格式在 §10；service64 dynamic 专项定位看 §11。** 已安装旧 wheel 的机器仍需更新 wheel：只更新 route 不会更新 Python 开关和 planner binding。
 
 ## 1. 算子做什么，当前支持到哪里
 
@@ -454,3 +454,103 @@ bash scripts/run_a5_ccu_peer_plan_alltoall.sh \
 - 基准很快、模型很慢：先对齐 CPU counts 就绪边界、重复规划、分配和等待；不要把微基准 prepared 收益直接乘 80 当端到端收益。
 
 需要进一步定位时阅读：[单口 L1 设计与预算](A5_CCU_SINGLE_PORT_L1_ALLTOALL.md)、[EP8 bottleneck 与计时诊断](A5_CCU_EP8_BOTTLENECK.md)、[ACL Graph 验证边界](A5_CCU_ACL_GRAPH_VALIDATION.md)。本教程完成前，不需要为了 prefill eager 接入额外解决动态入图。
+
+## 11. service64 dynamic 专项定位：从总差落实到具体阶段
+
+### 11.1 为什么需要这个入口
+
+现场三次同配置运行的 native counts_only 为 1889.9 / 312.2 / 1550.6 µs；同一段计数代码差约六倍。相对稳定的第二次运行中，M 的 host_counts_serial 比 D 快 11.7 µs，但 dynamic 比 N 慢 13.2 µs、比 D 慢 4.4 µs。不能据此宣布 L1 planner 是根因，也不能把不同时段的中位数相减当精确分解。
+
+新增 **`--dynamic-stage-audit`**，只用于 benchmark + 外部矩阵 + legacy counts。它自动启用 combination audit，并只跑五个诊断口径：
+
+| 口径 | 用途 |
+|---|---|
+| audit_counts_only | 同样的计数获取，无 payload/规划；N/D/M 标签下是同一段操作 |
+| audit_dynamic_prepared | counts + 固定 prepared 执行；剥离本次规划 |
+| audit_dynamic | counts + 本次规划 + 提交 |
+| audit_dynamic_serial | 上一项加每次完成同步；保留原有诊断对照 |
+| audit_counts_prepare_only | counts + 构造本次计划，不提交 payload |
+
+诊断改为每轮交错上述口径，轮换模式和口径顺序；普通测试的顺序不变。所有块仍有预热、原有 barrier、块尾同步。计数路径仍是原来的 synchronous all_gather API → stack → CPU → tolist/normalize，**不新增 collective、事件或计数阶段同步**。唯一逐次同步仍只在名字明确为 serial 的对照中。
+
+### 11.2 新增分段和含义
+
+每次调用的 `rank_local_audit[].samples[].stages` 保存：
+
+- `counts_alloc`：八个临时接收 tensor 分配。
+- `counts_contiguous`：本地计数输入整理。
+- `counts_collective`：原 `dist.all_gather` 调用的主机边界，不代表设备已经完成。
+- `counts_stack`：打包为 8×8 device tensor 的主机边界。
+- `counts_d2h`：`.cpu()` 的主机边界，**可能等待前置 collective/设备任务**，不能称为 512 字节拷贝的纯带宽耗时。
+- `counts_convert`：CPU tolist 和 normalize。
+- native：`native_splits`、`native_views`、`native_enqueue`、`native_work_wait`。prepared 对照复用 splits，所以没有本次 `native_splits` 字段。
+- custom dynamic：`custom_run`，以及已有 C++ Run 返回的 `cpp_plan_validate_us`、`cpp_submit_us`。前者含 payload 选择、规划和校验；后者是主机 Submit 边界，都不是设备时间。
+- custom prepared：`custom_execute`；prepare-only：`prepare_only`。
+
+上述 span 各有 `_wall_us`、`_cpu_us`；CPU 时间只统计当前 Python 调用线程，不含 SDK 工作线程。wall 大、CPU 小提示等待/被抢占的可能，**不能单凭这对数字区分主机调度和设备等待**。C++ 时间是 custom_run 的子区间，不要重复相加。
+
+汇总器对每个块选择一个最慢 rank，所有分段都取这个 rank，保留每轮记录、单次调用 P50/P95/max；不删除极端值。另输出同一次调用的八 rank `start_host_s` 差值（`start_spread_*`），用于判断到达不齐。该字段只对本实验单宿主、同一单调时钟域有效，不是跨机器时钟同步方案；到达差异可能是前一调用延迟的结果，不能直接当成根因。
+
+计时器会引入额外开销，这些数据用于定位，不作为新的性能成绩。修复后仍需关闭诊断回测 §6。
+
+### 11.3 DeepSeek 现场执行
+
+只拉当前分支的诊断脚本即可，**本次不改生产 C++/route/Python 包接口，不需要重编 wheel 或 route**。若现场脚本有未提交补丁，先保留再合并，不用 reset 覆盖。
+
+```bash
+cd "$A5_REPO"
+git pull --ff-only origin feature/a5-ccu-single-port-l1-alltoall
+python3 -m unittest discover -s tests/python/deepep -p test_a5_ccu_dynamic_stage_audit.py -v
+python3 -m unittest discover -s tests/python/deepep -p test_a5_ccu_combination_audit.py -v
+```
+
+沿用已经成功的八卡单口 L1 policy；不重新选端口，不改流量矩阵，不用 profiler：
+
+```bash
+export A5_ENABLE_L1=1
+export A5_EID_MAX_RELAYS_PER_PEER=0
+export HCCL_BUFFSIZE=64
+export A5_DIAG_MATRIX=/home/l00934901/profiling/sec6_dispatch.json
+# A5_L1_CONFIG 保持上一轮已验证 policy 的完整路径。
+: "${A5_L1_CONFIG:?请设置上一轮已验证的八卡单口L1 policy路径}"
+# 一次短验证：确认八 rank 数值、诊断字段和汇总都通过。
+bash scripts/run_a5_ccu_eid_alltoallv.sh \
+  --suite benchmark --mode all --planner l1_bottleneck --max-actions 56 \
+  --matrix-json "$A5_DIAG_MATRIX" --dtype float8_e4m3fn --width 5120 \
+  --counts-path legacy --dynamic-stage-audit \
+  --warmup 3 --iters 10 --rounds 1 --dynamic-iters 10
+```
+
+取脚本打印的**本次**结果目录，不要用可能指向别人任务的“最新目录”：
+
+```bash
+A5_DIAG_RUN=/替换为本次输出的/a5-ep8-eid.XXXXXX
+python3 scripts/summarize_a5_ccu_combination_audit.py "$A5_DIAG_RUN" \
+  --output-json "$A5_DIAG_RUN/dynamic-stage-summary.json" \
+  > "$A5_DIAG_RUN/dynamic-stage-summary.log"
+tail -1 "$A5_DIAG_RUN/dynamic-stage-summary.log"
+```
+
+短验证须同时有 `EP8_EID_ALL_RANKS_AND_EXIT_PASS`、`EP8_COMBINATION_AUDIT_SUMMARY_PASS` 和 `exit.status=0`。随后**只测 service64 dispatch 两次独立进程**，每次将上面的运行参数改为：
+
+```text
+--warmup 20 --iters 50 --rounds 3 --dynamic-iters 40
+```
+
+每次运行后都单独执行汇总。当前诊断各口径循环次数采用 dynamic-iters，iters 只保留普通 prepared 的参数语义。无需重跑其他八个矩阵或所有计数实现。卡忙则等空闲，不强杀他人任务；若再次出现毫秒级异常，保留，不挑一个“正常块”替换它。
+
+回传两个结果目录中的：`arguments.txt`、`environment.log`、`plans/topology.json`、`dynamic-stage-summary.json`，以及八 rank 的 `results/rank*.json`（需要时再取逐调用数据）。只抄总 N/M 不够定位。
+
+### 11.4 据证据选择修复，不先猜答案
+
+| 观测 | 下一步 |
+|---|---|
+| counts_alloc/convert 的 CPU 时间显著上升 | 定位临时分配/转换；之后用已有 reuse 计数路径做单项对照，不同时改 planner |
+| counts_collective 或 counts_d2h 的 wall 主导，CPU 很小 | 检查到达差、CPU 绑定/限流/共享负载和 HCCL 等待；D2H 包含依赖等待，不直接改成异步就宣称修复 |
+| counts_only 已有 300/1500 µs 两档，N/D/M 同时变 | 单独做纯计数、创建 L0 目录后计数、创建 L0+L1 目录后计数的常驻资源对照；当前 harness 即使 N 标签也已创建 custom 目录，不能充当纯 native 进程 |
+| fixed prepared 的 action 差距还在，而 cpp_plan_validate 很小 | 优先查 native work.wait 与 custom 提交/READY-DONE 的等待边界；不归因 planner |
+| 只有 dynamic 变慢，cpp_plan_validate 稳定增加 | 再优化 C++ 规划或输入转换；检查 custom_run 与其 C++ 子区间之差 |
+| serial 把 counts/action 差异转移到 fence，总差缩小 | 说明等待归属变化；不要将某一段减少当真实加速 |
+| CPU C 就绪的对照继续有收益 | 模型优先复用现有 CPU C，确认没有重复 gather/D2H；仍测 DIAG=0 端到端，不把微基准额外 collective 当模型必付开销 |
+
+这个入口是诊断补丁，不是“dynamic 已修复”。先定位具体慢在哪个区间，再做单项修改、关闭诊断复测，才算解决。

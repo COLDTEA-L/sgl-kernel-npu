@@ -7,7 +7,7 @@ AUDIT_METRICS = ('audit_dynamic', 'audit_dynamic_serial',
 
 class CombinationAudit:
     def __init__(self, read_counts, submit, execute_prepared, prepare_only, synchronize,
-                 clock=time.perf_counter):
+                 clock=time.perf_counter, stages=None):
         self.read_counts = read_counts
         self.submit = submit
         self.execute_prepared = execute_prepared
@@ -15,17 +15,22 @@ class CombinationAudit:
         self.synchronize = synchronize
         self.clock = clock
         self.samples = []
+        self.stages = stages
 
     def reset(self):
         self.samples.clear()
 
     def call(self, metric, mode):
-        if metric not in AUDIT_METRICS:
+        if metric not in AUDIT_METRICS and metric != 'audit_counts_only':
             raise ValueError('unknown combination audit metric: ' + metric)
+        if self.stages is not None:
+            self.stages.reset()
         t0 = self.clock()
         counts = self.read_counts()
         t1 = self.clock()
-        if metric == 'audit_counts_prepare_only':
+        if metric == 'audit_counts_only':
+            pass
+        elif metric == 'audit_counts_prepare_only':
             # Control only: host plan construction, no payload launch.
             self.prepare_only(mode, counts)
         elif metric == 'audit_dynamic_prepared':
@@ -42,3 +47,5 @@ class CombinationAudit:
                                  action_host_us=(t2-t1)*1e6,
                                  fence_host_us=(t3-t2)*1e6,
                                  call_host_us=(t3-t0)*1e6))
+        if self.stages is not None:
+            self.samples[-1].update(start_host_s=t0, stages=self.stages.snapshot())
