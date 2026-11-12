@@ -571,7 +571,7 @@ tail -1 "$A5_DIAG_RUN/dynamic-stage-summary.log"
 
 当前 harness 默认 `A5_CCU_PG_MODE=env`，通过创建前的 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 配置，并非必需显式传 config6。模型可能用通信域级配置覆盖环境。[HcclCommConfig 文档](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910beta1/API/hcclug/hcclcpp_07_0047.html)中创建字段 `hcclOpExpansionMode=6` 表示 CCU_SCHED；查询枚举 `HcclOpExpansionMode` 不是同一个数值编码，不能把查询 raw=5/6 与创建参数直接比较。以现场 9.3 头文件和实际 torch_npu 配置传递实现核对，不能盲改模型全局通信模式。
 
-本次模型命令是 `HCCL_BUFFSIZE=1024`，此前许多 harness 使用 64，二者不是完全相同的资源条件。也要核对通信域是否显式设置 buffer size 覆盖了环境。64 是诊断对照，不承诺是模型最终最优配置。
+本次模型命令是 `HCCL_BUFFSIZE=1024`，此前许多 harness 使用 64，二者不是完全相同的资源条件。也要核对通信域是否显式设置 buffer size 覆盖了环境。2026-11-12 模型对照已发现：全局改为 64 会在进入 custom 路径前触发原生 MoE 的 `Get WinSize failed`。因此不要把单算子用的 64 直接套到完整模型；该失败不能用于判断 L1 acquire 的 buffer 敏感性。后续保留模型已能运行的全局设置，只在确认的 EP group 创建配置处做单变量对照，详见 §12.6。
 
 ### 12.3 DeepSeek 的最小排查顺序
 
@@ -587,7 +587,7 @@ tail -1 "$A5_DIAG_RUN/dynamic-stage-summary.log"
 | 对照 | 保持/改变 | 能说明什么 |
 |---|---|---|
 | 模型原 EP group、L0-only 目录 | 同模型配置；L1=0 且重新生成七条 direct 的目录 | 模型的公共 CCU 建链是否可用；只改 planner 不算此对照 |
-| 模型原 EP group、L0+L1、BUFFSIZE=64 | 与失败模型的 1024 对照，确认实际通信域配置也一致改变 | 是否受 buffer/常驻资源条件影响；不是宣称必为 buffer 根因 |
+| 模型原 EP group、L0+L1、显式 EP buffer 200/512/1024 | 保持全局 HCCL_BUFFSIZE=1024 及其他组配置不变；各档先确认原生 MoE 能通过 | 是否受该 EP 域 buffer/常驻资源条件影响；只改 shell 不能证明改变了该域 |
 | 模型初始化阶段，专用 custom EP8 通信域、完整 L0+L1 目录 | 同物理卡/rank 顺序、同 SDK 配置；原模型 EP group 不变 | 若成功，问题与原通信域配置/状态/初始化顺序有关；仍不能单独证明缓存键冲突 |
 | 最小程序同一 comm，先执行模型用过的 native collective，再 prepare L0+L1 | 与全新 comm 直接 prepare 对照 | 是否由同域的先前通信/懒初始化触发 |
 
@@ -621,3 +621,25 @@ planner 已以 `(rank, die, port)` 为资源累计 TX/RX，并非把每个逻辑
 `hot_share>=0.28 && recv_pressure<=2.0` 是旧样本/路径条件下的经验筛选，不是 L1 的必要条件。可以作为独立保守 A/B 策略，但不能同时改规则、通信域和跨 die，再把结果归给某一项。
 
 uniform 当前路径配置下没有收益，可暂时不在模型启用这类计划；生产通用代价模型应考虑动作数、移动字节数、端口累计负载、共享注入上限和固定完成成本。不能直接按“L1 每搬一行额外多发一行”收费。若要确认 uniform 的性能原因，使用同 handle 的 D/M、逐轮配对、实际端口计数与设备时间线，保持计划和端口策略固定。
+
+
+### 12.6 2026-11-12 排查回报后的执行顺序
+
+本节更新 §12.3，不要求重复已经完成的静态核查。
+
+**已确认：** 每进程单次 Buffer/handle 创建；两个 dtype host 均在 handle 创建之后。28 对 L1 端点反向匹配零差异，每 rank 两个端口分配为 4/3。原模型 EP group 配合重新生成的 L0-only 七通道目录能启动；L0+L1 十四通道目录此前停在 acquire。故阻塞与增加 L1 目录相关，但尚未区分端点处理、资源、通信域状态或初始化时序。尚未进入 dispatch/combine 执行，不应归因两方向 payload 冲突。
+
+**配置证据：** 模型创建路径给 EP group 传入 `hccl_buffer_size=200, group_name=ep`；脚本环境为 `HCCL_BUFFSIZE=1024`。前者是已查到的创建输入，实际 SDK 生效值仍应由现场创建日志/配置传递核对。全局 64 那次在原生 `aclnnMoeDistributeDispatchV4` 的 window 检查失败，没有到达 custom prepare；不能据此断定 EP buffer 200 被覆盖，也不能证明 200 不可用，因为环境可能影响其他通信域。
+
+**已有 harness 能力的边界：** harness 在 config all_gather 之后才申请 L0+L1，证明“此前运行过任意 native collective 就必然失败”不成立。它没有复现模型完整 EP group 配置、原生 MoE 初始化及其他通信域的常驻占用，不能替代模型内专用 custom 通信域实验。
+
+按以下顺序开展，只测初始化及短正确性，不跑端到端性能：
+
+1. **先做 harness 配置对照。** 保持成功样本的 policy、设备顺序、wheel/route、环境和 counts 不变，记录默认创建配置，然后仅在实际 `ProcessGroupHCCL.Options().hccl_config` 中加入 `hccl_buffer_size=200`。在所有 rank 创建进程组前生效；不要用 `HCCL_BUFFSIZE=200` 代替。确认解析该 key 的现场 torch_npu 实现，并记录传入配置。默认/200 使用独立进程配对；若都过，再单独核对 `group_name` 等剩余模型配置，不一次改多个字段。失败则在仍存活时收集各 rank 原生栈和 plog；成功只排除“200 单独足以致错”，不排除模型资源组合。
+2. **复现一次模型原配置并保留现场。** 全局仍为 1024、EP 配置仍为 200，使用原 L0+L1 目录。记录各 rank acquire 前后的时间和创建序号；卡住时在清理前采集所有 worker 的原生线程栈及同期 plog，两次快照间隔约 5–10 秒。py-spy 可补 Python 调用位置，但不能代替 C++ 栈。工具若使用暂停式 attach，记录暂停时间，取栈后恢复进程，避免把诊断干预误认为原始等待原因。
+3. **模型内做专用域对照。** 在所有 rank 一致的模型初始化位置创建一份专用 custom EP8 域，保持 rank 顺序和明确的创建配置；custom 的完整 L0+L1 handle 使用该域，原生 MoE 继续使用原 EP 域。其余配置不改。若通过，优先调查原 EP 域既有状态/资源复用/初始化时序，不直接宣布通道缓存键冲突；若仍挂，继续查模型整体资源和调用时序。专用域没有自动消除全设备资源竞争。
+4. **按证据再做 EP buffer 扫描。** 保持模型全局 1024 及其他域不变，仅改变被测 EP 域显式 buffer 200/512/1024；每档用新进程，先确认能越过原生 MoE 前置阶段。未到达 acquire 的档位标记为前置失败，不参与 acquire 成败对比。不要同时改域、policy、planner 或 combine 开关。
+
+每组回报：实际创建配置、环境、库/manifest/policy 摘要、每 rank 最后阶段、acquire 耗时或采样等待栈、是否完成小数据校验和清理。先取得第一组有区别的对照，再缩小实验范围，无需机械跑完所有档位。
+
+适配层补传 `l1_budget` 是独立的契约完善：当前文件值为 None 时不改变默认预算，也不可能修复发生在 host 创建之前的 acquire 阻塞。后续带非空预算的拓扑必须原样传入。d46cd86 的文档/汇总器更新未改变生产 C++，现场 ac8da373 wheel 未因这一更新重编，本身不是版本错误证据；仍须固定实际加载库的 SHA。
