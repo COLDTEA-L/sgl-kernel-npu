@@ -34,6 +34,19 @@ def load(root):
     return results[0], json.loads((root/'plans'/'topology.json').read_text())
 
 
+def traffic_fields(plan):
+    # relay_bytes is payload assigned to any alternate path, NOT extra traffic
+    # for L1. Keep old report dictionaries readable without guessing extra bytes.
+    original = plan.get('original_network_bytes')
+    transmitted = plan.get('transmitted_network_bytes')
+    extra = 'unknown' if original is None or transmitted is None else transmitted - original
+    if extra != 'unknown' and extra < 0:
+        raise ValueError('transmitted network bytes smaller than original payload')
+    return (f"moved_bytes={plan['relay_bytes']} extra_network_bytes={extra} "
+            f"l1_rows={plan.get('l1_rows', 0)} "
+            f"participant_relay_rows={plan.get('participant_relay_rows', 'unknown')}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('run', type=Path)
@@ -69,7 +82,7 @@ def main():
             print(f"planner={report.get('planner')} actions={len(plan['actions'])} "
                   f"relay_rows={report['relay_rows']} evaluations={plan['candidate_evaluations']} "
                   f"peak_bytes={plan['direct_peak_bytes']}->{plan['planned_link_peak_bytes']} "
-                  f"extra_bytes={plan['relay_bytes']} stop={plan['stop_reason']}")
+                  f"{traffic_fields(plan)} stop={plan['stop_reason']}")
         for metric, values in report['median_us'].items():
             if metric not in baseline['median_us']: raise ValueError('baseline missing timing metric: '+metric)
             comparison = baseline['median_us'][metric]

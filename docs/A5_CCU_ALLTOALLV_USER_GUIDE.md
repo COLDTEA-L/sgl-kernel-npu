@@ -554,3 +554,70 @@ tail -1 "$A5_DIAG_RUN/dynamic-stage-summary.log"
 | CPU C 就绪的对照继续有收益 | 模型优先复用现有 CPU C，确认没有重复 gather/D2H；仍测 DIAG=0 端到端，不把微基准额外 collective 当模型必付开销 |
 
 这个入口是诊断补丁，不是“dynamic 已修复”。先定位具体慢在哪个区间，再做单项修改、关闭诊断复测，才算解决。
+
+## 12. 模型卡在 acquire_channels：先查通信域，另查均匀矩阵性能
+
+### 12.1 已知事实与不能据此下的结论
+
+2026-11-12 现场反馈：同 policy 的单算子正常，模型八 rank 均停在 `HcclChannelAcquire`，每 rank 14 条通道、7 条 L1。此时尚未执行 payload，不能用均匀矩阵的拥塞或 planner 动作数解释启动卡死。`L1_ENDPOINT_BIND graph_status=6` 在显式 EID 路径是允许的缺失查询，不等于 ChannelAcquire 返回错误。
+
+`prepare_ccu_urma_eid_alltoallv()` 先建 handle，之后才创建两个 dtype host。两个 host 共享一个 handle 不等于建了两份 L1 通道；只把 combine planner 改为 L0，没有改变该 handle 在创建阶段申请的目录，不能用此实验排除/证明通道竞争。
+
+[HcclChannelAcquire 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/api_ref/comm_opdev/control_plane_api/comms_domain_resource_mgmt/HcclChannelAcquire.md)确实描述了通信域/引擎/远端/protocol 的复用标识，但不能仅据这一概述断言现场 9.3 实现必然忽略端点差异。当前 harness 在同一 comm 中同时申请 L0 和显式 L1，并校验通道句柄互不重复；现场成功说明这种组合至少在该创建条件下可行。模型此前已经占用“7 direct+42 relay”需要实际创建日志证明，不能由旧版本配置推断。
+
+### 12.2 创建配置必须按真实 API 语义核对
+
+对模型与 harness 记录：实际 wheel/route SHA、已加载 libhccl/libhcomm 路径、通信组名称、group rank 到物理卡顺序、创建时 pg_options.hccl_config、环境变量、第一次 native collective/route prepare 的顺序。comm 指针只能比较同一进程内的身份，不用于跨 rank 判断是同一通信域。
+
+当前 harness 默认 `A5_CCU_PG_MODE=env`，通过创建前的 `HCCL_OP_EXPANSION_MODE=CCU_SCHED` 配置，并非必需显式传 config6。模型可能用通信域级配置覆盖环境。[HcclCommConfig 文档](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910beta1/API/hcclug/hcclcpp_07_0047.html)中创建字段 `hcclOpExpansionMode=6` 表示 CCU_SCHED；查询枚举 `HcclOpExpansionMode` 不是同一个数值编码，不能把查询 raw=5/6 与创建参数直接比较。以现场 9.3 头文件和实际 torch_npu 配置传递实现核对，不能盲改模型全局通信模式。
+
+本次模型命令是 `HCCL_BUFFSIZE=1024`，此前许多 harness 使用 64，二者不是完全相同的资源条件。也要核对通信域是否显式设置 buffer size 覆盖了环境。64 是诊断对照，不承诺是模型最终最优配置。
+
+### 12.3 DeepSeek 的最小排查顺序
+
+先收集现有日志，不重跑完整端到端：
+
+1. 给每次 Buffer/handle 创建记录 engine 实例编号、进程、EP group 名称、组内 rank/size、manifest/topology 摘要和调用位置。确认是否单次创建，是否混入旧 engine，所有 rank 是否使用同 generation。
+2. 找到**真正创建 EP group**的代码，贴其 pg_options；仅看适配层或 shell 环境不够。确认模型工作是否仍在初始化其他 collective 时进入 route prepare。
+3. 核对 `PEER_PATH_DESC`：每条 local/remote EID、物理卡和 die 必须与对端反向一致；policy 的 28 条无向记录展开成 56 条有向路径后统计端口，不能只统计 src 字段。
+4. 若有一次仍存活的卡死现场，抓各 worker 的原生线程栈及对应时段 plog（必要时两次快照）。需要区分 SDK 等待对端、资源/通知等待、进程内锁；不要仅从“无返回”推断复用键冲突。
+
+有卡后在新的进程中逐项改变一个条件，只测初始化/小数据正确性：
+
+| 对照 | 保持/改变 | 能说明什么 |
+|---|---|---|
+| 模型原 EP group、L0-only 目录 | 同模型配置；L1=0 且重新生成七条 direct 的目录 | 模型的公共 CCU 建链是否可用；只改 planner 不算此对照 |
+| 模型原 EP group、L0+L1、BUFFSIZE=64 | 与失败模型的 1024 对照，确认实际通信域配置也一致改变 | 是否受 buffer/常驻资源条件影响；不是宣称必为 buffer 根因 |
+| 模型初始化阶段，专用 custom EP8 通信域、完整 L0+L1 目录 | 同物理卡/rank 顺序、同 SDK 配置；原模型 EP group 不变 | 若成功，问题与原通信域配置/状态/初始化顺序有关；仍不能单独证明缓存键冲突 |
+| 最小程序同一 comm，先执行模型用过的 native collective，再 prepare L0+L1 | 与全新 comm 直接 prepare 对照 | 是否由同域的先前通信/懒初始化触发 |
+
+专用通信域应在全部参与进程一致的初始化位置、按框架要求的创建顺序建立，不能放在某 rank 的首次 MoE 调用里。诊断时让 **custom 的 L0+L1 整体**使用此域，不是只把 L1 channel 挪到另一个 comm；后者需要修改执行器资源契约，不是适配层改一行。独立域会增加资源，需要独立 close/destroy 生命周期，不能保证必然解决资源不足。一次 create 卡死后停止本次测试，不在同一失败域内反复申请。
+
+先定位启动阻塞，再测 uniform。跨 die、均匀门槛、动作数修改不作为本轮启动修复。
+
+### 12.4 uniform 的正确字节账和端口模型
+
+`U[i][j]=3072`，FP8 row_bytes=5120，self 不计入网络：
+
+| 项目 | 字节数 |
+|---|---:|
+| 原跨卡 payload，56×3072×5120 | 880,803,840 |
+| 改走 L1，32704×5120 | 167,444,480 |
+| 留在 L0 | 713,359,360 |
+| 分流后的 L0+L1 payload 合计 | 880,803,840 |
+
+旧汇总器把 `plan.relay_bytes` 显示成 `extra_bytes`，对 L1 有误导。本次改为 `moved_bytes`，并独立打印 `extra_network_bytes=transmitted_network_bytes-original_network_bytes`。仅 L1 时此增量为零；组内 L0 relay 的额外一跳才增加此处的网络字节账。这些字段不是交换网络内部物理 hop-byte 计数，也不表示 L1 不产生控制/协议代价。
+
+因此，不能用 167 MB 除以多出的 49.4 µs 证明“额外字节按 UB 线速发送”。prepared 慢约 10.8% 是实测事实，但原因仍可能是更多数据操作、共享注入资源、端口/交换路径竞争、控制/完成等待等。host_counts 小于 prepared 也不能证明规划为零，两者重叠和计时边界不同。
+
+planner 已以 `(rank, die, port)` 为资源累计 TX/RX，并非把每个逻辑 channel 当独占端口。例如 rank0 两口分配 4/3 条流，每流搬 584 行：L1 两口分别为 2336/1752 行，L0 各边为 2488 行；当前模型已计入这层共享。没有计入的可能是两个口共同的更上层注入瓶颈及协议成本，需要实测而不是再次重复计端口共享。
+
+“同 IO die”是当前执行器的支持边界，不是已证明的硬件永远限制；放开校验不等于支持跨 die。跨 die 需要验证各 die 的 CCU 实例、线程、通道、kernel、内存访问以及完成依赖。未来可用八个口时，也应按真实源 TX/目的 RX 资源分配，不强制“一口只准一条逻辑路径”。
+
+两个 dtype host 顺序执行时，使用同一份物理资源预算，不因 host 数量为二就把每口容量除二；并发执行则需调度器分配不重叠预算或串行化。适配层要同时传 `topology.get('l1_resources')` 和 `topology.get('l1_budget')`，不能只传前者丢掉控制器预算。
+
+### 12.5 收益准入暂不硬编码旧 F2 规则
+
+`hot_share>=0.28 && recv_pressure<=2.0` 是旧样本/路径条件下的经验筛选，不是 L1 的必要条件。可以作为独立保守 A/B 策略，但不能同时改规则、通信域和跨 die，再把结果归给某一项。
+
+uniform 当前路径配置下没有收益，可暂时不在模型启用这类计划；生产通用代价模型应考虑动作数、移动字节数、端口累计负载、共享注入上限和固定完成成本。不能直接按“L1 每搬一行额外多发一行”收费。若要确认 uniform 的性能原因，使用同 handle 的 D/M、逐轮配对、实际端口计数与设备时间线，保持计划和端口策略固定。
