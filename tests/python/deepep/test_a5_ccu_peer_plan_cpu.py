@@ -37,7 +37,10 @@ class PeerPlanTests(unittest.TestCase):
             result = subprocess.run(command + ["--relay-phys", relays],
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            data = json.loads(result.stdout.split(" ", 1)[1])
+            records = [line.split(" ", 1)[1] for line in result.stdout.splitlines()
+                       if line.startswith("PEER_POLICY_VALIDATED ")]
+            self.assertEqual(len(records), 1, result.stdout)
+            data = json.loads(records[0])
             self.assertEqual(data["relay_policy"], {"2,3": list(map(int, relays.split(",")))})
         for options in (["--relay-phys", "2"], ["--relay-phys", "9"],
                         ["--relay-phys", "0,0"], ["--relay-phys", ""],

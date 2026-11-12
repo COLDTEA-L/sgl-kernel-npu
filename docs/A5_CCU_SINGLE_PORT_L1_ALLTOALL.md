@@ -1,5 +1,8 @@
 # 2/4 卡与 EP8：单口 L1 路径接入和现场测试
 
+> 新模型接入优先执行 [rank graph L1 手册](A5_CCU_RANK_GRAPH_L1_MODEL.md)。新 route 默认 `A5_L1_ENDPOINT_MODE=rank_graph`。本页的旧显式单口流程必须设置 `export A5_L1_ENDPOINT_MODE=explicit_single`，并使用单口 policy；不修改系统 rootinfo。
+
+
 首次部署或交接给现场执行者，请先阅读 [完整使用、单算子性能与模型接入教程](A5_CCU_ALLTOALLV_USER_GUIDE.md)。本文保留单口 L1 的详细设计、策略格式和资源预算说明。
 
 分支：`feature/a5-ccu-single-port-l1-alltoall`。基于 EP8 提交优化 `9a378d4` 和两卡 L1 探针 `2dd863a`；不修改旧 9.1 分支。后端仍为 CCU + URMA，L1 网络路径不经过中间 NPU 的 HBM。

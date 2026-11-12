@@ -22,6 +22,7 @@ echo "结果目录：$A5_EID_RUN"
 printf 'EID_LOG_ENV global=%s modules=%s stdout=%s resource_diagnostics=%s hccl_buffsize_mb=%s\n' \
   "$ASCEND_GLOBAL_LOG_LEVEL" "$ASCEND_MODULE_LOG_LEVEL" "$ASCEND_SLOG_PRINT_TO_STDOUT" \
   "${A5_CCU_RESOURCE_DIAGNOSTICS:-0}" "$HCCL_BUFFSIZE" | tee "$A5_EID_RUN/environment.log"
+printf 'L1_ENDPOINT_ENV mode=%s\n' "${A5_L1_ENDPOINT_MODE:-rank_graph}" >> "$A5_EID_RUN/environment.log"
 printf '%s\n' "$@" > "$A5_EID_RUN/arguments.txt"
 git rev-parse HEAD > "$A5_EID_RUN/commit.txt"
 A5_L1_ARGS=()

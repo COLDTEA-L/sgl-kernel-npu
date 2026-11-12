@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "../common/create_trace.h"
+#include "../common/rank_graph_l1.h"
 #include "alltoallv_kernel.h"
 #include "eid_alltoallv_kernel.h"
 #include "route_kernel.h"
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <fstream>
 #include <iomanip>
@@ -1258,6 +1260,16 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             result.eidAllowed[p.dstRank*8+p.srcRank] |= 1u<<k;
         }
     }
+    // Production default: only graph-exposed L1 endpoints. Legacy explicit
+    // single-port experiments require an intentional process-start opt-in.
+    const char *l1ModeEnv = std::getenv("A5_L1_ENDPOINT_MODE");
+    const std::string l1Mode = l1ModeEnv ? l1ModeEnv : "rank_graph";
+    if (l1Mode != "rank_graph" && l1Mode != "explicit_single") return HCCL_E_PARA;
+    for (const auto &p : specs) if (p.l1 && p.l1Graph != (l1Mode == "rank_graph")) {
+        std::fprintf(stderr, "L1_MODE_MISMATCH mode=%s manifest=%s; regenerate catalog\n",
+                     l1Mode.c_str(), p.l1Graph ? "l1_graph" : "l1_single");
+        return HCCL_E_PARA;
+    }
     std::vector<HcclChannelDesc> descs;
     bool haveDie = false;
     for (uint32_t peer = 0; peer < r.rankSize; ++peer) {
@@ -1284,7 +1296,48 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
                 std::fprintf(stderr, "PEER_PLAN_INVALID physical device mapping differs from communicator\n");
                 return HCCL_E_PARA;
             }
-            if (p.relay || p.l1) {
+            if (p.l1Graph) {
+                uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
+                if (ParseEidText("graph_src_eid", p.srcEid.c_str(), src) != HCCL_SUCCESS ||
+                    ParseEidText("graph_dst_eid", p.dstEid.c_str(), dst) != HCCL_SUCCESS) return HCCL_E_PARA;
+                const uint8_t *local = forward ? src : dst;
+                const uint8_t *remote = forward ? dst : src;
+                const PathCandidate *selected = nullptr;
+                for (const auto &candidate : candidates) {
+                    const auto &link = candidate.link;
+                    const auto &a = link.srcEndpointDesc;
+                    const auto &b = link.dstEndpointDesc;
+                    if (!MatchesGraphL1(link, candidate.layer, desc.localEndpoint,
+                                        desc.remoteEndpoint, local, remote)) continue;
+                    // Identical duplicates in graph enumeration are harmless.
+                    if (selected && (std::memcmp(&selected->link.srcEndpointDesc, &a, sizeof(a)) != 0 ||
+                                     std::memcmp(&selected->link.dstEndpointDesc, &b, sizeof(b)) != 0)) {
+                        std::fprintf(stderr, "L1_GRAPH_AMBIGUOUS rank=%u peer=%u\n", r.rank, peer);
+                        return HCCL_E_PARA;
+                    }
+                    selected = &candidate;
+                }
+                if (!selected) {
+                    std::fprintf(stderr, "L1_GRAPH_PATH_UNAVAILABLE rank=%u peer=%u; no explicit EID fallback\n", r.rank, peer);
+                    return HCCL_E_NOT_FOUND;
+                }
+                const auto info = QueryEndpointInfo(comm, r.rank, selected->link.srcEndpointDesc);
+                const uint32_t expectedDie = forward ? p.srcDie : p.dstDie;
+                if (info.dieStatus != HCCL_SUCCESS || info.dieId != expectedDie || info.dieId != die) {
+                    std::fprintf(stderr, "L1_GRAPH_DIE_INVALID rank=%u peer=%u status=%d die=%u expected=%u l0_die=%u\n",
+                                 r.rank, peer, int(info.dieStatus), info.dieId, expectedDie, die);
+                    return info.dieStatus == HCCL_SUCCESS ? HCCL_E_PARA : info.dieStatus;
+                }
+                // Use the WHOLE graph descriptors, with no donor reconstruction,
+                // no address-type normalization and no explicit EID substitution.
+                desc.channelProtocol = selected->link.linkAttr.linkProtocol;
+                desc.localEndpoint = selected->link.srcEndpointDesc;
+                desc.remoteEndpoint = selected->link.dstEndpointDesc;
+                uid = selected->uid;
+                std::printf("L1_GRAPH_MATCH rank=%u peer=%u layer=1 die=%u descriptor=full source=rank_graph local=%s remote=%s\n",
+                            r.rank, peer, die, CommAddrToString(desc.localEndpoint.commAddr).c_str(),
+                            CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
+            } else if (p.relay || p.l1) {
                 uint8_t src[EID_BYTE_NUM] = {}, dst[EID_BYTE_NUM] = {};
                 status = ParseEidText("src_eid", p.srcEid.c_str(), src);
                 if (status != HCCL_SUCCESS) return status;
@@ -1345,7 +1398,7 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
             r.weights.push_back(p.weight); r.routeIndices.push_back(static_cast<uint32_t>(i));
             r.pathUids.push_back(uid);
             std::printf("PEER_PATH_DESC rank=%u peer=%u kind=%s relay_phy=%u weight=%u die=%u local=%s remote=%s\n",
-                r.rank, peer, p.l1 ? "l1_single" : p.relay ? "relay" : "direct", p.relayPhy, p.weight, die,
+                r.rank, peer, p.l1Graph ? "l1_graph" : p.l1 ? "l1_single" : p.relay ? "relay" : "direct", p.relayPhy, p.weight, die,
                 CommAddrToString(desc.localEndpoint.commAddr).c_str(),
                 CommAddrToString(desc.remoteEndpoint.commAddr).c_str());
         }

@@ -177,6 +177,7 @@ HcclResult HcclCcuUrmaCommandBlockWorkerStop(
 // EP8 participant EID channels: no intermediate HBM payload, one route launch.
 int A5CcuEidAllToAllVAbiVersion(void);
 int A5CcuSinglePortL1AbiVersion(void);
+int A5CcuRankGraphL1AbiVersion(void);
 int A5CcuEidV1CompatAbiVersion(void);
 int A5CcuEidPeerResourceAbiVersion(void);
 HcclResult HcclCcuUrmaPeerPlanSynchronize(uint64_t handle);

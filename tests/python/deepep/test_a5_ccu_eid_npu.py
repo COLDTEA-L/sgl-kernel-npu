@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'python/deep_ep/deep_ep'))
 from heuristic_alltoallv import RelayPlanner, normalize_counts, normalize_relays, normalize_l1_budget, gather_routing_counts
 from test_a5_ccu_heuristic_npu import synthetic
-from ccu_l1_config import planner_l1_options, l1_enabled
+from ccu_l1_config import planner_l1_options, l1_enabled, validate_l1_schema
 from a5_ccu_payload_test_utils import (PAYLOAD_DTYPE_NAMES, make_payload, full_payload,
     cat_payload, byte_payload_view, copy_payload_, fill_payload_, equal_payload,
     guards_intact, shifted_payload, clone_payload)
@@ -87,6 +87,8 @@ def main():
     print(f'L1_PLANNER_SWITCH requested={args.requested_planner} effective={args.planner}', flush=True)
     if (args.planner == 'l1_bottleneck') != (l1_resources is not None):
         raise ValueError('l1_bottleneck requires --l1-config topology and vice versa')
+    if l1_resources is not None:
+        validate_l1_schema(topology['l1_policy']['schema'])
     if topology.get('l1_budget') is not None:
         if l1_resources is None: raise ValueError('L1 budget requires L1 paths')
         normalize_l1_budget(topology['l1_budget'])
@@ -113,6 +115,9 @@ def main():
     route = ctypes.CDLL(str(route_path), mode=ctypes.RTLD_GLOBAL)
     if l1_resources is not None and route.A5CcuSinglePortL1AbiVersion()!=1:
         raise RuntimeError("rebuild route: A5CcuSinglePortL1AbiVersion=1 required")
+    if l1_resources is not None and topology['l1_policy']['schema'] == 'a5.rank-graph-l1.v1':
+        if getattr(route, 'A5CcuRankGraphL1AbiVersion', lambda: 0)() != 1:
+            raise RuntimeError('rebuild route: A5CcuRankGraphL1AbiVersion=1 required')
     required_abis = [
         ('A5CcuEidAllToAllVAbiVersion', 1), ('A5CcuEidV1CompatAbiVersion', 1),
         ('A5CcuEidPeerResourceAbiVersion', 1), ('A5CcuEidRegisterProbeAbiVersion', 1),

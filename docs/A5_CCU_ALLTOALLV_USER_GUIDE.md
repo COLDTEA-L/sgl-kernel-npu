@@ -4,13 +4,15 @@
 
 **第一次使用依次执行 §2–§5；测单算子看 §6；接 DeepSeek-V4.1 prefill 看 §7–§8；回报格式在 §10；service64 dynamic 专项定位看 §11。** 已安装旧 wheel 的机器仍需更新 wheel：只更新 route 不会更新 Python 开关和 planner binding。
 
+> **模型 L1 建链兼容路线更新：** 新默认 `A5_L1_ENDPOINT_MODE=rank_graph`，完整流程见 [Rank graph L1 模型接入](A5_CCU_RANK_GRAPH_L1_MODEL.md)。这次由 DeepSeek 先执行该文档 §3–§5，通过后 §6，按 §7 回报。需要重编 route、新 ABI=1，并部署新 Python 代码。下面旧的显式单口流程必须显式设置 `A5_L1_ENDPOINT_MODE=explicit_single`；不要把旧 policy 混入新默认模式。
+
 ## 1. 算子做什么，当前支持到哪里
 
 - 2/4 卡固定 AllToAll：显式策略配置 L0/L1 分流权重，入口见 §9。
 - MoE EP8 AllToAllV：输入全组一致的 8×8 行数矩阵 `C`，`C[i][j]` 是源 rank i 发往目的 rank j 的 **packed payload 行数**，不是原始 HTTP 请求数或未展开的 token 数。
 - 路径包括 L0 direct、组内 NPU 的 L0 fullmesh relay、显式单口 L1 网络路径。都使用 CCU+URMA；relay 不落中间 NPU HBM，源/目的 payload 本身仍在 NPU HBM。
 - 每条流至多一个备用路径：direct + 一个 L0 relay，或 direct + 一条 L1；不会同时给同一条流配置 L0 relay 和 L1。selector `8` 表示 L1，不是第九张卡。
-- L1 只接受实际枚举、与当前机器拓扑匹配的单口 EID，且与 L0 同 IO die。不能保证每张卡八个 L1 物理口都能被本执行器同时使用。聚合 EID 不在本教程范围。
+- L1 只接受实际枚举、与当前机器拓扑匹配的单口 EID，且与 L0 同 IO die。不能保证每张卡八个 L1 物理口都能被本执行器同时使用。这条是旧 explicit_single 模式的限制；新的 rank_graph 模式接受图中聚合端点，见上方专用手册。
 - L1 物理口按源 TX、目的 RX 分别累计负载；多个 peer 使用同一个口不能各自假设独占带宽。`C` 仍为 8×8，控制器可用冻结预算描述外部竞争；本版不是多节点 EP16 实现。
 - 模型接入先采用 **prefill eager**。固定 prepared 图验证成功不等于本次动态 routing 可以直接重放上次图；本教程不要求取消 `--enforce-eager`。
 
@@ -643,3 +645,9 @@ uniform 当前路径配置下没有收益，可暂时不在模型启用这类计
 每组回报：实际创建配置、环境、库/manifest/policy 摘要、每 rank 最后阶段、acquire 耗时或采样等待栈、是否完成小数据校验和清理。先取得第一组有区别的对照，再缩小实验范围，无需机械跑完所有档位。
 
 适配层补传 `l1_budget` 是独立的契约完善：当前文件值为 None 时不改变默认预算，也不可能修复发生在 host 创建之前的 acquire 阻塞。后续带非空预算的拓扑必须原样传入。d46cd86 的文档/汇总器更新未改变生产 C++，现场 ac8da373 wheel 未因这一更新重编，本身不是版本错误证据；仍须固定实际加载库的 SHA。
+
+## 13. Rank graph L1 聚合端点接入
+
+当前以尽快接通模型为目标，执行 [A5_CCU_RANK_GRAPH_L1_MODEL.md](A5_CCU_RANK_GRAPH_L1_MODEL.md) §3–§7。不要继续把首次 MoE 前的 comm init error4 当作 acquire_channels 的同一失败；本轮恢复首次 MoE 初始化位置，保持专用域与buffer设置，只更换 L1端点来源。
+
+新 route 默认只接受 l1_graph。旧显式单口实验须设置 A5_L1_ENDPOINT_MODE=explicit_single；该开关不改变 HCCL 的全局 rank graph、不修改系统拓扑文件，也不是运行中热切换。

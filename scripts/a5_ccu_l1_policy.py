@@ -160,6 +160,9 @@ def validate_config(path, devices, root_path=None):
 
 
 def apply_l1(rows, devices, path, root_path=None):
+    if json.loads(Path(path).read_text()).get('schema') == 'a5.rank-graph-l1.v1':
+        from a5_ccu_graph_l1_policy import apply_graph_l1
+        return apply_graph_l1(rows, devices, path, root_path)
     c = validate_config(path, devices, root_path)
     rows = [dict(r) for r in rows]
     resources = [[] for _ in range(len(devices)**2)]
