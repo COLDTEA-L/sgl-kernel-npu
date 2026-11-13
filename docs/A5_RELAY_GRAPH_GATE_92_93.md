@@ -1,5 +1,9 @@
 # CANN 9.2/9.3：direct + relay 与图内逐算子通知穿刺
 
+单机八卡资源域的多 job 串行调度见
+[路径占用即等待的 host scheduler v1](A5_SERIAL_PATH_SCHEDULER_92_93.md)。
+该模式复用本实验的两 rank 图内节点，通过集中 host 资源预约控制多组通信的并发。
+
 ## 注册兼容修复及目标机回报
 
 `7ee1ce6` 的 `PolicyKernel` 在 CCU 变量地址上执行 `policy += 8; audit += 8`，

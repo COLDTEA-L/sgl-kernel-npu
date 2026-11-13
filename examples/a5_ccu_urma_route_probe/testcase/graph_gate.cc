@@ -6,6 +6,7 @@
 #include "../op_host/utils.h"
 #include <atomic>
 #include <array>
+#include "graph_gate_scheduler.h"
 
 namespace {
 struct Catalog { std::vector<ChannelHandle> channels; };
@@ -75,7 +76,7 @@ void Await(Notice &n, bool callback)
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!Seen(n, callback)) {
         if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("notification timeout");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::microseconds(GatePollUs()));
     }
 }
 struct Node {
@@ -235,6 +236,10 @@ int GateMain(int argc, char **argv)
     }
     std::vector<uint32_t> input(bytes / 4), output(bytes / 4);
     uint64_t *hostStarted = nullptr; CHECK(aclrtMallocHost(reinterpret_cast<void **>(&hostStarted), 8));
+    GateSchedulerClient scheduler(rank);
+    const char *delayEnv = std::getenv("A5_GATE_GRANT_DELAY_MS");
+    const unsigned grantDelay = delayEnv ? std::stoul(delayEnv) : 0;
+    if (grantDelay > 10000) throw std::runtime_error("invalid grant delay");
     for (unsigned it = 0; it < iterations; ++it) {
         for (size_t i = 0; i < input.size(); ++i) input[i] = Value(rank, it, i);
         CHECK(aclrtMemcpy(nodes[0].send, bytes, input.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
@@ -257,12 +262,29 @@ int GateMain(int argc, char **argv)
             CHECK(aclrtSynchronizeStream(observe));
             if (*hostStarted || Seen(n.done, callback)) throw std::runtime_error("gate bypassed");
             std::vector<uint64_t> split(paths, 0);
-            const unsigned selected = fixed >= 0 ? static_cast<unsigned>(fixed) : (it + op) % (paths + 1);
-            if (selected < paths) split[selected] = bytes;
-            else { split[0] = bytes / 2; for (size_t p = 1; p < paths; ++p) split[p] = bytes / (2 * (paths - 1)); }
+            if (scheduler.Enabled()) {
+                // May wait for another collective's ALL-RANK DONE. No ACL calls
+                // in the callback; the device remains parked at its graph gate.
+                split = scheduler.Arrive(it, op, paths, bytes);
+                CHECK(aclrtMemcpyAsync(hostStarted, 8, n.started, 8, ACL_MEMCPY_DEVICE_TO_HOST, observe));
+                CHECK(aclrtSynchronizeStream(observe));
+                if (*hostStarted || Seen(n.done, callback)) throw std::runtime_error("gate bypassed while awaiting scheduler");
+                std::printf("SCHED_GRANTED rank=%u iteration=%u op=%u ticket=%lu\n", rank, it, op,
+                            static_cast<unsigned long>(scheduler.Ticket())); std::fflush(stdout);
+                // Debug contention window only; default 0 in performance runs.
+                std::this_thread::sleep_for(std::chrono::milliseconds(grantDelay));
+            } else {
+                const unsigned selected = fixed >= 0 ? static_cast<unsigned>(fixed) : (it + op) % (paths + 1);
+                if (selected < paths) split[selected] = bytes;
+                else { split[0] = bytes / 2; for (size_t p = 1; p < paths; ++p) split[p] = bytes / (2 * (paths - 1)); }
+            }
             for (size_t p = 0; p < paths; ++p) CHECK(aclrtValueWrite(n.policy + p, split[p], 0, control));
+            const auto releaseAt = std::chrono::steady_clock::now();
             CHECK(aclrtValueWrite(n.gate, 1, 0, control)); // publish payload BEFORE READY
             Await(n.done, callback);
+            const auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - releaseAt).count();
+            if (scheduler.Enabled()) scheduler.Done(it, op, static_cast<uint64_t>(elapsedNs));
             std::vector<uint64_t> audit(paths);
             CHECK(aclrtMemcpyAsync(audit.data(), paths * 8, n.audit, paths * 8, ACL_MEMCPY_DEVICE_TO_HOST, observe));
             CHECK(aclrtMemcpyAsync(output.data(), bytes, n.recv, bytes, ACL_MEMCPY_DEVICE_TO_HOST, observe));

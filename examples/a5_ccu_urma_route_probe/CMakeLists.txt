@@ -89,6 +89,9 @@ target_link_options(a5_graph_gate PRIVATE -Wl,-z,defs)
 option(A5_CCU_BUILD_HOST_TESTS "Test public API host lifecycle without NPU" OFF)
 if(A5_CCU_BUILD_HOST_TESTS)
     enable_testing()
+    add_executable(a5_gate_scheduler_client_cpu
+        ../../tests/cpp/test_a5_gate_scheduler_client.cc)
+    target_compile_options(a5_gate_scheduler_client_cpu PRIVATE -std=c++14 -Wall -Wextra -Werror)
     add_executable(a5_ccu_public_host_test
         ../../tests/cpp/test_a5_ccu_public_api.cpp op_host/public_ccu.cc)
     target_include_directories(a5_ccu_public_host_test SYSTEM PRIVATE ${HCCL_CUSTOM_OPS_INCLUDE_LIST})
