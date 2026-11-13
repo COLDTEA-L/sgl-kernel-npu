@@ -6,6 +6,18 @@
 `feature/a5-ccu-92-93-alltoall` 的 `121e8f4`。保留原 callback 调度封装，
 引入公开 CCU 接口实现和独立两卡 direct smoke。原 9.1 分支保持不变。
 
+## 新增：relay 与图内逐节点控制实验
+
+已新增 `a5_graph_gate`、`scripts/run_a5_relay_graph_gate.py`：支持 direct + 1/2 relay，
+在同一张图内放置两个通信节点，分别执行 ARRIVED/Wait/DONE。
+包含 CALLBACK、pinned D2H 两种通知测试和独立单卡通知 probe；host 发布的路径字节数
+由 CCU 在 gate 放行后动态读取。完整代码链、编译/运行命令和 DeepSeek 验收标准见
+[relay + 图内通知指南](A5_RELAY_GRAPH_GATE_92_93.md)。
+
+该新增 C++ probe 已通过 CANN 9.2 编译/链接/ABI 检查，图内通知 replay、
+实际 relay 和 9.3 执行仍待上卡。下文“待实现”指旧 DeepEP direct gate 测试，
+不要把 standalone C++ probe 与 DeepEP/NPUGraph 的验证状态混用。
+
 ## 状态与范围
 
 这是 92/93 实验开发基线，**不是两卡控制实验已实现或已通过的声明**。

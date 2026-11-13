@@ -78,6 +78,14 @@ install(FILES
 add_subdirectory(op_host)
 add_subdirectory(op_kernel_ccu)
 
+# Standalone relay + two-node graph control probe. No Torch dependency.
+add_executable(a5_graph_gate testcase/graph_gate.cc)
+target_include_directories(a5_graph_gate SYSTEM PRIVATE ${HCCL_CUSTOM_OPS_INCLUDE_LIST})
+target_compile_options(a5_graph_gate PRIVATE -std=c++14 -Wall -Wextra -Werror)
+target_link_directories(a5_graph_gate PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+target_link_libraries(a5_graph_gate PRIVATE a5_ccu_urma_route_probe hccl hcomm c_sec ascendcl ${CMAKE_DL_LIBS})
+target_link_options(a5_graph_gate PRIVATE -Wl,-z,defs)
+
 option(A5_CCU_BUILD_HOST_TESTS "Test public API host lifecycle without NPU" OFF)
 if(A5_CCU_BUILD_HOST_TESTS)
     enable_testing()
