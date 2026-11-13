@@ -14,15 +14,23 @@ import selectors
 import signal
 import socket
 import statistics
+import hashlib
 import subprocess
 import tempfile
 import time
 
 from a5_path_scheduler import JobSpec, Scheduler
+from a5_physical_resources import PhysicalInventory, conflicts
 
 
 def load_config(path):
     config = json.loads(path.read_text())
+    if config.get('resource_mode') != 'physical_link' or config.get('expectation') not in ('shared', 'disjoint'):
+        raise ValueError('require resource_mode=physical_link and expectation=shared|disjoint; card-sharing configs are obsolete')
+    def resolve(name):
+        value = Path(config[name])
+        return value if value.is_absolute() else path.parent / value
+    inventory = PhysicalInventory(resolve('topology_json'), resolve('provenance_json'))
     managed = config.get('managed_devices')
     if (not isinstance(managed, list) or len(managed) != 8 or
             any(type(d) is not int or d < 0 for d in managed) or len(set(managed)) != 8):
@@ -44,8 +52,8 @@ def load_config(path):
                 len(set(devices + relays)) != len(devices + relays) or
                 not set(devices + relays) <= set(managed)):
             raise ValueError(f'{name}: invalid endpoint/relay cards')
-        # Current workers initialize one runtime context/process per physical endpoint.
-        # Do not silently turn shared endpoints into an untested multi-process setup.
+        # A card may be another job's relay; this is required to share a two-hop
+        # physical link while keeping the worker endpoint sets disjoint.
         if endpoints & set(devices):
             raise ValueError('worker endpoint cards must be disjoint across jobs in v1')
         endpoints.update(devices)
@@ -60,17 +68,26 @@ def load_config(path):
             raise ValueError(f'{name}: manifest endpoints/relay order differ from configuration')
         j['relay_manifest'] = str(manifest)
         policy = j.get('policy', 'mixed')
-        if policy not in ['direct', 'mixed', 'cycle'] + [f'relay{i}' for i in range(len(relays))]:
-            raise ValueError(f'{name}: invalid policy')
+        if policy not in ['mixed'] + [f'relay{i}' for i in range(len(relays))]:
+            raise ValueError(f'{name}: physical benchmark uses fixed relay-only policy')
         j['policy'] = policy
-        extra = j.get('extra_resources', [])
-        if not isinstance(extra, list) or any(not isinstance(r, str) or not r or len(r) > 128 for r in extra):
-            raise ValueError('extra_resources must be a list of nonempty resource names')
-        # Conservative card contention domains, including metadata-only paths.
-        # Same namespace for endpoints and relays deliberately catches both roles.
-        j['resources'] = sorted({f'card:{d}' for d in devices + relays} |
-                                {f'configured:{r}' for r in extra})
+        if j.get('extra_resources'):
+            raise ValueError('physical benchmark does not accept manually invented contention resources')
+        j['path_links'] = [inventory.validate(row) for row in rows]
+        if len({int(r['src_die']) for r in rows}) != 1 or len({int(r['dst_die']) for r in rows}) != 1:
+            raise ValueError('relay catalog spans endpoint dies')
+        # Every catalog path exchanges metadata, even when its payload is zero.
+        j['resources'] = sorted({link for links in j['path_links'] for link in links})
+        indices = range(len(relays)) if policy == 'mixed' else [int(policy[5:])]
+        j['payload_resources'] = sorted({link for i in indices for link in j['path_links'][i]})
+        j['relay_only'] = True
         result.append(j)
+    shared = conflicts(result)
+    if config['expectation'] == 'shared' and not shared:
+        raise ValueError('no shared physical PAYLOAD link; sharing a relay card is insufficient')
+    if config['expectation'] == 'disjoint' and any(set(a['resources']) & set(b['resources'])
+                                                  for i, a in enumerate(result) for b in result[i + 1:]):
+        raise ValueError('disjoint config has overlapping physical catalog links')
     return result
 
 
@@ -189,6 +206,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--binary', type=Path, required=True)
     p.add_argument('--config', type=Path, required=True)
+    p.add_argument('--only-job', help='run one job from the validated physical plan for isolated timing/HCCN')
     p.add_argument('--output-root', type=Path, required=True)
     p.add_argument('--schedule', choices=['serialize', 'uncontrolled'], default='serialize')
     p.add_argument('--mode', choices=['GRAPH', 'EAGER'], default='GRAPH')
@@ -204,6 +222,12 @@ def main():
     a = p.parse_args()
     try:
         jobs = load_config(a.config.resolve())
+        if a.only_job:
+            jobs = [j for j in jobs if j['name'] == a.only_job]
+            if not jobs:
+                raise ValueError('--only-job not found in configuration')
+            if a.require_blocked:
+                raise ValueError('--only-job cannot require a conflict')
         if not a.binary.is_file():
             raise ValueError('binary must exist')
         if (a.bytes < 1024 or a.bytes > 1 << 28 or a.bytes % 1024 or a.iters < 4 or
@@ -218,7 +242,22 @@ def main():
     out = Path(tempfile.mkdtemp(prefix='a5-serial-scheduler.', dir=a.output_root.resolve()))
     (out / 'config.json').write_text(json.dumps(jobs, indent=2))
     (out / 'arguments.json').write_text(json.dumps({k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
-    specs = [JobSpec(j['name'], 2, frozenset(j['resources']), len(j['relay_phys']) + 1, a.bytes, j['policy']) for j in jobs]
+    specs = [JobSpec(j['name'], 2, frozenset(j['resources']), len(j['relay_phys']), a.bytes, j['policy'], True) for j in jobs]
+    physical = dict(resource_mode='physical_link', direction='both (two-rank bidirectional exchange)',
+                    shared_payload_links=conflicts(jobs),
+                    paths=[dict(job=j['name'], devices=j['devices'], relay_phys=j['relay_phys'],
+                                path_links=j['path_links'], payload_resources=j['payload_resources']) for j in jobs])
+    source = json.loads(a.config.read_text())
+    (out / 'source_config.json').write_text(json.dumps(source, indent=2))
+    for field, name in [('topology_json', 'topology.json'), ('provenance_json', 'provenance.json')]:
+        path = Path(source[field])
+        if not path.is_absolute():
+            path = a.config.resolve().parent / path
+        content = path.read_bytes()
+        (out / name).write_bytes(content)
+        physical[field + '_sha256'] = hashlib.sha256(content).hexdigest()
+    (out / 'physical_plan.json').write_text(json.dumps(physical, indent=2))
+    print(json.dumps(physical, indent=2), flush=True)
     print(f'RESULT_DIR={out}', flush=True)
     children, logs = [], []
     # Short AF_UNIX pathname, user-private directory, separate from potentially long log paths.
@@ -234,6 +273,8 @@ def main():
             for j in jobs:
                 jobout = out / j['name']
                 jobout.mkdir()
+                manifest = jobout / 'relay_manifest.tsv'
+                manifest.write_bytes(Path(j['relay_manifest']).read_bytes())
                 env = os.environ.copy()
                 for name in list(env):
                     if name.startswith(('A5_CCU_SYNTHETIC_', 'A5_CCU_DESC_', 'A5_CCU_PATH_', 'A5_CCU_SOURCE_ROUTE_', 'A5_GATE_')) or name in ('LD_PRELOAD', 'HCCL_ALGO', 'A5_CCU_CHANNEL_SYNC_MODE'):
@@ -241,13 +282,14 @@ def main():
                 env.update(ASCEND_RT_VISIBLE_DEVICES=','.join(map(str, j['devices'])),
                            HCCL_OP_EXPANSION_MODE='CCU_SCHED', A5_GATE_SCHED_SOCKET=str(endpoint),
                            A5_GATE_SCHED_JOB=j['name'], A5_GATE_POLL_US=str(a.poll_us),
+                           A5_GATE_RELAY_ONLY='1',
                            A5_GATE_SCHED_TIMEOUT_S=str(max(1, int(a.timeout) + 1)),
                            A5_GATE_GRANT_DELAY_MS=str(a.grant_delay_ms))
                 for rank in range(2):
                     log = (jobout / f'rank{rank}.log').open('w')
                     logs.append(log)
                     command = [str(a.binary.resolve()), str(rank), str(rank), str(jobout / 'bootstrap'),
-                               str(a.bytes), str(a.iters), j['relay_manifest'], a.notify, a.mode, '0']
+                               str(a.bytes), str(a.iters), str(manifest), a.notify, a.mode, '0']
                     children.append(subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
             while any(c.poll() is None for c in children):
                 if any(c.poll() not in (None, 0) for c in children):

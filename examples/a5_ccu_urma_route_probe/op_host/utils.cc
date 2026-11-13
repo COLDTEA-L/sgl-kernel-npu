@@ -816,8 +816,9 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     }
     const bool explicitPlan = plan != nullptr;
     if (explicitPlan) {
-        if (!plan->includeDiscoveredRoute || plan->relayManifest.empty() ||
-            plan->weights.size() < 2U || plan->weights.size() > MAX_EXPLICIT_PATHS ||
+        if (plan->relayManifest.empty() ||
+            plan->weights.size() < (plan->includeDiscoveredRoute ? 2U : 1U) ||
+            plan->weights.size() > MAX_EXPLICIT_PATHS ||
             std::any_of(plan->weights.begin(), plan->weights.end(),
                         [](uint32_t value) { return value == 0U; })) {
             std::fprintf(stderr, "[A5 CCU URMA] invalid explicit multipath plan\n");
@@ -851,7 +852,8 @@ HcclResult GetRouteResources(HcclComm comm, aclrtStream stream,
     }
     std::string routeKey = explicitPlan ?
         std::string("explicit_plan:") + plan->planName + ":direct=" +
-            std::to_string(plan->discoveredRoute) + ":manifest=" + plan->relayManifest :
+            std::to_string(plan->discoveredRoute) + ":include_direct=" +
+            std::to_string(plan->includeDiscoveredRoute) + ":manifest=" + plan->relayManifest :
         (syntheticManifestValue != nullptr && syntheticManifestValue[0] != '\0' ?
         std::string("synthetic_manifest:") + syntheticManifestValue :
         (manifestValue != nullptr && manifestValue[0] != '\0' ?

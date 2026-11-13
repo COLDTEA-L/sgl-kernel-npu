@@ -57,8 +57,9 @@ HcclResult GetPeerPlanResources(HcclComm comm, aclrtStream stream,
     EidRegisterStage eidStage = EidRegisterStage::FULL);
 
 // Normalized two-rank control-plane request used by the production-facing
-// explicit multipath API.  The discovered route is always channel 0 and the
-// manifest contributes channels 1..N in file order.  Keeping the request
+// explicit multipath API. If enabled, the discovered route is channel 0;
+// otherwise channels are relay-only. Manifest rows keep their file order.
+// Keeping the request
 // independent of environment variables lets a future host controller install
 // the same plan directly without changing the CCU data-plane kernel.
 struct RoutePlanRequest {

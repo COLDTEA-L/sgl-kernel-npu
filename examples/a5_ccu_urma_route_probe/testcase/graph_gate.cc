@@ -160,13 +160,15 @@ int GateMain(int argc, char **argv)
     aclrtStream main = nullptr, control = nullptr, observe = nullptr;
     CHECK(aclrtCreateStream(&main)); CHECK(aclrtCreateStream(&control)); CHECK(aclrtCreateStream(&observe));
     a5_ccu_urma_probe::RoutePlanRequest plan;
-    plan.includeDiscoveredRoute = true; plan.relayManifest = manifest;
-    plan.weights = {1};
+    const bool relayOnly = std::getenv("A5_GATE_RELAY_ONLY") && std::string(std::getenv("A5_GATE_RELAY_ONLY")) == "1";
+    plan.includeDiscoveredRoute = !relayOnly; plan.relayManifest = manifest;
+    if (!relayOnly) plan.weights = {1};
     // Count manifest rows; the production parser validates schema/EIDs/duplicates.
     { std::ifstream f(manifest); std::string line;
       if (!std::getline(f, line)) throw std::runtime_error("missing relay manifest");
       while (std::getline(f, line)) if (!line.empty() && line[0] != '#') plan.weights.push_back(1); }
-    if (plan.weights.size() < 2 || plan.weights.size() > 3) throw std::runtime_error("requires 1 or 2 explicit relays");
+    const size_t relayCount = plan.weights.size() - (relayOnly ? 0 : 1);
+    if (relayCount < 1 || relayCount > 2) throw std::runtime_error("requires 1 or 2 explicit relays");
     a5_ccu_urma_probe::RouteResources resources;
     CHECK(a5_ccu_urma_probe::GetRouteResources(comm, main,
         a5_ccu_urma_probe::RouteKernelKind::ROUTE_WRITE, &resources, &plan));
@@ -276,6 +278,7 @@ int GateMain(int argc, char **argv)
             } else {
                 const unsigned selected = fixed >= 0 ? static_cast<unsigned>(fixed) : (it + op) % (paths + 1);
                 if (selected < paths) split[selected] = bytes;
+                else if (relayOnly) { for (auto &value : split) value = bytes / paths; }
                 else { split[0] = bytes / 2; for (size_t p = 1; p < paths; ++p) split[p] = bytes / (2 * (paths - 1)); }
             }
             for (size_t p = 0; p < paths; ++p) CHECK(aclrtValueWrite(n.policy + p, split[p], 0, control));

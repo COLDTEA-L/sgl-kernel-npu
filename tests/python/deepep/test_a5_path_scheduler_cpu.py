@@ -1,6 +1,7 @@
 """Admission invariants and real Unix-socket launcher tests, without a device."""
 import json
 import os
+import hashlib
 from pathlib import Path
 import socket
 import subprocess
@@ -165,15 +166,41 @@ s.close()
 
 
 class AdapterTests(unittest.TestCase):
-    def config(self, root, shared=True):
+    def config(self, root, shared=True, same_relay=False, custom_b=None):
+        topology = dict(version='2.0', peer_count=8, peer_list=[dict(local_id=i) for i in range(8)], edge_list=[])
+        bindings = []
+        def eid(device, peer):
+            return '2001:0db8:0000:0000:0000:0000:0000:%04x' % (device * 16 + peer + 1)
+        for a in range(8):
+            for b in range(8):
+                if a != b:
+                    bindings.append(dict(device=a, die=0, port=b, eid=eid(a, b), net_layer=0,
+                                         net_instance_id='fixture', verified=True,
+                                         plane_id='0', name='udmac0', index=b))
+                if a < b:
+                    topology['edge_list'].append(dict(net_layer=0, protocols=['UB_CTP'], link_type='PEER2PEER',
+                        local_a=a, local_b=b, local_a_ports=[f'0/{b}'], local_b_ports=[f'0/{a}']))
+        topology['edge_count'] = len(topology['edge_list'])
+        (root / 'topology.json').write_text(json.dumps(topology))
+        (root / 'provenance.json').write_text(json.dumps(dict(source='rootinfo+atlas+live_hccn',
+            topology_json_sha256=hashlib.sha256((root / 'topology.json').read_bytes()).hexdigest(), bindings=bindings)))
         jobs = []
-        for name, devices, relays in [('a', [2, 3], [0, 1]),
-                                     ('b', [4, 5], [0, 1] if shared else [6, 7])]:
+        b_devices, b_relays = custom_b or ([0, 1] if shared and not same_relay else [4, 5],
+                                         [0, 1] if same_relay else ([2, 3] if shared else [6, 7]))
+        for name, devices, relays in [('a', [2, 3], [0, 1]), ('b', b_devices, b_relays)]:
             manifest = root / (name + '.tsv')
-            manifest.write_text('relay_phy\tsrc_phy\tdst_phy\n' + ''.join(f'{r}\t{devices[0]}\t{devices[1]}\n' for r in relays))
+            from resolve_a5_explicit_multirelay_eids import FIELDS
+            rows = []
+            for relay in relays:
+                rows.append(dict(route_id=1000 + relay, src_phy=devices[0], dst_phy=devices[1], relay_phy=relay,
+                    src_die=0, dst_die=0, relay_die=0, src_port=relay, dst_port=relay,
+                    relay_port_from_src=devices[0], relay_port_to_dst=devices[1],
+                    src_eid=eid(devices[0], relay), dst_eid=eid(devices[1], relay)))
+            manifest.write_text('\t'.join(FIELDS) + '\n' + ''.join('\t'.join(str(row.get(k, 0)) for k in FIELDS) + '\n' for row in rows))
             jobs.append(dict(name=name, devices=devices, relay_phys=relays, relay_manifest=manifest.name))
         path = root / 'config.json'
-        path.write_text(json.dumps(dict(managed_devices=list(range(8)), jobs=jobs)))
+        path.write_text(json.dumps(dict(resource_mode='physical_link', expectation='shared' if shared else 'disjoint',
+            topology_json='topology.json', provenance_json='provenance.json', managed_devices=list(range(8)), jobs=jobs)))
         return path
 
     def test_manifest_and_scope_validation(self):
@@ -181,7 +208,8 @@ class AdapterTests(unittest.TestCase):
             root = Path(temp)
             path = self.config(root)
             jobs = load_config(path)
-            self.assertEqual(set(jobs[0]['resources']) & set(jobs[1]['resources']), {'card:0', 'card:1'})
+            self.assertEqual(len(set(jobs[0]['resources']) & set(jobs[1]['resources'])), 4)
+            self.assertTrue(all(r.startswith('link:') for r in jobs[0]['resources']))
             config = json.loads(path.read_text())
             config['jobs'][0]['relay_phys'] = [1, 0]
             path.write_text(json.dumps(config))
@@ -206,6 +234,82 @@ class AdapterTests(unittest.TestCase):
             finally:
                 client.close()
                 server.close()
+
+    def test_shared_relay_card_is_not_a_physical_link_conflict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = self.config(Path(temp), same_relay=True)
+            with self.assertRaisesRegex(ValueError, 'no shared physical PAYLOAD link'):
+                load_config(path)
+            config = json.loads(path.read_text())
+            config['expectation'] = 'disjoint'
+            path.write_text(json.dumps(config))
+            jobs = load_config(path)
+            self.assertFalse(set(jobs[0]['resources']) & set(jobs[1]['resources']))
+
+    def test_manifest_port_not_bound_to_eid_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = self.config(root)
+            import csv
+            with (root / 'a.tsv').open() as f:
+                reader = csv.DictReader(f, delimiter='\t')
+                rows, fields = list(reader), reader.fieldnames
+            rows[0]['src_port'] = '7'
+            with (root / 'a.tsv').open('w') as f:
+                writer = csv.DictWriter(f, fieldnames=fields, delimiter='\t')
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, 'uniquely select'):
+                load_config(path)
+
+    def test_ambiguous_eid_port_and_topology_mismatch_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = self.config(root)
+            provenance = json.loads((root / 'provenance.json').read_text())
+            clone = dict(next(b for b in provenance['bindings'] if b['device'] == 2 and b['port'] == 0))
+            clone['port'] = 7
+            provenance['bindings'].append(clone)
+            (root / 'provenance.json').write_text(json.dumps(provenance))
+            with self.assertRaisesRegex(ValueError, 'uniquely select'):
+                load_config(path)
+            (root / 'topology.json').write_text((root / 'topology.json').read_text() + '\n')
+            with self.assertRaisesRegex(ValueError, 'provenance'):
+                load_config(path)
+
+    def test_metadata_overlap_does_not_count_as_payload_conflict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = self.config(Path(temp), custom_b=([0, 4], [2, 5]))
+            config = json.loads(path.read_text())
+            # Catalogs share 2-0, but payloads via relay1 use disjoint hops.
+            for job in config['jobs']:
+                job['policy'] = 'relay1'
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, 'no shared physical PAYLOAD link'):
+                load_config(path)
+
+    def test_manual_resource_name_cannot_fabricate_conflict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = self.config(Path(temp))
+            config = json.loads(path.read_text())
+            config['jobs'][0]['extra_resources'] = ['invented-conflict']
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, 'invented'):
+                load_config(path)
+
+    def test_topology_based_catalog_selection(self):
+        from a5_physical_resources import PhysicalInventory
+        from prepare_a5_physical_conflict import catalogs, choose
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.config(root)
+            inv = PhysicalInventory(root / 'topology.json', root / 'provenance.json')
+            a = catalogs(inv.provenance['bindings'], inv.edges, [2, 3], [0, 1], 0, inv)
+            b = catalogs(inv.provenance['bindings'], inv.edges, [0, 1], [2, 3], 0, inv)
+            self.assertEqual(len(choose(a, b, True)[2]), 4)
+            c = catalogs(inv.provenance['bindings'], inv.edges, [4, 5], [0, 1], 0, inv)
+            with self.assertRaisesRegex(ValueError, 'no requested physical-link'):
+                choose(a, c, True)
 
     def test_end_to_end_unix_socket_scheduler(self):
         for mode, shared in [('serialize', True), ('serialize', False), ('uncontrolled', True)]:
@@ -252,6 +356,23 @@ class AdapterTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('without all collective DONE', result.stderr)
+
+    def test_isolated_job_retains_same_relay_split(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / 'worker'
+            binary.write_text(FAKE_WORKER)
+            binary.chmod(0o755)
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/run_a5_serial_scheduler.py'),
+                '--binary', str(binary), '--config', str(self.config(root)), '--only-job', 'a',
+                '--output-root', str(root / 'out'), '--iters', '4', '--warmup-iters', '1'],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = next((root / 'out').iterdir())
+            report = json.loads((out / 'summary.json').read_text())
+            self.assertEqual(report['measured_collectives'], 6)
+            grants = [e for e in map(json.loads, (out / 'events.jsonl').read_text().splitlines()) if e['event'] == 'GRANT']
+            self.assertTrue(all(e['split'] == [2097152, 2097152] for e in grants))
 
     def test_nonzero_exit_after_pass_markers_is_failure(self):
         with tempfile.TemporaryDirectory() as temp:

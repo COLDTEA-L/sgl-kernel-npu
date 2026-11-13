@@ -1,224 +1,183 @@
-# A5 单机 8 卡：路径占用即等待的 host scheduler v1
+# A5：物理链路冲突下的 host 串行调度
 
 分支：`feature/a5-ccu-valuewait-callback-puncture-92-93`。
 
-本版只实现一个决策：**所需资源全部空闲才放行，否则保持 gate 关闭，等待占用者的全部 rank DONE**。
-没有耗时膨胀预测、自动改走 direct、抢占、运行中换路或资源超时自动释放。
-资源不相交的通信允许并行，不是整机全局串行。
+本次修正替代 `57ddd97` 的“共享 relay 卡就加锁”实验。旧例中 2→0→3 和 4→0→5 没有共同物理链路，不能用来验证物理链路冲突。本版使用两个并发的两 rank 通信 job，显式构造共同的 UB_CTP 链路，对照 uncontrolled 与 serialize。
 
-## 范围与验证状态
+## 设计与范围
 
-- 一个 Python host scheduler 管理显式配置的单机八卡资源域；各 rank 是独立 C++ worker。
-- 复用已有通过上卡测试的 `a5_graph_gate` 两 rank 执行入口。每个 job 是独立 communicator、独立图，图中有两个有数据依赖的通信节点。
-- 多个 job 可以并发到达，因此能制造真实的跨图资源冲突。原先同一 stream 内串行的两个节点本身不能制造并发冲突。
-- shared 示例有三组通信：2/3、4/5、6/7，共享 relay 0/1，实际涉及八卡。所有卡号均由 JSON 显式配置，manifest 必须与之匹配。
-- **这是八卡资源域中多个两 rank 通信的调度，不是一个八 rank AllToAllV 的 device 实现。** scheduler 核心支持任意参与 rank 数，CPU 测试覆盖八 rank 到齐及完成聚合；八 rank AllToAllV/DeepEP/NPUGraph adapter 尚未接入。
-- CANN 9.2 容器已完成新 C++ worker `-Wall -Wextra -Werror` 编译、严格链接、ABI 加载；原 host ctest 1/1、原 launcher CPU 测试 4/4、新 scheduler CPU 测试 14/14 通过。新 CPU 测试含真实 Unix socket 和多进程假 worker，不是 NPU 性能证据。
-- 当前容器无 NPU 映射，**本版调度器尚未上卡，不声明性能提升**。已有 9.3 gate/relay 通过报告不能代替新多 job 调度实验。
-
-## 资源和调度语义
-
-`JobSpec.resources` 默认是该 job 两张 endpoint 和所有 relay 的 `card:<physical_id>` 集合。
-同一卡在 endpoint/relay 两种角色下使用同一个资源名。资源粒度故意保守：共享 relay 卡就串行，即使可能走不同端口。
-不是从卡号自动推断真实端口拓扑，也不是卡与卡邻接矩阵。
-
-当前 `PolicyKernel` 会在所有 catalog channels 上交换 metadata，零字节路径只跳过 payload。
-因此 **direct policy 仍预约整个已建链 catalog，包括 relay 卡**，不能将 direct policy 当作完全不使用 relay 的资源基线。
-以后修改 metadata 协议或增加独立 direct catalog 后，才能安全缩减锁集合。
-
-`extra_resources` 可给 job 增加共享资源名，例如两个 job 都设置 `["fabric-port-X"]`，会附加相同的 `configured:fabric-port-X` 锁。
-它们只能增加默认锁，不能删掉默认锁。不同卡仍可能共享某个交换/链路资源，需用实际拓扑补充；不把默认卡集合宣称为完整物理冲突模型。
-disjoint 示例的含义是“配置的资源集合不相交”，是否物理完全无争用还需 HCCN/拓扑证据。
-
-只记录当前 launcher 管理的 workload；其他用户、进程的通信不在账上，建议测试时记录背景流量。
-v1 不允许多个 worker job 复用 endpoint 卡，以免引入未经验证的同卡多进程 runtime 行为；relay 可以共享。
-
-状态流：
+默认卡位建议如下，最终必须通过本机拓扑解析，不预设具体 die/port：
 
 ```text
-ARRIVING：聚合同一 (job, iteration, op) 的 ARRIVED，不占用资源
-   ↓ 所有 rank 到齐
-WAITING：所需资源有冲突则留在队列
-   ↓ 一次性预约全部资源；生成唯一 ticket；发送各 rank 的 GO
-RUNNING：预约期间包含发送 GO、写 policy、READY 和通信执行
-   ↓ 聚合全部 rank 的 DONE（匹配同一个 ticket）
-DONE：释放全部资源，重新调度等待队列
+job A：通信卡 2、3，relay 0、1
+       2 ↔ 0 ↔ 3
+       2 ↔ 1 ↔ 3
+
+job B：通信卡 0、1，relay 2、3
+       0 ↔ 2 ↔ 1
+       0 ↔ 3 ↔ 1
+
+目标共同链路：2↔0、3↔0、2↔1、3↔1 中至少一条
+必须是相同的卡/die/port 两端，不只是相同的两张卡。
 ```
 
-按就绪顺序扫描。后来的不相交任务可以越过阻塞任务；与较早阻塞任务共享资源的任务不能插队。
-等待者不部分占锁，避免多资源“先占一半再等另一半”的死锁。
-重复 ARRIVED、重复/旧 ticket DONE、越序消息、提前断连或进程失败均使本次实验失败，不自动解锁继续运行。
-只有实际全部 DONE 才释放；没有基于预计耗时或超时的资源释放。
+通信是双向的，因此使用同一物理链路的两个方向都会有数据流量；不能把单向 A→B 与 B→A 自动视为同向带宽冲突。本版两 rank 双向交换会同时覆盖两方向。
 
-## 调用链与数据流
+每张卡只有一个 endpoint worker；它可以同时充当另一个 job 的 relay。这是有意构造共同物理 hop，需要在目标设备验证同时建链与执行是否可用。
+单机管理域仍为八卡，最小冲突实验实际使用其中四张，卡号可显式修改。
+两 job 各一张图，每张图有两个按序执行的通信节点；并发来自跨 job。
+
+为了明确物理路径，本版 benchmark 只创建显式 relay catalog，不创建自动发现的 direct channel。
+默认 mixed 是两条 relay 各一半 payload，仍是多路径通信；支持固定 relay0/relay1，暂不在物理 benchmark 中使用 direct/cycle。
+旧的独立 gate 实验不设置 `A5_GATE_RELAY_ONLY` 时保持 direct+relay 行为。
+
+## 物理资源校验和控制流程
+
+`prepare_a5_physical_conflict.py`：
+
+1. 查询本机 rootinfo、Atlas 和实时 hccn EID/端口状态。
+2. 枚举候选 relay 路径，要求同一 relay die、每个 endpoint 的 catalog 使用同一 IO die。
+3. 只接受 EID 唯一绑定到预期物理端口的路径；EID 对应多个端口时拒绝将它视为精确端口控制。
+4. 为两个 job 选择至少一条共同 payload 链路；无解就失败，不通过手填资源名制造冲突。
+5. 输出 manifest、config、拓扑快照、provenance 和共同链路列表。
+
+链路资源名格式：
 
 ```text
-run_a5_serial_scheduler.py
-  load_config → JobSpec[] → Scheduler → ControlServer(AF_UNIX)
-  启动各 job 的 rank0 / rank1（各自 visible_devices、manifest、bootstrap）
-
-graph_gate.cc / GateMain
-  GetRouteResources → 注册 PolicyKernel → capture 两个图内通信节点
-  GateSchedulerClient：HELLO job rank → OK
-  ExecuteAsync(model)
-    图内：arrival callback / D2H notice
-    host：Await(arrival) → started==0 / done 未出现
-          scheduler.Arrive(iteration, op) → 阻塞等待 GO
-    server：on_arrived → 收齐 rank → 检查资源 → reserve → GO ticket split[]
-    host：再次确认 started==0 / done 未出现
-          control stream: ValueWrite(policy[p], split[p]) → ValueWrite(gate, 1)
-    图内：ValueWait(gate==1) → started=1 → PolicyKernel
-          逐路径 LoadArg(policyAddr/auditAddr) → Load policy → Store audit
-          非零路径 Write → 全部 EventWait → 双端完成握手 → done notice
-    host：Await(done) → DONE iteration op ticket release_to_done_ns → ACK
-    server：收齐全部 DONE → release → 下一个等待者 GO
-    host：audit/payload 校验 → 两 rank 验证 barrier
-    图内：gate=0 → D2D recv0→send1 → 第二个节点
-  每轮尾部 drain exec/control 后才能复位通知槽和重放
+link:<物理卡>/<die>/<port><-><物理卡>/<die>/<port>
+例如 link:0/0/7<->2/0/0（仅格式示例，不是实际端口断言）
 ```
 
-callback 只更新原子通知计数；socket、调度、Runtime API 都在普通 host 线程执行。
-放行使用独立 control stream，policy 和 READY 按顺序写入；没有把 READY 排在已被 ValueWait 阻塞的 stream 上。
-任务 ABI 保持 `4 + 2*paths`，固定的是 device 地址，policy 值由 scheduler 的 GO 每次给出。
-各 rank 根据同一个 job 的 policy 得到相同分块，支持 `mixed/direct/relay0/relay1/cycle`；本版不根据冲突改变这些分块。
+两端排序归一化；一项代表双向物理链路，因为每个 job 本身双向收发。
+launcher 再校验每条 manifest hop 存在于 Atlas、EID 绑定及端口状态，且 provenance 的拓扑 hash 一致。
+共享 relay 卡、不同物理端口的两条路径不再产生同一个锁。
+共享模式要求非零 payload 路径真正有公共链路，仅 metadata 重叠不算 payload 冲突。
+所有 catalog hop 仍参与预约，因为零 payload 的 channel 仍有 metadata；payload 链路列表单独输出。
 
-DONE 前已有全部本地路径的 EventWait 和两端完成握手；调度器还会聚合两个 rank 的 DONE。
-DONE 上报在 host audit/payload 验证前，减少验证拷贝对通信资源释放的影响。若随后校验失败，整次实验仍失败并终止其他 worker。
-完整图结束和通信 DONE 是不同层次；本版每个 graph slot 同时仅允许一轮在途。
+```text
+图内 ARRIVED → ValueWait(gate) → 读 policy → 全部路径搬运/等待/完成握手 → DONE
 
-## API 和文件
+host 普通线程：ARRIVED → Unix socket → 收齐参与 rank
+scheduler：检查物理链路锁 → 原子预约 → GO(ticket, split)
+host control stream：写 policy → READY
+scheduler：收齐同一 ticket 的全部 rank DONE → 释放物理链路 → 下一组 GO
+```
 
-| 文件 / 接口 | 职责 |
-|---|---|
-| `scripts/a5_path_scheduler.py` | 无 CANN 依赖的调度状态机、资源预约、FIFO、公平性、统计 |
-| `scripts/run_a5_serial_scheduler.py` | 配置校验、Unix socket server、worker 生命周期、超时、日志和 summary |
-| `testcase/graph_gate_scheduler.h` | C++ host client，HELLO / ARRIVED / GO / DONE / ACK |
-| `testcase/graph_gate.cc` | 图内通知、gate、policy、CCU 通信与结果校验；无 scheduler 环境变量时保持原实验模式 |
-| `aclrtLaunchHostFunc` / D2H notice | 图内到达、完成通知 |
-| `aclrtValueWait` | 图内通信主体前等待 |
-| `aclrtValueWrite` | 图外 control stream 写 policy、READY |
-| `HcommCcuKernelLaunch` | 启动已注册的 policy kernel |
+callback 只更新原子通知；socket 和 Runtime 提交由普通 host 线程执行。
+WAITING 不部分占锁。共享资源 FIFO，不相交任务可并行。超时、旧 ticket、重复 DONE、worker 失败均使实验失败，不以预计结束时间释放资源。
+policy/audit 地址仍逐路径由 host 传入，任务 ABI 仍为 `4 + 2*paths`。
+relay-only 时 paths 为 relay 数量；完成握手使用 catalog 的第一个 relay channel。
+
+拓扑与 EID 校验提供“所配置路径具有共同物理 hop”的证据。实际转发是否按这些端口执行、并发是否导致带宽下降，还需要 HCCN 和时间测量，不能仅凭准备脚本或 CPU PASS 下结论。
 
 ## 1. 构建与 CPU 检查
 
-在此分支的仓库根目录运行。CANN 9.3 替换为实际安装路径，不加载旧 patched HCCL：
+在仓库根目录执行，路径按实际 CANN 版本修改：
 
 ```bash
 unset LD_PRELOAD
 source /usr/local/Ascend/cann-9.3.0/set_env.sh
 bash scripts/build_a5_ccu_urma_route_probe.sh \
-  --cann-path /usr/local/Ascend/cann-9.3.0 \
-  --build-dir /tmp/a5-scheduler-build
+  --cann-path /usr/local/Ascend/cann-9.3.0 --build-dir /tmp/a5-scheduler-build
 /tmp/a5-scheduler-build/a5_graph_gate --check-abi
 python3 -m unittest discover -s tests/python/deepep -p 'test_a5_path_scheduler_cpu.py' -v
-python3 -m unittest discover -s tests/python/deepep -p 'test_a5_relay_graph_gate_cpu.py' -v
-# 使用实际 C++ GateSchedulerClient 替换 socket 集成测试中的 Python 假 worker：
 A5_SCHEDULER_CPU_CLIENT=/tmp/a5-scheduler-build/a5_gate_scheduler_client_cpu \
   python3 -m unittest discover -s tests/python/deepep -p 'test_a5_path_scheduler_cpu.py' -v
+python3 -m unittest discover -s tests/python/deepep -p 'test_a5_relay_graph_gate_cpu.py' -v
 ```
 
-`a5_gate_scheduler_client_cpu` 仅为协议测试夹具，会模拟 worker 成功标记，不能用于上卡/性能验收。
-所有上卡命令必须使用 `a5_graph_gate`。
+CPU fixture 会模拟成功标记，仅用于协议测试；所有上卡命令必须使用 `a5_graph_gate`。
+新 CPU 测试覆盖仅共享 relay 卡拒绝、metadata-only 重叠拒绝、错误端口/EID 绑定拒绝、拓扑 hash 校验、真实 socket、调度资源生命周期。
+开发用 9.2 容器无 NPU，编译与 CPU 通过不能替代这次新物理配置的上卡验证。
+本次已通过 9.2 SDK 的 -Werror 编译、严格链接、ABI 加载、原 host ctest 1/1、原 launcher 4/4，以及新物理调度测试 21/21（含实际 C++ socket client）。新路径角色交叉和物理流量尚待上卡验证。
 
-## 2. 准备卡号与真实 manifest
+## 2. 生成有共同物理链路的计划
 
-以下示例使用 0..7，不代表这些卡目前空闲。更换卡号时同时修改 JSON 和 manifest 生成参数。
-manifest 相对路径相对于 JSON 所在目录解析。
+使用一个新的输出目录。卡号和文件路径按现场修改：
 
 ```bash
-mkdir -p /tmp/a5-scheduler-plans
-cp examples/a5_ccu_urma_route_probe/testcase/scheduler_shared.example.json \
-  /tmp/a5-scheduler-plans/shared.json
-cp examples/a5_ccu_urma_route_probe/testcase/scheduler_disjoint.example.json \
-  /tmp/a5-scheduler-plans/disjoint.json
-
-for pair in 2,3 4,5 6,7; do
-  src=${pair%,*}
-  dst=${pair#*,}
-  python3 scripts/resolve_a5_explicit_multirelay_eids.py \
-    --root-info /etc/hccl_rootinfo.json \
-    --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
-    --src-phy "$src" --dst-phy "$dst" --relay-phys 0,1 \
-    > "/tmp/a5-scheduler-plans/relays_${src}_${dst}.tsv"
-done
-
-python3 scripts/resolve_a5_explicit_multirelay_eids.py \
+python3 scripts/prepare_a5_physical_conflict.py \
   --root-info /etc/hccl_rootinfo.json \
   --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
-  --src-phy 4 --dst-phy 5 --relay-phys 6,7 \
-  > /tmp/a5-scheduler-plans/relays_4_5_via_6_7.tsv
+  --managed-devices 0,1,2,3,4,5,6,7 \
+  --scenario shared \
+  --a-devices 2,3 --a-relays 0,1 \
+  --b-devices 0,1 --b-relays 2,3 \
+  --output-dir /tmp/a5-physical-shared
 ```
 
-resolver 发现候选歧义时显式选择 plane，不猜 EID。JSON/manifest 的卡序必须一致，所有 endpoint/relay local die 约束沿用原实验。
-多 communicator 同时初始化可能暴露 jetty/channel 限制：若 HcclCommInitRootInfo/建链失败，报告具体 API 和 plog，不归为 scheduler gate 失败。
+检查 `selection.json` 的 `shared_payload_links` 非空，列出共同链路两端卡/die/port。
+脚本输出 `CONFIG=/tmp/a5-physical-shared/config.json`。
+计划只选择满足目标的物理路径，不自动猜“同一 relay 必然冲突”。没有可用组合时调整实际卡位或 relay 数，不能跳过校验。
+本步是只读硬件查询，不提交 NPU 任务；需重新准备本机计划，避免使用其他机器或过期 EID。
 
-## 3. 先验证“冲突时确实等待”
+## 3. 正确性：共同链路被占用时等待
 
 ```bash
 python3 scripts/run_a5_serial_scheduler.py \
   --binary /tmp/a5-scheduler-build/a5_graph_gate \
-  --config /tmp/a5-scheduler-plans/shared.json \
+  --config /tmp/a5-physical-shared/config.json \
   --schedule serialize --mode GRAPH --notify CALLBACK \
   --bytes 4194304 --iters 4 --warmup-iters 0 \
   --cohort-barrier --grant-delay-ms 200 --require-blocked \
-  --timeout 300 --output-root /tmp/a5-scheduler-results
+  --timeout 300 --output-root /tmp/a5-physical-correctness
 ```
 
-`--cohort-barrier` 是合成 workload 的到达对齐开关：同一 iteration/op 的全部 job 到齐后才调度；不是算法的必要条件。
-`--grant-delay-ms 200` 仅用于正确性：拿到预约的 worker 在写 READY 前等待 200ms，让竞争者的等待清晰可见。它属于预约占用，不能当通信耗时或性能收益。
+`cohort-barrier` 对齐两 job 同一节点的到达；200ms 是预约后、READY 前的调试窗口，仅用于观察排队，不能计为通信性能。
+两 job 共四个 worker，每个 worker 应有 8 个 GATE_OP_PASS，audit/payload 正确，零退出，launcher 输出 SERIAL_SCHEDULER_ALL_WORKERS_PASS。
+events.jsonl 应出现 BLOCKED；后一个共享链路任务的 GRANT 必须在前者两个 rank 的 DONE 和 RELEASE 之后。
+逐节点 gate 不得提前执行。依次验证 EAGER/GRAPH × CALLBACK/D2H 四组合，不自动 fallback。
 
-通过标准：
+## 4. 无共同链路的对照
 
-1. launcher 输出 `SERIAL_SCHEDULER_ALL_WORKERS_PASS`，所有 worker 零退出。
-2. 每个 worker 都有 `2*iters` 个 `GATE_OP_PASS`，audit 和 payload 正确。
-3. `events.jsonl` 有 BLOCKED，且任意共享资源的两次 GRANT 之间，前者必须出现所有 rank DONE 和 RELEASE。
-4. worker 在收到 GO 前后的检查均为 started=0 / done 未出现。
-5. 同一任务只有一个 ticket；所有 rank 使用相同 split；没有旧 replay 的通知混入。
+```bash
+python3 scripts/prepare_a5_physical_conflict.py \
+  --root-info /etc/hccl_rootinfo.json \
+  --topology-json /usr/local/Ascend/driver/topo/950/atlas_950_1.json \
+  --managed-devices 0,1,2,3,4,5,6,7 --scenario disjoint \
+  --a-devices 2,3 --a-relays 0,1 \
+  --b-devices 4,5 --b-relays 6,7 \
+  --output-dir /tmp/a5-physical-disjoint
+```
 
-可将 GRAPH 改 EAGER、CALLBACK 改 D2H 做四组合检查，不允许自动 fallback。
+将第3步 config 换为此 config，移除 require-blocked。预期在首个 RELEASE 前已有两项 GRANT，没有物理链路锁冲突，数据校验通过。
+也可用原来的共享 relay 卡配置 A2/3 via0/1、B4/5 via0/1，指定 scenario=disjoint：只有拓扑证明其各 hop 不相交时才接受。这验证“同卡不同链路”不会被卡级锁误串行。
+物理链路不相交仍可能有 die/HBM 等其他争用，本实验只验证链路冲突。
 
-## 4. 验证“不冲突的任务仍并行”
+## 5. 性能：并发使用同一链路 vs scheduler 串行
 
-使用同一命令换成 `disjoint.json`，移除 `--require-blocked`，仍可保留 200ms debug 窗口。
-预期在第一项 RELEASE 前能看到两项 GRANT，且没有资源 BLOCKED。
-这证明没有错误地串行整机。这里只证明配置资源域的并发，物理路径仍建议 HCCN 验证。
-
-## 5. 性能对照
-
-正确性通过后必须把 debug delay 设为 0。相同配置、字节数、policy、通知方式、poll 间隔、cohort 开关下比较：
+使用完全相同的 shared config，先将 grant-delay 设为0：
 
 ```bash
 for schedule in uncontrolled serialize; do
   python3 scripts/run_a5_serial_scheduler.py \
     --binary /tmp/a5-scheduler-build/a5_graph_gate \
-    --config /tmp/a5-scheduler-plans/shared.json \
+    --config /tmp/a5-physical-shared/config.json \
     --schedule "$schedule" --mode GRAPH --notify CALLBACK \
     --bytes 67108864 --iters 50 --warmup-iters 5 \
     --cohort-barrier --grant-delay-ms 0 --poll-us 50 \
-    --timeout 600 --output-root /tmp/a5-scheduler-perf
+    --timeout 600 --output-root /tmp/a5-physical-perf
 done
 ```
 
-建议再用 4MiB、16MiB、256MiB；去掉 cohort barrier 重测非同步到达；交替测试顺序、各重复至少三次，并记录背景通信。
-`uncontrolled` 仍经过同一套通知、IPC 和 policy 下发，只是不限制资源重叠，因此可以比较“冲突串行策略”的效果。
-另用原 `run_a5_relay_graph_gate.py --hold-ms 0` 测独立 job，估计集中控制额外开销；单 job 的结果不能直接当多 job 总吞吐。
+再测 4/16/256MiB，交替顺序各重复至少三次。uncontrolled 保留相同通知、IPC 和 policy 写入，只允许物理链路重叠预约。
+单独测 A、B 的通信作为无竞争耗时参考：在同一个 shared config 和上述性能命令中分别加 `--only-job a`、`--only-job b`，保留相同 bytes、iters、policy 和通知设置，移除 require-blocked。
+完整物理配置仍会先验证，再只启动选中的一个 job；catalog 和 payload split 保持一致。不要拿旧 direct+relay 模式作单算子基线。
 
-结果目录：
+HCCN 验证必须覆盖 `physical_plan.json` 的共同链路两端：
 
-- `arguments.json`、`config.json`：实际参数、卡号、manifest 和资源集合。
-- `events.jsonl`：单调时钟下 ARRIVED / READY / BLOCKED / GRANT / DONE / RELEASE 时间线。
-- `<job>/rank{0,1}.log`：真实 worker 的 CCU、gate、audit、payload 结果。
-- `metrics.json`：逐 collective 的各 rank 到达差、cohort 等待、资源等待、预约占用、ready→done，以及每 rank release→done。
-- `summary.json`：去 warmup 后的均值/p50/p95、阻塞次数和整个合成 iteration 的 span。
-- `failure.json`：出错时仍在预约、排队的任务；不会通过超时清账伪造 PASS。
+1. 单独 A、单独 B 都应使同一对物理端口的 payload 计数显著增加，证明共同 hop 真被使用。
+2. uncontrolled 必须确认有实际搬运重叠，不能只看 GO/预约区间重叠；使用适当消息大小、重复轮数和端口采样。
+3. serialize 应显示分时使用，并结合全部 DONE 后放行的时间线。
+4. 全程只有共同 relay 卡而端口不一致，不满足实验要求；没有实际重叠时不能声称测到冲突膨胀。
 
-时间含义：
+结果保存 `physical_plan.json`（path→物理 hop、共同 payload 链路）、拓扑/provenance 快照、各 job manifest、events.jsonl、metrics.json、summary.json 和 worker 日志。
+时间线使用同一 host monotonic_ns；release→done 包含 Runtime 和 polling，不是纯 device 时间；iteration span 包含节点间验证与 IPC，不是模型迭代时间。
+给出 resource_wait、reservation、ready→done、iteration span 的均值/分位数及重复实验波动；性能变差也如实记录。
 
-- 所有 scheduler 时间戳是同一 host 的 `monotonic_ns`，不依赖设备时钟同步。
-- 资源等待从满足 cohort 条件开始计，cohort 等待单列；预约占用从 GRANT 记到最后一个 DONE。
-- rank release→done 从 host 调用 READY 前记到发现 DONE，包含 Runtime 下发与轮询延迟，不是纯 device kernel 时间。
-- iteration span 从当轮最早 ARRIVED 到最后 DONE，包含两个节点间的验证、D2D、IPC 等开销；未含图前输入初始化，跨 job 非同步重放时各轮 span 可重叠。
-- Python、socket、50us host poll 和逐节点验证对小消息可能占主导。它们用于第一版功能与相对性能，不能将 span 直接宣称为真实模型迭代耗时，也不能用其倒数声称模型吞吐。
-- 建议结合 HCCN 观察 uncontrolled 的 relay 重叠与 serialize 的时分使用，但正确性最终依赖 audit/payload、完整 rank 完成和资源时间线。
+## 失败归因
 
-后续接八 rank AllToAllV 时，应保留 Scheduler 状态机，新增能生成完整 peer/path policy、聚合八 rank 到达/完成的 adapter；不要仅把当前两 rank worker 的 communicator size 改成 8。
+依次区分拓扑/EID准备、HCCL初始化、建链、CCU注册、图捕获/replay、调度IPC、gate放行、通信完成、audit/payload。
+一个卡兼任另一个 job 的 relay 可能暴露额外的建链/执行限制，失败时保留具体 API、返回码和 plog，不换成无共同链路配置后宣称完成物理冲突实验。
+9.2 既有 jetty 创建失败与 policy/audit 地址派生注册失败是不同问题；保持逐路径地址 ABI。
+最终报告必须分别说明：共同物理 hop 的拓扑证据、实际 HCCN 证据、串行控制正确性、是否测到时间膨胀和串行收益。

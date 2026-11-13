@@ -1,4 +1,8 @@
 {
+  "resource_mode": "physical_link",
+  "expectation": "disjoint",
+  "topology_json": "topology.json",
+  "provenance_json": "provenance.json",
   "managed_devices": [0, 1, 2, 3, 4, 5, 6, 7],
   "jobs": [
     {"name": "a", "devices": [2, 3], "relay_phys": [0, 1], "relay_manifest": "relays_2_3.tsv", "policy": "mixed"},

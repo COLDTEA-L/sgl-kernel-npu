@@ -3,6 +3,7 @@
 #include "../../examples/a5_ccu_urma_route_probe/testcase/graph_gate_scheduler.h"
 #include <cstdio>
 #include <thread>
+#include <fstream>
 
 int main(int argc, char **argv)
 {
@@ -13,9 +14,14 @@ int main(int argc, char **argv)
         const size_t bytes = std::stoull(argv[4]);
         GateSchedulerClient client(rank);
         if (!client.Enabled()) throw std::runtime_error("CPU protocol fixture requires a scheduler");
+        std::ifstream manifest(argv[6]);
+        std::string line;
+        std::getline(manifest, line);
+        size_t paths = std::getenv("A5_GATE_RELAY_ONLY") ? 0 : 1;
+        while (std::getline(manifest, line)) if (!line.empty() && line[0] != '#') ++paths;
         for (unsigned it = 0; it < iterations; ++it) {
             for (unsigned op = 0; op < 2; ++op) {
-                client.Arrive(it, op, 3, bytes);
+                client.Arrive(it, op, paths, bytes);
                 std::this_thread::sleep_for(std::chrono::milliseconds(rank == 0 ? 1 : 5));
                 client.Done(it, op, 1000000);
                 std::printf("GATE_OP_PASS rank=%u iteration=%u op=%u\n", rank, it, op);

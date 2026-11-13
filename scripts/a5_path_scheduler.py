@@ -15,14 +15,20 @@ class JobSpec:
     paths: int
     nbytes: int
     policy: str = 'mixed'
+    relay_only: bool = False
 
     def split(self, iteration, op):
-        choices = {'direct': 0, 'mixed': self.paths}
-        choices.update({f'relay{i}': i + 1 for i in range(self.paths - 1)})
+        choices = {'mixed': self.paths}
+        if not self.relay_only:
+            choices['direct'] = 0
+        offset = 0 if self.relay_only else 1
+        choices.update({f'relay{i}': i + offset for i in range(self.paths - offset)})
         selected = (iteration + op) % (self.paths + 1) if self.policy == 'cycle' else choices[self.policy]
         result = [0] * self.paths
         if selected < self.paths:
             result[selected] = self.nbytes
+        elif self.relay_only:
+            result = [self.nbytes // self.paths] * self.paths
         else:
             result[0] = self.nbytes // 2
             for i in range(1, self.paths):
@@ -58,7 +64,7 @@ class Scheduler:
         if not self.jobs or len(self.jobs) != len(jobs):
             raise ValueError('empty/duplicate jobs')
         for j in jobs:
-            if j.ranks < 1 or not j.resources or not 2 <= j.paths <= 3:
+            if j.ranks < 1 or not j.resources or not (1 if j.relay_only else 2) <= j.paths <= 3:
                 raise ValueError('invalid job specification')
             j.split(0, 0)
         self.iterations, self.mode, self.cohort_barrier = iterations, mode, cohort_barrier
