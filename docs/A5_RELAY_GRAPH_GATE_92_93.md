@@ -1,5 +1,40 @@
 # CANN 9.2/9.3：direct + relay 与图内逐算子通知穿刺
 
+## 注册兼容修复及目标机回报
+
+`7ee1ce6` 的 `PolicyKernel` 在 CCU 变量地址上执行 `policy += 8; audit += 8`，
+随后用于 Load/Store。用户转交的 CANN 9.3.0 对照实验显示：builder 返回成功，
+但 `HcommCcuKernelRegisterEnd` 返回4；直接基址 Load/Store 和第二次注册会话均成功，
+加回地址算术后再次失败。证据支持此 kernel 的地址派生与 9.3 codegen 存在兼容问题，
+不能据此泛化为所有 CCU 地址算术都不支持。
+
+本分支已按报告修复：host 逐路径传入 policy/audit 地址，device 每个地址直接
+LoadArg 后用于 Load/Store，任务参数从6个改为 `4 + 2*paths`，3条路径为10个。
+注册名改为 `A5GraphGateRelayV2HostAddresses`，避免混用旧注册 ABI。
+固定的是地址，policy **值**仍在 gate 放行后由 device 动态读取。
+
+独立应用修复后，开发服务器 `cam_lyw_92` 已重新通过真实SDK的 `-Werror` 编译、
+严格链接、`GRAPH_GATE_ABI_PASS`、host ctest 1/1、launcher CPU测试4/4。
+日志：`/home/liuyuanwen/profiling/a5-gate-address-fix.hbhMiO/{build.log,abi.log}`。
+该检查没有NPU执行，仍不能作为修复后9.3注册/上卡的独立复验。
+
+用户报告修复提交为 `672c26b`（`a5-relay-graph-gate-fix`）；在本次接收报告时，
+该提交/分支尚未存在于 origin，因此本分支根据转交的 diff 独立应用等价修复，
+未声称合入该提交或独立复查以下原始日志。
+
+目标机回报：`yuanwen_dsk`，CANN9.3.0，Ascend950DT V120，通信2/3、relay0/1，
+driver25.1.rc2、firmware7.0.9.101.200。20轮 EAGER/GRAPH × CALLBACK/D2H
+均为每rank40个 GATE_OP_PASS；hold2000ms×4轮通过；四种固定策略通过。
+报告的 HCCN 指纹为 direct8.81M、单relay8.81M，mixed两relay各2.20M、direct4.41M。
+这是用户提供的上卡证据，不是本开发容器重新运行的结果。
+报告及日志位于目标机 `/home/l00934901/a5_relay_graph_gate/REPORT.md` 和
+`logs/{revert_check,matrix,hold,policy,hccn}/`。
+
+另一个9.2失败独立记录：通信域初始化 HcclCommInitRootInfo 返回1，plog为
+`halAsyncDmaJettyCreate ... drvRetCode=7`；9.2通知probe正常。
+该失败发生在自定义kernel注册前，不应归为本次地址ABI问题；jetty资源限制是报告中的
+解释，具体驱动原因仍应结合现场资源和底层日志核实。9.2编译通过不等于9.2通信已通过。
+
 分支：`feature/a5-ccu-valuewait-callback-puncture-92-93`。目标是让 DeepSeek
 在目标卡上验证同一张图内的两个通信节点可被 host 分别放行，并能按本轮决策改变
 direct/relay 数据分配。程序不依赖 Torch，不代表 DeepEP/NPUGraph 已验证。
@@ -33,7 +68,10 @@ D2D copy 代表图中的数据依赖节点，不是实际 MoE 计算。通信0�
 通信1把收到的数据送回原rank，因此两个输出分别校验为对端输入、本rank输入。
 图尾还要排空 exec/control stream，不能提前复位 host 通知槽或开始下一轮。
 
-## 图内通知：两个独立实验，均未上卡验证
+## 图内通知：两个独立实验
+
+修复后的9.3上卡结果以文首用户回报为准。下文描述测试方法；开发服务器
+`cam_lyw_92` 的编译结果始终与目标机执行结果分开记录。
 
 `--notify CALLBACK`：两个 ARRIVED 和两个 DONE 均以 `aclrtLaunchHostFunc`
 放在捕获范围内。callback 参数在所有 replay 期间保持有效，只更新原子计数。

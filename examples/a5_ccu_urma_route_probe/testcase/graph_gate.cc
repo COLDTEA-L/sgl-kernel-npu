@@ -12,21 +12,26 @@ struct Catalog { std::vector<ChannelHandle> channels; };
 CcuResult PolicyKernel(CcuKernelArg arg)
 {
     const auto &channels = static_cast<const Catalog *>(arg)->channels;
-    ccu::Variable input, output, inputToken, outputToken, policy, audit;
+    ccu::Variable input, output, inputToken, outputToken;
     EMIT(ccu::LoadArg(input, 0)); EMIT(ccu::LoadArg(output, 1));
     EMIT(ccu::LoadArg(inputToken, 2)); EMIT(ccu::LoadArg(outputToken, 3));
-    EMIT(ccu::LoadArg(policy, 4)); EMIT(ccu::LoadArg(audit, 5));
     std::vector<ccu::Variable> outputs, tokens, sizes;
     std::vector<ccu::Event> events(channels.size());
-    for (auto channel : channels) {
+    for (size_t i = 0; i < channels.size(); ++i) {
+        const auto channel = channels[i];
         outputs.push_back(ccu::GetResByChannel<ccu::Variable>(channel, 0));
         tokens.push_back(ccu::GetResByChannel<ccu::Variable>(channel, 1));
         EMIT(ccu::WriteVariableWithNotify(channel, output, 0, 0));
         EMIT(ccu::WriteVariableWithNotify(channel, outputToken, 1, 1));
         sizes.emplace_back();
-        EMIT(ccu::Load(policy, sizes.back()));
-        EMIT(ccu::Store(audit, sizes.back())); // audit actual device-side policy
-        policy += 8; audit += 8;
+        // CANN 9.3 RegisterEnd rejects derived variable addresses used by
+        // Load/Store in this kernel. Pass each address directly from the host;
+        // retain runtime loads so graph replay never freezes policy VALUES.
+        ccu::Variable policyAddr, auditAddr;
+        EMIT(ccu::LoadArg(policyAddr, static_cast<uint32_t>(4 + i)));
+        EMIT(ccu::LoadArg(auditAddr, static_cast<uint32_t>(4 + channels.size() + i)));
+        EMIT(ccu::Load(policyAddr, sizes.back()));
+        EMIT(ccu::Store(auditAddr, sizes.back())); // audit actual device-side policy
     }
     for (auto channel : channels) {
         EMIT(ccu::NotifyWait(channel, 0)); EMIT(ccu::NotifyWait(channel, 1));
@@ -175,11 +180,11 @@ int GateMain(int argc, char **argv)
     CHECK(HcclCommQueryCcuIns(comm, &instance, &count));
     const void *args[] = {&catalog}; CcuKernelHandle kernel = 0;
     CHECK(HcommCcuKernelRegisterStart(instance));
-    CHECK(HcommCcuKernelRegister(instance, resources.dieId, "A5GraphGateRelayV1",
+    CHECK(HcommCcuKernelRegister(instance, resources.dieId, "A5GraphGateRelayV2HostAddresses",
         reinterpret_cast<const void *>(PolicyKernel), args, 1, &kernel));
     CHECK(HcommCcuKernelRegisterEnd(instance));
     uint32_t argCount = 0; CHECK(HcommCcuGetTaskArgsNum(kernel, &argCount));
-    if (argCount != 6) throw std::runtime_error("task ABI mismatch");
+    if (argCount != 4 + 2 * paths) throw std::runtime_error("task ABI mismatch");
     std::array<Node, 2> nodes;
     std::vector<HcclMemHandle> registrations;
     for (auto &n : nodes) {
@@ -205,9 +210,14 @@ int GateMain(int argc, char **argv)
             EnqueueNotice(n.arrival, callback, exec); // INSIDE capture, per operator
             CHECK(aclrtValueWait(n.gate, 1, ACL_STREAM_WAIT_VALUE_EQ, exec));
             CHECK(aclrtValueWrite(n.started, 1, 0, exec));
-            const uint64_t task[] = {reinterpret_cast<uint64_t>(n.send), reinterpret_cast<uint64_t>(n.recv),
-                n.inputToken, n.outputToken, reinterpret_cast<uint64_t>(n.policy), reinterpret_cast<uint64_t>(n.audit)};
-            CHECK(HcommCcuKernelLaunch(resources.routeThread, kernel, task, 6));
+            std::vector<uint64_t> task = {reinterpret_cast<uint64_t>(n.send),
+                reinterpret_cast<uint64_t>(n.recv), n.inputToken, n.outputToken};
+            for (size_t p = 0; p < paths; ++p)
+                task.push_back(reinterpret_cast<uint64_t>(n.policy + p));
+            for (size_t p = 0; p < paths; ++p)
+                task.push_back(reinterpret_cast<uint64_t>(n.audit + p));
+            CHECK(HcommCcuKernelLaunch(resources.routeThread, kernel, task.data(),
+                                      static_cast<uint32_t>(task.size())));
             EnqueueNotice(n.done, callback, exec);
             CHECK(aclrtValueWrite(n.gate, 0, 0, exec));
             if (op == 0) CHECK(aclrtMemcpyAsync(nodes[1].send, bytes, n.recv, bytes,

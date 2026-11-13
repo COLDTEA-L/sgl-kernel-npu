@@ -8,25 +8,30 @@
 
 ## 新增：relay 与图内逐节点控制实验
 
+已接收目标9.3上卡报告并修复 PolicyKernel 地址参数 ABI：每路径 policy/audit 地址
+由host直接传入，总参数 `4+2*paths`；不再在CCU变量上派生Load/Store地址。
+报告中9.3的图内通知、同图双节点、relay策略与端口指纹通过；9.2仍有独立的
+jetty创建失败。证据来源和限制见下方新指南，旧“未上卡”描述指最初开发容器验证状态。
+
 已新增 `a5_graph_gate`、`scripts/run_a5_relay_graph_gate.py`：支持 direct + 1/2 relay，
 在同一张图内放置两个通信节点，分别执行 ARRIVED/Wait/DONE。
 包含 CALLBACK、pinned D2H 两种通知测试和独立单卡通知 probe；host 发布的路径字节数
 由 CCU 在 gate 放行后动态读取。完整代码链、编译/运行命令和 DeepSeek 验收标准见
 [relay + 图内通知指南](A5_RELAY_GRAPH_GATE_92_93.md)。
 
-该新增 C++ probe 已通过 CANN 9.2 编译/链接/ABI 检查，图内通知 replay、
-实际 relay 和 9.3 执行仍待上卡。下文“待实现”指旧 DeepEP direct gate 测试，
+该新增 C++ probe 已通过开发容器 CANN 9.2 编译/链接/ABI 检查；修复后9.3执行
+由目标机报告验证。下文“待实现”指旧 DeepEP direct gate 测试，
 不要把 standalone C++ probe 与 DeepEP/NPUGraph 的验证状态混用。
 
 ## 状态与范围
 
-这是 92/93 实验开发基线，**不是两卡控制实验已实现或已通过的声明**。
+以下说明原始 DeepEP 穿刺封装的范围；standalone C++ 新实验结果见上文。
 原 `A5ValueWaitCallbackScheduler` 仍在 arrival 后自动放行，需要增加手动/延迟 release。
 原 Python 穿刺仍依赖 relay manifest 和 patched HCCL，不能用于此次两卡目标；
 旧 `run_a5_valuewait_callback_puncture.sh` 在本分支提前拒绝执行，避免混用库。
 
 实施任务和完整验收见 [Issue #13](https://github.com/COLDTEA-L/sgl-kernel-npu/issues/13)。
-仅用两个通信卡、不用 relay、不维护资源矩阵。
+原始 direct 阶段仅用两个通信卡；新增实验使用显式relay，仍不维护资源矩阵。
 
 ## 版本变化
 
@@ -88,7 +93,7 @@ bash scripts/build_a5_ccu_public_api_smoke.sh \
 两张物理卡必须可由命令行替换。先检查基线 direct，再加 eager gate，最后验证
 graph capture/replay；捕获失败要单独报告，不以 eager PASS 替代。
 
-## 新实验待实现的执行链
+## 历史：原始单节点 DeepEP 实验执行链
 
 ```text
 S_exec (=实际 routeStream):
